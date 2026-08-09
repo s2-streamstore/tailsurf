@@ -1,6 +1,6 @@
 //! JSON request and response models for the REST v1 control plane.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{BearerToken, StreamId, TokenId, TokenPermissions};
 
@@ -15,15 +15,58 @@ pub enum Visibility {
     Public,
 }
 
+/// Requested S2 record retention for a new stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestedRetention {
+    /// Automatically trim records older than this many seconds.
+    Seconds(u64),
+    /// Retain records indefinitely.
+    Infinite,
+}
+
+impl Serialize for RequestedRetention {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Seconds(seconds) => serializer.serialize_u64(*seconds),
+            Self::Infinite => serializer.serialize_str("infinite"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestedRetention {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WireRetention {
+            Seconds(u64),
+            Name(String),
+        }
+
+        match WireRetention::deserialize(deserializer)? {
+            WireRetention::Seconds(seconds) => Ok(Self::Seconds(seconds)),
+            WireRetention::Name(name) if name == "infinite" => Ok(Self::Infinite),
+            WireRetention::Name(_) => Err(D::Error::custom(
+                "retention must be seconds or \"infinite\"",
+            )),
+        }
+    }
+}
+
 /// Options for creating a stream.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
     /// Initial stream visibility. Defaults to private.
     #[serde(default)]
     pub visibility: Visibility,
-    /// Requested retention in seconds, or the service default when absent.
+    /// Requested retention, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retention_secs: Option<u64>,
+    pub retention_secs: Option<RequestedRetention>,
     /// Stream-token permissions to issue atomically with creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_tokens: Option<Vec<TokenPermissions>>,
@@ -185,6 +228,35 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize create request"),
             json!({ "visibility": "private" })
+        );
+    }
+
+    #[test]
+    fn serializes_finite_and_infinite_retention_requests() {
+        for (retention, expected) in [
+            (RequestedRetention::Seconds(604_800), json!(604_800)),
+            (RequestedRetention::Infinite, json!("infinite")),
+        ] {
+            let request = CreateStreamRequest {
+                retention_secs: Some(retention),
+                ..CreateStreamRequest::default()
+            };
+            let value = serde_json::to_value(request).expect("serialize create request");
+            assert_eq!(value["retention_secs"], expected);
+            assert_eq!(
+                serde_json::from_value::<CreateStreamRequest>(value)
+                    .expect("deserialize create request")
+                    .retention_secs,
+                Some(retention)
+            );
+        }
+
+        assert!(
+            serde_json::from_value::<CreateStreamRequest>(json!({
+                "visibility": "private",
+                "retention_secs": "forever"
+            }))
+            .is_err()
         );
     }
 

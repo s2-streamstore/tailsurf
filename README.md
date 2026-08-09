@@ -72,6 +72,15 @@ Create a public stream:
 tsf new --public
 ```
 
+Choose record retention with a human duration:
+
+```sh
+tsf new --retention 7d
+make test | tsf write --new --retention 6h
+```
+
+`--retention infinite` explicitly requests infinite retention. The service enforces the current free-user limit and returns a clear error when a requested policy is unavailable.
+
 `tsf new` prints the stream retention in seconds along with the generated URLs.
 
 Stream command output into a new URL:

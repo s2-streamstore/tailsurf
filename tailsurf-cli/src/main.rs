@@ -5,6 +5,7 @@ use std::{
     fs::OpenOptions,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
+    str::FromStr,
 };
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -18,8 +19,8 @@ use tailsurf::{
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
-            IssuedStreamToken, StreamInfoResponse, StreamTokenStatus, UpdateStreamRequest,
-            Visibility,
+            IssuedStreamToken, RequestedRetention, StreamInfoResponse, StreamTokenStatus,
+            UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -80,6 +81,12 @@ struct NewArgs {
     private: bool,
     #[arg(long = "token", value_name = "PERMISSIONS")]
     tokens: Vec<TokenPermissions>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Record retention, such as 6h, 7d, or infinite"
+    )]
+    retention: Option<RetentionArg>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
     #[arg(long = "owner-token-file", value_name = "PATH")]
@@ -99,6 +106,13 @@ struct WriteArgs {
     public: bool,
     #[arg(long, conflicts_with = "public")]
     private: bool,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        requires = "new",
+        help = "New-stream record retention, such as 6h, 7d, or infinite"
+    )]
+    retention: Option<RetentionArg>,
     #[arg(long)]
     raw: bool,
     #[arg(last = true, value_name = "COMMAND")]
@@ -207,6 +221,40 @@ enum OutputFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetentionArg {
+    Seconds(u64),
+    Infinite,
+}
+
+impl FromStr for RetentionArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("infinite") {
+            return Ok(Self::Infinite);
+        }
+        let duration = humantime::parse_duration(value)
+            .map_err(|error| format!("invalid retention duration: {error}"))?;
+        if duration.is_zero() {
+            return Err("retention must be at least one second".to_owned());
+        }
+        if duration.subsec_nanos() != 0 {
+            return Err("retention must be a whole number of seconds".to_owned());
+        }
+        Ok(Self::Seconds(duration.as_secs()))
+    }
+}
+
+impl From<RetentionArg> for RequestedRetention {
+    fn from(value: RetentionArg) -> Self {
+        match value {
+            RetentionArg::Seconds(seconds) => Self::Seconds(seconds),
+            RetentionArg::Infinite => Self::Infinite,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteBuffering {
     Raw,
     Lines,
@@ -267,7 +315,7 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
     let created = TsfClient::with_api_base_url(api_url)
         .create_stream(&CreateStreamRequest {
             visibility,
-            retention_secs: None,
+            retention_secs: args.retention.map(Into::into),
             issue_tokens,
         })
         .await
@@ -290,7 +338,7 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
         let created = TsfClient::with_api_base_url(api_url.clone())
             .create_stream(&CreateStreamRequest {
                 visibility,
-                retention_secs: None,
+                retention_secs: args.retention.map(Into::into),
                 issue_tokens: Some(default_cli_tokens(visibility)),
             })
             .await

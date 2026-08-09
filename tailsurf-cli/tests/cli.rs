@@ -28,9 +28,9 @@ use tailsurf::{
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
-            IssuedStreamToken, ListTokensResponse, RevokeTokenRequest, StreamInfoResponse,
-            StreamTailResponse, StreamTokenStatus, StreamTokenSummary, UpdateStreamRequest,
-            Visibility,
+            IssuedStreamToken, ListTokensResponse, RequestedRetention, RevokeTokenRequest,
+            StreamInfoResponse, StreamTailResponse, StreamTokenStatus, StreamTokenSummary,
+            UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -50,6 +50,8 @@ use tokio::{
     time::{sleep, timeout},
 };
 use url::Url;
+
+const FREE_RETENTION_LIMIT_MESSAGE: &str = "Infinite retention is unavailable for free users.";
 
 #[tokio::test]
 async fn new_outputs_json_and_token_files() {
@@ -157,6 +159,43 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
         "stream_id=<stream_id>\nretention_secs=<retention_secs>\nrw=<url>\nr=<url>\n"
     );
     assert_created_output_urls_parse(&explicit.stdout, &["rw", "r"]);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_and_write_new_accept_human_retention_and_surface_free_limits() {
+    let server = TestServer::start().await;
+
+    let finite = run_tsf(
+        &server,
+        ["new", "--retention", "7d", "--format", "json"],
+        None,
+    )
+    .await;
+    assert!(finite.status.success(), "stderr={}", finite.stderr);
+    let finite_json: serde_json::Value =
+        serde_json::from_str(&finite.stdout).expect("finite JSON output");
+    assert_eq!(finite_json["retention_secs"], 604_800);
+
+    let write = run_tsf(
+        &server,
+        ["write", "--new", "--retention", "6h"],
+        Some("retained\n"),
+    )
+    .await;
+    assert!(write.status.success(), "stderr={}", write.stderr);
+    assert!(write.stderr.contains("retention_secs=21600"));
+
+    let denied = run_tsf(&server, ["new", "--retention", "infinite"], None).await;
+    assert!(!denied.status.success());
+    assert!(
+        denied
+            .stderr
+            .contains(&format!("free_plan_limit: {FREE_RETENTION_LIMIT_MESSAGE}")),
+        "stderr={}",
+        denied.stderr
+    );
 
     server.abort();
 }
@@ -1289,7 +1328,18 @@ struct TestRecord {
 async fn test_create_stream(
     State(state): State<Arc<TestApiState>>,
     Json(request): Json<CreateStreamRequest>,
-) -> Json<CreateStreamResponse> {
+) -> Response {
+    let retention_secs = match request.retention_secs {
+        None => 864_000,
+        Some(RequestedRetention::Seconds(seconds)) => seconds,
+        Some(RequestedRetention::Infinite) => {
+            return test_error(
+                StatusCode::FORBIDDEN,
+                "free_plan_limit",
+                FREE_RETENTION_LIMIT_MESSAGE,
+            );
+        }
+    };
     let stream_id = {
         let mut next_stream = state.next_stream.lock().expect("next stream lock");
         let stream_id = format!("{:032x}", *next_stream)
@@ -1336,9 +1386,10 @@ async fn test_create_stream(
     Json(CreateStreamResponse {
         stream_id,
         visibility: request.visibility,
-        retention_secs: request.retention_secs.unwrap_or(864_000),
+        retention_secs,
         tokens: response_tokens,
     })
+    .into_response()
 }
 
 async fn test_get_stream(

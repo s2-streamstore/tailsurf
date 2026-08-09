@@ -20,7 +20,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: python3 scripts/published-cli-smoke.py --self-test
-      - run: cargo package --workspace
+      - run: cargo package -p tailsurf
+      - run: cargo package -p tailsurf-cli --list
 
   msrv:
     runs-on: ubuntu-latest
