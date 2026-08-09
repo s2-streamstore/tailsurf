@@ -8,7 +8,7 @@ pub mod client;
 pub mod ids;
 /// Stream-token permission parsing and validation.
 pub mod permissions;
-/// TSF REST models and v2 binary WebSocket protocol types.
+/// TSF REST models and v3 binary WebSocket protocol types.
 pub mod protocol;
 /// Human-facing stream share URL parsing and construction.
 pub mod stream_url;

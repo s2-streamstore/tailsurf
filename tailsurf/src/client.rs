@@ -136,7 +136,7 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Cloneable TSF control-plane and v2 data-plane client.
+/// Cloneable TSF control-plane and v3 data-plane client.
 ///
 /// Mutating REST operations are not retried because a timeout may occur after the service applies the mutation. Metadata reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by [`TsfProducer`].
 #[derive(Clone)]

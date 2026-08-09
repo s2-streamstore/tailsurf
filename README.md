@@ -11,7 +11,7 @@ Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or
 - Give agents a reliable async channel with durable catch-up.
 - Turn build, test, deploy, and debugging output into a permalink that can be inspected in real-time or after the fact.
 
-`tsf` has an API and 2 first-class clients:
+`tsf` has an API and two first-class clients:
 - Full-featured CLI
 - Gist-style scrubbable live transcript with web UI
 
@@ -81,7 +81,7 @@ make test | tsf write --new --retention 6h
 
 `--retention infinite` explicitly requests infinite retention. The service enforces the current free-user limit and returns a clear error when a requested policy is unavailable.
 
-`tsf new` prints the stream retention in seconds along with the generated URLs.
+`tsf new` prints the stream ID, visibility, retention in seconds, and generated URLs.
 
 Stream command output into a new URL:
 
@@ -107,11 +107,26 @@ Use raw mode when you want to send stdin as byte records instead of line-framed 
 cat artifact.bin | tsf write --new --raw
 ```
 
+On Ctrl-C, `tsf write` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the producer, and exits with status 130.
+
 Tail or replay a URL:
 
 ```sh
 tsf tail '{url}'
+tsf tail -n 200 '{url}'
+tsf tail --seq-num 0 --count 500 '{url}'
 tsf replay '{url}'
+```
+
+`tail` follows new records unless `--count` bounds it. `replay` snapshots the current durable tail and exits after printing that range.
+
+Both commands preserve payload bytes. They exit successfully when a downstream pipe closes normally.
+
+Inspect stream metadata:
+
+```sh
+tsf info '{url}'
+tsf info '{url}' --format json
 ```
 
 Owner URLs contain `#o=` and can manage the stream:
@@ -142,20 +157,21 @@ Package and publish order:
 ```sh
 cargo package --workspace
 cargo publish -p tailsurf
-# Wait for tailsurf 0.1.0 to appear in the crates.io index before packaging/publishing the CLI.
+# Wait for the matching tailsurf version to appear in the crates.io index.
 cargo package -p tailsurf-cli
 cargo publish -p tailsurf-cli
 ```
 
-Use `cargo package --workspace` as the clean-tree preflight because it verifies both crates from the workspace source. After publishing `tailsurf`, wait for `tailsurf 0.1.0` to appear in the crates.io index before packaging or publishing `tailsurf-cli` by itself, because the packaged CLI resolves its SDK dependency from crates.io rather than the local workspace path.
+Use `cargo package --workspace` as the clean-tree preflight because it verifies both crates from the workspace source. After publishing `tailsurf`, wait for the matching workspace version to appear in the crates.io index before packaging or publishing `tailsurf-cli` by itself. The packaged CLI resolves its SDK dependency from crates.io instead of the local workspace path.
 
 After `tailsurf-cli` is visible in the crates.io index, run the install smoke against the deployed service:
 
 ```sh
-TSF_CLI_VERSION=0.1.0 TSF_API_URL=https://tail.surf TSF_WEB_URL=https://tail.surf python3 scripts/published-cli-smoke.py
+TSF_API_URL=https://tail.surf TSF_WEB_URL=https://tail.surf python3 scripts/published-cli-smoke.py
 ```
 
 Try the CLI URL parser:
+
 ```sh
 cargo run -p tailsurf-cli -- parse-url 'https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=example-token'
 ```

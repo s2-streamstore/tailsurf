@@ -12,11 +12,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass
 
 
 DEFAULT_PACKAGE = "tailsurf-cli"
-DEFAULT_VERSION = "0.1.0"
 INSTALL_TIMEOUT_SECS = int(os.environ.get("TSF_PUBLISHED_CLI_INSTALL_TIMEOUT_SECS", "300"))
 COMMAND_TIMEOUT_SECS = int(os.environ.get("TSF_PUBLISHED_CLI_COMMAND_TIMEOUT_SECS", "30"))
 
@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--api-url", default=os.environ.get("TSF_API_URL"))
     parser.add_argument("--web-url", default=os.environ.get("TSF_WEB_URL"))
-    parser.add_argument("--version", default=os.environ.get("TSF_CLI_VERSION", DEFAULT_VERSION))
+    parser.add_argument("--version", default=os.environ.get("TSF_CLI_VERSION") or workspace_version())
     parser.add_argument("--package", default=os.environ.get("TSF_CLI_PACKAGE", DEFAULT_PACKAGE))
     parser.add_argument("--cargo", default=os.environ.get("CARGO", "cargo"))
     parser.add_argument("--tsf-bin", default=os.environ.get("TSF_BIN"), help="Use an existing tsf binary instead of cargo installing from crates.")
@@ -92,6 +92,13 @@ def parse_args() -> argparse.Namespace:
         help="Pass --locked to cargo install.",
     )
     return parser.parse_args()
+
+
+def workspace_version() -> str:
+    cargo_toml = pathlib.Path(__file__).resolve().parents[1] / "Cargo.toml"
+    with cargo_toml.open("rb") as file:
+        manifest = tomllib.load(file)
+    return str(manifest["workspace"]["package"]["version"])
 
 
 def install_published_cli(args: argparse.Namespace, temp_dir: pathlib.Path) -> str:

@@ -43,7 +43,7 @@ use tailsurf::{
     stream_url::StreamLocator,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     process::Command as TokioCommand,
     sync::Notify,
@@ -52,6 +52,67 @@ use tokio::{
 use url::Url;
 
 const FREE_RETENTION_LIMIT_MESSAGE: &str = "Infinite retention is unavailable for free users.";
+
+#[test]
+fn help_and_version_describe_the_cli() {
+    let help = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .arg("--help")
+        .output()
+        .expect("tsf help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("help UTF-8");
+    assert!(help.contains("Create, write, and read tail.surf streams"));
+    assert!(help.contains("info        Show current stream metadata"));
+    assert!(help.contains("tail        Follow a stream"));
+
+    let version = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .arg("--version")
+        .output()
+        .expect("tsf version");
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).expect("version UTF-8"),
+        format!("tsf {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn write_rejects_missing_or_conflicting_destinations() {
+    let missing = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .arg("write")
+        .output()
+        .expect("tsf write");
+    assert!(!missing.status.success());
+    let missing_error = String::from_utf8(missing.stderr).expect("stderr UTF-8");
+    assert!(missing_error.contains("write requires a stream URL unless --new is set"));
+    assert!(!missing_error.contains("Location:"));
+
+    let misplaced_public = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["write", "--public"])
+        .output()
+        .expect("tsf write --public");
+    assert!(!misplaced_public.status.success());
+    assert!(
+        String::from_utf8(misplaced_public.stderr)
+            .expect("stderr UTF-8")
+            .contains("--public requires --new")
+    );
+
+    let conflicting = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args([
+            "write",
+            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=secret",
+            "--new",
+        ])
+        .output()
+        .expect("conflicting tsf write");
+    assert!(!conflicting.status.success());
+    assert!(
+        String::from_utf8(conflicting.stderr)
+            .expect("stderr UTF-8")
+            .contains("cannot be used with '--new'")
+    );
+}
 
 #[tokio::test]
 async fn new_outputs_json_and_token_files() {
@@ -95,6 +156,7 @@ async fn new_outputs_json_and_token_files() {
     assert!(output.status.success(), "stderr={}", output.stderr);
     let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("json output");
     assert!(json["stream_id"].as_str().is_some());
+    assert_eq!(json["visibility"], "private");
     assert_eq!(json["retention_secs"], 864_000);
     assert!(json["urls"]["o"].as_str().is_some());
     assert!(json["urls"]["r"].as_str().is_some());
@@ -140,7 +202,7 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(private.status.success(), "stderr={}", private.stderr);
     assert_eq!(
         normalize_created_stream_output(&private.stdout),
-        "stream_id=<stream_id>\nretention_secs=<retention_secs>\no=<url>\nw=<url>\nr=<url>\n"
+        "stream_id=<stream_id>\nvisibility=private\nretention_secs=<retention_secs>\no=<url>\nw=<url>\nr=<url>\n"
     );
     assert_created_output_urls_parse(&private.stdout, &["o", "w", "r"]);
 
@@ -148,7 +210,7 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(public.status.success(), "stderr={}", public.stderr);
     assert_eq!(
         normalize_created_stream_output(&public.stdout),
-        "stream_id=<stream_id>\nretention_secs=<retention_secs>\no=<url>\nw=<url>\n"
+        "stream_id=<stream_id>\nvisibility=public\nretention_secs=<retention_secs>\no=<url>\nw=<url>\n"
     );
     assert_created_output_urls_parse(&public.stdout, &["o", "w"]);
 
@@ -156,7 +218,7 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "stream_id=<stream_id>\nretention_secs=<retention_secs>\nrw=<url>\nr=<url>\n"
+        "stream_id=<stream_id>\nvisibility=private\nretention_secs=<retention_secs>\nrw=<url>\nr=<url>\n"
     );
     assert_created_output_urls_parse(&explicit.stdout, &["rw", "r"]);
 
@@ -213,7 +275,7 @@ async fn write_new_then_replay_round_trips_command_output() {
     assert_eq!(output.stdout, "");
     assert_eq!(
         normalize_created_stream_output(&output.stderr),
-        "stream_id=<stream_id>\nretention_secs=<retention_secs>\no=<url>\nw=<url>\nr=<url>\n"
+        "stream_id=<stream_id>\nvisibility=private\nretention_secs=<retention_secs>\no=<url>\nw=<url>\nr=<url>\n"
     );
     let read_url = output
         .stderr
@@ -225,6 +287,19 @@ async fn write_new_then_replay_round_trips_command_output() {
     let replay = run_tsf(&server, ["replay", read_url], None).await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
     assert_eq!(replay.stdout, "hello from cli integration\n");
+
+    let bounded_tail = run_tsf(
+        &server,
+        ["tail", "--seq-num", "0", "--count", "1", read_url],
+        None,
+    )
+    .await;
+    assert!(
+        bounded_tail.status.success(),
+        "stderr={}",
+        bounded_tail.stderr
+    );
+    assert_eq!(bounded_tail.stdout, "hello from cli integration\n");
 
     server.abort();
 }
@@ -414,6 +489,62 @@ async fn write_raw_flushes_on_linger() {
     assert_eq!(data[0].as_ref(), b"a");
     assert_eq!(data[1].as_ref(), b"b");
 
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_stdin_write_flushes_before_exiting_130() {
+    let server = TestServer::start().await;
+    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    command
+        .arg("--api-url")
+        .arg(server.api_url.to_string())
+        .arg("--web-url")
+        .arg("http://localhost:3000")
+        .args(["write", "--new"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("spawn tsf write");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let mut stderr_output = String::new();
+    let read_url = loop {
+        let mut line = String::new();
+        let read = stderr.read_line(&mut line).await.expect("read created URL");
+        assert!(read > 0, "tsf exited before printing a read URL");
+        stderr_output.push_str(&line);
+        if let Some(url) = line.strip_prefix("r=") {
+            break url.trim_end().to_owned();
+        }
+    };
+
+    stdin.write_all(b"partial line").await.expect("write stdin");
+    sleep(Duration::from_millis(100)).await;
+    let pid = child.id().expect("tsf process ID");
+    let signal = TokioCommand::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .await
+        .expect("send SIGINT");
+    assert!(signal.success());
+    drop(stdin);
+
+    stderr
+        .read_to_string(&mut stderr_output)
+        .await
+        .expect("read stderr");
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("timed out waiting for interrupted tsf")
+        .expect("wait for tsf");
+    assert_eq!(status.code(), Some(130), "stderr={stderr_output}");
+
+    let replay = run_tsf(&server, ["replay", read_url.as_str()], None).await;
+    assert!(replay.status.success(), "stderr={}", replay.stderr);
+    assert_eq!(replay.stdout, "partial line");
     server.abort();
 }
 
@@ -787,6 +918,35 @@ async fn tail_selector_flags_are_sent_as_read_query() {
 }
 
 #[tokio::test]
+async fn zero_count_reads_complete_without_opening_a_socket() {
+    let server = FakeReadServer::start().await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+
+    let tail = run_tsf_with_api_url(
+        server.api_url.clone(),
+        ["tail", "--count", "0", read_url.as_str()],
+        None,
+    )
+    .await;
+    assert!(tail.status.success(), "stderr={}", tail.stderr);
+    assert_eq!(tail.stdout, "");
+
+    let replay = run_tsf_with_api_url(
+        server.api_url.clone(),
+        ["replay", "--count", "0", read_url.as_str()],
+        None,
+    )
+    .await;
+    assert!(replay.status.success(), "stderr={}", replay.stderr);
+    assert_eq!(replay.stdout, "");
+    assert!(server.read_attempts().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
     let server = FakeReadServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
@@ -1149,6 +1309,15 @@ async fn owner_commands_manage_visibility_tokens_and_deletion() {
         serde_json::from_str(&created.stdout).expect("create output");
     let owner_url = created_json["urls"]["o"].as_str().expect("owner URL");
 
+    let info = run_tsf(&server, ["info", owner_url, "--format", "json"], None).await;
+    assert!(info.status.success(), "stderr={}", info.stderr);
+    let info_json: serde_json::Value =
+        serde_json::from_str(&info.stdout).expect("stream info output");
+    assert_eq!(info_json["stream_id"], created_json["stream_id"]);
+    assert_eq!(info_json["visibility"], "private");
+    assert_eq!(info_json["state"], "active");
+    assert_eq!(info_json["retention_secs"], 864_000);
+
     let visibility = run_tsf(
         &server,
         ["visibility", owner_url, "public", "--format", "json"],
@@ -1395,6 +1564,7 @@ async fn test_create_stream(
 async fn test_get_stream(
     State(state): State<Arc<TestApiState>>,
     Path(stream_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let streams = state.streams.lock().expect("streams lock");
     let Some(stream) = streams.get(&stream_id) else {
@@ -1402,6 +1572,11 @@ async fn test_get_stream(
     };
     if stream.deleted {
         return test_error(StatusCode::CONFLICT, "conflict", "stream is deleted");
+    }
+    if stream.visibility == Visibility::Private
+        && !test_authorized(stream, &headers, TokenPermissions::allows_read)
+    {
+        return test_error(StatusCode::FORBIDDEN, "forbidden", "read token required");
     }
     Json(test_get_stream_response(stream)).into_response()
 }
@@ -1843,40 +2018,8 @@ async fn run_tsf_with_api_url<const N: usize>(
     args: [&str; N],
     stdin: Option<&str>,
 ) -> CommandOutput {
-    let api_url = api_url.to_string();
     let args = args.map(str::to_owned).to_vec();
-    let stdin = stdin.map(str::to_owned);
-    tokio::task::spawn_blocking(move || run_tsf_blocking(api_url, args, stdin))
-        .await
-        .expect("tsf runner")
-}
-
-fn run_tsf_blocking(api_url: String, args: Vec<String>, stdin: Option<String>) -> CommandOutput {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tsf"));
-    command
-        .arg("--api-url")
-        .arg(api_url)
-        .arg("--web-url")
-        .arg("http://localhost:3000")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    }
-
-    let mut child = command.spawn().expect("spawn tsf");
-    if let Some(stdin) = stdin {
-        use std::io::Write as _;
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(stdin.as_bytes())
-            .expect("write stdin");
-    }
-    let output = child.wait_with_output().expect("tsf output");
+    let output = run_tsf_bytes(api_url, args, stdin.map(|value| value.as_bytes().to_vec())).await;
     CommandOutput {
         status: output.status,
         stdout: String::from_utf8(output.stdout).expect("stdout utf8"),
@@ -1894,23 +2037,41 @@ async fn run_tsf_bytes_with_api_url<const N: usize>(
     api_url: Url,
     args: [&str; N],
 ) -> CommandOutputBytes {
-    let api_url = api_url.to_string();
     let args = args.map(str::to_owned).to_vec();
-    tokio::task::spawn_blocking(move || run_tsf_bytes_blocking(api_url, args))
-        .await
-        .expect("tsf byte runner")
+    run_tsf_bytes(api_url, args, None).await
 }
 
-fn run_tsf_bytes_blocking(api_url: String, args: Vec<String>) -> CommandOutputBytes {
-    let output = Command::new(env!("CARGO_BIN_EXE_tsf"))
+async fn run_tsf_bytes(
+    api_url: Url,
+    args: Vec<String>,
+    stdin: Option<Vec<u8>>,
+) -> CommandOutputBytes {
+    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    command
         .arg("--api-url")
-        .arg(api_url)
+        .arg(api_url.to_string())
         .arg("--web-url")
         .arg("http://localhost:3000")
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .kill_on_drop(true);
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+
+    let mut child = command.spawn().expect("spawn tsf");
+    if let Some(input) = stdin {
+        let mut child_stdin = child.stdin.take().expect("tsf stdin");
+        child_stdin
+            .write_all(&input)
+            .await
+            .expect("write tsf stdin");
+        child_stdin.shutdown().await.expect("close tsf stdin");
+    }
+    let output = timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .expect("timed out waiting for tsf")
         .expect("tsf output");
     CommandOutputBytes {
         status: output.status,

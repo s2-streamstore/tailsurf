@@ -3,8 +3,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::OpenOptions,
+    io::ErrorKind,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::{ExitCode, ExitStatus, Stdio},
     str::FromStr,
 };
 
@@ -43,18 +44,22 @@ const RAW_LINGER: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
-#[command(about = "tail.surf command line client")]
+#[command(version, about = "Create, write, and read tail.surf streams")]
 struct Cli {
+    /// Tailsurf API origin.
     #[arg(
         long = "api-url",
         env = "TSF_API_URL",
-        default_value = "https://tail.surf"
+        default_value = "https://tail.surf",
+        global = true
     )]
     api_url: Url,
+    /// Origin used when printing share URLs.
     #[arg(
         long = "web-url",
         env = "TSF_WEB_URL",
-        default_value = "https://tail.surf"
+        default_value = "https://tail.surf",
+        global = true
     )]
     web_url: Url,
     #[command(subcommand)]
@@ -63,22 +68,36 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a stream and print its share URLs.
     New(NewArgs),
+    /// Stream stdin or a command's output to a stream.
     Write(WriteArgs),
+    /// Follow a stream, optionally starting from retained records.
     Tail(TailArgs),
+    /// Print a bounded snapshot of retained records.
     Replay(ReplayArgs),
+    /// Show current stream metadata.
+    Info(InfoArgs),
+    /// Permanently delete a stream.
     Delete(OwnerUrlArgs),
+    /// Change stream visibility.
     Visibility(VisibilityArgs),
+    /// Manage stream tokens.
     Token(TokenArgs),
-    ParseUrl { url: String },
+    /// Validate a stream URL without exposing its token.
+    ParseUrl {
+        /// Stream share URL.
+        #[arg(value_name = "STREAM_URL")]
+        url: String,
+    },
 }
 
 #[derive(Debug, Args)]
 struct NewArgs {
-    #[arg(long, conflicts_with = "private")]
+    /// Allow anonymous reads.
+    #[arg(long)]
     public: bool,
-    #[arg(long, conflicts_with = "public")]
-    private: bool,
+    /// Issue this token permission set. May be repeated.
     #[arg(long = "token", value_name = "PERMISSIONS")]
     tokens: Vec<TokenPermissions>,
     #[arg(
@@ -87,75 +106,111 @@ struct NewArgs {
         help = "Record retention, such as 6h, 7d, or infinite"
     )]
     retention: Option<RetentionArg>,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Write the owner token secret to this file.
     #[arg(long = "owner-token-file", value_name = "PATH")]
     owner_token_file: Option<PathBuf>,
+    /// Write the read token secret to this file.
     #[arg(long = "read-token-file", value_name = "PATH")]
     read_token_file: Option<PathBuf>,
+    /// Write the write token secret to this file.
     #[arg(long = "write-token-file", value_name = "PATH")]
     write_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct WriteArgs {
+    /// Write-capable stream share URL. Required unless --new is set.
+    #[arg(value_name = "STREAM_URL", conflicts_with = "new")]
     url: Option<String>,
+    /// Create a private stream before writing.
     #[arg(long)]
     new: bool,
-    #[arg(long, conflicts_with = "private")]
+    /// Make the new stream publicly readable.
+    #[arg(long)]
     public: bool,
-    #[arg(long, conflicts_with = "public")]
-    private: bool,
     #[arg(
         long,
         value_name = "DURATION",
-        requires = "new",
         help = "New-stream record retention, such as 6h, 7d, or infinite"
     )]
     retention: Option<RetentionArg>,
+    /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
     #[arg(long)]
     raw: bool,
+    /// Command to run. Its stdout and stderr are written to the stream.
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
 struct TailArgs {
+    /// Read-capable or public stream share URL.
+    #[arg(value_name = "STREAM_URL")]
     url: String,
+    /// Start this many retained records before the live tail.
     #[arg(short = 'n', long, conflicts_with_all = ["seq_num", "timestamp"])]
     tail_offset: Option<u64>,
+    /// Start at this S2 sequence number.
     #[arg(long, conflicts_with = "timestamp")]
     seq_num: Option<u64>,
+    /// Start at this Unix timestamp in milliseconds.
     #[arg(long, conflicts_with = "seq_num")]
     timestamp: Option<u64>,
+    /// Stop after this many stored records instead of following forever.
     #[arg(long)]
     count: Option<u64>,
+    /// Maximum assembled transcript record size.
     #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_LOGICAL_RECORD_BYTES)]
     max_logical_record_bytes: usize,
 }
 
 #[derive(Debug, Args)]
 struct ReplayArgs {
+    /// Read-capable or public stream share URL.
+    #[arg(value_name = "STREAM_URL")]
     url: String,
+    /// Start at this S2 sequence number.
     #[arg(long, conflicts_with = "timestamp")]
     seq_num: Option<u64>,
+    /// Start at this Unix timestamp in milliseconds.
     #[arg(long, conflicts_with = "seq_num")]
     timestamp: Option<u64>,
+    /// Print at most this many stored records.
     #[arg(long)]
     count: Option<u64>,
+    /// Maximum assembled transcript record size.
     #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_LOGICAL_RECORD_BYTES)]
     max_logical_record_bytes: usize,
 }
 
 #[derive(Debug, Args)]
+struct InfoArgs {
+    /// Read-capable or public stream share URL.
+    #[arg(value_name = "STREAM_URL")]
+    url: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
 struct OwnerUrlArgs {
+    /// Owner stream share URL.
+    #[arg(value_name = "OWNER_URL")]
     url: String,
 }
 
 #[derive(Debug, Args)]
 struct VisibilityArgs {
+    /// Owner stream share URL.
+    #[arg(value_name = "OWNER_URL")]
     url: String,
+    /// New visibility.
     visibility: VisibilityArg,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -168,34 +223,50 @@ struct TokenArgs {
 
 #[derive(Debug, Subcommand)]
 enum TokenCommand {
+    /// List non-secret token metadata.
     List(ListTokenArgs),
+    /// Issue a new token and print its secret once.
     Issue(IssueTokenArgs),
+    /// Revoke a token by its non-secret ID.
     Revoke(RevokeTokenArgs),
 }
 
 #[derive(Debug, Args)]
 struct ListTokenArgs {
+    /// Owner stream share URL.
+    #[arg(value_name = "OWNER_URL")]
     url: String,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
 struct IssueTokenArgs {
+    /// Owner stream share URL.
+    #[arg(value_name = "OWNER_URL")]
     url: String,
+    /// Permissions for the new token, such as r, w, rw, or o.
     #[arg(long = "token", value_name = "PERMISSIONS")]
     permissions: TokenPermissions,
+    /// RFC 3339 expiration timestamp.
     #[arg(long)]
     expires_at: Option<String>,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Write the new token secret to this file.
     #[arg(long = "token-file", value_name = "PATH")]
     token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct RevokeTokenArgs {
+    /// Owner stream share URL.
+    #[arg(value_name = "OWNER_URL")]
     url: String,
+    /// Non-secret token ID from `tsf token list`.
+    #[arg(value_name = "TOKEN_ID")]
     token_id: TokenId,
 }
 
@@ -263,14 +334,14 @@ enum WriteBuffering {
 #[derive(Debug)]
 struct WriterState {
     writer_id: WriterId,
-    next_writer_seq: BTreeMap<StreamId, u64>,
+    next_writer_seq: u64,
 }
 
 impl WriterState {
     fn new_random() -> Self {
         Self {
             writer_id: WriterId::new_random(),
-            next_writer_seq: BTreeMap::new(),
+            next_writer_seq: 0,
         }
     }
 
@@ -278,29 +349,57 @@ impl WriterState {
         self.writer_id
     }
 
-    fn reserve_writer_seq(&mut self, stream_id: &StreamId) -> eyre::Result<u64> {
-        let next = self.next_writer_seq.entry(*stream_id).or_default();
-        let reserved = *next;
-        *next = next
+    fn reserve_writer_seq(&mut self) -> eyre::Result<u64> {
+        let reserved = self.next_writer_seq;
+        self.next_writer_seq = self
+            .next_writer_seq
             .checked_add(1)
-            .with_context(|| format!("writer sequence for stream {stream_id} overflowed"))?;
+            .context("writer sequence overflowed")?;
         Ok(reserved)
     }
 }
 
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
-    let cli = Cli::parse();
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
+        Err(error) => {
+            print_error(&error);
+            ExitCode::FAILURE
+        }
+    }
+}
 
+async fn run(cli: Cli) -> eyre::Result<()> {
     match cli.command {
         Command::New(args) => new_stream(cli.api_url, cli.web_url, args).await,
         Command::Write(args) => write_stream(cli.api_url, cli.web_url, args).await,
         Command::Tail(args) => tail_stream(cli.api_url, args).await,
         Command::Replay(args) => replay_stream(cli.api_url, args).await,
+        Command::Info(args) => stream_info(cli.api_url, args).await,
         Command::Delete(args) => delete_stream(cli.api_url, args).await,
         Command::Visibility(args) => update_visibility(cli.api_url, args).await,
         Command::Token(args) => token_command(cli.api_url, cli.web_url, args).await,
         Command::ParseUrl { url } => parse_url(&url),
+    }
+}
+
+fn is_broken_pipe(error: &eyre::Report) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::BrokenPipe)
+    })
+}
+
+fn print_error(error: &eyre::Report) {
+    let mut chain = error.chain();
+    if let Some(message) = chain.next() {
+        eprintln!("error: {message}");
+    }
+    for cause in chain {
+        eprintln!("  caused by: {cause}");
     }
 }
 
@@ -327,6 +426,7 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
 }
 
 async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Result<()> {
+    validate_write_args(&args)?;
     let buffering = if args.raw {
         WriteBuffering::Raw
     } else {
@@ -371,6 +471,22 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
     }
 }
 
+fn validate_write_args(args: &WriteArgs) -> eyre::Result<()> {
+    if args.new {
+        return Ok(());
+    }
+    if args.public {
+        bail!("--public requires --new");
+    }
+    if args.retention.is_some() {
+        bail!("--retention requires --new");
+    }
+    if args.url.is_none() {
+        bail!("write requires a stream URL unless --new is set");
+    }
+    Ok(())
+}
+
 async fn stream_stdin_to_writer(
     api_url: Url,
     stream_id: StreamId,
@@ -388,34 +504,36 @@ async fn stream_stdin_to_writer(
         .await
         .context("failed to connect writer")?;
 
-    match buffering {
-        WriteBuffering::Raw => stream_raw_stdin_to_writer(&writer, &mut state, &stream_id).await,
-        WriteBuffering::Lines => stream_lines_to_writer(&writer, &mut state, &stream_id).await,
+    let interrupted = match buffering {
+        WriteBuffering::Raw => stream_raw_stdin_to_writer(&writer, &mut state).await,
+        WriteBuffering::Lines => stream_lines_to_writer(&writer, &mut state).await,
     }?;
-    writer.close().await.context("failed to close writer")
+    writer.close().await.context("failed to close writer")?;
+    if interrupted {
+        exit_interrupted();
+    }
+    Ok(())
 }
 
 async fn stream_raw_stdin_to_writer(
     writer: &TsfProducer,
     state: &mut WriterState,
-    stream_id: &StreamId,
-) -> eyre::Result<()> {
+) -> eyre::Result<bool> {
     let mut stdin = tokio::io::stdin();
     let mut buffer = vec![0_u8; 16 * 1024];
     let mut appender = RawRecordAppender::new(RAW_LINGER);
     let mut session = WriterSession {
         writer,
         state,
-        stream_id,
         pending_tickets: VecDeque::new(),
     };
-    loop {
+    let interrupted = loop {
         if let Some(deadline) = appender.deadline() {
             tokio::select! {
                 byte_count = stdin.read(&mut buffer) => {
                     let byte_count = byte_count.context("failed to read stdin")?;
                     if byte_count == 0 {
-                        break;
+                        break false;
                     }
                     appender.push_bytes(&mut session, &buffer[..byte_count]).await?;
                 }
@@ -424,7 +542,7 @@ async fn stream_raw_stdin_to_writer(
                 }
                 interrupt = tokio::signal::ctrl_c() => {
                     interrupt.context("failed to listen for interrupt signal")?;
-                    exit_interrupted();
+                    break true;
                 }
             }
         } else {
@@ -432,59 +550,57 @@ async fn stream_raw_stdin_to_writer(
                 byte_count = stdin.read(&mut buffer) => byte_count.context("failed to read stdin")?,
                 interrupt = tokio::signal::ctrl_c() => {
                     interrupt.context("failed to listen for interrupt signal")?;
-                    exit_interrupted();
+                    break true;
                 }
             };
             if byte_count == 0 {
-                break;
+                break false;
             }
             appender
                 .push_bytes(&mut session, &buffer[..byte_count])
                 .await?;
         };
-    }
+    };
     appender.finish(&mut session).await?;
     session.finish().await?;
 
-    Ok(())
+    Ok(interrupted)
 }
 
 async fn stream_lines_to_writer(
     writer: &TsfProducer,
     state: &mut WriterState,
-    stream_id: &StreamId,
-) -> eyre::Result<()> {
+) -> eyre::Result<bool> {
     let mut stdin = tokio::io::stdin();
     let mut read_buffer = vec![0_u8; 16 * 1024];
     let mut line_appender = LineRecordAppender::new();
     let mut session = WriterSession {
         writer,
         state,
-        stream_id,
         pending_tickets: VecDeque::new(),
     };
 
-    loop {
+    let interrupted = loop {
         let byte_count = tokio::select! {
             byte_count = stdin.read(&mut read_buffer) => byte_count.context("failed to read stdin")?,
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt.context("failed to listen for interrupt signal")?;
-                exit_interrupted();
+                break true;
             }
         };
         if byte_count == 0 {
-            break;
+            break false;
         }
 
         line_appender
             .push_bytes(&mut session, &read_buffer[..byte_count])
             .await?;
-    }
+    };
 
     line_appender.finish(&mut session).await?;
     session.finish().await?;
 
-    Ok(())
+    Ok(interrupted)
 }
 
 async fn stream_command_to_writer(
@@ -504,30 +620,37 @@ async fn stream_command_to_writer(
         ))
         .await
         .context("failed to connect writer")?;
-    let status = {
+    let outcome = {
         let mut session = WriterSession {
             writer: &writer,
             state: &mut state,
-            stream_id: &stream_id,
             pending_tickets: VecDeque::new(),
         };
-        let status = stream_child_command_output(&mut session, buffering, command).await?;
+        let outcome = stream_child_command_output(&mut session, buffering, command).await?;
         session.finish().await?;
-        status
+        outcome
     };
     writer.close().await.context("failed to close writer")?;
-    if status.success() {
+    if outcome.interrupted {
+        exit_interrupted();
+    }
+    if outcome.status.success() {
         Ok(())
     } else {
-        exit_with_status(status)
+        exit_with_status(outcome.status)
     }
+}
+
+struct ChildCommandOutcome {
+    status: ExitStatus,
+    interrupted: bool,
 }
 
 async fn stream_child_command_output(
     session: &mut WriterSession<'_>,
     buffering: WriteBuffering,
     command: Vec<String>,
-) -> eyre::Result<ExitStatus> {
+) -> eyre::Result<ChildCommandOutcome> {
     let program = command
         .first()
         .context("command mode requires a program after --")?;
@@ -550,35 +673,46 @@ async fn stream_child_command_output(
     let stdout_task = tokio::spawn(read_child_pipe(stdout, chunk_tx.clone()));
     let stderr_task = tokio::spawn(read_child_pipe(stderr, chunk_tx));
 
-    let stream_result = tokio::select! {
-        result = async {
-            match buffering {
-                WriteBuffering::Raw => stream_raw_chunks_to_writer(session, &mut chunk_rx).await?,
-                WriteBuffering::Lines => {
-                    let mut line_appender = LineRecordAppender::new();
-                    while let Some(chunk) = chunk_rx.recv().await {
-                        line_appender.push_bytes(session, &chunk?).await?;
-                    }
-                    line_appender.finish(session).await?;
+    let stream_output = async {
+        match buffering {
+            WriteBuffering::Raw => stream_raw_chunks_to_writer(session, &mut chunk_rx).await?,
+            WriteBuffering::Lines => {
+                let mut line_appender = LineRecordAppender::new();
+                while let Some(chunk) = chunk_rx.recv().await {
+                    line_appender.push_bytes(session, &chunk?).await?;
                 }
+                line_appender.finish(session).await?;
             }
-            eyre::Result::<()>::Ok(())
-        } => result,
+        }
+        eyre::Result::<()>::Ok(())
+    };
+    tokio::pin!(stream_output);
+
+    let (stream_result, interrupted) = tokio::select! {
+        result = &mut stream_output => (result, false),
         interrupt = tokio::signal::ctrl_c() => {
             interrupt.context("failed to listen for interrupt signal")?;
             let _ = child.kill().await;
-            exit_interrupted();
+            (stream_output.await, true)
         }
     };
 
     if let Err(error) = stream_result {
         let _ = child.kill().await;
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
         return Err(error);
     }
 
     stdout_task.await.context("stdout reader task panicked")??;
     stderr_task.await.context("stderr reader task panicked")??;
-    child.wait().await.context("failed to wait for command")
+    let status = child.wait().await.context("failed to wait for command")?;
+    Ok(ChildCommandOutcome {
+        status,
+        interrupted,
+    })
 }
 
 async fn read_child_pipe<R>(
@@ -708,27 +842,25 @@ impl LineRecordAppender {
     async fn push_bytes(
         &mut self,
         session: &mut WriterSession<'_>,
-        bytes: &[u8],
+        mut bytes: &[u8],
     ) -> eyre::Result<()> {
-        for byte in bytes {
+        while !bytes.is_empty() {
             if self.pending.len() == MAX_RECORD_BYTES {
-                let data = self.pending.split().freeze();
-                session
-                    .append_line_part(self.split_part_index, false, data)
-                    .await?;
-                self.split_part_index = self
-                    .split_part_index
-                    .checked_add(1)
-                    .context("line split part index overflowed")?;
+                self.flush(session, false).await?;
             }
 
-            self.pending.extend_from_slice(&[*byte]);
-            if *byte == b'\n' {
-                let data = self.pending.split().freeze();
-                session
-                    .append_line_part(self.split_part_index, true, data)
-                    .await?;
-                self.split_part_index = 0;
+            let available = MAX_RECORD_BYTES - self.pending.len();
+            let window_len = available.min(bytes.len());
+            let window = &bytes[..window_len];
+            let take = window
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(window_len, |index| index + 1);
+            self.pending.extend_from_slice(&window[..take]);
+            bytes = &bytes[take..];
+
+            if self.pending.last() == Some(&b'\n') {
+                self.flush(session, true).await?;
             }
         }
         Ok(())
@@ -736,11 +868,23 @@ impl LineRecordAppender {
 
     async fn finish(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
         if !self.pending.is_empty() {
-            let data = self.pending.split().freeze();
-            session
-                .append_line_part(self.split_part_index, true, data)
-                .await?;
+            self.flush(session, true).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self, session: &mut WriterSession<'_>, is_final: bool) -> eyre::Result<()> {
+        let data = self.pending.split().freeze();
+        session
+            .append_line_part(self.split_part_index, is_final, data)
+            .await?;
+        if is_final {
             self.split_part_index = 0;
+        } else {
+            self.split_part_index = self
+                .split_part_index
+                .checked_add(1)
+                .context("line split part index overflowed")?;
         }
         Ok(())
     }
@@ -749,7 +893,6 @@ impl LineRecordAppender {
 struct WriterSession<'a> {
     writer: &'a TsfProducer,
     state: &'a mut WriterState,
-    stream_id: &'a StreamId,
     pending_tickets: VecDeque<AppendTicket>,
 }
 
@@ -777,7 +920,7 @@ impl WriterSession<'_> {
     ) -> eyre::Result<()> {
         let writer_seq_num = self
             .state
-            .reserve_writer_seq(self.stream_id)
+            .reserve_writer_seq()
             .context("failed to reserve writer sequence")?;
         let record = WriteRecord::new(writer_seq_num, part, format, data);
         let ticket = self
@@ -827,12 +970,15 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
         request = request.with_stream_token(token);
     }
 
-    read_transcript_loop(api_url, request, true, args.max_logical_record_bytes).await
+    read_transcript(api_url, request, args.max_logical_record_bytes).await
 }
 
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     ensure_single_selector(args.seq_num, args.timestamp)?;
     let locator = StreamLocator::parse(&args.url).context("invalid stream URL")?;
+    if args.count == Some(0) {
+        return Ok(());
+    }
     let read_token = locator.token_with(TokenPermissions::allows_read);
     let read_client = if let Some(token) = read_token {
         TsfClient::with_api_base_url_and_rest_bearer_token(api_url.clone(), token.expose_secret())
@@ -863,7 +1009,21 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
         request = request.with_stream_token(token);
     }
 
-    read_transcript_loop(api_url, request, false, args.max_logical_record_bytes).await
+    read_transcript(api_url, request, args.max_logical_record_bytes).await
+}
+
+async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
+    let locator = StreamLocator::parse(&args.url).context("invalid stream URL")?;
+    let client = if let Some(token) = locator.token.as_ref() {
+        TsfClient::with_api_base_url_and_rest_bearer_token(api_url, token.token.expose_secret())
+    } else {
+        TsfClient::with_api_base_url(api_url)
+    };
+    let stream = client
+        .get_stream(&locator.stream_id)
+        .await
+        .context("failed to get stream")?;
+    print_stream_info(&stream, args.format)
 }
 
 async fn delete_stream(api_url: Url, args: OwnerUrlArgs) -> eyre::Result<()> {
@@ -960,44 +1120,37 @@ async fn revoke_token(api_url: Url, args: RevokeTokenArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn read_transcript_loop(
+async fn read_transcript(
     api_url: Url,
-    mut options: ReadStreamOptions,
-    follow: bool,
+    options: ReadStreamOptions,
     max_logical_record_bytes: usize,
 ) -> eyre::Result<()> {
+    if options.count == Some(0) {
+        return Ok(());
+    }
+
     let client = TsfClient::with_api_base_url(api_url);
     let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
     let mut stdout = tokio::io::stdout();
-    let mut last_s2_seq_num = None;
+    let mut reader = client
+        .connect_reader(options)
+        .await
+        .context("failed to connect reader")?;
 
-    loop {
-        let mut reader = client
-            .connect_reader(options.clone())
-            .await
-            .context("failed to connect reader")?;
-
-        while let Some(record) = tokio::select! {
-            record = reader.next_record() => record.context("failed to read stream")?,
-            interrupt = tokio::signal::ctrl_c() => {
-                interrupt.context("failed to listen for interrupt signal")?;
-                exit_interrupted();
-            }
-        } {
-            last_s2_seq_num = Some(record.s2_seq_num);
-            let record = transcript
-                .push_record(record)
-                .context("failed to assemble transcript record")?;
-            write_transcript_record(&mut stdout, record).await?;
+    while let Some(record) = tokio::select! {
+        record = reader.next_record() => record.context("failed to read stream")?,
+        interrupt = tokio::signal::ctrl_c() => {
+            interrupt.context("failed to listen for interrupt signal")?;
+            exit_interrupted();
         }
-
-        if !follow {
-            return Ok(());
-        }
-        if let Some(last_s2_seq_num) = last_s2_seq_num {
-            options.start = Some(ReadStart::SeqNum(last_s2_seq_num.saturating_add(1)));
-        }
+    } {
+        let record = transcript
+            .push_record(record)
+            .context("failed to assemble transcript record")?;
+        write_transcript_record(&mut stdout, record).await?;
     }
+
+    Ok(())
 }
 
 async fn write_transcript_record(
@@ -1067,6 +1220,10 @@ fn print_created_stream(
     match format {
         OutputFormat::Text => {
             target.print_line(&format!("stream_id={}", created.stream_id));
+            target.print_line(&format!(
+                "visibility={}",
+                visibility_label(created.visibility)
+            ));
             target.print_line(&format!("retention_secs={}", created.retention_secs));
             for issued in &created.tokens {
                 let url = stream_url(
@@ -1081,6 +1238,7 @@ fn print_created_stream(
         OutputFormat::Json => {
             let output = CreatedStreamOutput {
                 stream_id: created.stream_id.to_string(),
+                visibility: visibility_label(created.visibility),
                 retention_secs: created.retention_secs,
                 urls: created
                     .tokens
@@ -1289,6 +1447,7 @@ impl OutputTarget {
 #[derive(Serialize)]
 struct CreatedStreamOutput {
     stream_id: String,
+    visibility: &'static str,
     retention_secs: u64,
     urls: BTreeMap<String, String>,
 }
@@ -1311,4 +1470,22 @@ struct ParsedUrlOutput {
 struct ParsedTokenOutput {
     permissions: String,
     token_present: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_wrapped_broken_pipes_only() {
+        let broken_pipe: eyre::Report =
+            std::io::Error::new(ErrorKind::BrokenPipe, "closed consumer").into();
+        assert!(is_broken_pipe(
+            &broken_pipe.wrap_err("failed to write stdout")
+        ));
+
+        let connection_reset: eyre::Report =
+            std::io::Error::new(ErrorKind::ConnectionReset, "reset consumer").into();
+        assert!(!is_broken_pipe(&connection_reset));
+    }
 }
