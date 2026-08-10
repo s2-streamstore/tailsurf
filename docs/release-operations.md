@@ -16,7 +16,7 @@ The installer routes on `tail.surf` redirect to the latest public GitHub release
 
 Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamstore/tailsurf` repository and the `release-plz.yml` workflow without a GitHub environment.
 
-Linux and Windows binaries build on Blacksmith runners. Release orchestration, macOS signing and notarization, hosting, and artifact attestations run on GitHub-hosted runners.
+Release builds, macOS signing and notarization, hosting, and artifact attestations run on GitHub-hosted runners.
 
 ## Updates
 

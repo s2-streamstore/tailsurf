@@ -24,8 +24,3 @@ github-build-setup = "../dist-build-setup.yml"
 global-artifacts-jobs = ["./notarize-macos"]
 dispatch-releases = true
 pr-run-mode = "plan"
-
-[dist.github-custom-runners]
-aarch64-unknown-linux-musl = { runner = "blacksmith-4vcpu-ubuntu-2404-arm", host = "aarch64-unknown-linux-gnu" }
-x86_64-unknown-linux-musl = { runner = "blacksmith-4vcpu-ubuntu-2404", host = "x86_64-unknown-linux-gnu" }
-x86_64-pc-windows-msvc = "blacksmith-4vcpu-windows-2025"
