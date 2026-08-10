@@ -1,6 +1,6 @@
 //! Exact binary codec for one-frame-per-message `tsf.v3` WebSocket traffic.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{BearerToken, WriterId};
 use secrecy::ExposeSecret;
@@ -246,22 +246,37 @@ pub enum ServerFrame {
 }
 
 impl ClientFrame {
-    /// Encodes one client frame into a complete WebSocket binary message.
-    pub fn encode(&self) -> Result<Bytes, FrameCodecError> {
-        let mut output = BytesMut::new();
+    /// Encoded size of every [`ClientFrame::AppendRecord`] field before the payload.
+    const APPEND_HEADER_LEN: usize = 1 + 8 + 4 + 1;
 
+    /// Returns the exact wire length of this frame, validating the payload size for records.
+    fn encoded_len(&self) -> Result<usize, FrameCodecError> {
+        match self {
+            Self::AuthRead { bearer_token } => Ok(1 + bearer_token.expose_secret().len()),
+            Self::AuthWrite { bearer_token, .. } => {
+                Ok(1 + WriterId::BYTE_LEN + bearer_token.expose_secret().len())
+            }
+            Self::AppendRecord { data, .. } => {
+                validate_record_len(data.len())?;
+                Ok(Self::APPEND_HEADER_LEN + data.len())
+            }
+        }
+    }
+
+    /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
+    fn encode_into(&self, output: &mut BytesMut) {
         match self {
             Self::AuthRead { bearer_token } => {
-                output.extend_from_slice(&[ClientOp::AuthRead.byte()]);
-                output.extend_from_slice(bearer_token.expose_secret().as_bytes());
+                output.put_u8(ClientOp::AuthRead.byte());
+                output.put_slice(bearer_token.expose_secret().as_bytes());
             }
             Self::AuthWrite {
                 writer_id,
                 bearer_token,
             } => {
-                output.extend_from_slice(&[ClientOp::AuthWrite.byte()]);
-                output.extend_from_slice(writer_id.as_bytes());
-                output.extend_from_slice(bearer_token.expose_secret().as_bytes());
+                output.put_u8(ClientOp::AuthWrite.byte());
+                output.put_slice(writer_id.as_bytes());
+                output.put_slice(bearer_token.expose_secret().as_bytes());
             }
             Self::AppendRecord {
                 writer_seq_num,
@@ -269,15 +284,19 @@ impl ClientFrame {
                 format,
                 data,
             } => {
-                validate_record_len(data.len())?;
-                output.extend_from_slice(&[ClientOp::AppendRecord.byte()]);
-                output.extend_from_slice(&writer_seq_num.to_be_bytes());
-                output.extend_from_slice(&part.raw().to_be_bytes());
-                output.extend_from_slice(&[format.byte()]);
-                output.extend_from_slice(data);
+                output.put_u8(ClientOp::AppendRecord.byte());
+                output.put_u64(*writer_seq_num);
+                output.put_u32(part.raw());
+                output.put_u8(format.byte());
+                output.put_slice(data);
             }
         }
+    }
 
+    /// Encodes one client frame into a complete WebSocket binary message.
+    pub fn encode(&self) -> Result<Bytes, FrameCodecError> {
+        let mut output = BytesMut::with_capacity(self.encoded_len()?);
+        self.encode_into(&mut output);
         Ok(output.freeze())
     }
 
@@ -293,51 +312,69 @@ impl ClientFrame {
 }
 
 impl ServerFrame {
-    /// Encodes one server frame into a complete WebSocket binary message.
-    pub fn encode(&self) -> Result<Bytes, FrameCodecError> {
-        let mut output = BytesMut::new();
+    /// Encoded size of every [`ServerFrame::ReadRecord`] field before the payload.
+    const READ_RECORD_HEADER_LEN: usize = 1 + 8 + 8 + WriterId::BYTE_LEN + 8 + 4 + 1;
+    /// Largest encoded size among the fixed-width frames, set by [`ServerFrame::Ack`].
+    const MAX_FIXED_FRAME_LEN: usize = 1 + 4 * 8;
 
+    /// Returns the exact wire length of this frame, validating the payload size for records.
+    fn encoded_len(&self) -> Result<usize, FrameCodecError> {
+        match self {
+            Self::ReadRecord(record) => {
+                validate_record_len(record.data.len())?;
+                Ok(Self::READ_RECORD_HEADER_LEN + record.data.len())
+            }
+            _ => Ok(Self::MAX_FIXED_FRAME_LEN),
+        }
+    }
+
+    /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
+    fn encode_into(&self, output: &mut BytesMut) {
         match self {
             Self::Hello { version } => {
-                output.extend_from_slice(&[ServerOp::Hello.byte()]);
-                output.extend_from_slice(&version.to_be_bytes());
+                output.put_u8(ServerOp::Hello.byte());
+                output.put_u16(*version);
             }
-            Self::AuthRequired => output.extend_from_slice(&[ServerOp::AuthRequired.byte()]),
+            Self::AuthRequired => output.put_u8(ServerOp::AuthRequired.byte()),
             Self::Ack {
                 writer_seq_start,
                 writer_seq_end,
                 s2_seq_start,
                 s2_seq_end,
             } => {
-                output.extend_from_slice(&[ServerOp::Ack.byte()]);
-                output.extend_from_slice(&writer_seq_start.to_be_bytes());
-                output.extend_from_slice(&writer_seq_end.to_be_bytes());
-                output.extend_from_slice(&s2_seq_start.to_be_bytes());
-                output.extend_from_slice(&s2_seq_end.to_be_bytes());
+                output.put_u8(ServerOp::Ack.byte());
+                output.put_u64(*writer_seq_start);
+                output.put_u64(*writer_seq_end);
+                output.put_u64(*s2_seq_start);
+                output.put_u64(*s2_seq_end);
             }
             Self::ReadRecord(record) => {
-                validate_record_len(record.data.len())?;
-                output.extend_from_slice(&[ServerOp::ReadRecord.byte()]);
-                output.extend_from_slice(&record.s2_seq_num.to_be_bytes());
-                output.extend_from_slice(&record.timestamp_ms.to_be_bytes());
-                output.extend_from_slice(record.writer_id.as_bytes());
-                output.extend_from_slice(&record.writer_seq_num.to_be_bytes());
-                output.extend_from_slice(&record.part.raw().to_be_bytes());
-                output.extend_from_slice(&[record.format.byte()]);
-                output.extend_from_slice(&record.data);
+                output.put_u8(ServerOp::ReadRecord.byte());
+                output.put_u64(record.s2_seq_num);
+                output.put_u64(record.timestamp_ms);
+                output.put_slice(record.writer_id.as_bytes());
+                output.put_u64(record.writer_seq_num);
+                output.put_u32(record.part.raw());
+                output.put_u8(record.format.byte());
+                output.put_slice(&record.data);
             }
-            Self::Heartbeat => output.extend_from_slice(&[ServerOp::Heartbeat.byte()]),
+            Self::Heartbeat => output.put_u8(ServerOp::Heartbeat.byte()),
             Self::ReconnectAdvised { deadline_secs } => {
-                output.extend_from_slice(&[ServerOp::ReconnectAdvised.byte()]);
-                output.extend_from_slice(&[*deadline_secs]);
+                output.put_u8(ServerOp::ReconnectAdvised.byte());
+                output.put_u8(*deadline_secs);
             }
             Self::ReadTail(tail) => {
-                output.extend_from_slice(&[ServerOp::ReadTail.byte()]);
-                output.extend_from_slice(&tail.next_s2_seq_num.to_be_bytes());
-                output.extend_from_slice(&tail.timestamp_ms.to_be_bytes());
+                output.put_u8(ServerOp::ReadTail.byte());
+                output.put_u64(tail.next_s2_seq_num);
+                output.put_u64(tail.timestamp_ms);
             }
         }
+    }
 
+    /// Encodes one server frame into a complete WebSocket binary message.
+    pub fn encode(&self) -> Result<Bytes, FrameCodecError> {
+        let mut output = BytesMut::with_capacity(self.encoded_len()?);
+        self.encode_into(&mut output);
         Ok(output.freeze())
     }
 
