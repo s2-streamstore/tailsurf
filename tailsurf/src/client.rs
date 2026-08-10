@@ -12,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
@@ -64,7 +64,7 @@ pub struct TsfClientConfig {
     pub websocket_connect_timeout: Duration,
     /// Timeout for authentication, frame sends, and append acknowledgements.
     pub websocket_operation_timeout: Duration,
-    /// Optional idle timeout while waiting for a read frame. `None` waits indefinitely.
+    /// Optional idle timeout while waiting for a read frame. Protocol heartbeats reset the timer. `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
     /// Retry policy for idempotent metadata reads and initial socket setup.
     pub retry_policy: RetryPolicy,
@@ -191,14 +191,11 @@ impl TsfClient {
         &self,
         request: &CreateStreamRequest,
     ) -> Result<CreateStreamResponse, TsfClientError> {
-        let response = self
-            .apply_rest_auth(self.http.post(self.rest_url("/streams")?))
-            .timeout(self.config.rest_request_timeout)
-            .json(request)
-            .send()
-            .await?;
-
-        json_response(response, "create stream").await
+        self.send_json(
+            self.http.post(self.rest_url("/streams")).json(request),
+            "create stream",
+        )
+        .await
     }
 
     /// Retrieves current stream metadata, retrying transient failures according to policy.
@@ -206,18 +203,8 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
     ) -> Result<StreamInfoResponse, TsfClientError> {
-        let url = self.rest_url(&format!("/streams/{stream_id}"))?;
-        self.retry_transient(|| {
-            let request = self
-                .apply_rest_auth(self.http.get(url.clone()))
-                .timeout(self.config.rest_request_timeout);
-
-            async move {
-                let response = request.send().await?;
-                json_response(response, "get stream").await
-            }
-        })
-        .await
+        self.get_json(format!("/streams/{stream_id}"), "get stream")
+            .await
     }
 
     /// Retrieves the current durable stream tail, retrying transient failures according to policy.
@@ -225,18 +212,8 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
     ) -> Result<StreamTailResponse, TsfClientError> {
-        let url = self.rest_url(&format!("/streams/{stream_id}/tail"))?;
-        self.retry_transient(|| {
-            let request = self
-                .apply_rest_auth(self.http.get(url.clone()))
-                .timeout(self.config.rest_request_timeout);
-
-            async move {
-                let response = request.send().await?;
-                json_response(response, "check stream tail").await
-            }
-        })
-        .await
+        self.get_json(format!("/streams/{stream_id}/tail"), "check stream tail")
+            .await
     }
 
     /// Retrieves retained stream bounds, retrying transient failures according to policy.
@@ -244,18 +221,8 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
     ) -> Result<StreamRangeResponse, TsfClientError> {
-        let url = self.rest_url(&format!("/streams/{stream_id}/range"))?;
-        self.retry_transient(|| {
-            let request = self
-                .apply_rest_auth(self.http.get(url.clone()))
-                .timeout(self.config.rest_request_timeout);
-
-            async move {
-                let response = request.send().await?;
-                json_response(response, "check stream range").await
-            }
-        })
-        .await
+        self.get_json(format!("/streams/{stream_id}/range"), "check stream range")
+            .await
     }
 
     /// Updates owner-controlled stream settings.
@@ -266,33 +233,25 @@ impl TsfClient {
         stream_id: &StreamId,
         request: &UpdateStreamRequest,
     ) -> Result<StreamInfoResponse, TsfClientError> {
-        let response = self
-            .apply_rest_auth(
-                self.http
-                    .patch(self.rest_url(&format!("/streams/{stream_id}"))?),
-            )
-            .timeout(self.config.rest_request_timeout)
-            .json(request)
-            .send()
-            .await?;
-
-        json_response(response, "update stream").await
+        self.send_json(
+            self.http
+                .patch(self.rest_url(&format!("/streams/{stream_id}")))
+                .json(request),
+            "update stream",
+        )
+        .await
     }
 
     /// Permanently deletes a stream.
     ///
     /// This mutation is attempted once and is not transparently retried.
     pub async fn delete_stream(&self, stream_id: &StreamId) -> Result<(), TsfClientError> {
-        let response = self
-            .apply_rest_auth(
-                self.http
-                    .delete(self.rest_url(&format!("/streams/{stream_id}"))?),
-            )
-            .timeout(self.config.rest_request_timeout)
-            .send()
-            .await?;
-
-        empty_response(response, StatusCode::NO_CONTENT, "delete stream").await
+        self.send_empty(
+            self.http
+                .delete(self.rest_url(&format!("/streams/{stream_id}"))),
+            "delete stream",
+        )
+        .await
     }
 
     /// Issues a new secret stream token.
@@ -303,17 +262,13 @@ impl TsfClient {
         stream_id: &StreamId,
         request: &IssueTokenRequest,
     ) -> Result<IssueTokenResponse, TsfClientError> {
-        let response = self
-            .apply_rest_auth(
-                self.http
-                    .post(self.rest_url(&format!("/streams/{stream_id}/tokens"))?),
-            )
-            .timeout(self.config.rest_request_timeout)
-            .json(request)
-            .send()
-            .await?;
-
-        json_response(response, "issue token").await
+        self.send_json(
+            self.http
+                .post(self.rest_url(&format!("/streams/{stream_id}/tokens")))
+                .json(request),
+            "issue token",
+        )
+        .await
     }
 
     /// Lists retained, non-secret token metadata, retrying transient failures according to policy.
@@ -321,18 +276,8 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
     ) -> Result<ListTokensResponse, TsfClientError> {
-        let url = self.rest_url(&format!("/streams/{stream_id}/tokens"))?;
-        self.retry_transient(|| {
-            let request = self
-                .apply_rest_auth(self.http.get(url.clone()))
-                .timeout(self.config.rest_request_timeout);
-
-            async move {
-                let response = request.send().await?;
-                json_response(response, "list tokens").await
-            }
-        })
-        .await
+        self.get_json(format!("/streams/{stream_id}/tokens"), "list tokens")
+            .await
     }
 
     /// Revokes a stream token by its non-secret identifier.
@@ -346,17 +291,13 @@ impl TsfClient {
         let request = RevokeTokenRequest {
             token_id: *token_id,
         };
-        let response = self
-            .apply_rest_auth(
-                self.http
-                    .delete(self.rest_url(&format!("/streams/{stream_id}/tokens"))?),
-            )
-            .timeout(self.config.rest_request_timeout)
-            .json(&request)
-            .send()
-            .await?;
-
-        empty_response(response, StatusCode::NO_CONTENT, "revoke token").await
+        self.send_empty(
+            self.http
+                .delete(self.rest_url(&format!("/streams/{stream_id}/tokens")))
+                .json(&request),
+            "revoke token",
+        )
+        .await
     }
 
     /// Connects the standard bounded, reconnecting durable producer.
@@ -480,12 +421,12 @@ impl TsfClient {
         .await
     }
 
-    fn rest_url(&self, path: &str) -> Result<Url, TsfClientError> {
+    fn rest_url(&self, path: &str) -> Url {
         let mut url = self.config.api_base_url.clone();
         url.set_path(&format!("{API_PREFIX}{path}"));
         url.set_query(None);
         url.set_fragment(None);
-        Ok(url)
+        url
     }
 
     fn apply_rest_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -501,7 +442,7 @@ impl TsfClient {
         path: &str,
         query: &[(&'static str, String)],
     ) -> Result<Url, TsfClientError> {
-        let mut url = self.rest_url(path)?;
+        let mut url = self.rest_url(path);
         let scheme = match url.scheme() {
             "http" => "ws",
             "https" => "wss",
@@ -516,6 +457,50 @@ impl TsfClient {
         }
 
         Ok(url)
+    }
+
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: String,
+        operation: &'static str,
+    ) -> Result<T, TsfClientError> {
+        let url = self.rest_url(&path);
+        self.retry_transient(|| self.send_json(self.http.get(url.clone()), operation))
+            .await
+    }
+
+    async fn send_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+    ) -> Result<T, TsfClientError> {
+        let response = self
+            .apply_rest_auth(request)
+            .timeout(self.config.rest_request_timeout)
+            .send()
+            .await?;
+        json_response(response, operation).await
+    }
+
+    async fn send_empty(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+    ) -> Result<(), TsfClientError> {
+        let response = self
+            .apply_rest_auth(request)
+            .timeout(self.config.rest_request_timeout)
+            .send()
+            .await?;
+        let status = response.status();
+        if status == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        Err(TsfClientError::HttpStatus {
+            operation,
+            status,
+            body: http_status_body(response).await,
+        })
     }
 
     async fn retry_transient<T, Fut>(
@@ -689,9 +674,6 @@ impl AppendAck {
     }
 
     fn validate(self) -> Result<Self, TsfClientError> {
-        if self.writer_seq_start > self.writer_seq_end || self.s2_seq_start > self.s2_seq_end {
-            return Err(TsfClientError::InvalidAppendAck(self));
-        }
         self.record_count()?;
         Ok(self)
     }
@@ -998,7 +980,6 @@ enum ProducerCommand {
 
 struct PendingAppend {
     record: WriteRecord,
-    writer_seq_num: u64,
     ack_tx: oneshot::Sender<Result<AppendReceipt, TsfClientError>>,
     _byte_permit: OwnedSemaphorePermit,
     _record_permit: OwnedSemaphorePermit,
@@ -1025,15 +1006,14 @@ async fn run_producer(
                         byte_permit,
                         record_permit,
                     }) => {
-                        let writer_seq_num = record.writer_seq_num;
+                        let record_to_send = record.clone();
                         pending.push_back(PendingAppend {
                             record,
-                            writer_seq_num,
                             ack_tx,
                             _byte_permit: byte_permit,
                             _record_permit: record_permit,
                         });
-                        if let Err(error) = send_latest_pending(&mut session, &pending).await
+                        if let Err(error) = session.send(record_to_send).await
                             && let Err(error) = recover_pending_appends(
                                 &mut session,
                                 &client,
@@ -1113,16 +1093,6 @@ async fn run_producer(
     }
 }
 
-async fn send_latest_pending(
-    session: &mut TsfAppendSession,
-    pending: &VecDeque<PendingAppend>,
-) -> Result<(), TsfClientError> {
-    let pending = pending
-        .back()
-        .expect("pending append should exist after submit");
-    session.send(pending.record.clone()).await
-}
-
 async fn recover_pending_appends(
     session: &mut TsfAppendSession,
     client: &TsfClient,
@@ -1130,45 +1100,29 @@ async fn recover_pending_appends(
     pending: &VecDeque<PendingAppend>,
     max_reconnect_attempts: usize,
     reconnect_attempts: &mut usize,
-    error: TsfClientError,
+    mut error: TsfClientError,
 ) -> Result<(), TsfClientError> {
     if !error.is_retryable() {
         return Err(error);
     }
-    *session = reconnect_and_resend(
-        client,
-        options,
-        pending,
-        max_reconnect_attempts,
-        reconnect_attempts,
-        error,
-    )
-    .await?;
-    Ok(())
-}
 
-async fn reconnect_and_resend(
-    client: &TsfClient,
-    options: &WriteStreamOptions,
-    pending: &VecDeque<PendingAppend>,
-    max_reconnect_attempts: usize,
-    reconnect_attempts: &mut usize,
-    mut last_error: TsfClientError,
-) -> Result<TsfAppendSession, TsfClientError> {
     while *reconnect_attempts < max_reconnect_attempts {
         *reconnect_attempts += 1;
         match client.connect_append_session(options.clone()).await {
-            Ok(mut session) => match resend_pending(&mut session, pending).await {
-                Ok(()) => return Ok(session),
-                Err(error) if error.is_retryable() => last_error = error,
-                Err(error) => return Err(error),
+            Ok(mut connected) => match resend_pending(&mut connected, pending).await {
+                Ok(()) => {
+                    *session = connected;
+                    return Ok(());
+                }
+                Err(next_error) if next_error.is_retryable() => error = next_error,
+                Err(next_error) => return Err(next_error),
             },
-            Err(error) if error.is_retryable() => last_error = error,
-            Err(error) => return Err(error),
+            Err(next_error) if next_error.is_retryable() => error = next_error,
+            Err(next_error) => return Err(next_error),
         }
     }
 
-    Err(last_error)
+    Err(error)
 }
 
 async fn resend_pending(
@@ -1201,13 +1155,13 @@ fn dispatch_ack(
         let Some(front) = pending.front() else {
             return Err(TsfClientError::InvalidAppendAck(ack));
         };
-        if front.writer_seq_num < writer_seq_num {
+        if front.record.writer_seq_num < writer_seq_num {
             return Err(TsfClientError::AppendNotAcknowledged {
-                writer_seq_num: front.writer_seq_num,
+                writer_seq_num: front.record.writer_seq_num,
                 ack,
             });
         }
-        if front.writer_seq_num > writer_seq_num {
+        if front.record.writer_seq_num > writer_seq_num {
             return Err(TsfClientError::InvalidAppendAck(ack));
         }
 
@@ -1374,15 +1328,20 @@ struct ReadSocket {
 
 impl ReadSocket {
     async fn next_outcome(&mut self) -> Result<ReadSocketOutcome, TsfClientError> {
-        if let Some(read_idle_timeout) = self.read_idle_timeout {
-            with_timeout(
-                read_idle_timeout,
-                "read stream record",
-                next_read_socket_outcome(&mut self.ws),
-            )
-            .await
-        } else {
-            next_read_socket_outcome(&mut self.ws).await
+        loop {
+            let outcome = if let Some(read_idle_timeout) = self.read_idle_timeout {
+                with_timeout(
+                    read_idle_timeout,
+                    "read stream record",
+                    next_read_socket_frame(&mut self.ws),
+                )
+                .await?
+            } else {
+                next_read_socket_frame(&mut self.ws).await?
+            };
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
+            }
         }
     }
 
@@ -1447,7 +1406,7 @@ async fn with_timeout<T>(
         .map_err(|_| TsfClientError::Timeout { operation })?
 }
 
-async fn json_response<T: serde::de::DeserializeOwned>(
+async fn json_response<T: DeserializeOwned>(
     response: reqwest::Response,
     operation: &'static str,
 ) -> Result<T, TsfClientError> {
@@ -1462,24 +1421,6 @@ async fn json_response<T: serde::de::DeserializeOwned>(
     }
 
     Ok(response.json().await?)
-}
-
-async fn empty_response(
-    response: reqwest::Response,
-    expected: StatusCode,
-    operation: &'static str,
-) -> Result<(), TsfClientError> {
-    let status = response.status();
-    if status != expected {
-        let body = http_status_body(response).await;
-        return Err(TsfClientError::HttpStatus {
-            operation,
-            status,
-            body,
-        });
-    }
-
-    Ok(())
 }
 
 async fn http_status_body(response: reqwest::Response) -> String {
@@ -1548,20 +1489,24 @@ async fn next_read_socket_outcome(
     ws: &mut ClientWebSocket,
 ) -> Result<ReadSocketOutcome, TsfClientError> {
     loop {
-        match next_server_frame(ws).await? {
-            Some(ServerFrame::ReadRecord(record)) => return Ok(ReadSocketOutcome::Record(record)),
-            Some(ServerFrame::ReadTail(tail)) => return Ok(ReadSocketOutcome::Tail(tail)),
-            Some(ServerFrame::Heartbeat) => {}
-            Some(ServerFrame::ReconnectAdvised { .. }) => {
-                return Ok(ReadSocketOutcome::ReconnectAdvised);
-            }
-            Some(frame) => {
-                return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-                    &frame,
-                )));
-            }
-            None => return Ok(ReadSocketOutcome::Closed),
+        if let Some(outcome) = next_read_socket_frame(ws).await? {
+            return Ok(outcome);
         }
+    }
+}
+
+async fn next_read_socket_frame(
+    ws: &mut ClientWebSocket,
+) -> Result<Option<ReadSocketOutcome>, TsfClientError> {
+    match next_server_frame(ws).await? {
+        Some(ServerFrame::ReadRecord(record)) => Ok(Some(ReadSocketOutcome::Record(record))),
+        Some(ServerFrame::ReadTail(tail)) => Ok(Some(ReadSocketOutcome::Tail(tail))),
+        Some(ServerFrame::Heartbeat) => Ok(None),
+        Some(ServerFrame::ReconnectAdvised { .. }) => Ok(Some(ReadSocketOutcome::ReconnectAdvised)),
+        Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+            &frame,
+        ))),
+        None => Ok(Some(ReadSocketOutcome::Closed)),
     }
 }
 
@@ -1700,9 +1645,7 @@ impl TsfClientError {
     fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
-            Self::HttpStatus { status, .. } => {
-                matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
-            }
+            Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
             Self::Timeout { .. } => true,
             Self::WebSocket(error) => is_retryable_websocket_error(error),
             Self::WebSocketClosed => true,
@@ -1725,6 +1668,10 @@ fn is_retryable_close_code(code: u16) -> bool {
     matches!(code, 1000 | 1001 | 1005 | 1006 | 1011..=1015)
 }
 
+fn is_retryable_http_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
 fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
     match error {
         WebSocketError::ConnectionClosed
@@ -1732,10 +1679,7 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
         | WebSocketError::Tls(_)
         | WebSocketError::WriteBufferFull(_) => true,
         WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
-        WebSocketError::Http(response) => matches!(
-            response.status().as_u16(),
-            408 | 425 | 429 | 500 | 502 | 503 | 504
-        ),
+        WebSocketError::Http(response) => is_retryable_http_status(response.status().as_u16()),
         _ => false,
     }
 }
@@ -1743,6 +1687,24 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind WebSocket listener");
+        let address = listener.local_addr().expect("WebSocket listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept WebSocket client");
+            tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept WebSocket handshake")
+        });
+        let (client, _) = connect_async(format!("ws://{address}"))
+            .await
+            .expect("connect WebSocket client");
+
+        (client, server.await.expect("join WebSocket server"))
+    }
 
     #[test]
     fn default_config_uses_api_origin() {
@@ -1758,6 +1720,103 @@ mod tests {
         );
         assert_eq!(config.retry_policy, RetryPolicy::default());
         assert!(config.rest_bearer_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_idle_timeout_resets_on_protocol_heartbeat() {
+        let (client, mut server) = connected_websockets().await;
+        let sender = tokio::spawn(async move {
+            for _ in 0..12 {
+                sleep(Duration::from_millis(20)).await;
+                server
+                    .send(Message::Binary(
+                        ServerFrame::Heartbeat.encode().expect("encode heartbeat"),
+                    ))
+                    .await
+                    .expect("send heartbeat");
+            }
+            server
+                .send(Message::Binary(
+                    ServerFrame::ReadTail(ReadTail {
+                        next_s2_seq_num: 42,
+                        timestamp_ms: 1_786_377_600_000,
+                    })
+                    .encode()
+                    .expect("encode read tail"),
+                ))
+                .await
+                .expect("send read tail");
+        });
+        let mut socket = ReadSocket {
+            ws: client,
+            read_idle_timeout: Some(Duration::from_millis(100)),
+        };
+
+        let outcome = socket.next_outcome().await.expect("read tail outcome");
+
+        assert!(matches!(
+            outcome,
+            ReadSocketOutcome::Tail(ReadTail {
+                next_s2_seq_num: 42,
+                timestamp_ms: 1_786_377_600_000,
+            })
+        ));
+        sender.await.expect("join heartbeat sender");
+    }
+
+    #[tokio::test]
+    async fn explicit_read_timeout_does_not_reset_on_protocol_heartbeat() {
+        let (client, mut server) = connected_websockets().await;
+        let sender = tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(20)).await;
+                server
+                    .send(Message::Binary(
+                        ServerFrame::Heartbeat.encode().expect("encode heartbeat"),
+                    ))
+                    .await
+                    .expect("send heartbeat");
+            }
+        });
+        let mut socket = ReadSocket {
+            ws: client,
+            read_idle_timeout: Some(Duration::from_secs(1)),
+        };
+
+        let result = socket
+            .next_outcome_with_timeout(Duration::from_millis(100))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::Timeout {
+                operation: "read stream record"
+            })
+        ));
+        sender.abort();
+    }
+
+    #[tokio::test]
+    async fn read_idle_timeout_still_rejects_a_silent_connection() {
+        let (client, server) = connected_websockets().await;
+        let server = tokio::spawn(async move {
+            let _server = server;
+            sleep(Duration::from_secs(1)).await;
+        });
+        let mut socket = ReadSocket {
+            ws: client,
+            read_idle_timeout: Some(Duration::from_millis(50)),
+        };
+
+        let result = socket.next_outcome().await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::Timeout {
+                operation: "read stream record"
+            })
+        ));
+        server.abort();
     }
 
     #[test]
@@ -1778,7 +1837,7 @@ mod tests {
         );
 
         assert_eq!(
-            client.rest_url("/streams").expect("REST URL").as_str(),
+            client.rest_url("/streams").as_str(),
             "http://localhost:8787/api/v1/streams"
         );
     }

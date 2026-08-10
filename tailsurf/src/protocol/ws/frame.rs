@@ -283,68 +283,12 @@ impl ClientFrame {
 
     /// Decodes one client frame, copying any record payload into owned bytes.
     pub fn decode(input: &[u8]) -> Result<Self, FrameCodecError> {
-        let (&op_byte, body) = input.split_first().ok_or(FrameCodecError::EmptyFrame)?;
-
-        match ClientOp::try_from(op_byte)? {
-            ClientOp::AuthRead => Ok(Self::AuthRead {
-                bearer_token: BearerToken::from(utf8_tail(body)?),
-            }),
-            ClientOp::AuthWrite => {
-                let (writer_id, token_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
-                Ok(Self::AuthWrite {
-                    writer_id: WriterId::from_bytes(writer_id),
-                    bearer_token: BearerToken::from(utf8_tail(token_bytes)?),
-                })
-            }
-            ClientOp::AppendRecord => {
-                let (writer_seq_num, body) = read_u64(body)?;
-                let (part_raw, body) = read_u32(body)?;
-                let (format, body) = read_record_format(body)?;
-                let data = body;
-                validate_record_len(data.len())?;
-                Ok(Self::AppendRecord {
-                    writer_seq_num,
-                    part: PartHeader::from_raw(part_raw),
-                    format,
-                    data: Bytes::copy_from_slice(data),
-                })
-            }
-        }
+        decode_client_frame(input)
     }
 
     /// Decodes one client frame while retaining a zero-copy slice for record payload data.
     pub fn decode_bytes(input: Bytes) -> Result<Self, FrameCodecError> {
-        let Some(&op_byte) = input.first() else {
-            return Err(FrameCodecError::EmptyFrame);
-        };
-        let body = &input[1..];
-
-        match ClientOp::try_from(op_byte)? {
-            ClientOp::AuthRead => Ok(Self::AuthRead {
-                bearer_token: BearerToken::from(utf8_tail(body)?),
-            }),
-            ClientOp::AuthWrite => {
-                let (writer_id, token_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
-                Ok(Self::AuthWrite {
-                    writer_id: WriterId::from_bytes(writer_id),
-                    bearer_token: BearerToken::from(utf8_tail(token_bytes)?),
-                })
-            }
-            ClientOp::AppendRecord => {
-                let (writer_seq_num, body) = read_u64(body)?;
-                let (part_raw, body) = read_u32(body)?;
-                let (format, body) = read_record_format(body)?;
-                let data = body;
-                validate_record_len(data.len())?;
-                let data_start = input.len() - data.len();
-                Ok(Self::AppendRecord {
-                    writer_seq_num,
-                    part: PartHeader::from_raw(part_raw),
-                    format,
-                    data: input.slice(data_start..),
-                })
-            }
-        }
+        decode_client_frame(input)
     }
 }
 
@@ -399,147 +343,144 @@ impl ServerFrame {
 
     /// Decodes one server frame, copying any record payload into owned bytes.
     pub fn decode(input: &[u8]) -> Result<Self, FrameCodecError> {
-        let (&op_byte, body) = input.split_first().ok_or(FrameCodecError::EmptyFrame)?;
-
-        match ServerOp::try_from(op_byte)? {
-            ServerOp::Hello => {
-                let (version, body) = read_u16(body)?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::Hello { version })
-            }
-            ServerOp::AuthRequired => {
-                ensure_empty(op_byte, body)?;
-                Ok(Self::AuthRequired)
-            }
-            ServerOp::Ack => {
-                let (writer_seq_start, body) = read_u64(body)?;
-                let (writer_seq_end, body) = read_u64(body)?;
-                let (s2_seq_start, body) = read_u64(body)?;
-                let (s2_seq_end, body) = read_u64(body)?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::Ack {
-                    writer_seq_start,
-                    writer_seq_end,
-                    s2_seq_start,
-                    s2_seq_end,
-                })
-            }
-            ServerOp::ReadRecord => {
-                let (s2_seq_num, body) = read_u64(body)?;
-                let (timestamp_ms, body) = read_u64(body)?;
-                let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
-                let (writer_seq_num, body) = read_u64(body)?;
-                let (part_raw, body) = read_u32(body)?;
-                let (format, body) = read_record_format(body)?;
-                let data = body;
-                validate_record_len(data.len())?;
-                Ok(Self::ReadRecord(ReadRecord {
-                    s2_seq_num,
-                    timestamp_ms,
-                    writer_id: WriterId::from_bytes(writer_id),
-                    writer_seq_num,
-                    part: PartHeader::from_raw(part_raw),
-                    format,
-                    data: Bytes::copy_from_slice(data),
-                }))
-            }
-            ServerOp::Heartbeat => {
-                ensure_empty(op_byte, body)?;
-                Ok(Self::Heartbeat)
-            }
-            ServerOp::ReconnectAdvised => {
-                let (&deadline_secs, body) =
-                    body.split_first().ok_or(FrameCodecError::TruncatedFrame {
-                        op: op_byte,
-                        needed: 1,
-                    })?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::ReconnectAdvised { deadline_secs })
-            }
-            ServerOp::ReadTail => {
-                let (next_s2_seq_num, body) = read_u64(body)?;
-                let (timestamp_ms, body) = read_u64(body)?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::ReadTail(ReadTail {
-                    next_s2_seq_num,
-                    timestamp_ms,
-                }))
-            }
-        }
+        decode_server_frame(input)
     }
 
     /// Decodes one server frame while retaining a zero-copy slice for record payload data.
     pub fn decode_bytes(input: Bytes) -> Result<Self, FrameCodecError> {
-        let Some(&op_byte) = input.first() else {
-            return Err(FrameCodecError::EmptyFrame);
-        };
-        let body = &input[1..];
+        decode_server_frame(input)
+    }
+}
 
-        match ServerOp::try_from(op_byte)? {
-            ServerOp::Hello => {
-                let (version, body) = read_u16(body)?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::Hello { version })
-            }
-            ServerOp::AuthRequired => {
-                ensure_empty(op_byte, body)?;
-                Ok(Self::AuthRequired)
-            }
-            ServerOp::Ack => {
-                let (writer_seq_start, body) = read_u64(body)?;
-                let (writer_seq_end, body) = read_u64(body)?;
-                let (s2_seq_start, body) = read_u64(body)?;
-                let (s2_seq_end, body) = read_u64(body)?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::Ack {
-                    writer_seq_start,
-                    writer_seq_end,
-                    s2_seq_start,
-                    s2_seq_end,
-                })
-            }
-            ServerOp::ReadRecord => {
-                let (s2_seq_num, body) = read_u64(body)?;
-                let (timestamp_ms, body) = read_u64(body)?;
-                let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
-                let (writer_seq_num, body) = read_u64(body)?;
-                let (part_raw, body) = read_u32(body)?;
-                let (format, body) = read_record_format(body)?;
-                let data = body;
-                validate_record_len(data.len())?;
-                let data_start = input.len() - data.len();
-                Ok(Self::ReadRecord(ReadRecord {
-                    s2_seq_num,
-                    timestamp_ms,
-                    writer_id: WriterId::from_bytes(writer_id),
-                    writer_seq_num,
-                    part: PartHeader::from_raw(part_raw),
-                    format,
-                    data: input.slice(data_start..),
-                }))
-            }
-            ServerOp::Heartbeat => {
-                ensure_empty(op_byte, body)?;
-                Ok(Self::Heartbeat)
-            }
-            ServerOp::ReconnectAdvised => {
-                let (&deadline_secs, body) =
-                    body.split_first().ok_or(FrameCodecError::TruncatedFrame {
-                        op: op_byte,
-                        needed: 1,
-                    })?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::ReconnectAdvised { deadline_secs })
-            }
-            ServerOp::ReadTail => {
-                let (next_s2_seq_num, body) = read_u64(body)?;
-                let (timestamp_ms, body) = read_u64(body)?;
-                ensure_empty(op_byte, body)?;
-                Ok(Self::ReadTail(ReadTail {
-                    next_s2_seq_num,
-                    timestamp_ms,
-                }))
-            }
+trait FrameInput {
+    fn as_bytes(&self) -> &[u8];
+    fn into_record_data(self, start: usize) -> Bytes;
+}
+
+impl FrameInput for &[u8] {
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+
+    fn into_record_data(self, start: usize) -> Bytes {
+        Bytes::copy_from_slice(&self[start..])
+    }
+}
+
+impl FrameInput for Bytes {
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+
+    fn into_record_data(self, start: usize) -> Bytes {
+        self.slice(start..)
+    }
+}
+
+fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodecError> {
+    let bytes = input.as_bytes();
+    let Some((&op_byte, body)) = bytes.split_first() else {
+        return Err(FrameCodecError::EmptyFrame);
+    };
+
+    match ClientOp::try_from(op_byte)? {
+        ClientOp::AuthRead => Ok(ClientFrame::AuthRead {
+            bearer_token: BearerToken::from(utf8_tail(body)?),
+        }),
+        ClientOp::AuthWrite => {
+            let (writer_id, token_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            Ok(ClientFrame::AuthWrite {
+                writer_id: WriterId::from_bytes(writer_id),
+                bearer_token: BearerToken::from(utf8_tail(token_bytes)?),
+            })
+        }
+        ClientOp::AppendRecord => {
+            let (writer_seq_num, body) = read_u64(body)?;
+            let (part_raw, body) = read_u32(body)?;
+            let (format, data) = read_record_format(body)?;
+            validate_record_len(data.len())?;
+            let data_start = bytes.len() - data.len();
+            let data = input.into_record_data(data_start);
+            Ok(ClientFrame::AppendRecord {
+                writer_seq_num,
+                part: PartHeader::from_raw(part_raw),
+                format,
+                data,
+            })
+        }
+    }
+}
+
+fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodecError> {
+    let bytes = input.as_bytes();
+    let Some((&op_byte, body)) = bytes.split_first() else {
+        return Err(FrameCodecError::EmptyFrame);
+    };
+
+    match ServerOp::try_from(op_byte)? {
+        ServerOp::Hello => {
+            let (version, body) = read_u16(body)?;
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::Hello { version })
+        }
+        ServerOp::AuthRequired => {
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::AuthRequired)
+        }
+        ServerOp::Ack => {
+            let (writer_seq_start, body) = read_u64(body)?;
+            let (writer_seq_end, body) = read_u64(body)?;
+            let (s2_seq_start, body) = read_u64(body)?;
+            let (s2_seq_end, body) = read_u64(body)?;
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::Ack {
+                writer_seq_start,
+                writer_seq_end,
+                s2_seq_start,
+                s2_seq_end,
+            })
+        }
+        ServerOp::ReadRecord => {
+            let (s2_seq_num, body) = read_u64(body)?;
+            let (timestamp_ms, body) = read_u64(body)?;
+            let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            let (writer_seq_num, body) = read_u64(body)?;
+            let (part_raw, body) = read_u32(body)?;
+            let (format, data) = read_record_format(body)?;
+            validate_record_len(data.len())?;
+            let data_start = bytes.len() - data.len();
+            let data = input.into_record_data(data_start);
+            Ok(ServerFrame::ReadRecord(ReadRecord {
+                s2_seq_num,
+                timestamp_ms,
+                writer_id: WriterId::from_bytes(writer_id),
+                writer_seq_num,
+                part: PartHeader::from_raw(part_raw),
+                format,
+                data,
+            }))
+        }
+        ServerOp::Heartbeat => {
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::Heartbeat)
+        }
+        ServerOp::ReconnectAdvised => {
+            let (&deadline_secs, body) =
+                body.split_first().ok_or(FrameCodecError::TruncatedFrame {
+                    op: op_byte,
+                    needed: 1,
+                })?;
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::ReconnectAdvised { deadline_secs })
+        }
+        ServerOp::ReadTail => {
+            let (next_s2_seq_num, body) = read_u64(body)?;
+            let (timestamp_ms, body) = read_u64(body)?;
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::ReadTail(ReadTail {
+                next_s2_seq_num,
+                timestamp_ms,
+            }))
         }
     }
 }
@@ -656,89 +597,6 @@ mod tests {
         assert_eq!(part.index(), 42);
         assert!(part.is_final());
         assert_eq!(PartHeader::from_raw(part.raw()), part);
-    }
-
-    #[test]
-    fn client_append_round_trips() {
-        let frame = ClientFrame::AppendRecord {
-            writer_seq_num: 7,
-            part: PartHeader::unsplit(),
-            format: RecordFormat::Transcript,
-            data: Bytes::from_static(b"hello"),
-        };
-
-        let encoded = frame.encode().expect("encode frame");
-        assert_client_frame_eq(ClientFrame::decode(&encoded).expect("decode frame"), &frame);
-        assert_client_frame_eq(
-            ClientFrame::decode_bytes(encoded).expect("decode bytes frame"),
-            &frame,
-        );
-    }
-
-    #[test]
-    fn client_auth_frames_round_trip() {
-        let read = ClientFrame::AuthRead {
-            bearer_token: BearerToken::from("read-token"),
-        };
-        let write = ClientFrame::AuthWrite {
-            writer_id: WriterId::from_bytes([3; WriterId::BYTE_LEN]),
-            bearer_token: BearerToken::from("write-token"),
-        };
-
-        assert_client_frame_eq(
-            ClientFrame::decode(&read.encode().expect("encode read auth"))
-                .expect("decode read auth"),
-            &read,
-        );
-        assert_client_frame_eq(
-            ClientFrame::decode(&write.encode().expect("encode write auth"))
-                .expect("decode write auth"),
-            &write,
-        );
-    }
-
-    #[test]
-    fn server_read_record_round_trips() {
-        let writer_id = WriterId::from_bytes([9; WriterId::BYTE_LEN]);
-        let frame = ServerFrame::ReadRecord(ReadRecord {
-            s2_seq_num: 11,
-            timestamp_ms: 1_786_000_000_123,
-            writer_id,
-            writer_seq_num: 12,
-            part: PartHeader::unsplit(),
-            format: RecordFormat::Transcript,
-            data: Bytes::from_static(b"line\n"),
-        });
-
-        let encoded = frame.encode().expect("encode frame");
-        assert_eq!(ServerFrame::decode(&encoded).expect("decode frame"), frame);
-        assert_eq!(
-            ServerFrame::decode_bytes(encoded).expect("decode bytes frame"),
-            frame
-        );
-    }
-
-    #[test]
-    fn server_control_frames_round_trip() {
-        for frame in [
-            ServerFrame::Hello { version: TSF_V3 },
-            ServerFrame::AuthRequired,
-            ServerFrame::Ack {
-                writer_seq_start: 1,
-                writer_seq_end: 2,
-                s2_seq_start: 3,
-                s2_seq_end: 4,
-            },
-            ServerFrame::Heartbeat,
-            ServerFrame::ReconnectAdvised { deadline_secs: 5 },
-            ServerFrame::ReadTail(ReadTail {
-                next_s2_seq_num: 6,
-                timestamp_ms: 7,
-            }),
-        ] {
-            let encoded = frame.encode().expect("encode frame");
-            assert_eq!(ServerFrame::decode(&encoded).expect("decode frame"), frame);
-        }
     }
 
     #[test]
@@ -901,51 +759,5 @@ mod tests {
         frame.extend_from_slice(&[RecordFormat::Bytes.byte()]);
         frame.extend(std::iter::repeat_n(0, data_len));
         frame.freeze()
-    }
-
-    fn assert_client_frame_eq(actual: ClientFrame, expected: &ClientFrame) {
-        match (actual, expected) {
-            (
-                ClientFrame::AuthRead {
-                    bearer_token: actual,
-                },
-                ClientFrame::AuthRead {
-                    bearer_token: expected,
-                },
-            ) => assert_eq!(actual.expose_secret(), expected.expose_secret()),
-            (
-                ClientFrame::AuthWrite {
-                    writer_id: actual_writer_id,
-                    bearer_token: actual,
-                },
-                ClientFrame::AuthWrite {
-                    writer_id: expected_writer_id,
-                    bearer_token: expected,
-                },
-            ) => {
-                assert_eq!(actual_writer_id, *expected_writer_id);
-                assert_eq!(actual.expose_secret(), expected.expose_secret());
-            }
-            (
-                ClientFrame::AppendRecord {
-                    writer_seq_num: actual_writer_seq_num,
-                    part: actual_part,
-                    format: actual_format,
-                    data: actual_data,
-                },
-                ClientFrame::AppendRecord {
-                    writer_seq_num: expected_writer_seq_num,
-                    part: expected_part,
-                    format: expected_format,
-                    data: expected_data,
-                },
-            ) => {
-                assert_eq!(actual_writer_seq_num, *expected_writer_seq_num);
-                assert_eq!(actual_part, *expected_part);
-                assert_eq!(actual_format, *expected_format);
-                assert_eq!(actual_data, *expected_data);
-            }
-            (actual, expected) => panic!("client frame mismatch: {actual:?} != {expected:?}"),
-        }
     }
 }

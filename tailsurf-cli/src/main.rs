@@ -30,7 +30,7 @@ use tailsurf::{
         },
     },
     stream_url::{StreamLocator, stream_url},
-    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript, TranscriptRecord},
+    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -160,13 +160,19 @@ struct TailArgs {
     /// Start this many retained records before the live tail.
     #[arg(short = 'n', long, conflicts_with_all = ["seq_num", "timestamp"])]
     tail_offset: Option<u64>,
+    #[command(flatten)]
+    read: ReadArgs,
+}
+
+#[derive(Debug, Args)]
+struct ReadArgs {
     /// Start at this S2 sequence number.
     #[arg(long, conflicts_with = "timestamp")]
     seq_num: Option<u64>,
     /// Start at this Unix timestamp in milliseconds.
     #[arg(long, conflicts_with = "seq_num")]
     timestamp: Option<u64>,
-    /// Stop after this many stored records instead of following forever.
+    /// Read at most this many stored records.
     #[arg(long)]
     count: Option<u64>,
     /// Maximum assembled transcript record size.
@@ -179,18 +185,8 @@ struct ReplayArgs {
     /// Read-capable or public stream share URL.
     #[arg(value_name = "STREAM_URL")]
     url: String,
-    /// Start at this S2 sequence number.
-    #[arg(long, conflicts_with = "timestamp")]
-    seq_num: Option<u64>,
-    /// Start at this Unix timestamp in milliseconds.
-    #[arg(long, conflicts_with = "seq_num")]
-    timestamp: Option<u64>,
-    /// Print at most this many stored records.
-    #[arg(long)]
-    count: Option<u64>,
-    /// Maximum assembled transcript record size.
-    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_LOGICAL_RECORD_BYTES)]
-    max_logical_record_bytes: usize,
+    #[command(flatten)]
+    read: ReadArgs,
 }
 
 #[derive(Debug, Args)]
@@ -408,14 +404,6 @@ impl WriterState {
         }
     }
 
-    fn writer_id(&self) -> WriterId {
-        self.writer_id
-    }
-
-    fn appended(&self) -> u64 {
-        self.next_writer_seq
-    }
-
     fn reserve_writer_seq(&mut self) -> eyre::Result<u64> {
         let reserved = self.next_writer_seq;
         self.next_writer_seq = self
@@ -514,7 +502,7 @@ fn print_error(error: &eyre::Report) {
 async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<()> {
     let visibility = visibility_from_flags(args.public);
     let issue_tokens = if args.links.is_empty() {
-        new_default_links()
+        vec![TokenPermissions::owner()]
     } else {
         args.links.iter().map(|access| access.0).collect()
     };
@@ -622,7 +610,7 @@ fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> Option<Ur
     created
         .tokens
         .iter()
-        .find(|issued| link_label(issued.permissions) == "view")
+        .find(|issued| issued.permissions == TokenPermissions::read())
         .map(|issued| {
             stream_url(
                 web_url,
@@ -645,7 +633,7 @@ async fn stream_stdin_to_writer(
     let writer = client
         .connect_producer(WriteStreamOptions::with_stream_token(
             stream_id,
-            state.writer_id(),
+            state.writer_id,
             &token,
         ))
         .await
@@ -656,7 +644,7 @@ async fn stream_stdin_to_writer(
         WriteBuffering::Lines => stream_lines_to_writer(&writer, &mut state).await,
     }?;
     writer.close().await.context("failed to close writer")?;
-    print_write_summary(state.appended(), view_link.as_ref());
+    print_write_summary(state.next_writer_seq, view_link.as_ref());
     if interrupted {
         exit_interrupted();
     }
@@ -709,7 +697,7 @@ async fn stream_raw_stdin_to_writer(
                 .await?;
         };
     };
-    appender.finish(&mut session).await?;
+    appender.flush(&mut session).await?;
     session.finish().await?;
 
     Ok(interrupted)
@@ -764,7 +752,7 @@ async fn stream_command_to_writer(
     let writer = client
         .connect_producer(WriteStreamOptions::with_stream_token(
             stream_id,
-            state.writer_id(),
+            state.writer_id,
             &token,
         ))
         .await
@@ -780,14 +768,14 @@ async fn stream_command_to_writer(
         outcome
     };
     writer.close().await.context("failed to close writer")?;
-    print_write_summary(state.appended(), view_link.as_ref());
+    print_write_summary(state.next_writer_seq, view_link.as_ref());
     if outcome.interrupted {
         exit_interrupted();
     }
     if outcome.status.success() {
         Ok(())
     } else {
-        exit_with_status(outcome.status)
+        std::process::exit(exit_code_from_status(outcome.status))
     }
 }
 
@@ -941,10 +929,6 @@ impl RawRecordAppender {
             .append_physical_record(PartHeader::unsplit(), RecordFormat::Bytes, data)
             .await
     }
-
-    async fn finish(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
-        self.flush(session).await
-    }
 }
 
 async fn stream_raw_chunks_to_writer(
@@ -973,7 +957,7 @@ async fn stream_raw_chunks_to_writer(
             appender.push_bytes(session, &chunk?).await?;
         }
     }
-    appender.finish(session).await
+    appender.flush(session).await
 }
 
 struct LineRecordAppender {
@@ -1105,28 +1089,24 @@ impl WriterSession<'_> {
 }
 
 async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
-    ensure_single_selector(args.seq_num, args.timestamp)?;
     let locator = StreamLocator::parse(&args.url).context("invalid stream URL")?;
     let mut request = ReadStreamOptions::new(locator.stream_id);
-    request.start = Some(if let Some(seq_num) = args.seq_num {
-        ReadStart::SeqNum(seq_num)
-    } else if let Some(timestamp) = args.timestamp {
-        ReadStart::TimestampMs(timestamp)
-    } else {
-        ReadStart::TailOffset(args.tail_offset.unwrap_or_default())
-    });
-    request.count = args.count;
+    request.start = Some(selected_read_start(
+        args.read.seq_num,
+        args.read.timestamp,
+        ReadStart::TailOffset(args.tail_offset.unwrap_or_default()),
+    ));
+    request.count = args.read.count;
     if let Some(token) = locator.token_with(TokenPermissions::allows_read) {
         request = request.with_stream_token(token);
     }
 
-    read_transcript(api_url, request, args.max_logical_record_bytes).await
+    read_transcript(api_url, request, args.read.max_logical_record_bytes).await
 }
 
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
-    ensure_single_selector(args.seq_num, args.timestamp)?;
     let locator = StreamLocator::parse(&args.url).context("invalid stream URL")?;
-    if args.count == Some(0) {
+    if args.read.count == Some(0) {
         return Ok(());
     }
     let read_token = locator.token_with(TokenPermissions::allows_read);
@@ -1144,22 +1124,21 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     }
 
     let mut request = ReadStreamOptions::new(locator.stream_id);
-    request.start = Some(if let Some(seq_num) = args.seq_num {
-        ReadStart::SeqNum(seq_num)
-    } else if let Some(timestamp) = args.timestamp {
-        ReadStart::TimestampMs(timestamp)
-    } else {
-        ReadStart::SeqNum(0)
-    });
+    request.start = Some(selected_read_start(
+        args.read.seq_num,
+        args.read.timestamp,
+        ReadStart::SeqNum(0),
+    ));
     request.until = Some(tail.next_s2_seq_num - 1);
     request.count = args
+        .read
         .count
         .or_else(|| replay_count_from_tail(&request, tail.next_s2_seq_num));
     if let Some(token) = read_token {
         request = request.with_stream_token(token);
     }
 
-    read_transcript(api_url, request, args.max_logical_record_bytes).await
+    read_transcript(api_url, request, args.read.max_logical_record_bytes).await
 }
 
 async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
@@ -1293,22 +1272,14 @@ async fn read_transcript(
             exit_interrupted();
         }
     } {
-        let record = transcript
+        if let Some(record) = transcript
             .push_record(record)
-            .context("failed to assemble transcript record")?;
-        write_transcript_record(&mut stdout, record).await?;
+            .context("failed to assemble transcript record")?
+        {
+            write_transcript_data(&mut stdout, record.data).await?;
+        }
     }
 
-    Ok(())
-}
-
-async fn write_transcript_record(
-    stdout: &mut tokio::io::Stdout,
-    record: Option<TranscriptRecord>,
-) -> eyre::Result<()> {
-    if let Some(record) = record {
-        write_transcript_data(stdout, record.data).await?;
-    }
     Ok(())
 }
 
@@ -1389,7 +1360,7 @@ fn print_created_stream(
                             issued.permissions,
                             &issued.token,
                         ),
-                        if issued.permissions.to_string() == "o" {
+                        if issued.permissions.allows_owner() {
                             "  (keep private)"
                         } else {
                             ""
@@ -1550,10 +1521,6 @@ fn write_secret_file(path: &Path, secret: &str) -> std::io::Result<()> {
     std::io::Write::write_all(&mut file, secret.as_bytes())
 }
 
-fn new_default_links() -> Vec<TokenPermissions> {
-    vec![TokenPermissions::owner()]
-}
-
 fn write_new_default_links(visibility: Visibility) -> Vec<TokenPermissions> {
     match visibility {
         Visibility::Private => vec![TokenPermissions::owner(), TokenPermissions::read()],
@@ -1625,11 +1592,15 @@ fn humanize_retention(secs: u64) -> String {
     unit(secs, "second")
 }
 
-fn ensure_single_selector(seq_num: Option<u64>, timestamp: Option<u64>) -> eyre::Result<()> {
-    if seq_num.is_some() && timestamp.is_some() {
-        bail!("only one of --seq-num or --timestamp can be set");
-    }
-    Ok(())
+fn selected_read_start(
+    seq_num: Option<u64>,
+    timestamp: Option<u64>,
+    default: ReadStart,
+) -> ReadStart {
+    seq_num
+        .map(ReadStart::SeqNum)
+        .or_else(|| timestamp.map(ReadStart::TimestampMs))
+        .unwrap_or(default)
 }
 
 fn replay_count_from_tail(options: &ReadStreamOptions, next_s2_seq_num: u64) -> Option<u64> {
@@ -1638,10 +1609,6 @@ fn replay_count_from_tail(options: &ReadStreamOptions, next_s2_seq_num: u64) -> 
         None => Some(next_s2_seq_num),
         Some(ReadStart::TimestampMs(_) | ReadStart::TailOffset(_)) => None,
     }
-}
-
-fn exit_with_status(status: ExitStatus) -> ! {
-    std::process::exit(exit_code_from_status(status));
 }
 
 fn exit_interrupted() -> ! {

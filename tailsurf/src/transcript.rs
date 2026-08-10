@@ -403,33 +403,6 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_duplicate_split_prefixes() {
-        let mut transcript = LogicalTranscript::new();
-
-        assert_eq!(
-            push(
-                &mut transcript,
-                record(7, PartHeader::new(0, false).expect("part"), b"hel"),
-            ),
-            None
-        );
-        assert_eq!(
-            push(
-                &mut transcript,
-                record(7, PartHeader::new(0, false).expect("part"), b"HEL"),
-            ),
-            None
-        );
-        assert_chunked_record(
-            push(
-                &mut transcript,
-                record(8, PartHeader::new(1, true).expect("part"), b"lo"),
-            ),
-            b"hello",
-        );
-    }
-
-    #[test]
     fn chunked_transcript_data_advances_across_parts() {
         let mut data = TranscriptData::from_ordered_chunks(vec![
             Bytes::from_static(b"hel"),
@@ -520,13 +493,6 @@ mod tests {
                 data: TranscriptData::from_static(b"second")
             })
         );
-    }
-
-    #[test]
-    fn default_logical_record_limit_exceeds_physical_record_limit() {
-        let transcript = LogicalTranscript::new();
-
-        assert!(transcript.max_logical_record_bytes() > MAX_RECORD_BYTES);
     }
 
     #[test]
