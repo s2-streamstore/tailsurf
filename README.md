@@ -25,10 +25,24 @@ Language-neutral TSF v3 frame vectors live in `tailsurf/fixtures/v3.json`. They 
 
 ## Install
 
-Install the CLI from crates.io:
+Install the prebuilt CLI on macOS or Linux:
 
 ```sh
-cargo install tailsurf-cli
+curl --proto '=https' --tlsv1.2 -LsSf https://tail.surf/install | sh
+```
+
+Install it from PowerShell on Windows:
+
+```powershell
+irm https://tail.surf/install.ps1 | iex
+```
+
+The direct installer puts `tsf` in `~/.local/bin`. It writes an installer receipt so `tsf` can update only the files that installer owns.
+
+Cargo remains the Rust-native fallback:
+
+```sh
+cargo install tailsurf-cli --locked
 ```
 
 For workspace development, install it from the local checkout:
@@ -36,6 +50,20 @@ For workspace development, install it from the local checkout:
 ```sh
 cargo install --path tailsurf-cli
 ```
+
+Update a direct installation explicitly:
+
+```sh
+tsf update
+```
+
+Check without installing:
+
+```sh
+tsf update --check
+```
+
+`tsf` does not check for updates in the background. Installations owned by a package manager stay with that manager. Cargo users rerun `cargo install tailsurf-cli --locked`. cargo-binstall users rerun `cargo binstall tailsurf-cli`.
 
 To use a local API:
 
@@ -154,17 +182,23 @@ python3 scripts/published-cli-smoke.py --self-test
 cargo package --workspace
 ```
 
-Package and publish order:
+## Releases
 
-```sh
-cargo package --workspace
-cargo publish -p tailsurf
-# Wait for the matching tailsurf version to appear in the crates.io index.
-cargo package -p tailsurf-cli
-cargo publish -p tailsurf-cli
-```
+Release-plz opens or updates a release PR after changes reach `main`. It derives the next workspace version from conventional commits and checks SDK API compatibility. Both crates use the same version.
 
-Use `cargo package --workspace` as the clean-tree preflight because it verifies both crates from the workspace source. After publishing `tailsurf`, wait for the matching workspace version to appear in the crates.io index before packaging or publishing `tailsurf-cli` by itself. The packaged CLI resolves its SDK dependency from crates.io instead of the local workspace path.
+Merging the release PR publishes `tailsurf` first and then `tailsurf-cli`. Release-plz creates one `vX.Y.Z` tag. It then dispatches the binary release workflow directly so the repository token does not depend on tag-triggered workflow chaining.
+
+Cargo-dist creates one GitHub release for that tag. It builds `tsf` for Apple Silicon and Intel macOS, ARM64 and x86-64 musl Linux, and x86-64 Windows. Axoupdater is embedded in `tsf` and uses the cargo-dist receipt for explicit updates.
+
+The release contains versioned archives, shell and PowerShell installers, SHA-256 checksums, and GitHub artifact attestations. macOS executables use Developer ID signing with hardened runtime. Windows executables use SSL.com eSigner production signing. Linux artifacts rely on checksums and GitHub attestations.
+
+GitHub release builds fail when signing credentials are missing. macOS signing uses the `CODESIGN_CERTIFICATE`, `CODESIGN_CERTIFICATE_PASSWORD`, and `CODESIGN_IDENTITY` repository secrets. Windows signing uses `SSLDOTCOM_USERNAME`, `SSLDOTCOM_PASSWORD`, `SSLDOTCOM_TOTP_SECRET`, and `SSLDOTCOM_CREDENTIAL_ID`.
+
+Cargo-dist does not notarize macOS artifacts. Browser-downloaded macOS archives may still trigger Gatekeeper until Apple notarization is added.
+
+The installer routes on `tail.surf` redirect to the latest public GitHub release. Older tags and their assets remain available for rollback and CI pinning. Homebrew distribution is not configured.
+
+Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamstore/tailsurf` repository and the `release-plz.yml` workflow without a GitHub environment.
 
 After `tailsurf-cli` is visible in the crates.io index, run the install smoke against the deployed service:
 

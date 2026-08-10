@@ -1,0 +1,17 @@
+[workspace]
+changelog_update = false
+git_release_enable = false
+git_tag_enable = false
+release_always = false
+
+[[package]]
+name = "tailsurf"
+changelog_include = ["tailsurf-cli"]
+changelog_path = "CHANGELOG.md"
+changelog_update = true
+git_release_enable = false
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "tailsurf-cli"

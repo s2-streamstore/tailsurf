@@ -1,0 +1,26 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+packages = ["tailsurf-cli"]
+installers = ["shell", "powershell"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+install-path = "~/.local/bin"
+hosting = "github"
+install-updater = false
+checksum = "sha256"
+github-attestations = true
+github-attestations-phase = "host"
+macos-sign = true
+ssldotcom-windows-sign = "prod"
+github-build-setup = "../dist-build-setup.yml"
+dispatch-releases = true
+pr-run-mode = "plan"

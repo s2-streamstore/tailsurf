@@ -1,0 +1,65 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Publish crates
+    if: github.repository == 's2-streamstore/tailsurf'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      id-token: write
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish release
+        id: release-plz
+        uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build release artifacts
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag="$(jq -er '[.[].version] | unique | if length == 1 then "v\(.[0])" else error("release versions are not coordinated") end' <<<"$RELEASES")"
+          gh workflow run release.yml --ref "$tag" -f tag="$tag"
+
+  release-pr:
+    name: Prepare release PR
+    if: github.repository == 's2-streamstore/tailsurf'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Prepare release PR
+        uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

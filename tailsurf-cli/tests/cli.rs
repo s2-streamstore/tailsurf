@@ -64,6 +64,7 @@ fn help_and_version_describe_the_cli() {
     assert!(help.contains("Create, write, and read tail.surf streams"));
     assert!(help.contains("info        Show current stream metadata"));
     assert!(help.contains("tail        Follow a stream"));
+    assert!(help.contains("update      Update an installation managed by the tail.surf installer"));
 
     let version = Command::new(env!("CARGO_BIN_EXE_tsf"))
         .arg("--version")
@@ -74,6 +75,29 @@ fn help_and_version_describe_the_cli() {
         String::from_utf8(version.stdout).expect("version UTF-8"),
         format!("tsf {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn update_explains_package_manager_ownership_without_installer_receipt() {
+    let update = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .arg("update")
+        .output()
+        .expect("tsf update");
+    assert!(!update.status.success());
+    let error = String::from_utf8(update.stderr).expect("stderr UTF-8");
+    assert!(error.contains("not managed by the tail.surf installer"));
+    assert!(error.contains("cargo install tailsurf-cli --locked"));
+}
+
+#[test]
+fn update_check_respects_package_manager_ownership() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["update", "--check"])
+        .output()
+        .expect("tsf update --check");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    assert!(error.contains("not managed by the tail.surf installer"));
 }
 
 #[test]
