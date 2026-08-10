@@ -7,7 +7,7 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -24,7 +24,7 @@ jobs:
       - run: cargo package -p tailsurf-cli --list
 
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
