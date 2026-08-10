@@ -1,0 +1,131 @@
+name: Notarize macOS binaries
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+    secrets:
+      APPLE_NOTARY_ISSUER_ID:
+        required: true
+      APPLE_NOTARY_KEY_ID:
+        required: true
+      APPLE_NOTARY_PRIVATE_KEY:
+        required: true
+
+jobs:
+  notarize:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Require notarization credentials
+        shell: bash
+        env:
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+        run: |
+          missing=()
+          for name in APPLE_NOTARY_ISSUER_ID APPLE_NOTARY_KEY_ID APPLE_NOTARY_PRIVATE_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            printf 'Missing required Apple notarization secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Download signed macOS archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-build-local-*-apple-darwin
+          path: artifacts
+          merge-multiple: true
+
+      - name: Prepare notarization payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          payload="$RUNNER_TEMP/tailsurf-notarization-payload"
+          archive="$RUNNER_TEMP/tailsurf-macos-notarization.zip"
+          mkdir -p "$payload"
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            source_archive="artifacts/tailsurf-cli-${target}.tar.xz"
+            extracted="$RUNNER_TEMP/extracted-${target}"
+            binary="$extracted/tailsurf-cli-${target}/tsf"
+
+            if [ ! -f "$source_archive" ]; then
+              printf 'Missing signed macOS archive: %s\n' "$source_archive" >&2
+              exit 1
+            fi
+
+            mkdir -p "$extracted" "$payload/$target"
+            tar -xJf "$source_archive" -C "$extracted"
+            codesign --verify --strict --verbose=2 "$binary"
+            cp -p "$binary" "$payload/$target/tsf"
+          done
+
+          codesign --verify --strict --verbose=2 "$payload/aarch64-apple-darwin/tsf"
+          codesign --verify --strict --verbose=2 "$payload/x86_64-apple-darwin/tsf"
+          /usr/bin/ditto -c -k --norsrc --keepParent "$payload" "$archive"
+
+      - name: Submit binaries to Apple
+        shell: bash
+        env:
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          archive="$RUNNER_TEMP/tailsurf-macos-notarization.zip"
+          results="$GITHUB_WORKSPACE/notarization-results"
+          submission="$results/submission.json"
+          log="$results/notarization-log.json"
+
+          mkdir -p "$results"
+          umask 077
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
+
+          set +e
+          xcrun notarytool submit "$archive" \
+            --key "$key" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --output-format json \
+            --wait \
+            --timeout 30m > "$submission"
+          submit_status=$?
+          set -e
+
+          jq . "$submission"
+          submission_id="$(jq -r '.id // empty' "$submission")"
+          if [ -n "$submission_id" ]; then
+            xcrun notarytool log "$submission_id" "$log" \
+              --key "$key" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" || true
+            if [ -f "$log" ]; then
+              jq . "$log"
+            fi
+          fi
+
+          if [ "$submit_status" -ne 0 ]; then
+            exit "$submit_status"
+          fi
+          jq -e '.status == "Accepted"' "$submission" > /dev/null
+
+      - name: Upload notarization records
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-notarization-records
+          path: notarization-results/*.json
+          if-no-files-found: warn
+          retention-days: 30

@@ -21,5 +21,6 @@ github-attestations = true
 github-attestations-phase = "host"
 macos-sign = true
 github-build-setup = "../dist-build-setup.yml"
+global-artifacts-jobs = ["./notarize-macos"]
 dispatch-releases = true
 pr-run-mode = "plan"
