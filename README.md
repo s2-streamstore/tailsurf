@@ -190,9 +190,9 @@ Merging the release PR publishes `tailsurf` first and then `tailsurf-cli`. Relea
 
 Cargo-dist creates one GitHub release for that tag. It builds `tsf` for Apple Silicon and Intel macOS, ARM64 and x86-64 musl Linux, and x86-64 Windows. Axoupdater is embedded in `tsf` and uses the cargo-dist receipt for explicit updates.
 
-The release contains versioned archives, shell and PowerShell installers, SHA-256 checksums, and GitHub artifact attestations. macOS executables use Developer ID signing with hardened runtime. Windows executables use SSL.com eSigner production signing. Linux artifacts rely on checksums and GitHub attestations.
+The release contains versioned archives, shell and PowerShell installers, SHA-256 checksums, and GitHub artifact attestations. macOS executables use Developer ID signing with hardened runtime. Windows executables are unsigned. Linux and Windows artifacts rely on checksums and GitHub attestations.
 
-GitHub release builds fail when signing credentials are missing. macOS signing uses the `CODESIGN_CERTIFICATE`, `CODESIGN_CERTIFICATE_PASSWORD`, and `CODESIGN_IDENTITY` repository secrets. Windows signing uses `SSLDOTCOM_USERNAME`, `SSLDOTCOM_PASSWORD`, `SSLDOTCOM_TOTP_SECRET`, and `SSLDOTCOM_CREDENTIAL_ID`.
+GitHub release builds fail when macOS signing credentials are missing. Signing uses the `CODESIGN_CERTIFICATE`, `CODESIGN_CERTIFICATE_PASSWORD`, and `CODESIGN_IDENTITY` repository secrets.
 
 Cargo-dist does not notarize macOS artifacts. Browser-downloaded macOS archives may still trigger Gatekeeper until Apple notarization is added.
 

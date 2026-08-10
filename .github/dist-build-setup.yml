@@ -17,23 +17,3 @@
       exit 1
     fi
     echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"
-
-- name: Require Windows signing credentials
-  if: runner.os == 'Windows'
-  shell: bash
-  env:
-    SSLDOTCOM_USERNAME: ${{ secrets.SSLDOTCOM_USERNAME }}
-    SSLDOTCOM_PASSWORD: ${{ secrets.SSLDOTCOM_PASSWORD }}
-    SSLDOTCOM_TOTP_SECRET: ${{ secrets.SSLDOTCOM_TOTP_SECRET }}
-    SSLDOTCOM_CREDENTIAL_ID: ${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}
-  run: |
-    missing=()
-    for name in SSLDOTCOM_USERNAME SSLDOTCOM_PASSWORD SSLDOTCOM_TOTP_SECRET SSLDOTCOM_CREDENTIAL_ID; do
-      if [ -z "${!name:-}" ]; then
-        missing+=("$name")
-      fi
-    done
-    if [ "${#missing[@]}" -ne 0 ]; then
-      printf 'Missing required Windows signing secrets: %s\n' "${missing[*]}" >&2
-      exit 1
-    fi

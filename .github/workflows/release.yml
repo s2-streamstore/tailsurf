@@ -116,10 +116,6 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      SSLDOTCOM_USERNAME: ${{ secrets.SSLDOTCOM_USERNAME }}
-      SSLDOTCOM_PASSWORD: ${{ secrets.SSLDOTCOM_PASSWORD }}
-      SSLDOTCOM_CREDENTIAL_ID: ${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}
-      SSLDOTCOM_TOTP_SECRET: ${{ secrets.SSLDOTCOM_TOTP_SECRET }}
       CODESIGN_CERTIFICATE: ${{ secrets.CODESIGN_CERTIFICATE }}
       CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.CODESIGN_CERTIFICATE_PASSWORD }}
       CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
@@ -157,25 +153,6 @@ jobs:
           "CODESIGN_CERTIFICATE": "${{ secrets.CODESIGN_CERTIFICATE }}"
           "CODESIGN_CERTIFICATE_PASSWORD": "${{ secrets.CODESIGN_CERTIFICATE_PASSWORD }}"
           "CODESIGN_IDENTITY": "${{ secrets.CODESIGN_IDENTITY }}"
-      - name: "Require Windows signing credentials"
-        if: "runner.os == 'Windows'"
-        run: |
-          missing=()
-          for name in SSLDOTCOM_USERNAME SSLDOTCOM_PASSWORD SSLDOTCOM_TOTP_SECRET SSLDOTCOM_CREDENTIAL_ID; do
-            if [ -z "${!name:-}" ]; then
-              missing+=("$name")
-            fi
-          done
-          if [ "${#missing[@]}" -ne 0 ]; then
-            printf 'Missing required Windows signing secrets: %s\n' "${missing[*]}" >&2
-            exit 1
-          fi
-        shell: "bash"
-        env:
-          "SSLDOTCOM_CREDENTIAL_ID": "${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}"
-          "SSLDOTCOM_PASSWORD": "${{ secrets.SSLDOTCOM_PASSWORD }}"
-          "SSLDOTCOM_TOTP_SECRET": "${{ secrets.SSLDOTCOM_TOTP_SECRET }}"
-          "SSLDOTCOM_USERNAME": "${{ secrets.SSLDOTCOM_USERNAME }}"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
