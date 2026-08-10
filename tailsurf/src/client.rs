@@ -20,7 +20,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
         Error as WebSocketError, Message,
         client::IntoClientRequest,
@@ -1410,17 +1410,23 @@ async fn connect_websocket(
     url: Url,
     connect_timeout: Duration,
 ) -> Result<ClientWebSocket, TsfClientError> {
+    // TSF v3 sends one frame per message, so Nagle would hold a small append back for an ACK.
+    const DISABLE_NAGLE: bool = true;
+
     let mut request = url.as_str().into_client_request()?;
     request.headers_mut().insert(
         SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static(TSF_WS_PROTOCOL),
     );
 
-    let (ws, response) = timeout(connect_timeout, connect_async(request))
-        .await
-        .map_err(|_| TsfClientError::Timeout {
-            operation: "connect websocket",
-        })??;
+    let (ws, response) = timeout(
+        connect_timeout,
+        connect_async_with_config(request, None, DISABLE_NAGLE),
+    )
+    .await
+    .map_err(|_| TsfClientError::Timeout {
+        operation: "connect websocket",
+    })??;
     let selected_protocol = response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -1728,6 +1734,7 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::connect_async;
 
     async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
