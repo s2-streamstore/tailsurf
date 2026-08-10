@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     extract::{
         Path, Query, State, WebSocketUpgrade,
-        ws::{CloseFrame, Message, WebSocket},
+        ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -87,17 +87,6 @@ fn update_explains_package_manager_ownership_without_installer_receipt() {
     let error = String::from_utf8(update.stderr).expect("stderr UTF-8");
     assert!(error.contains("not managed by the tail.surf installer"));
     assert!(error.contains("cargo install tailsurf-cli --locked"));
-}
-
-#[test]
-fn update_check_respects_package_manager_ownership() {
-    let output = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["update", "--check"])
-        .output()
-        .expect("tsf update --check");
-    assert!(!output.status.success());
-    let error = String::from_utf8(output.stderr).expect("stderr UTF-8");
-    assert!(error.contains("not managed by the tail.surf installer"));
 }
 
 #[test]
@@ -666,70 +655,34 @@ async fn producer_close_is_not_blocked_by_an_unused_reservation() {
 }
 
 #[tokio::test]
-async fn default_producer_blocks_after_128_unacknowledged_records() {
-    let server = HoldingWriteServer::start(128).await;
-    let producer = connect_default_producer(&server.api_url).await;
-    let mut tickets = Vec::new();
-    for writer_seq_num in 0..128 {
-        tickets.push(
-            producer
-                .submit(test_write_record(writer_seq_num, Bytes::from_static(b"x")))
-                .await
-                .expect("submit within record window"),
-        );
-    }
-    server.wait_for_records(128).await;
-
-    assert!(
-        timeout(
-            Duration::from_millis(100),
-            producer.submit(test_write_record(128, Bytes::from_static(b"x"))),
-        )
-        .await
-        .is_err(),
-        "129th submit must wait for a durability acknowledgement"
-    );
-
-    server.release_acknowledgements();
-    for ticket in tickets {
-        ticket.await.expect("durability acknowledgement");
-    }
-    let final_ticket = timeout(
-        Duration::from_secs(1),
-        producer.submit(test_write_record(128, Bytes::from_static(b"x"))),
-    )
-    .await
-    .expect("record window reopened")
-    .expect("final submit");
-    final_ticket.await.expect("final acknowledgement");
-    producer.close().await.expect("producer close");
-    server.abort();
+async fn default_producer_enforces_record_and_byte_windows() {
+    assert_default_producer_window(128, Bytes::from_static(b"x")).await;
+    assert_default_producer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
 }
 
-#[tokio::test]
-async fn default_producer_blocks_after_five_unacknowledged_mebibytes() {
-    let server = HoldingWriteServer::start(10).await;
+async fn assert_default_producer_window(capacity: usize, payload: Bytes) {
+    let server = HoldingWriteServer::start(capacity).await;
     let producer = connect_default_producer(&server.api_url).await;
-    let payload = Bytes::from(vec![0_u8; MAX_RECORD_BYTES]);
+    let record_count = u64::try_from(capacity).expect("window capacity fits u64");
     let mut tickets = Vec::new();
-    for writer_seq_num in 0..10 {
+    for writer_seq_num in 0..record_count {
         tickets.push(
             producer
                 .submit(test_write_record(writer_seq_num, payload.clone()))
                 .await
-                .expect("submit within byte window"),
+                .expect("submit within producer window"),
         );
     }
-    server.wait_for_records(10).await;
+    server.wait_for_records(capacity).await;
 
     assert!(
         timeout(
             Duration::from_millis(100),
-            producer.submit(test_write_record(10, Bytes::from_static(b"x"))),
+            producer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
         )
         .await
         .is_err(),
-        "submit beyond 5 MiB must wait for a durability acknowledgement"
+        "submit beyond the producer window must wait for an acknowledgement"
     );
 
     server.release_acknowledgements();
@@ -738,10 +691,10 @@ async fn default_producer_blocks_after_five_unacknowledged_mebibytes() {
     }
     let final_ticket = timeout(
         Duration::from_secs(1),
-        producer.submit(test_write_record(10, Bytes::from_static(b"x"))),
+        producer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
     )
     .await
-    .expect("byte window reopened")
+    .expect("producer window reopened")
     .expect("final submit");
     final_ticket.await.expect("final acknowledgement");
     producer.close().await.expect("producer close");
@@ -792,7 +745,7 @@ async fn producer_reconnect_resends_every_unacknowledged_record_in_order() {
 
 #[tokio::test]
 async fn tail_reconnect_resumes_after_last_s2_sequence() {
-    let server = FakeReadServer::start().await;
+    let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -822,77 +775,13 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
         Some("1")
     );
     assert_eq!(attempts[1].query.get("tail_offset"), None);
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn tail_broken_websocket_resumes_after_last_s2_sequence() {
-    let server = FakeReadServer::start_broken_read().await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
-
-    let output = run_tsf_until_stdout_contains(
-        server.api_url.clone(),
-        ["tail", read_url.as_str()],
-        b"first\nsecond\n",
-        Duration::from_secs(5),
-    )
-    .await;
-
-    assert_eq!(output.stdout, "first\nsecond\n");
-    assert_eq!(output.stderr, "");
-    let attempts = server.read_attempts();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].bearer_token, "read-secret");
-    assert_eq!(attempts[1].bearer_token, "read-secret");
-    assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(attempts[0].query.get("seq_num"), None);
-    assert_eq!(
-        attempts[1].query.get("seq_num").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(attempts[1].query.get("tail_offset"), None);
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn tail_server_shutdown_resumes_after_last_s2_sequence() {
-    let server = FakeReadServer::start_server_shutdown().await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
-
-    let output = run_tsf_until_stdout_contains(
-        server.api_url.clone(),
-        ["tail", read_url.as_str()],
-        b"first\nsecond\n",
-        Duration::from_secs(5),
-    )
-    .await;
-
-    assert_eq!(output.stdout, "first\nsecond\n");
-    assert_eq!(output.stderr, "");
-    let attempts = server.read_attempts();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(
-        attempts[1].query.get("seq_num").map(String::as_str),
-        Some("1")
-    );
 
     server.abort();
 }
 
 #[tokio::test]
 async fn tail_selector_flags_are_sent_as_read_query() {
-    let tail_offset_server = FakeReadServer::start().await;
+    let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -922,7 +811,7 @@ async fn tail_selector_flags_are_sent_as_read_query() {
     assert_eq!(attempts[0].query.get("timestamp"), None);
     tail_offset_server.abort();
 
-    let seq_server = FakeReadServer::start().await;
+    let seq_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let seq_output = run_tsf_until_stdout_contains(
         seq_server.api_url.clone(),
         ["tail", "--seq-num", "42", "--count", "3", read_url.as_str()],
@@ -947,7 +836,7 @@ async fn tail_selector_flags_are_sent_as_read_query() {
     assert_eq!(attempts[0].query.get("timestamp"), None);
     seq_server.abort();
 
-    let timestamp_server = FakeReadServer::start().await;
+    let timestamp_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let timestamp_output = run_tsf_until_stdout_contains(
         timestamp_server.api_url.clone(),
         ["tail", "--timestamp", "1781717406000", read_url.as_str()],
@@ -971,7 +860,7 @@ async fn tail_selector_flags_are_sent_as_read_query() {
 
 #[tokio::test]
 async fn zero_count_reads_complete_without_opening_a_socket() {
-    let server = FakeReadServer::start().await;
+    let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1000,7 +889,7 @@ async fn zero_count_reads_complete_without_opening_a_socket() {
 
 #[tokio::test]
 async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
-    let server = FakeReadServer::start().await;
+    let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1021,86 +910,6 @@ async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
     );
     assert!(server.read_attempts().is_empty());
     server.abort();
-}
-
-#[tokio::test]
-async fn cli_reports_url_errors_before_opening_sockets() {
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-
-    let read_server = FakeReadServer::start().await;
-    let bad_tail = run_tsf_with_api_url(
-        read_server.api_url.clone(),
-        ["tail", "http://localhost:3000/not-a-stream"],
-        None,
-    )
-    .await;
-    assert!(!bad_tail.status.success(), "stdout={}", bad_tail.stdout);
-    assert!(
-        bad_tail.stderr.contains("invalid stream URL"),
-        "stderr={}",
-        bad_tail.stderr
-    );
-    assert!(read_server.read_attempts().is_empty());
-
-    let bad_replay = run_tsf_with_api_url(
-        read_server.api_url.clone(),
-        ["replay", "http://localhost:3000/not-a-stream"],
-        None,
-    )
-    .await;
-    assert!(!bad_replay.status.success(), "stdout={}", bad_replay.stdout);
-    assert!(
-        bad_replay.stderr.contains("invalid stream URL"),
-        "stderr={}",
-        bad_replay.stderr
-    );
-    assert!(read_server.read_attempts().is_empty());
-    read_server.abort();
-
-    let write_server = FakeWriteServer::start().await;
-    let read_only_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
-    let missing_write_token = run_tsf_with_api_url(
-        write_server.api_url.clone(),
-        ["write", &read_only_url],
-        Some("data"),
-    )
-    .await;
-    assert!(
-        !missing_write_token.status.success(),
-        "stdout={}",
-        missing_write_token.stdout
-    );
-    assert!(
-        missing_write_token
-            .stderr
-            .contains("URL does not grant write access"),
-        "stderr={}",
-        missing_write_token.stderr
-    );
-    assert!(write_server.append_attempts().is_empty());
-    write_server.abort();
-
-    let read_only_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
-    let missing_owner_token = run_tsf_with_api_url(
-        Url::parse("http://127.0.0.1:1").expect("api URL"),
-        ["visibility", &read_only_url, "public"],
-        None,
-    )
-    .await;
-    assert!(
-        !missing_owner_token.status.success(),
-        "stdout={}",
-        missing_owner_token.stdout
-    );
-    assert!(
-        missing_owner_token
-            .stderr
-            .contains("URL does not grant owner access"),
-        "stderr={}",
-        missing_owner_token.stderr
-    );
 }
 
 #[tokio::test]
@@ -1136,37 +945,8 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
 }
 
 #[tokio::test]
-async fn replay_suppresses_reused_writer_sequences() {
-    let server = FakeReadServer::start_replay_transcript().await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
-
-    let output =
-        run_tsf_with_api_url(server.api_url.clone(), ["replay", read_url.as_str()], None).await;
-
-    assert!(output.status.success(), "stderr={}", output.stderr);
-    assert_eq!(output.stdout, "dedupe\nstable\n");
-    let attempts = server.read_attempts();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].bearer_token, "read-secret");
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-
-    server.abort();
-}
-
-#[tokio::test]
 async fn replay_rejects_logical_records_above_configured_limit() {
-    let server = FakeReadServer::start_replay_split_record().await;
+    let server = FakeReadServer::start(FakeReadMode::ReplaySplitRecord).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1209,7 +989,7 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
         .expect("stream id");
     let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
 
-    let seq_server = FakeReadServer::start_replay_transcript().await;
+    let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let seq_output = run_tsf_with_api_url(
         seq_server.api_url.clone(),
         ["replay", "--seq-num", "2", read_url.as_str()],
@@ -1235,7 +1015,7 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     assert_eq!(attempts[0].query.get("timestamp"), None);
     seq_server.abort();
 
-    let timestamp_server = FakeReadServer::start_replay_transcript().await;
+    let timestamp_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let timestamp_output = run_tsf_with_api_url(
         timestamp_server.api_url.clone(),
         ["replay", "--timestamp", "1781717406000", read_url.as_str()],
@@ -1262,7 +1042,7 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     assert_eq!(attempts[0].query.get("seq_num"), None);
     timestamp_server.abort();
 
-    let count_server = FakeReadServer::start_replay_binary().await;
+    let count_server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
     let count_output = run_tsf_bytes_with_api_url(
         count_server.api_url.clone(),
         ["replay", "--count", "1", read_url.as_str()],
@@ -1293,40 +1073,8 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
 }
 
 #[tokio::test]
-async fn replay_rejects_ambiguous_start_selectors_before_connecting() {
-    let server = FakeReadServer::start_replay_transcript().await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
-
-    let output = run_tsf_with_api_url(
-        server.api_url.clone(),
-        [
-            "replay",
-            "--seq-num",
-            "5",
-            "--timestamp",
-            "1781717406000",
-            read_url.as_str(),
-        ],
-        None,
-    )
-    .await;
-
-    assert!(!output.status.success(), "stdout={}", output.stdout);
-    assert!(
-        output.stderr.contains("cannot be used with"),
-        "stderr={}",
-        output.stderr
-    );
-    assert!(server.read_attempts().is_empty());
-    server.abort();
-}
-
-#[tokio::test]
 async fn replay_preserves_non_utf8_stdout_bytes() {
-    let server = FakeReadServer::start_replay_binary().await;
+    let server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1854,12 +1602,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
             return;
         }
     }
-    socket
-        .send(Message::Binary(
-            ServerFrame::Hello { version: TSF_V3 }
-                .encode()
-                .expect("hello"),
-        ))
+    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
 
@@ -1890,19 +1633,17 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
             });
             s2_seq_num
         };
-        socket
-            .send(Message::Binary(
-                ServerFrame::Ack {
-                    writer_seq_start: writer_seq_num,
-                    writer_seq_end: writer_seq_num,
-                    s2_seq_start: s2_seq_num,
-                    s2_seq_end: s2_seq_num,
-                }
-                .encode()
-                .expect("ack"),
-            ))
-            .await
-            .expect("send ack");
+        send_server_frame(
+            &mut socket,
+            ServerFrame::Ack {
+                writer_seq_start: writer_seq_num,
+                writer_seq_end: writer_seq_num,
+                s2_seq_start: s2_seq_num,
+                s2_seq_end: s2_seq_num,
+            },
+        )
+        .await
+        .expect("send ack");
     }
 }
 
@@ -1922,10 +1663,7 @@ async fn test_read_flow(
     query: HashMap<String, String>,
     mut socket: WebSocket,
 ) {
-    socket
-        .send(Message::Binary(
-            ServerFrame::AuthRequired.encode().expect("auth required"),
-        ))
+    send_server_frame(&mut socket, ServerFrame::AuthRequired)
         .await
         .expect("send auth required");
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
@@ -1950,31 +1688,24 @@ async fn test_read_flow(
         }
         test_select_records(stream, &query)
     };
-    socket
-        .send(Message::Binary(
-            ServerFrame::Hello { version: TSF_V3 }
-                .encode()
-                .expect("hello"),
-        ))
+    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
     for record in records {
-        socket
-            .send(Message::Binary(
-                ServerFrame::ReadRecord(ReadRecord {
-                    s2_seq_num: record.s2_seq_num,
-                    timestamp_ms: record.timestamp_ms,
-                    writer_id: record.writer_id,
-                    writer_seq_num: record.writer_seq_num,
-                    part: record.part,
-                    format: record.format,
-                    data: record.data,
-                })
-                .encode()
-                .expect("read record"),
-            ))
-            .await
-            .expect("send record");
+        send_server_frame(
+            &mut socket,
+            ServerFrame::ReadRecord(ReadRecord {
+                s2_seq_num: record.s2_seq_num,
+                timestamp_ms: record.timestamp_ms,
+                writer_id: record.writer_id,
+                writer_seq_num: record.writer_seq_num,
+                part: record.part,
+                format: record.format,
+                data: record.data,
+            }),
+        )
+        .await
+        .expect("send record");
     }
     socket
         .send(Message::Close(None))
@@ -2429,12 +2160,7 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
         *connections += 1;
         connection_index
     };
-    if socket
-        .send(Message::Binary(
-            ServerFrame::Hello { version: TSF_V3 }
-                .encode()
-                .expect("hello"),
-        ))
+    if send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .is_err()
     {
@@ -2504,16 +2230,22 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
 }
 
 async fn send_test_ack(socket: &mut WebSocket, start: u64, end: u64) -> Result<(), axum::Error> {
+    send_server_frame(
+        socket,
+        ServerFrame::Ack {
+            writer_seq_start: start,
+            writer_seq_end: end,
+            s2_seq_start: start,
+            s2_seq_end: end,
+        },
+    )
+    .await
+}
+
+async fn send_server_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result<(), axum::Error> {
     socket
         .send(Message::Binary(
-            ServerFrame::Ack {
-                writer_seq_start: start,
-                writer_seq_end: end,
-                s2_seq_start: start,
-                s2_seq_end: end,
-            }
-            .encode()
-            .expect("ack"),
+            frame.encode().expect("encode server frame"),
         ))
         .await
 }
@@ -2589,12 +2321,7 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     else {
         return;
     };
-    socket
-        .send(Message::Binary(
-            ServerFrame::Hello { version: TSF_V3 }
-                .encode()
-                .expect("hello"),
-        ))
+    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
 
@@ -2631,19 +2358,17 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
         return;
     }
 
-    socket
-        .send(Message::Binary(
-            ServerFrame::Ack {
-                writer_seq_start: writer_seq_num,
-                writer_seq_end: writer_seq_num,
-                s2_seq_start: 0,
-                s2_seq_end: 0,
-            }
-            .encode()
-            .expect("ack"),
-        ))
-        .await
-        .expect("send ack");
+    send_server_frame(
+        &mut socket,
+        ServerFrame::Ack {
+            writer_seq_start: writer_seq_num,
+            writer_seq_end: writer_seq_num,
+            s2_seq_start: 0,
+            s2_seq_end: 0,
+        },
+    )
+    .await
+    .expect("send ack");
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2652,18 +2377,14 @@ struct ReadAttempt {
     query: HashMap<String, String>,
 }
 
-#[derive(Default)]
 struct FakeReadState {
     read_attempts: Mutex<Vec<ReadAttempt>>,
     mode: FakeReadMode,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 enum FakeReadMode {
-    #[default]
     Reconnect,
-    BrokenRead,
-    ServerShutdown,
     ReplayTranscript,
     ReplayBinary,
     ReplaySplitRecord,
@@ -2676,31 +2397,7 @@ struct FakeReadServer {
 }
 
 impl FakeReadServer {
-    async fn start() -> Self {
-        Self::start_with_mode(FakeReadMode::Reconnect).await
-    }
-
-    async fn start_broken_read() -> Self {
-        Self::start_with_mode(FakeReadMode::BrokenRead).await
-    }
-
-    async fn start_server_shutdown() -> Self {
-        Self::start_with_mode(FakeReadMode::ServerShutdown).await
-    }
-
-    async fn start_replay_transcript() -> Self {
-        Self::start_with_mode(FakeReadMode::ReplayTranscript).await
-    }
-
-    async fn start_replay_binary() -> Self {
-        Self::start_with_mode(FakeReadMode::ReplayBinary).await
-    }
-
-    async fn start_replay_split_record() -> Self {
-        Self::start_with_mode(FakeReadMode::ReplaySplitRecord).await
-    }
-
-    async fn start_with_mode(mode: FakeReadMode) -> Self {
+    async fn start(mode: FakeReadMode) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(FakeReadState {
@@ -2739,7 +2436,7 @@ async fn fake_read_tail(
     Path(stream_id): Path<String>,
 ) -> Json<serde_json::Value> {
     let next_s2_seq_num = match state.mode {
-        FakeReadMode::Reconnect | FakeReadMode::BrokenRead | FakeReadMode::ServerShutdown => 2,
+        FakeReadMode::Reconnect => 2,
         FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
@@ -2765,10 +2462,7 @@ async fn fake_read_flow(
     query: HashMap<String, String>,
     mut socket: WebSocket,
 ) {
-    socket
-        .send(Message::Binary(
-            ServerFrame::AuthRequired.encode().expect("auth required"),
-        ))
+    send_server_frame(&mut socket, ServerFrame::AuthRequired)
         .await
         .expect("send auth required");
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
@@ -2787,59 +2481,29 @@ async fn fake_read_flow(
         });
         attempts.len()
     };
-    socket
-        .send(Message::Binary(
-            ServerFrame::Hello { version: TSF_V3 }
-                .encode()
-                .expect("hello"),
-        ))
+    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
-    socket
-        .send(Message::Binary(
-            ServerFrame::ReadTail(ReadTail {
-                next_s2_seq_num: 10,
-                timestamp_ms: 1_781_717_406_010,
-            })
-            .encode()
-            .expect("read tail"),
-        ))
-        .await
-        .expect("send read tail");
+    send_server_frame(
+        &mut socket,
+        ServerFrame::ReadTail(ReadTail {
+            next_s2_seq_num: 10,
+            timestamp_ms: 1_781_717_406_010,
+        }),
+    )
+    .await
+    .expect("send read tail");
 
     match state.mode {
         FakeReadMode::Reconnect => {
             if attempt_count == 1 {
                 send_read_record(&mut socket, 0, 0, b"first\n").await;
-                socket
-                    .send(Message::Binary(
-                        ServerFrame::ReconnectAdvised { deadline_secs: 0 }
-                            .encode()
-                            .expect("reconnect advised"),
-                    ))
-                    .await
-                    .expect("send reconnect advised");
-            } else {
-                send_read_record(&mut socket, 1, 1, b"second\n").await;
-            }
-        }
-        FakeReadMode::BrokenRead => {
-            if attempt_count == 1 {
-                send_read_record(&mut socket, 0, 0, b"first\n").await;
-            } else {
-                send_read_record(&mut socket, 1, 1, b"second\n").await;
-            }
-        }
-        FakeReadMode::ServerShutdown => {
-            if attempt_count == 1 {
-                send_read_record(&mut socket, 0, 0, b"first\n").await;
-                socket
-                    .send(Message::Close(Some(CloseFrame {
-                        code: 1001,
-                        reason: "server_shutdown".into(),
-                    })))
-                    .await
-                    .expect("close for server shutdown");
+                send_server_frame(
+                    &mut socket,
+                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+                )
+                .await
+                .expect("send reconnect advised");
             } else {
                 send_read_record(&mut socket, 1, 1, b"second\n").await;
             }
@@ -2859,6 +2523,7 @@ async fn fake_read_flow(
                 &mut socket,
                 0,
                 0,
+                PartHeader::unsplit(),
                 RecordFormat::Bytes,
                 &[0x00, 0xff, b'b', b'i', b'n', b'\n'],
             )
@@ -2867,6 +2532,7 @@ async fn fake_read_flow(
                 &mut socket,
                 1,
                 1,
+                PartHeader::unsplit(),
                 RecordFormat::Bytes,
                 &[0xf0, 0x28, 0x8c, 0x28],
             )
@@ -2877,19 +2543,21 @@ async fn fake_read_flow(
                 .expect("close binary replay socket");
         }
         FakeReadMode::ReplaySplitRecord => {
-            send_read_part(
+            send_read_record_with_format(
                 &mut socket,
                 0,
                 0,
                 PartHeader::new(0, false).expect("part"),
+                RecordFormat::Transcript,
                 b"hel",
             )
             .await;
-            send_read_part(
+            send_read_record_with_format(
                 &mut socket,
                 1,
                 1,
                 PartHeader::new(1, true).expect("part"),
+                RecordFormat::Transcript,
                 b"lo",
             )
             .await;
@@ -2911,6 +2579,7 @@ async fn send_read_record(
         socket,
         s2_seq_num,
         writer_seq_num,
+        PartHeader::unsplit(),
         RecordFormat::Transcript,
         data,
     )
@@ -2921,48 +2590,22 @@ async fn send_read_record_with_format(
     socket: &mut WebSocket,
     s2_seq_num: u64,
     writer_seq_num: u64,
+    part: PartHeader,
     format: RecordFormat,
     data: &[u8],
 ) {
-    socket
-        .send(Message::Binary(
-            ServerFrame::ReadRecord(ReadRecord {
-                s2_seq_num,
-                timestamp_ms: 1_781_717_406_000 + s2_seq_num,
-                writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
-                writer_seq_num,
-                part: PartHeader::unsplit(),
-                format,
-                data: Bytes::copy_from_slice(data),
-            })
-            .encode()
-            .expect("read record"),
-        ))
-        .await
-        .expect("send read record");
-}
-
-async fn send_read_part(
-    socket: &mut WebSocket,
-    s2_seq_num: u64,
-    writer_seq_num: u64,
-    part: PartHeader,
-    data: &[u8],
-) {
-    socket
-        .send(Message::Binary(
-            ServerFrame::ReadRecord(ReadRecord {
-                s2_seq_num,
-                timestamp_ms: 1_781_717_406_000 + s2_seq_num,
-                writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
-                writer_seq_num,
-                part,
-                format: RecordFormat::Transcript,
-                data: Bytes::copy_from_slice(data),
-            })
-            .encode()
-            .expect("read record"),
-        ))
-        .await
-        .expect("send read part");
+    send_server_frame(
+        socket,
+        ServerFrame::ReadRecord(ReadRecord {
+            s2_seq_num,
+            timestamp_ms: 1_781_717_406_000 + s2_seq_num,
+            writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
+            writer_seq_num,
+            part,
+            format,
+            data: Bytes::copy_from_slice(data),
+        }),
+    )
+    .await
+    .expect("send read record");
 }

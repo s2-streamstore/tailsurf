@@ -84,24 +84,23 @@ fn parse_stream_id(url: &Url) -> Result<StreamId, StreamUrlError> {
 }
 
 fn parse_fragment(fragment: &str) -> Result<Option<StreamTokenParam>, StreamUrlError> {
-    let mut token = None;
-
-    for (key, value) in form_urlencoded::parse(fragment.as_bytes()) {
-        if token.is_some() {
-            return Err(StreamUrlError::MultipleTokens);
-        }
-        let permissions = key.parse()?;
-        let value = value.into_owned();
-        if value.is_empty() {
-            return Err(StreamUrlError::InvalidToken);
-        }
-        token = Some(StreamTokenParam {
-            permissions,
-            token: value.into(),
-        });
+    let mut pairs = form_urlencoded::parse(fragment.as_bytes());
+    let Some((permissions, token)) = pairs.next() else {
+        return Ok(None);
+    };
+    let permissions = permissions.parse()?;
+    let token = token.into_owned();
+    if token.is_empty() {
+        return Err(StreamUrlError::InvalidToken);
+    }
+    if pairs.next().is_some() {
+        return Err(StreamUrlError::MultipleTokens);
     }
 
-    Ok(token)
+    Ok(Some(StreamTokenParam {
+        permissions,
+        token: token.into(),
+    }))
 }
 
 /// Error returned while parsing a Tailsurf share URL.

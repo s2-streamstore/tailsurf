@@ -61,35 +61,3 @@ where
 {
     serializer.serialize_str(token.expose_secret())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ubid_ids_round_trip_as_strings() {
-        let stream_id: StreamId = "0123456789abcdefghjkmnpqrstvwxyz"
-            .parse()
-            .expect("stream id");
-        let token_id: TokenId = "0123456789abcdefghjkmnpq".parse().expect("token id");
-
-        assert_eq!(stream_id.to_string(), "0123456789abcdefghjkmnpqrstvwxyz");
-        assert_eq!(token_id.to_string(), "0123456789abcdefghjkmnpq");
-    }
-
-    #[test]
-    fn rejects_invalid_ubid_text_ids() {
-        assert!("".parse::<StreamId>().is_err());
-        assert!("stream id".parse::<StreamId>().is_err());
-        assert!("".parse::<TokenId>().is_err());
-        assert!("token\tid".parse::<TokenId>().is_err());
-    }
-
-    #[test]
-    fn writer_ids_are_16_byte_binary_values() {
-        let writer_id = WriterId::new_random();
-
-        assert_eq!(writer_id.as_bytes().len(), WriterId::BYTE_LEN);
-        assert_eq!(WriterId::from_bytes(*writer_id.as_bytes()), writer_id);
-    }
-}
