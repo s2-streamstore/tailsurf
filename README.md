@@ -15,14 +15,6 @@ Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or
 - Full-featured CLI
 - Gist-style scrubbable live transcript with web UI
 
-## Development
-
-This repo is a Rust workspace with two crates:
-- `tailsurf`: SDK/common crate with shared API types, stream URL parsing, permissions, IDs, and binary frame encoding.
-- `tailsurf-cli`: CLI shell for stream workflows and URL validation. Its binary is named `tsf`.
-
-Language-neutral TSF v3 frame vectors live in `tailsurf/fixtures/v3.json`. They are packaged with the SDK and exercised by both the Rust and TypeScript implementations.
-
 ## Install
 
 Install the prebuilt CLI on macOS or Linux:
@@ -45,12 +37,6 @@ Cargo remains the Rust-native fallback:
 cargo install tailsurf-cli --locked
 ```
 
-For workspace development, install it from the local checkout:
-
-```sh
-cargo install --path tailsurf-cli
-```
-
 Update a direct installation explicitly:
 
 ```sh
@@ -65,17 +51,6 @@ tsf update --check
 
 `tsf` does not check for updates in the background. Installations owned by a package manager stay with that manager. Cargo users rerun `cargo install tailsurf-cli --locked`. cargo-binstall users rerun `cargo binstall tailsurf-cli`.
 
-To use a local API:
-
-```sh
-export TSF_API_URL=http://127.0.0.1:8787
-export TSF_WEB_URL=http://localhost:3000
-```
-
-`TSF_API_URL` is the API origin. The SDK appends the versioned `/api/v1` namespace.
-
-SDK readers and producers retry bounded transient WebSocket interruptions, including service shutdown and restart closes, while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes such as `1002` and `1008` fail immediately instead of reconnecting with a request that cannot succeed.
-
 ## SDK quickstart
 
 The [`create_write_read_delete`](https://github.com/s2-streamstore/tailsurf/blob/main/tailsurf/examples/create_write_read_delete.rs) example creates a private stream, writes one durable record through the reconnecting producer, reads it back, and deletes the stream with its owner token:
@@ -84,7 +59,11 @@ The [`create_write_read_delete`](https://github.com/s2-streamstore/tailsurf/blob
 cargo run -p tailsurf --example create_write_read_delete
 ```
 
-Set `TSF_API_URL` to run the same example against a local API. Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession` is the lower-level frame/ack API.
+Set `TSF_API_URL` to use a non-default API origin. The SDK appends the versioned `/api/v1` namespace.
+
+Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession` is the lower-level frame/ack API.
+
+SDK readers and producers retry bounded transient WebSocket interruptions while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes fail immediately.
 
 ## CLI quickstart
 
@@ -171,44 +150,9 @@ Access levels are `view`, `write`, `view+write`, and `owner`. `--expires` accept
 
 Token file options write only the secret value. On Unix, `tsf` creates and tightens these files to mode `0600`.
 
-Run the checks:
-```sh
-cargo fmt --all --check
-cargo test --workspace
-cargo check --workspace --examples
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
-python3 scripts/published-cli-smoke.py --self-test
-cargo package --workspace
-```
+## Development
 
-## Releases
-
-Release-plz opens or updates a release PR after changes reach `main`. It derives the next workspace version from conventional commits and checks SDK API compatibility. Both crates use the same version.
-
-Merging the release PR publishes `tailsurf` first and then `tailsurf-cli`. Release-plz creates one `vX.Y.Z` tag. It then dispatches the binary release workflow directly so the repository token does not depend on tag-triggered workflow chaining.
-
-Cargo-dist creates one GitHub release for that tag. It builds `tsf` for Apple Silicon and Intel macOS, ARM64 and x86-64 musl Linux, and x86-64 Windows. Axoupdater is embedded in `tsf` and uses the cargo-dist receipt for explicit updates.
-
-The release contains versioned archives, shell and PowerShell installers, SHA-256 checksums, and GitHub artifact attestations. macOS executables use Developer ID signing with hardened runtime and Apple notarization. Windows executables are unsigned. Linux and Windows artifacts rely on checksums and GitHub attestations.
-
-GitHub release builds fail when macOS signing or notarization credentials are missing. Signing uses the `CODESIGN_CERTIFICATE`, `CODESIGN_CERTIFICATE_PASSWORD`, and `CODESIGN_IDENTITY` repository secrets. Notarization uses the `APPLE_NOTARY_ISSUER_ID`, `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_PRIVATE_KEY` repository secrets. Apple must accept both signed macOS binaries before dist can publish the release.
-
-The installer routes on `tail.surf` redirect to the latest public GitHub release. Older tags and their assets remain available for rollback and CI pinning. Homebrew distribution is not configured.
-
-Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamstore/tailsurf` repository and the `release-plz.yml` workflow without a GitHub environment.
-
-After `tailsurf-cli` is visible in the crates.io index, run the install smoke against the deployed service:
-
-```sh
-TSF_API_URL=https://tail.surf TSF_WEB_URL=https://tail.surf python3 scripts/published-cli-smoke.py
-```
-
-Try the CLI URL parser:
-
-```sh
-cargo run -p tailsurf-cli -- parse-url 'https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=example-token'
-```
+See [Development](docs/development.md) for the workspace layout, local-service setup, checks, and diagnostics. Release maintainers should also read [Release operations](docs/release-operations.md).
 
 ## License
 
