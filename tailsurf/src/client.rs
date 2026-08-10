@@ -64,7 +64,7 @@ pub struct TsfClientConfig {
     pub websocket_connect_timeout: Duration,
     /// Timeout for authentication, frame sends, and append acknowledgements.
     pub websocket_operation_timeout: Duration,
-    /// Optional idle timeout while waiting for a read frame. `None` waits indefinitely.
+    /// Optional idle timeout while waiting for a read frame. Protocol heartbeats reset the timer. `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
     /// Retry policy for idempotent metadata reads and initial socket setup.
     pub retry_policy: RetryPolicy,
@@ -1375,12 +1375,18 @@ struct ReadSocket {
 impl ReadSocket {
     async fn next_outcome(&mut self) -> Result<ReadSocketOutcome, TsfClientError> {
         if let Some(read_idle_timeout) = self.read_idle_timeout {
-            with_timeout(
-                read_idle_timeout,
-                "read stream record",
-                next_read_socket_outcome(&mut self.ws),
-            )
-            .await
+            loop {
+                let outcome = with_timeout(
+                    read_idle_timeout,
+                    "read stream record",
+                    next_read_socket_frame_outcome(&mut self.ws),
+                )
+                .await?;
+                match outcome {
+                    ReadSocketFrameOutcome::Outcome(outcome) => return Ok(outcome),
+                    ReadSocketFrameOutcome::Heartbeat => {}
+                }
+            }
         } else {
             next_read_socket_outcome(&mut self.ws).await
         }
@@ -1404,6 +1410,11 @@ enum ReadSocketOutcome {
     Tail(ReadTail),
     ReconnectAdvised,
     Closed,
+}
+
+enum ReadSocketFrameOutcome {
+    Outcome(ReadSocketOutcome),
+    Heartbeat,
 }
 
 async fn connect_websocket(
@@ -1548,20 +1559,31 @@ async fn next_read_socket_outcome(
     ws: &mut ClientWebSocket,
 ) -> Result<ReadSocketOutcome, TsfClientError> {
     loop {
-        match next_server_frame(ws).await? {
-            Some(ServerFrame::ReadRecord(record)) => return Ok(ReadSocketOutcome::Record(record)),
-            Some(ServerFrame::ReadTail(tail)) => return Ok(ReadSocketOutcome::Tail(tail)),
-            Some(ServerFrame::Heartbeat) => {}
-            Some(ServerFrame::ReconnectAdvised { .. }) => {
-                return Ok(ReadSocketOutcome::ReconnectAdvised);
-            }
-            Some(frame) => {
-                return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-                    &frame,
-                )));
-            }
-            None => return Ok(ReadSocketOutcome::Closed),
+        match next_read_socket_frame_outcome(ws).await? {
+            ReadSocketFrameOutcome::Outcome(outcome) => return Ok(outcome),
+            ReadSocketFrameOutcome::Heartbeat => {}
         }
+    }
+}
+
+async fn next_read_socket_frame_outcome(
+    ws: &mut ClientWebSocket,
+) -> Result<ReadSocketFrameOutcome, TsfClientError> {
+    match next_server_frame(ws).await? {
+        Some(ServerFrame::ReadRecord(record)) => Ok(ReadSocketFrameOutcome::Outcome(
+            ReadSocketOutcome::Record(record),
+        )),
+        Some(ServerFrame::ReadTail(tail)) => Ok(ReadSocketFrameOutcome::Outcome(
+            ReadSocketOutcome::Tail(tail),
+        )),
+        Some(ServerFrame::Heartbeat) => Ok(ReadSocketFrameOutcome::Heartbeat),
+        Some(ServerFrame::ReconnectAdvised { .. }) => Ok(ReadSocketFrameOutcome::Outcome(
+            ReadSocketOutcome::ReconnectAdvised,
+        )),
+        Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+            &frame,
+        ))),
+        None => Ok(ReadSocketFrameOutcome::Outcome(ReadSocketOutcome::Closed)),
     }
 }
 
@@ -1744,6 +1766,24 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
 mod tests {
     use super::*;
 
+    async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind WebSocket listener");
+        let address = listener.local_addr().expect("WebSocket listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept WebSocket client");
+            tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept WebSocket handshake")
+        });
+        let (client, _) = connect_async(format!("ws://{address}"))
+            .await
+            .expect("connect WebSocket client");
+
+        (client, server.await.expect("join WebSocket server"))
+    }
+
     #[test]
     fn default_config_uses_api_origin() {
         let config = TsfClientConfig::default();
@@ -1758,6 +1798,103 @@ mod tests {
         );
         assert_eq!(config.retry_policy, RetryPolicy::default());
         assert!(config.rest_bearer_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_idle_timeout_resets_on_protocol_heartbeat() {
+        let (client, mut server) = connected_websockets().await;
+        let sender = tokio::spawn(async move {
+            for _ in 0..12 {
+                sleep(Duration::from_millis(20)).await;
+                server
+                    .send(Message::Binary(
+                        ServerFrame::Heartbeat.encode().expect("encode heartbeat"),
+                    ))
+                    .await
+                    .expect("send heartbeat");
+            }
+            server
+                .send(Message::Binary(
+                    ServerFrame::ReadTail(ReadTail {
+                        next_s2_seq_num: 42,
+                        timestamp_ms: 1_786_377_600_000,
+                    })
+                    .encode()
+                    .expect("encode read tail"),
+                ))
+                .await
+                .expect("send read tail");
+        });
+        let mut socket = ReadSocket {
+            ws: client,
+            read_idle_timeout: Some(Duration::from_millis(100)),
+        };
+
+        let outcome = socket.next_outcome().await.expect("read tail outcome");
+
+        assert!(matches!(
+            outcome,
+            ReadSocketOutcome::Tail(ReadTail {
+                next_s2_seq_num: 42,
+                timestamp_ms: 1_786_377_600_000,
+            })
+        ));
+        sender.await.expect("join heartbeat sender");
+    }
+
+    #[tokio::test]
+    async fn explicit_read_timeout_does_not_reset_on_protocol_heartbeat() {
+        let (client, mut server) = connected_websockets().await;
+        let sender = tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(20)).await;
+                server
+                    .send(Message::Binary(
+                        ServerFrame::Heartbeat.encode().expect("encode heartbeat"),
+                    ))
+                    .await
+                    .expect("send heartbeat");
+            }
+        });
+        let mut socket = ReadSocket {
+            ws: client,
+            read_idle_timeout: Some(Duration::from_secs(1)),
+        };
+
+        let result = socket
+            .next_outcome_with_timeout(Duration::from_millis(100))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::Timeout {
+                operation: "read stream record"
+            })
+        ));
+        sender.abort();
+    }
+
+    #[tokio::test]
+    async fn read_idle_timeout_still_rejects_a_silent_connection() {
+        let (client, server) = connected_websockets().await;
+        let server = tokio::spawn(async move {
+            let _server = server;
+            sleep(Duration::from_secs(1)).await;
+        });
+        let mut socket = ReadSocket {
+            ws: client,
+            read_idle_timeout: Some(Duration::from_millis(50)),
+        };
+
+        let result = socket.next_outcome().await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::Timeout {
+                operation: "read stream record"
+            })
+        ));
+        server.abort();
     }
 
     #[test]
