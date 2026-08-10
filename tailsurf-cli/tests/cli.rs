@@ -310,7 +310,12 @@ async fn write_new_then_replay_round_trips_command_output() {
     assert_eq!(output.stdout, "");
     assert_eq!(
         normalize_created_stream_output(&output.stderr),
-        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n<records> durable · view <url>\n"
+    );
+    assert!(
+        output.stderr.contains("1 record durable · view "),
+        "stderr={}",
+        output.stderr
     );
     let read_url = output
         .stderr
@@ -2198,6 +2203,12 @@ fn normalize_created_stream_output(output: &str) -> String {
                 format!("Created {visibility} stream <stream_id>")
             } else if line.starts_with("Retention:") {
                 "Retention: <retention>".to_owned()
+            } else if line.starts_with(|c: char| c.is_ascii_digit()) && line.contains(" durable") {
+                if line.contains(" · view ") {
+                    "<records> durable · view <url>".to_owned()
+                } else {
+                    "<records> durable".to_owned()
+                }
             } else {
                 let mut tokens = line.split_whitespace();
                 match (tokens.next(), tokens.next()) {

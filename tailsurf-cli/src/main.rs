@@ -415,6 +415,10 @@ impl WriterState {
         self.writer_id
     }
 
+    fn appended(&self) -> u64 {
+        self.next_writer_seq
+    }
+
     fn reserve_writer_seq(&mut self) -> eyre::Result<u64> {
         let reserved = self.next_writer_seq;
         self.next_writer_seq = self
@@ -540,7 +544,7 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
         WriteBuffering::Lines
     };
     let command = args.command;
-    let (stream_id, token) = if args.new {
+    let (stream_id, token, view_link) = if args.new {
         let visibility = visibility_from_flags(args.public);
         let created = TsfClient::with_api_base_url(api_url.clone())
             .create_stream(&CreateStreamRequest {
@@ -558,7 +562,23 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
             .context("created stream did not include a write-capable link")?
             .token
             .clone();
-        (created.stream_id, token)
+        let view_link = if matches!(created.visibility, Visibility::Public) {
+            Some(bare_stream_url(&web_url, &created.stream_id))
+        } else {
+            created
+                .tokens
+                .iter()
+                .find(|issued| link_label(issued.permissions) == "view")
+                .map(|issued| {
+                    stream_url(
+                        &web_url,
+                        &created.stream_id,
+                        issued.permissions,
+                        &issued.token,
+                    )
+                })
+        };
+        (created.stream_id, token, view_link)
     } else {
         let url = args
             .url
@@ -568,13 +588,21 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
             .token_with(TokenPermissions::allows_write)
             .context("URL does not grant write access")?
             .clone();
-        (locator.stream_id, token)
+        (locator.stream_id, token, None)
     };
 
     if command.is_empty() {
-        stream_stdin_to_writer(api_url, stream_id, token, buffering).await
+        stream_stdin_to_writer(api_url, stream_id, token, buffering, view_link).await
     } else {
-        stream_command_to_writer(api_url, stream_id, token, buffering, command).await
+        stream_command_to_writer(api_url, stream_id, token, buffering, command, view_link).await
+    }
+}
+
+fn print_write_summary(records: u64, view_link: Option<&Url>) {
+    let noun = if records == 1 { "record" } else { "records" };
+    match view_link {
+        Some(url) => eprintln!("{records} {noun} durable · view {url}"),
+        None => eprintln!("{records} {noun} durable"),
     }
 }
 
@@ -599,6 +627,7 @@ async fn stream_stdin_to_writer(
     stream_id: StreamId,
     token: BearerToken,
     buffering: WriteBuffering,
+    view_link: Option<Url>,
 ) -> eyre::Result<()> {
     let client = TsfClient::with_api_base_url(api_url);
     let mut state = WriterState::new_random();
@@ -616,6 +645,7 @@ async fn stream_stdin_to_writer(
         WriteBuffering::Lines => stream_lines_to_writer(&writer, &mut state).await,
     }?;
     writer.close().await.context("failed to close writer")?;
+    print_write_summary(state.appended(), view_link.as_ref());
     if interrupted {
         exit_interrupted();
     }
@@ -716,6 +746,7 @@ async fn stream_command_to_writer(
     token: BearerToken,
     buffering: WriteBuffering,
     command: Vec<String>,
+    view_link: Option<Url>,
 ) -> eyre::Result<()> {
     let client = TsfClient::with_api_base_url(api_url);
     let mut state = WriterState::new_random();
@@ -738,6 +769,7 @@ async fn stream_command_to_writer(
         outcome
     };
     writer.close().await.context("failed to close writer")?;
+    print_write_summary(state.appended(), view_link.as_ref());
     if outcome.interrupted {
         exit_interrupted();
     }
