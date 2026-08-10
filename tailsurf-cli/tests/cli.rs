@@ -561,8 +561,18 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         }
     };
 
-    stdin.write_all(b"partial line").await.expect("write stdin");
-    sleep(Duration::from_millis(100)).await;
+    let stream_id = StreamLocator::parse(&read_url)
+        .expect("valid read URL")
+        .stream_id;
+    stdin
+        .write_all(b"complete line\npartial line")
+        .await
+        .expect("write stdin");
+    server.wait_for_records(&stream_id, 1).await;
+    assert!(
+        child.try_wait().expect("check tsf process").is_none(),
+        "tsf exited while stdin remained open"
+    );
     let pid = child.id().expect("tsf process ID");
     let signal = TokioCommand::new("kill")
         .args(["-INT", &pid.to_string()])
@@ -584,7 +594,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
 
     let replay = run_tsf(&server, ["replay", read_url.as_str()], None).await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
-    assert_eq!(replay.stdout, "partial line");
+    assert_eq!(replay.stdout, "complete line\npartial line");
     server.abort();
 }
 
@@ -1491,6 +1501,27 @@ impl TestServer {
             .token_list_failures_remaining
             .lock()
             .expect("token list failure lock") += 1;
+    }
+
+    async fn wait_for_records(&self, stream_id: &StreamId, expected: usize) {
+        let stream_id = stream_id.to_string();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let observed = self
+                    .state
+                    .streams
+                    .lock()
+                    .expect("streams lock")
+                    .get(&stream_id)
+                    .map_or(0, |stream| stream.records.len());
+                if observed >= expected {
+                    return;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("server received records");
     }
 
     fn abort(self) {
