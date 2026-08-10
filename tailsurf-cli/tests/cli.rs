@@ -580,7 +580,6 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         .await
         .expect("send SIGINT");
     assert!(signal.success());
-    drop(stdin);
 
     stderr
         .read_to_string(&mut stderr_output)
@@ -590,6 +589,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         .await
         .expect("timed out waiting for interrupted tsf")
         .expect("wait for tsf");
+    drop(stdin);
     assert_eq!(status.code(), Some(130), "stderr={stderr_output}");
 
     let replay = run_tsf(&server, ["replay", read_url.as_str()], None).await;
