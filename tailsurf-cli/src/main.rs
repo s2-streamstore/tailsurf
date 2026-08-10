@@ -132,13 +132,10 @@ struct NewArgs {
 
 #[derive(Debug, Args)]
 struct WriteArgs {
-    /// Write-capable stream share URL. Required unless --new is set.
-    #[arg(value_name = "STREAM_URL", conflicts_with = "new")]
+    /// Write-capable stream share URL. Creates a stream when omitted.
+    #[arg(value_name = "STREAM_URL")]
     url: Option<String>,
-    /// Create a private stream before writing.
-    #[arg(long)]
-    new: bool,
-    /// Make the new stream publicly readable.
+    /// Make a newly created stream publicly readable.
     #[arg(long)]
     public: bool,
     #[arg(
@@ -517,19 +514,18 @@ fn print_error(error: &eyre::Report) {
 async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<()> {
     let visibility = visibility_from_flags(args.public);
     let issue_tokens = if args.links.is_empty() {
-        Some(new_default_links())
+        new_default_links()
     } else {
-        Some(args.links.iter().map(|access| access.0).collect())
+        args.links.iter().map(|access| access.0).collect()
     };
 
-    let created = TsfClient::with_api_base_url(api_url)
-        .create_stream(&CreateStreamRequest {
-            visibility,
-            retention_secs: args.retention.map(Into::into),
-            issue_tokens,
-        })
-        .await
-        .context("failed to create stream")?;
+    let created = create_stream(
+        api_url,
+        visibility,
+        args.retention.map(Into::into),
+        issue_tokens,
+    )
+    .await?;
     write_token_files(&created.tokens, &args)?;
     print_created_stream(&web_url, &created, args.format, OutputTarget::Stdout)?;
 
@@ -544,16 +540,22 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
         WriteBuffering::Lines
     };
     let command = args.command;
-    let (stream_id, token, view_link) = if args.new {
+    let (stream_id, token, view_link) = if let Some(url) = args.url {
+        let locator = StreamLocator::parse(&url).context("invalid stream URL")?;
+        let token = locator
+            .token_with(TokenPermissions::allows_write)
+            .context("URL does not grant write access")?
+            .clone();
+        (locator.stream_id, token, None)
+    } else {
         let visibility = visibility_from_flags(args.public);
-        let created = TsfClient::with_api_base_url(api_url.clone())
-            .create_stream(&CreateStreamRequest {
-                visibility,
-                retention_secs: args.retention.map(Into::into),
-                issue_tokens: Some(write_new_default_links(visibility)),
-            })
-            .await
-            .context("failed to create stream")?;
+        let created = create_stream(
+            api_url.clone(),
+            visibility,
+            args.retention.map(Into::into),
+            write_new_default_links(visibility),
+        )
+        .await?;
         print_created_stream(&web_url, &created, OutputFormat::Text, OutputTarget::Stderr)?;
         let token = created
             .tokens
@@ -562,33 +564,10 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
             .context("created stream did not include a write-capable link")?
             .token
             .clone();
-        let view_link = if matches!(created.visibility, Visibility::Public) {
-            Some(bare_stream_url(&web_url, &created.stream_id))
-        } else {
-            created
-                .tokens
-                .iter()
-                .find(|issued| link_label(issued.permissions) == "view")
-                .map(|issued| {
-                    stream_url(
-                        &web_url,
-                        &created.stream_id,
-                        issued.permissions,
-                        &issued.token,
-                    )
-                })
-        };
-        (created.stream_id, token, view_link)
-    } else {
-        let url = args
-            .url
-            .context("write requires a stream URL unless --new is set")?;
-        let locator = StreamLocator::parse(&url).context("invalid stream URL")?;
-        let token = locator
-            .token_with(TokenPermissions::allows_write)
-            .context("URL does not grant write access")?
-            .clone();
-        (locator.stream_id, token, None)
+        let view_link = created_view_link(&web_url, &created)
+            .context("created stream did not include a view link")?;
+        println!("{view_link}");
+        (created.stream_id, token, Some(view_link))
     };
 
     if command.is_empty() {
@@ -607,19 +586,51 @@ fn print_write_summary(records: u64, view_link: Option<&Url>) {
 }
 
 fn validate_write_args(args: &WriteArgs) -> eyre::Result<()> {
-    if args.new {
+    if args.url.is_none() {
         return Ok(());
     }
     if args.public {
-        bail!("--public requires --new");
+        bail!("--public cannot be used when writing to an existing stream");
     }
     if args.retention.is_some() {
-        bail!("--retention requires --new");
-    }
-    if args.url.is_none() {
-        bail!("write requires a stream URL unless --new is set");
+        bail!("--retention cannot be used when writing to an existing stream");
     }
     Ok(())
+}
+
+async fn create_stream(
+    api_url: Url,
+    visibility: Visibility,
+    retention_secs: Option<RequestedRetention>,
+    issue_tokens: Vec<TokenPermissions>,
+) -> eyre::Result<CreateStreamResponse> {
+    TsfClient::with_api_base_url(api_url)
+        .create_stream(&CreateStreamRequest {
+            visibility,
+            retention_secs,
+            issue_tokens: Some(issue_tokens),
+        })
+        .await
+        .context("failed to create stream")
+}
+
+fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> Option<Url> {
+    if matches!(created.visibility, Visibility::Public) {
+        return Some(bare_stream_url(web_url, &created.stream_id));
+    }
+
+    created
+        .tokens
+        .iter()
+        .find(|issued| link_label(issued.permissions) == "view")
+        .map(|issued| {
+            stream_url(
+                web_url,
+                &created.stream_id,
+                issued.permissions,
+                &issued.token,
+            )
+        })
 }
 
 async fn stream_stdin_to_writer(

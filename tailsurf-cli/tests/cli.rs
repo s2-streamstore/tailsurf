@@ -101,40 +101,41 @@ fn update_check_respects_package_manager_ownership() {
 }
 
 #[test]
-fn write_rejects_missing_or_conflicting_destinations() {
-    let missing = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .arg("write")
+fn write_help_describes_implicit_creation() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["write", "--help"])
         .output()
-        .expect("tsf write");
-    assert!(!missing.status.success());
-    let missing_error = String::from_utf8(missing.stderr).expect("stderr UTF-8");
-    assert!(missing_error.contains("write requires a stream URL unless --new is set"));
-    assert!(!missing_error.contains("Location:"));
+        .expect("tsf write --help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("help UTF-8");
+    assert!(help.contains("Creates a stream when omitted"));
+    assert!(!help.contains("--new"));
+}
+
+#[test]
+fn write_rejects_creation_options_with_an_existing_destination() {
+    const WRITE_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=secret";
 
     let misplaced_public = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["write", "--public"])
+        .args(["write", WRITE_URL, "--public"])
         .output()
-        .expect("tsf write --public");
+        .expect("tsf write URL --public");
     assert!(!misplaced_public.status.success());
     assert!(
         String::from_utf8(misplaced_public.stderr)
             .expect("stderr UTF-8")
-            .contains("--public requires --new")
+            .contains("--public cannot be used when writing to an existing stream")
     );
 
-    let conflicting = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args([
-            "write",
-            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=secret",
-            "--new",
-        ])
+    let misplaced_retention = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["write", WRITE_URL, "--retention", "6h"])
         .output()
-        .expect("conflicting tsf write");
-    assert!(!conflicting.status.success());
+        .expect("tsf write URL --retention 6h");
+    assert!(!misplaced_retention.status.success());
     assert!(
-        String::from_utf8(conflicting.stderr)
+        String::from_utf8(misplaced_retention.stderr)
             .expect("stderr UTF-8")
-            .contains("cannot be used with '--new'")
+            .contains("--retention cannot be used when writing to an existing stream")
     );
 }
 
@@ -261,7 +262,7 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
 }
 
 #[tokio::test]
-async fn new_and_write_new_accept_human_retention_and_surface_free_limits() {
+async fn new_and_url_less_write_accept_human_retention_and_surface_free_limits() {
     let server = TestServer::start().await;
 
     let finite = run_tsf(
@@ -275,12 +276,7 @@ async fn new_and_write_new_accept_human_retention_and_surface_free_limits() {
         serde_json::from_str(&finite.stdout).expect("finite JSON output");
     assert_eq!(finite_json["retention_secs"], 604_800);
 
-    let write = run_tsf(
-        &server,
-        ["write", "--new", "--retention", "6h"],
-        Some("retained\n"),
-    )
-    .await;
+    let write = run_tsf(&server, ["write", "--retention", "6h"], Some("retained\n")).await;
     assert!(write.status.success(), "stderr={}", write.stderr);
     assert!(write.stderr.contains("Retention: 6 hours"));
 
@@ -298,16 +294,31 @@ async fn new_and_write_new_accept_human_retention_and_surface_free_limits() {
 }
 
 #[tokio::test]
-async fn write_new_then_replay_round_trips_command_output() {
+async fn write_without_url_prints_a_public_view_url_on_stdout() {
     let server = TestServer::start().await;
-    let output = run_tsf(
-        &server,
-        ["write", "--new"],
-        Some("hello from cli integration\n"),
-    )
-    .await;
+    let output = run_tsf(&server, ["write", "--public"], Some("public\n")).await;
+
     assert!(output.status.success(), "stderr={}", output.stderr);
-    assert_eq!(output.stdout, "");
+    assert_eq!(output.stdout.lines().count(), 1);
+    let view_url = Url::parse(output.stdout.trim()).expect("public view URL");
+    assert_eq!(
+        view_url.origin().ascii_serialization(),
+        "http://localhost:3000"
+    );
+    assert!(view_url.path().starts_with("/s/"));
+    assert!(view_url.fragment().is_none());
+    assert!(output.stderr.contains("Created public stream"));
+    assert!(output.stderr.contains("1 record durable · view "));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn write_without_url_then_replay_round_trips_command_output() {
+    let server = TestServer::start().await;
+    let output = run_tsf(&server, ["write"], Some("hello from cli integration\n")).await;
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    assert_eq!(output.stdout.lines().count(), 1);
     assert_eq!(
         normalize_created_stream_output(&output.stderr),
         "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n<records> durable · view <url>\n"
@@ -317,11 +328,7 @@ async fn write_new_then_replay_round_trips_command_output() {
         "stderr={}",
         output.stderr
     );
-    let read_url = output
-        .stderr
-        .lines()
-        .find_map(|line| extract_link_line(line, "view"))
-        .expect("read url");
+    let read_url = output.stdout.trim();
     StreamLocator::parse(read_url).expect("valid read URL");
 
     let replay = run_tsf(&server, ["replay", read_url], None).await;
@@ -345,13 +352,12 @@ async fn write_new_then_replay_round_trips_command_output() {
 }
 
 #[tokio::test]
-async fn write_new_command_streams_output_and_propagates_exit_status() {
+async fn write_without_url_command_streams_output_and_propagates_exit_status() {
     let server = TestServer::start().await;
     let output = run_tsf(
         &server,
         [
             "write",
-            "--new",
             "--",
             "sh",
             "-c",
@@ -361,11 +367,8 @@ async fn write_new_command_streams_output_and_propagates_exit_status() {
     )
     .await;
     assert_eq!(output.status.code(), Some(7), "stderr={}", output.stderr);
-    let read_url = output
-        .stderr
-        .lines()
-        .find_map(|line| extract_link_line(line, "view"))
-        .expect("read url");
+    assert_eq!(output.stdout.lines().count(), 1);
+    let read_url = output.stdout.trim();
 
     let replay = run_tsf(&server, ["replay", read_url], None).await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
@@ -382,7 +385,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     input.push('\n');
     input.push_str("tail\n");
 
-    let output = run_tsf(&server, ["write", "--new"], Some(input.as_str())).await;
+    let output = run_tsf(&server, ["write"], Some(input.as_str())).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_url = output
         .stderr
@@ -429,7 +432,7 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let server = TestServer::start().await;
     let input = "x".repeat(MAX_RECORD_BYTES + 10);
 
-    let output = run_tsf(&server, ["write", "--new", "--raw"], Some(input.as_str())).await;
+    let output = run_tsf(&server, ["write", "--raw"], Some(input.as_str())).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_url = output
         .stderr
@@ -489,7 +492,6 @@ async fn write_raw_flushes_on_linger() {
         &server,
         [
             "write",
-            "--new",
             "--raw",
             "--",
             "sh",
@@ -542,7 +544,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         .arg(server.api_url.to_string())
         .arg("--web-url")
         .arg("http://localhost:3000")
-        .args(["write", "--new"])
+        .arg("write")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

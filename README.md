@@ -83,7 +83,7 @@ Choose record retention with a human duration:
 
 ```sh
 tsf new --retention 7d
-make test | tsf write --new --retention 6h
+make test | tsf write --retention 6h
 ```
 
 `--retention infinite` explicitly requests infinite retention. The service enforces the current free-user limit and returns a clear error when a requested policy is unavailable.
@@ -93,25 +93,28 @@ make test | tsf write --new --retention 6h
 Stream command output into a new URL:
 
 ```sh
-make test | tsf write --new
+make test | tsf write
 ```
+
+`tsf write` creates a stream when no URL is supplied. It prints the view URL to stdout. Creation details, the owner link, and durability status go to stderr.
 
 Run a command through `tsf` when you want `tsf` to propagate the command exit status:
 
 ```sh
-tsf write --new -- make test
+tsf write -- make test
 ```
 
 By default, `tsf write` makes line boundaries transcript record boundaries and marks records as transcript-oriented:
 
 ```sh
-make test | tsf write --new
+make test | tsf write
+make test | tsf write '{write-url}'
 ```
 
 Use raw mode when you want to send stdin as byte records instead of line-framed transcript records. Raw mode flushes at the physical record size limit, after a short linger, and at EOF:
 
 ```sh
-cat artifact.bin | tsf write --new --raw
+cat artifact.bin | tsf write --raw
 ```
 
 On Ctrl-C, `tsf write` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the producer, and exits with status 130.
