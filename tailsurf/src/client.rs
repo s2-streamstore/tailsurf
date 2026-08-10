@@ -915,23 +915,34 @@ impl IntoRecordData for &str {
 }
 
 impl TsfAppendSession {
-    /// Sends one physical append frame after validating its size.
+    /// Sends one physical append frame under the operation timeout.
     pub async fn send(&mut self, record: WriteRecord) -> Result<(), TsfClientError> {
-        record.validate()?;
-        with_timeout(
-            self.operation_timeout,
-            "send append frame",
-            send_client_frame(
-                &mut self.ws,
-                ClientFrame::AppendRecord {
-                    writer_seq_num: record.writer_seq_num,
-                    part: record.part,
-                    format: record.format,
-                    data: record.data,
-                },
-            ),
-        )
+        let operation_timeout = self.operation_timeout;
+
+        with_timeout(operation_timeout, "send append frame", async move {
+            self.buffer(&record).await?;
+            self.flush().await
+        })
         .await
+    }
+
+    /// Encodes one record into the socket's write buffer, leaving the flush to the caller.
+    async fn buffer(&mut self, record: &WriteRecord) -> Result<(), TsfClientError> {
+        let frame = ClientFrame::AppendRecord {
+            writer_seq_num: record.writer_seq_num,
+            part: record.part,
+            format: record.format,
+            data: record.data.clone(),
+        }
+        .encode()?;
+        self.ws.feed(Message::Binary(frame)).await?;
+        Ok(())
+    }
+
+    /// Writes every buffered append frame to the transport in one flush.
+    async fn flush(&mut self) -> Result<(), TsfClientError> {
+        self.ws.flush().await?;
+        Ok(())
     }
 
     /// Waits for and validates the next durability acknowledgement.
@@ -1000,20 +1011,11 @@ async fn run_producer(
         tokio::select! {
             cmd = cmd_rx.recv(), if close_tx.is_none() => {
                 match cmd {
-                    Some(ProducerCommand::Submit {
-                        record,
-                        ack_tx,
-                        byte_permit,
-                        record_permit,
-                    }) => {
-                        let record_to_send = record.clone();
-                        pending.push_back(PendingAppend {
-                            record,
-                            ack_tx,
-                            _byte_permit: byte_permit,
-                            _record_permit: record_permit,
-                        });
-                        if let Err(error) = session.send(record_to_send).await
+                    Some(command) => {
+                        let first_new = pending.len();
+                        drain_submissions(&mut pending, &mut cmd_rx, &mut close_tx, command);
+
+                        if let Err(error) = send_retained(&mut session, &pending, first_new).await
                             && let Err(error) = recover_pending_appends(
                                 &mut session,
                                 &client,
@@ -1028,9 +1030,6 @@ async fn run_producer(
                             finish_producer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
-                    }
-                    Some(ProducerCommand::Close { done_tx }) => {
-                        close_tx = Some(done_tx);
                     }
                     None => {
                         fail_pending(&mut pending, "append producer dropped");
@@ -1093,6 +1092,58 @@ async fn run_producer(
     }
 }
 
+/// Moves the submitted record and every already-queued submission into `pending`.
+///
+/// This never awaits, so a batch is fully retained before any I/O can fail: a failed or timed-out
+/// write leaves every record in `pending` for reconnect resend.
+fn drain_submissions(
+    pending: &mut VecDeque<PendingAppend>,
+    cmd_rx: &mut mpsc::Receiver<ProducerCommand>,
+    close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
+    first: ProducerCommand,
+) {
+    let mut command = Some(first);
+
+    while let Some(ProducerCommand::Submit {
+        record,
+        ack_tx,
+        byte_permit,
+        record_permit,
+    }) = command
+    {
+        pending.push_back(PendingAppend {
+            record,
+            ack_tx,
+            _byte_permit: byte_permit,
+            _record_permit: record_permit,
+        });
+        command = cmd_rx.try_recv().ok();
+    }
+
+    if let Some(ProducerCommand::Close { done_tx }) = command {
+        *close_tx = Some(done_tx);
+    }
+}
+
+/// Writes the retained records from `from` onwards under one operation timeout and one flush.
+async fn send_retained(
+    session: &mut TsfAppendSession,
+    pending: &VecDeque<PendingAppend>,
+    from: usize,
+) -> Result<(), TsfClientError> {
+    if from >= pending.len() {
+        return Ok(());
+    }
+    let operation_timeout = session.operation_timeout;
+
+    with_timeout(operation_timeout, "send append frames", async move {
+        for pending in pending.iter().skip(from) {
+            session.buffer(&pending.record).await?;
+        }
+        session.flush().await
+    })
+    .await
+}
 async fn recover_pending_appends(
     session: &mut TsfAppendSession,
     client: &TsfClient,
@@ -1109,7 +1160,7 @@ async fn recover_pending_appends(
     while *reconnect_attempts < max_reconnect_attempts {
         *reconnect_attempts += 1;
         match client.connect_append_session(options.clone()).await {
-            Ok(mut connected) => match resend_pending(&mut connected, pending).await {
+            Ok(mut connected) => match send_retained(&mut connected, pending, 0).await {
                 Ok(()) => {
                     *session = connected;
                     return Ok(());
@@ -1123,16 +1174,6 @@ async fn recover_pending_appends(
     }
 
     Err(error)
-}
-
-async fn resend_pending(
-    session: &mut TsfAppendSession,
-    pending: &VecDeque<PendingAppend>,
-) -> Result<(), TsfClientError> {
-    for pending in pending {
-        session.send(pending.record.clone()).await?;
-    }
-    Ok(())
 }
 
 fn dispatch_ack(
