@@ -81,7 +81,7 @@ make test | tsf write --new --retention 6h
 
 `--retention infinite` explicitly requests infinite retention. The service enforces the current free-user limit and returns a clear error when a requested policy is unavailable.
 
-`tsf new` prints the stream ID, visibility, retention in seconds, and generated URLs.
+`tsf new` prints the stream ID, retention, and an owner link. Issue more links at creation with `--link view`, `--link write`, `--link view+write`, or `--link owner`. Links are shown once.
 
 Stream command output into a new URL:
 
@@ -133,11 +133,13 @@ Owner URLs contain `#o=` and can manage the stream:
 
 ```sh
 tsf visibility '{owner-url}' public
-tsf token issue '{owner-url}' --token r
-tsf token list '{owner-url}'
-tsf token revoke '{owner-url}' '{token_id}'
+tsf link issue '{owner-url}' --access view --expires 7d
+tsf link list '{owner-url}'
+tsf link revoke '{owner-url}' '{link_id}'
 tsf delete '{owner-url}'
 ```
+
+Access levels are `view`, `write`, `view+write`, and `owner`. `--expires` accepts durations such as `1h` or `7d`, or `never` (the default).
 
 Token file options write only the secret value. On Unix, `tsf` creates and tightens these files to mode `0600`.
 

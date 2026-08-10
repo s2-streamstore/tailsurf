@@ -131,7 +131,7 @@ def create_stream(tsf_bin: str, api_url: str, web_url: str) -> CreatedStream:
         tsf_bin,
         api_url,
         web_url,
-        ["new", "--format", "json"],
+        ["new", "--format", "json", "--link", "owner", "--link", "write", "--link", "view"],
         "tsf new --format json",
     )
     return parse_created_stream(result.stdout)

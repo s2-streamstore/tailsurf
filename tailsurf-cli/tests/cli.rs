@@ -143,10 +143,16 @@ async fn new_outputs_json_and_token_files() {
             "new",
             "--format",
             "json",
+            "--link",
+            "owner",
+            "--link",
+            "view",
+            "--link",
+            "write",
             "--owner-token-file",
             owner_file.to_str().expect("owner path"),
-            "--read-token-file",
-            read_file.to_str().expect("read path"),
+            "--view-token-file",
+            read_file.to_str().expect("view path"),
             "--write-token-file",
             write_file.to_str().expect("write path"),
         ],
@@ -202,23 +208,28 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(private.status.success(), "stderr={}", private.stderr);
     assert_eq!(
         normalize_created_stream_output(&private.stdout),
-        "stream_id=<stream_id>\nvisibility=private\nretention_secs=<retention_secs>\no=<url>\nw=<url>\nr=<url>\n"
+        "Created private stream <stream_id>\nRetention: <retention>\n\n  owner <url>\n\nLinks are shown once.\n"
     );
-    assert_created_output_urls_parse(&private.stdout, &["o", "w", "r"]);
+    assert_created_output_urls_parse(&private.stdout, &["o"]);
 
     let public = run_tsf(&server, ["new", "--public"], None).await;
     assert!(public.status.success(), "stderr={}", public.stderr);
     assert_eq!(
         normalize_created_stream_output(&public.stdout),
-        "stream_id=<stream_id>\nvisibility=public\nretention_secs=<retention_secs>\no=<url>\nw=<url>\n"
+        "Created public stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n"
     );
-    assert_created_output_urls_parse(&public.stdout, &["o", "w"]);
+    assert_created_output_urls_parse(&public.stdout, &["o"]);
 
-    let explicit = run_tsf(&server, ["new", "--token", "rw", "--token", "r"], None).await;
+    let explicit = run_tsf(
+        &server,
+        ["new", "--link", "view+write", "--link", "view"],
+        None,
+    )
+    .await;
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "stream_id=<stream_id>\nvisibility=private\nretention_secs=<retention_secs>\nrw=<url>\nr=<url>\n"
+        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  view+write <url>\n\nLinks are shown once.\n"
     );
     assert_created_output_urls_parse(&explicit.stdout, &["rw", "r"]);
 
@@ -247,7 +258,7 @@ async fn new_and_write_new_accept_human_retention_and_surface_free_limits() {
     )
     .await;
     assert!(write.status.success(), "stderr={}", write.stderr);
-    assert!(write.stderr.contains("retention_secs=21600"));
+    assert!(write.stderr.contains("Retention: 6 hours"));
 
     let denied = run_tsf(&server, ["new", "--retention", "infinite"], None).await;
     assert!(!denied.status.success());
@@ -275,12 +286,12 @@ async fn write_new_then_replay_round_trips_command_output() {
     assert_eq!(output.stdout, "");
     assert_eq!(
         normalize_created_stream_output(&output.stderr),
-        "stream_id=<stream_id>\nvisibility=private\nretention_secs=<retention_secs>\no=<url>\nw=<url>\nr=<url>\n"
+        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n"
     );
     let read_url = output
         .stderr
         .lines()
-        .find_map(|line| line.strip_prefix("r="))
+        .find_map(|line| extract_link_line(line, "view"))
         .expect("read url");
     StreamLocator::parse(read_url).expect("valid read URL");
 
@@ -324,7 +335,7 @@ async fn write_new_command_streams_output_and_propagates_exit_status() {
     let read_url = output
         .stderr
         .lines()
-        .find_map(|line| line.strip_prefix("r="))
+        .find_map(|line| extract_link_line(line, "view"))
         .expect("read url");
 
     let replay = run_tsf(&server, ["replay", read_url], None).await;
@@ -347,7 +358,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     let read_url = output
         .stderr
         .lines()
-        .find_map(|line| line.strip_prefix("r="))
+        .find_map(|line| extract_link_line(line, "view"))
         .expect("read url");
     let locator = StreamLocator::parse(read_url).expect("valid read URL");
     let read_token = locator
@@ -394,7 +405,7 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let read_url = output
         .stderr
         .lines()
-        .find_map(|line| line.strip_prefix("r="))
+        .find_map(|line| extract_link_line(line, "view"))
         .expect("read url");
     let locator = StreamLocator::parse(read_url).expect("valid read URL");
     let read_token = locator
@@ -463,7 +474,7 @@ async fn write_raw_flushes_on_linger() {
     let read_url = output
         .stderr
         .lines()
-        .find_map(|line| line.strip_prefix("r="))
+        .find_map(|line| extract_link_line(line, "view"))
         .expect("read url");
     let locator = StreamLocator::parse(read_url).expect("valid read URL");
     let read_token = locator
@@ -516,7 +527,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         let read = stderr.read_line(&mut line).await.expect("read created URL");
         assert!(read > 0, "tsf exited before printing a read URL");
         stderr_output.push_str(&line);
-        if let Some(url) = line.strip_prefix("r=") {
+        if let Some(url) = extract_link_line(&line, "view") {
             break url.trim_end().to_owned();
         }
     };
@@ -1023,7 +1034,7 @@ async fn cli_reports_url_errors_before_opening_sockets() {
     assert!(
         missing_write_token
             .stderr
-            .contains("stream URL does not contain a write token"),
+            .contains("URL does not grant write access"),
         "stderr={}",
         missing_write_token.stderr
     );
@@ -1045,7 +1056,7 @@ async fn cli_reports_url_errors_before_opening_sockets() {
     assert!(
         missing_owner_token
             .stderr
-            .contains("stream URL does not contain an owner token"),
+            .contains("URL does not grant owner access"),
         "stderr={}",
         missing_owner_token.stderr
     );
@@ -1057,12 +1068,11 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
 
     let public = run_tsf(&server, ["new", "--public"], None).await;
     assert!(public.status.success(), "stderr={}", public.stderr);
-    let lines = public
+    let owner_url = public
         .stdout
         .lines()
-        .filter_map(|line| line.split_once('='))
-        .collect::<HashMap<_, _>>();
-    let owner_url = lines.get("o").expect("owner URL");
+        .find_map(|line| extract_link_line(line, "owner"))
+        .expect("owner URL");
     let bad_owner_url = owner_url
         .split_once("#o=")
         .map(|(prefix, _token)| format!("{prefix}#o=bad-owner-secret"))
@@ -1332,7 +1342,7 @@ async fn owner_commands_manage_visibility_tokens_and_deletion() {
     let issued = run_tsf(
         &server,
         [
-            "token", "issue", owner_url, "--token", "r", "--format", "json",
+            "link", "issue", owner_url, "--access", "view", "--format", "json",
         ],
         None,
     )
@@ -1350,14 +1360,14 @@ async fn owner_commands_manage_visibility_tokens_and_deletion() {
     server.fail_next_token_list();
     let listed = run_tsf(
         &server,
-        ["token", "list", owner_url, "--format", "json"],
+        ["link", "list", owner_url, "--format", "json"],
         None,
     )
     .await;
     assert!(listed.status.success(), "stderr={}", listed.stderr);
     let listed_json: serde_json::Value =
         serde_json::from_str(&listed.stdout).expect("token list output");
-    assert_eq!(listed_json["tokens"].as_array().map(Vec::len), Some(4));
+    assert_eq!(listed_json["tokens"].as_array().map(Vec::len), Some(2));
     assert_eq!(
         listed_json["tokens"]
             .as_array()
@@ -1368,7 +1378,7 @@ async fn owner_commands_manage_visibility_tokens_and_deletion() {
 
     let revoked = run_tsf(
         &server,
-        ["token", "revoke", owner_url, token_id.as_str()],
+        ["link", "revoke", owner_url, token_id.as_str()],
         None,
     )
     .await;
@@ -1377,7 +1387,7 @@ async fn owner_commands_manage_visibility_tokens_and_deletion() {
 
     let listed = run_tsf(
         &server,
-        ["token", "list", owner_url, "--format", "json"],
+        ["link", "list", owner_url, "--format", "json"],
         None,
     )
     .await;
@@ -2159,16 +2169,21 @@ fn normalize_created_stream_output(output: &str) -> String {
     output
         .lines()
         .map(|line| {
-            if line.starts_with("stream_id=") {
-                "stream_id=<stream_id>".to_owned()
-            } else if line.starts_with("retention_secs=") {
-                "retention_secs=<retention_secs>".to_owned()
-            } else if let Some((permission, _url)) = line.split_once('=')
-                && matches!(permission, "o" | "w" | "r" | "rw")
-            {
-                format!("{permission}=<url>")
+            if let Some(rest) = line.strip_prefix("Created ") {
+                let visibility = rest.split_whitespace().next().unwrap_or_default();
+                format!("Created {visibility} stream <stream_id>")
+            } else if line.starts_with("Retention:") {
+                "Retention: <retention>".to_owned()
             } else {
-                line.to_owned()
+                let mut tokens = line.split_whitespace();
+                match (tokens.next(), tokens.next()) {
+                    (Some(label @ ("view" | "write" | "view+write" | "owner")), Some(url))
+                        if url.starts_with("http") =>
+                    {
+                        format!("  {label} <url>")
+                    }
+                    _ => line.to_owned(),
+                }
             }
         })
         .collect::<Vec<_>>()
@@ -2176,16 +2191,38 @@ fn normalize_created_stream_output(output: &str) -> String {
         + "\n"
 }
 
+fn extract_link_line<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != label {
+        return None;
+    }
+    tokens.next().filter(|url| url.starts_with("http"))
+}
+
+fn link_label_for(permission: &str) -> &str {
+    match permission {
+        "o" => "owner",
+        "r" => "view",
+        "w" => "write",
+        "rw" => "view+write",
+        other => other,
+    }
+}
+
 fn assert_created_output_urls_parse(output: &str, expected_permissions: &[&str]) {
-    let lines = output
+    let stream_id = output
         .lines()
-        .filter_map(|line| line.split_once('='))
-        .collect::<HashMap<_, _>>();
-    let stream_id = lines.get("stream_id").expect("stream_id line");
+        .find_map(|line| line.strip_prefix("Created "))
+        .and_then(|rest| rest.split_whitespace().last())
+        .expect("created stream line");
     for permission in expected_permissions {
-        let url = lines.get(permission).expect("permission URL line");
+        let label = link_label_for(permission);
+        let url = output
+            .lines()
+            .find_map(|line| extract_link_line(line, label))
+            .expect("permission URL line");
         let locator = StreamLocator::parse(url).expect("stream URL parses");
-        assert_eq!(locator.stream_id.to_string(), *stream_id);
+        assert_eq!(locator.stream_id.to_string(), stream_id);
         let permissions = permission
             .parse::<TokenPermissions>()
             .expect("expected permission parses");
