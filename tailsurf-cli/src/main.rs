@@ -13,11 +13,12 @@ use axoupdater::AxoUpdater;
 use bytes::{Buf, Bytes, BytesMut};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Context, ContextCompat, bail};
+use memchr::memchr;
 use secrecy::ExposeSecret;
 use serde::Serialize;
 use tailsurf::{
     AppendTicket, BearerToken, StreamId, TokenId, TokenPermissions, TsfClient, TsfProducer,
-    WriteRecord, WriterId,
+    TsfReadSession, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -30,10 +31,10 @@ use tailsurf::{
         },
     },
     stream_url::{StreamLocator, stream_url},
-    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript},
+    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript, TranscriptRecord},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     process::Command as TokioCommand,
     sync::mpsc,
     time::{Duration, Instant, sleep_until},
@@ -42,6 +43,12 @@ use url::Url;
 
 const INTERRUPT_EXIT_CODE: i32 = 130;
 const RAW_LINGER: Duration = Duration::from_millis(10);
+/// Stdout batching window for `tail` and `replay`.
+const TRANSCRIPT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+/// Decoded transcript records held while stdout drains.
+const TRANSCRIPT_RECORD_QUEUE: usize = 8;
+/// Stdin read block size for line-framed and raw writes.
+const STDIN_READ_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
@@ -414,7 +421,8 @@ impl WriterState {
     }
 }
 
-#[tokio::main]
+// One socket, one stdin, one stdout: worker threads only add wakeup and handoff cost.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -656,7 +664,7 @@ async fn stream_raw_stdin_to_writer(
     state: &mut WriterState,
 ) -> eyre::Result<bool> {
     let mut stdin = tokio::io::stdin();
-    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut buffer = vec![0_u8; STDIN_READ_BYTES];
     let mut appender = RawRecordAppender::new(RAW_LINGER);
     let mut session = WriterSession {
         writer,
@@ -708,7 +716,7 @@ async fn stream_lines_to_writer(
     state: &mut WriterState,
 ) -> eyre::Result<bool> {
     let mut stdin = tokio::io::stdin();
-    let mut read_buffer = vec![0_u8; 16 * 1024];
+    let mut read_buffer = BytesMut::with_capacity(STDIN_READ_BYTES);
     let mut line_appender = LineRecordAppender::new();
     let mut session = WriterSession {
         writer,
@@ -717,8 +725,9 @@ async fn stream_lines_to_writer(
     };
 
     let interrupted = loop {
+        read_buffer.reserve(STDIN_READ_BYTES);
         let byte_count = tokio::select! {
-            byte_count = stdin.read(&mut read_buffer) => byte_count.context("failed to read stdin")?,
+            byte_count = stdin.read_buf(&mut read_buffer) => byte_count.context("failed to read stdin")?,
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt.context("failed to listen for interrupt signal")?;
                 break true;
@@ -729,7 +738,7 @@ async fn stream_lines_to_writer(
         }
 
         line_appender
-            .push_bytes(&mut session, &read_buffer[..byte_count])
+            .push_bytes(&mut session, read_buffer.split().freeze())
             .await?;
     };
 
@@ -817,7 +826,7 @@ async fn stream_child_command_output(
             WriteBuffering::Lines => {
                 let mut line_appender = LineRecordAppender::new();
                 while let Some(chunk) = chunk_rx.recv().await {
-                    line_appender.push_bytes(session, &chunk?).await?;
+                    line_appender.push_bytes(session, chunk?).await?;
                 }
                 line_appender.finish(session).await?;
             }
@@ -860,20 +869,17 @@ async fn read_child_pipe<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffer = vec![0_u8; MAX_RECORD_BYTES];
+    let mut buffer = BytesMut::with_capacity(MAX_RECORD_BYTES);
     loop {
+        buffer.reserve(MAX_RECORD_BYTES);
         let byte_count = pipe
-            .read(&mut buffer)
+            .read_buf(&mut buffer)
             .await
             .context("failed to read command output")?;
         if byte_count == 0 {
             return Ok(());
         }
-        if chunk_tx
-            .send(Ok(Bytes::copy_from_slice(&buffer[..byte_count])))
-            .await
-            .is_err()
-        {
+        if chunk_tx.send(Ok(buffer.split().freeze())).await.is_err() {
             return Ok(());
         }
     }
@@ -976,7 +982,7 @@ impl LineRecordAppender {
     async fn push_bytes(
         &mut self,
         session: &mut WriterSession<'_>,
-        mut bytes: &[u8],
+        mut bytes: Bytes,
     ) -> eyre::Result<()> {
         while !bytes.is_empty() {
             if self.pending.len() == MAX_RECORD_BYTES {
@@ -985,15 +991,19 @@ impl LineRecordAppender {
 
             let available = MAX_RECORD_BYTES - self.pending.len();
             let window_len = available.min(bytes.len());
-            let window = &bytes[..window_len];
-            let take = window
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(window_len, |index| index + 1);
-            self.pending.extend_from_slice(&window[..take]);
-            bytes = &bytes[take..];
+            let newline = memchr(b'\n', &bytes[..window_len]);
+            let take = newline.map_or(window_len, |index| index + 1);
 
-            if self.pending.last() == Some(&b'\n') {
+            // A line that arrived whole is already contiguous, so send the slice itself.
+            if self.pending.is_empty() && newline.is_some() {
+                let line = bytes.split_to(take);
+                self.send_part(session, line, true).await?;
+                continue;
+            }
+
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes.advance(take);
+            if newline.is_some() {
                 self.flush(session, true).await?;
             }
         }
@@ -1009,6 +1019,16 @@ impl LineRecordAppender {
 
     async fn flush(&mut self, session: &mut WriterSession<'_>, is_final: bool) -> eyre::Result<()> {
         let data = self.pending.split().freeze();
+        self.send_part(session, data, is_final).await
+    }
+
+    /// Sends one physical part and advances or resets the split index.
+    async fn send_part(
+        &mut self,
+        session: &mut WriterSession<'_>,
+        data: Bytes,
+        is_final: bool,
+    ) -> eyre::Result<()> {
         session
             .append_line_part(self.split_part_index, is_final, data)
             .await?;
@@ -1258,35 +1278,96 @@ async fn read_transcript(
     }
 
     let client = TsfClient::with_api_base_url(api_url);
-    let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
-    let mut stdout = tokio::io::stdout();
-    let mut reader = client
+    let reader = client
         .connect_reader(options)
         .await
         .context("failed to connect reader")?;
+    let (record_tx, mut record_rx) = mpsc::channel(TRANSCRIPT_RECORD_QUEUE);
+    let reader_task = tokio::spawn(assemble_transcript_records(
+        reader,
+        max_logical_record_bytes,
+        record_tx,
+    ));
 
-    while let Some(record) = tokio::select! {
-        record = reader.next_record() => record.context("failed to read stream")?,
-        interrupt = tokio::signal::ctrl_c() => {
-            interrupt.context("failed to listen for interrupt signal")?;
-            exit_interrupted();
+    let mut stdout = BufWriter::with_capacity(TRANSCRIPT_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
+    let result = write_transcript_records(&mut record_rx, &mut stdout).await;
+    stdout.flush().await.context("failed to flush stdout")?;
+    result?;
+
+    reader_task.await.context("transcript reader task panicked")
+}
+
+/// Writes decoded records until the reader finishes, flushing whenever none is already waiting.
+async fn write_transcript_records(
+    record_rx: &mut mpsc::Receiver<eyre::Result<TranscriptRecord>>,
+    stdout: &mut BufWriter<tokio::io::Stdout>,
+) -> eyre::Result<()> {
+    loop {
+        let record = tokio::select! {
+            record = record_rx.recv() => record,
+            interrupt = tokio::signal::ctrl_c() => {
+                interrupt.context("failed to listen for interrupt signal")?;
+                stdout.flush().await.context("failed to flush stdout")?;
+                exit_interrupted();
+            }
+        };
+        let Some(record) = record else {
+            return Ok(());
+        };
+
+        write_transcript_data(stdout, record?.data).await?;
+        // Batching must never hold output back, so flush as soon as nothing is already decoded.
+        if record_rx.is_empty() {
+            stdout.flush().await.context("failed to flush stdout")?;
         }
-    } {
-        if let Some(record) = transcript
+    }
+}
+
+/// Reassembles logical records off the output path so socket reads overlap stdout writes.
+async fn assemble_transcript_records(
+    mut reader: TsfReadSession,
+    max_logical_record_bytes: usize,
+    record_tx: mpsc::Sender<eyre::Result<TranscriptRecord>>,
+) {
+    // Failures belong in stream order behind the records already sent, not in the join result.
+    if let Err(error) =
+        forward_transcript_records(&mut reader, max_logical_record_bytes, &record_tx).await
+    {
+        let _ = record_tx.send(Err(error)).await;
+    }
+}
+
+async fn forward_transcript_records(
+    reader: &mut TsfReadSession,
+    max_logical_record_bytes: usize,
+    record_tx: &mpsc::Sender<eyre::Result<TranscriptRecord>>,
+) -> eyre::Result<()> {
+    let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
+
+    while let Some(record) = reader
+        .next_record()
+        .await
+        .context("failed to read stream")?
+    {
+        let Some(record) = transcript
             .push_record(record)
             .context("failed to assemble transcript record")?
-        {
-            write_transcript_data(&mut stdout, record.data).await?;
+        else {
+            continue;
+        };
+        if record_tx.send(Ok(record)).await.is_err() {
+            return Ok(());
         }
     }
 
     Ok(())
 }
-
 async fn write_transcript_data(
-    stdout: &mut tokio::io::Stdout,
+    stdout: &mut (impl AsyncWrite + Unpin),
     mut data: impl Buf,
 ) -> eyre::Result<()> {
+    // Chunk-at-a-time beats `write_all_buf` here: stdout is not vectored, so the vectored path
+    // only adds per-poll `IoSlice` setup for the common single-chunk record.
     while data.has_remaining() {
         let chunk = data.chunk();
         let chunk_len = chunk.len();
@@ -1299,7 +1380,6 @@ async fn write_transcript_data(
             .context("failed to write stdout")?;
         data.advance(chunk_len);
     }
-    stdout.flush().await.context("failed to flush stdout")?;
     Ok(())
 }
 

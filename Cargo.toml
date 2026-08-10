@@ -19,6 +19,7 @@ clap = "4.6.6"
 eyre = "0.6.12"
 futures-util = "0.3.33"
 humantime = "2.4.0"
+memchr = "2.8.3"
 rand = "0.10.2"
 reqwest = "0.13.4"
 secrecy = { version = "0.10.3", features = ["serde"] }
