@@ -2,22 +2,15 @@ name: Notarize macOS binaries
 
 on:
   workflow_call:
-    inputs:
-      plan:
-        required: true
-        type: string
-    secrets:
-      APPLE_NOTARY_ISSUER_ID:
-        required: true
-      APPLE_NOTARY_KEY_ID:
-        required: true
-      APPLE_NOTARY_PRIVATE_KEY:
-        required: true
 
 jobs:
   notarize:
     runs-on: macos-14
+    environment: release
     timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Require notarization credentials
         shell: bash
@@ -38,7 +31,7 @@ jobs:
           fi
 
       - name: Download signed macOS archives
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: artifacts-build-local-*-apple-darwin
           path: artifacts
@@ -123,7 +116,7 @@ jobs:
 
       - name: Upload notarization records
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-notarization-records
           path: notarization-results/*.json

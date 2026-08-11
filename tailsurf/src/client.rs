@@ -4,6 +4,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
+    str::FromStr,
     sync::Arc,
     task::{Context, Poll},
     time::Duration,
@@ -11,6 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
 use tokio::{
@@ -52,6 +54,7 @@ use secrecy::ExposeSecret;
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const API_PREFIX: &str = "/api/v1";
+const DEFAULT_READ_TAIL_OFFSET: u64 = 80;
 
 /// Timeouts, retry behavior, API origin, and optional account authorization for [`TsfClient`].
 #[derive(Clone, Debug)]
@@ -66,7 +69,7 @@ pub struct TsfClientConfig {
     pub websocket_operation_timeout: Duration,
     /// Optional idle timeout while waiting for a read frame. Protocol heartbeats reset the timer. `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
-    /// Retry policy for idempotent metadata reads and initial socket setup.
+    /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and consecutive read reconnects without a delivered record.
     pub retry_policy: RetryPolicy,
     /// Optional account bearer token sent on REST requests.
     pub rest_bearer_token: Option<BearerToken>,
@@ -138,7 +141,7 @@ impl Default for RetryPolicy {
 
 /// Cloneable TSF control-plane and v3 data-plane client.
 ///
-/// Mutating REST operations are not retried because a timeout may occur after the service applies the mutation. Metadata reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by [`TsfProducer`].
+/// Anonymous stream creation is retried with one idempotency key. Other mutating REST operations are not retried because a timeout may occur after the service applies the mutation. Metadata reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by [`TsfProducer`].
 #[derive(Clone)]
 pub struct TsfClient {
     config: TsfClientConfig,
@@ -186,14 +189,36 @@ impl TsfClient {
 
     /// Creates a stream and returns its metadata and newly issued secret tokens.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// The client generates one idempotency key for this logical call and reuses it while retrying transient failures according to policy.
     pub async fn create_stream(
         &self,
         request: &CreateStreamRequest,
     ) -> Result<CreateStreamResponse, TsfClientError> {
-        self.send_json(
-            self.http.post(self.rest_url("/streams")).json(request),
-            "create stream",
+        let idempotency_key = CreateStreamIdempotencyKey::new_random();
+        self.create_stream_with_idempotency_key(request, &idempotency_key)
+            .await
+    }
+
+    /// Creates or recovers a logical stream creation using a caller-owned idempotency key.
+    ///
+    /// The key is owner-equivalent recovery material. Generate and persist it securely before the first request, then reuse it with the identical request after cancellation, process loss, or an ambiguous response.
+    pub async fn create_stream_with_idempotency_key(
+        &self,
+        request: &CreateStreamRequest,
+        idempotency_key: &CreateStreamIdempotencyKey,
+    ) -> Result<CreateStreamResponse, TsfClientError> {
+        self.retry_when(
+            || {
+                self.send_json_with_bearer(
+                    self.http
+                        .post(self.rest_url("/streams"))
+                        .header("Idempotency-Key", idempotency_key.expose_secret())
+                        .json(request),
+                    "create stream",
+                    None,
+                )
+            },
+            TsfClientError::is_recoverable_create_failure,
         )
         .await
     }
@@ -360,10 +385,25 @@ impl TsfClient {
     }
 
     /// Connects a resumable read session at the requested position and bounds.
+    ///
+    /// An explicit tail offset, or the service-default offset of 80 records, is resolved to an absolute S2 sequence number before the first socket is opened. Reconnects therefore resume from the same position even if the stream advances before a record arrives.
     pub async fn connect_reader(
         &self,
-        options: ReadStreamOptions,
+        mut options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
+        let tail_offset = match options.start {
+            None => Some(DEFAULT_READ_TAIL_OFFSET),
+            Some(ReadStart::TailOffset(offset)) => Some(offset),
+            Some(ReadStart::SeqNum(_) | ReadStart::TimestampMs(_)) => None,
+        };
+        if let Some(offset) = tail_offset {
+            let tail = self
+                .get_stream_tail_with_bearer(&options.stream_id, options.bearer_token.as_ref())
+                .await?;
+            options.start = Some(ReadStart::SeqNum(
+                tail.next_s2_seq_num.saturating_sub(offset),
+            ));
+        }
         let socket = self.connect_read_socket(options.clone()).await?;
         Ok(TsfReadSession::new(self.clone(), options, socket))
     }
@@ -429,8 +469,12 @@ impl TsfClient {
         url
     }
 
-    fn apply_rest_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(token) = &self.config.rest_bearer_token {
+    fn apply_rest_auth(
+        &self,
+        request: reqwest::RequestBuilder,
+        bearer_token: Option<&BearerToken>,
+    ) -> reqwest::RequestBuilder {
+        if let Some(token) = bearer_token {
             request.bearer_auth(token.expose_secret())
         } else {
             request
@@ -464,9 +508,34 @@ impl TsfClient {
         path: String,
         operation: &'static str,
     ) -> Result<T, TsfClientError> {
+        self.get_json_with_bearer(path, operation, None).await
+    }
+
+    async fn get_stream_tail_with_bearer(
+        &self,
+        stream_id: &StreamId,
+        bearer_token: Option<&BearerToken>,
+    ) -> Result<StreamTailResponse, TsfClientError> {
+        self.get_json_with_bearer(
+            format!("/streams/{stream_id}/tail"),
+            "check stream tail",
+            bearer_token,
+        )
+        .await
+    }
+
+    async fn get_json_with_bearer<T: DeserializeOwned>(
+        &self,
+        path: String,
+        operation: &'static str,
+        bearer_token: Option<&BearerToken>,
+    ) -> Result<T, TsfClientError> {
         let url = self.rest_url(&path);
-        self.retry_transient(|| self.send_json(self.http.get(url.clone()), operation))
-            .await
+        let bearer_token = bearer_token.or(self.config.rest_bearer_token.as_ref());
+        self.retry_transient(|| {
+            self.send_json_with_bearer(self.http.get(url.clone()), operation, bearer_token)
+        })
+        .await
     }
 
     async fn send_json<T: DeserializeOwned>(
@@ -474,8 +543,18 @@ impl TsfClient {
         request: reqwest::RequestBuilder,
         operation: &'static str,
     ) -> Result<T, TsfClientError> {
+        self.send_json_with_bearer(request, operation, self.config.rest_bearer_token.as_ref())
+            .await
+    }
+
+    async fn send_json_with_bearer<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+        bearer_token: Option<&BearerToken>,
+    ) -> Result<T, TsfClientError> {
         let response = self
-            .apply_rest_auth(request)
+            .apply_rest_auth(request, bearer_token)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -488,7 +567,7 @@ impl TsfClient {
         operation: &'static str,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request)
+            .apply_rest_auth(request, self.config.rest_bearer_token.as_ref())
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -503,9 +582,17 @@ impl TsfClient {
         })
     }
 
-    async fn retry_transient<T, Fut>(
+    async fn retry_transient<T, Fut>(&self, run: impl FnMut() -> Fut) -> Result<T, TsfClientError>
+    where
+        Fut: Future<Output = Result<T, TsfClientError>>,
+    {
+        self.retry_when(run, TsfClientError::is_retryable).await
+    }
+
+    async fn retry_when<T, Fut>(
         &self,
         mut run: impl FnMut() -> Fut,
+        should_retry: impl Fn(&TsfClientError) -> bool,
     ) -> Result<T, TsfClientError>
     where
         Fut: Future<Output = Result<T, TsfClientError>>,
@@ -517,7 +604,7 @@ impl TsfClient {
         for attempt in 1..=attempts {
             match run().await {
                 Ok(value) => return Ok(value),
-                Err(error) if attempt < attempts && error.is_retryable() => {
+                Err(error) if attempt < attempts && should_retry(&error) => {
                     if !backoff.is_zero() {
                         sleep(backoff).await;
                     }
@@ -540,6 +627,81 @@ impl Default for TsfClient {
 /// Returns the default `https://tail.surf` API origin.
 pub fn default_api_base_url() -> Url {
     Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
+}
+
+/// Owner-equivalent recovery key for one logical stream-creation request.
+#[derive(Clone, Debug)]
+pub struct CreateStreamIdempotencyKey(BearerToken);
+
+impl CreateStreamIdempotencyKey {
+    /// Generates a cryptographically random canonical 256-bit key.
+    pub fn new_random() -> Self {
+        let mut bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        Self(encode_base64url_32(&bytes).into())
+    }
+}
+
+impl FromStr for CreateStreamIdempotencyKey {
+    type Err = InvalidCreateStreamIdempotencyKey;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_canonical_base64url_32(value) {
+            Ok(Self(value.into()))
+        } else {
+            Err(InvalidCreateStreamIdempotencyKey)
+        }
+    }
+}
+
+impl ExposeSecret<str> for CreateStreamIdempotencyKey {
+    fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+/// Error returned for a malformed stream-creation idempotency key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("create idempotency key must be canonical 43-character unpadded base64url")]
+pub struct InvalidCreateStreamIdempotencyKey;
+
+fn is_canonical_base64url_32(value: &str) -> bool {
+    const FINAL_CHARS: &[u8] = b"AEIMQUYcgkosw048";
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|last| FINAL_CHARS.contains(last))
+}
+
+fn encode_base64url_32(bytes: &[u8; 32]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(43);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
+        ));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6))],
+        ));
+        encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
+    }
+    let remainder = chunks.remainder();
+    debug_assert_eq!(remainder.len(), 2);
+    encoded.push(char::from(ALPHABET[usize::from(remainder[0] >> 2)]));
+    encoded.push(char::from(
+        ALPHABET[usize::from(((remainder[0] & 0x03) << 4) | (remainder[1] >> 4))],
+    ));
+    encoded.push(char::from(
+        ALPHABET[usize::from((remainder[1] & 0x0f) << 2)],
+    ));
+    debug_assert_eq!(encoded.len(), 43);
+    encoded
 }
 
 /// Low-level authenticated write socket without retained-record recovery.
@@ -1252,16 +1414,25 @@ pub struct TsfReadSession {
     socket: ReadSocket,
     finished: bool,
     last_observed_tail: Option<ReadTail>,
+    no_progress_reconnects: usize,
+    reconnect_backoff: Duration,
+    pending_reconnect_backoff: Duration,
+    reconnect_needed: bool,
 }
 
 impl TsfReadSession {
     fn new(client: TsfClient, options: ReadStreamOptions, socket: ReadSocket) -> Self {
+        let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
             client,
             options,
             socket,
             finished: false,
             last_observed_tail: None,
+            no_progress_reconnects: 0,
+            reconnect_backoff,
+            pending_reconnect_backoff: Duration::ZERO,
+            reconnect_needed: false,
         }
     }
 
@@ -1272,7 +1443,7 @@ impl TsfReadSession {
 
     /// Waits for the next physical record using the configured idle timeout.
     pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
-        self.next_record_inner(None).await
+        self.next_record_inner().await
     }
 
     /// Waits for the next physical record with a caller-supplied timeout for this operation.
@@ -1280,20 +1451,20 @@ impl TsfReadSession {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<ReadRecord>, TsfClientError> {
-        self.next_record_inner(Some(timeout)).await
+        with_timeout(timeout, "read stream record", self.next_record_inner()).await
     }
 
-    async fn next_record_inner(
-        &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<Option<ReadRecord>, TsfClientError> {
+    async fn next_record_inner(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
         loop {
             if self.finished || read_options_exhausted(&self.options) {
                 self.finished = true;
                 return Ok(None);
             }
+            if self.reconnect_needed {
+                self.reconnect().await?;
+            }
 
-            match self.next_socket_outcome(timeout).await {
+            match self.socket.next_outcome().await {
                 Ok(ReadSocketOutcome::Record(record)) => {
                     self.record_delivered(record.s2_seq_num);
                     return Ok(Some(record));
@@ -1302,6 +1473,7 @@ impl TsfReadSession {
                     self.last_observed_tail = Some(tail);
                 }
                 Ok(ReadSocketOutcome::ReconnectAdvised) => {
+                    self.require_reconnect()?;
                     self.reconnect().await?;
                 }
                 Ok(ReadSocketOutcome::Closed) => {
@@ -1309,6 +1481,7 @@ impl TsfReadSession {
                     return Ok(None);
                 }
                 Err(error) if error.is_resumable_read_interruption() => {
+                    self.require_reconnect()?;
                     self.reconnect().await?;
                 }
                 Err(error) => return Err(error),
@@ -1316,26 +1489,44 @@ impl TsfReadSession {
         }
     }
 
-    async fn next_socket_outcome(
-        &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<ReadSocketOutcome, TsfClientError> {
-        if let Some(timeout) = timeout {
-            self.socket.next_outcome_with_timeout(timeout).await
-        } else {
-            self.socket.next_outcome().await
-        }
-    }
-
     async fn reconnect(&mut self) -> Result<(), TsfClientError> {
-        self.socket = self
+        debug_assert!(self.reconnect_needed);
+        if !self.pending_reconnect_backoff.is_zero() {
+            sleep(self.pending_reconnect_backoff).await;
+        }
+        let socket = self
             .client
             .connect_read_socket(self.options.clone())
             .await?;
+        self.socket = socket;
+        self.pending_reconnect_backoff = Duration::ZERO;
+        self.reconnect_needed = false;
+        Ok(())
+    }
+
+    fn require_reconnect(&mut self) -> Result<(), TsfClientError> {
+        if self.reconnect_needed {
+            return Ok(());
+        }
+        let retry_policy = self.client.config.retry_policy;
+        let max_reconnects = retry_policy.attempt_count().saturating_sub(1);
+        if self.no_progress_reconnects >= max_reconnects {
+            return Err(TsfClientError::ReadReconnectLimitExceeded {
+                max_connection_attempts: retry_policy.attempt_count(),
+            });
+        }
+        self.no_progress_reconnects += 1;
+        self.pending_reconnect_backoff = self.reconnect_backoff;
+        self.reconnect_backoff = retry_policy.next_backoff(self.reconnect_backoff);
+        self.reconnect_needed = true;
         Ok(())
     }
 
     fn record_delivered(&mut self, s2_seq_num: u64) {
+        self.no_progress_reconnects = 0;
+        self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
+        self.pending_reconnect_backoff = Duration::ZERO;
+        self.reconnect_needed = false;
         match s2_seq_num.checked_add(1) {
             Some(next_seq_num) => self.options.start = Some(ReadStart::SeqNum(next_seq_num)),
             None => self.finished = true,
@@ -1384,18 +1575,6 @@ impl ReadSocket {
                 return Ok(outcome);
             }
         }
-    }
-
-    async fn next_outcome_with_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<ReadSocketOutcome, TsfClientError> {
-        with_timeout(
-            timeout,
-            "read stream record",
-            next_read_socket_outcome(&mut self.ws),
-        )
-        .await
     }
 }
 
@@ -1528,16 +1707,6 @@ async fn next_server_frame(
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Text(_) => return Err(TsfClientError::UnexpectedTextMessage),
             Message::Frame(_) => {}
-        }
-    }
-}
-
-async fn next_read_socket_outcome(
-    ws: &mut ClientWebSocket,
-) -> Result<ReadSocketOutcome, TsfClientError> {
-    loop {
-        if let Some(outcome) = next_read_socket_frame(ws).await? {
-            return Ok(outcome);
         }
     }
 }
@@ -1677,6 +1846,14 @@ pub enum TsfClientError {
     /// A private read requested authentication but no token was configured.
     #[error("private stream read requires a bearer token")]
     MissingReadToken,
+    /// Consecutive read connections ended or requested reconnect without delivering a record.
+    #[error(
+        "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"
+    )]
+    ReadReconnectLimitExceeded {
+        /// Configured maximum consecutive connection attempts, including the initial connection.
+        max_connection_attempts: usize,
+    },
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
@@ -1689,6 +1866,17 @@ pub enum TsfClientError {
 }
 
 impl TsfClientError {
+    /// Returns whether retrying a failed create with the same idempotency key and request is safe and may succeed.
+    pub fn is_recoverable_create_failure(&self) -> bool {
+        match self {
+            Self::Http(error) => {
+                error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
+            }
+            Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
+            _ => false,
+        }
+    }
+
     fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
@@ -1703,6 +1891,7 @@ impl TsfClientError {
 
     fn is_resumable_read_interruption(&self) -> bool {
         match self {
+            Self::Timeout { .. } => true,
             Self::WebSocket(error) => is_retryable_websocket_error(error),
             Self::WebSocketClosed => true,
             Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),
@@ -1770,6 +1959,33 @@ mod tests {
         assert!(config.rest_bearer_token.is_none());
     }
 
+    #[test]
+    fn idempotency_key_encoding_is_canonical_unpadded_base64url() {
+        let encoded = encode_base64url_32(&[0_u8; 32]);
+
+        assert_eq!(encoded, "A".repeat(43));
+    }
+
+    #[test]
+    fn create_idempotency_keys_validate_and_redact_debug_output() {
+        let key = CreateStreamIdempotencyKey::new_random();
+        let exposed = key.expose_secret().to_owned();
+
+        assert!(is_canonical_base64url_32(&exposed));
+        assert_eq!(
+            exposed
+                .parse::<CreateStreamIdempotencyKey>()
+                .expect("canonical key")
+                .expose_secret(),
+            exposed
+        );
+        assert!(!format!("{key:?}").contains(&exposed));
+        assert!(matches!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse::<CreateStreamIdempotencyKey>(),
+            Err(InvalidCreateStreamIdempotencyKey)
+        ));
+    }
+
     #[tokio::test]
     async fn read_idle_timeout_resets_on_protocol_heartbeat() {
         let (client, mut server) = connected_websockets().await;
@@ -1831,9 +2047,12 @@ mod tests {
             read_idle_timeout: Some(Duration::from_secs(1)),
         };
 
-        let result = socket
-            .next_outcome_with_timeout(Duration::from_millis(100))
-            .await;
+        let result = with_timeout(
+            Duration::from_millis(100),
+            "read stream record",
+            socket.next_outcome(),
+        )
+        .await;
 
         assert!(matches!(
             result,

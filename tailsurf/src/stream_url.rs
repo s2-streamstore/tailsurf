@@ -7,6 +7,9 @@ use secrecy::ExposeSecret;
 
 /// Default origin for Tailsurf share URLs.
 pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";
+/// Encoded length of a 256-bit stream token.
+pub const STREAM_TOKEN_ENCODED_LENGTH: usize = 43;
+const STREAM_TOKEN_FINAL_CHARS: &[u8] = b"AEIMQUYcgkosw048";
 
 /// Permission label and secret value decoded from a share URL fragment.
 #[derive(Clone, Debug)]
@@ -30,6 +33,7 @@ impl StreamLocator {
     /// Parses a complete share URL and rejects malformed or ambiguous token fragments.
     pub fn parse(input: &str) -> Result<Self, StreamUrlError> {
         let url = Url::parse(input)?;
+        validate_share_scheme(&url)?;
         let stream_id = parse_stream_id(&url)?;
 
         let token = url.fragment().map(parse_fragment).transpose()?.flatten();
@@ -46,14 +50,20 @@ impl StreamLocator {
     }
 }
 
-/// Builds a share URL with a percent-encoded secret token fragment.
+/// Builds a share URL after validating the canonical unpadded base64url token.
 pub fn stream_url(
     base_url: &Url,
     stream_id: &StreamId,
     permissions: TokenPermissions,
     token: &BearerToken,
-) -> Url {
+) -> Result<Url, StreamUrlError> {
+    validate_stream_token(token.expose_secret())?;
     let mut url = base_url.clone();
+    validate_share_scheme(&url)?;
+    url.set_username("")
+        .map_err(|()| StreamUrlError::InvalidBaseUrl)?;
+    url.set_password(None)
+        .map_err(|()| StreamUrlError::InvalidBaseUrl)?;
     url.set_path(&format!("/s/{stream_id}"));
     url.set_query(None);
 
@@ -62,7 +72,7 @@ pub fn stream_url(
         .finish();
     url.set_fragment(Some(&fragment));
 
-    url
+    Ok(url)
 }
 
 /// Returns the default Tailsurf web origin.
@@ -90,9 +100,7 @@ fn parse_fragment(fragment: &str) -> Result<Option<StreamTokenParam>, StreamUrlE
     };
     let permissions = permissions.parse()?;
     let token = token.into_owned();
-    if token.is_empty() {
-        return Err(StreamUrlError::InvalidToken);
-    }
+    validate_stream_token(&token)?;
     if pairs.next().is_some() {
         return Err(StreamUrlError::MultipleTokens);
     }
@@ -103,12 +111,42 @@ fn parse_fragment(fragment: &str) -> Result<Option<StreamTokenParam>, StreamUrlE
     }))
 }
 
+fn validate_stream_token(token: &str) -> Result<(), StreamUrlError> {
+    if token.len() == STREAM_TOKEN_ENCODED_LENGTH
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && token
+            .as_bytes()
+            .last()
+            .is_some_and(|last| STREAM_TOKEN_FINAL_CHARS.contains(last))
+    {
+        Ok(())
+    } else {
+        Err(StreamUrlError::InvalidToken)
+    }
+}
+
+fn validate_share_scheme(url: &Url) -> Result<(), StreamUrlError> {
+    if matches!(url.scheme(), "http" | "https") {
+        Ok(())
+    } else {
+        Err(StreamUrlError::InvalidScheme(url.scheme().to_owned()))
+    }
+}
+
 /// Error returned while parsing a Tailsurf share URL.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamUrlError {
     /// The input is not an absolute URL.
     #[error("invalid stream URL: {0}")]
     Url(#[from] url::ParseError),
+    /// The URL does not use HTTP or HTTPS.
+    #[error("stream URL scheme must be http or https, not {0:?}")]
+    InvalidScheme(String),
+    /// The validated HTTP(S) base URL could not be normalized for output.
+    #[error("stream URL base could not be normalized")]
+    InvalidBaseUrl,
     /// The path is not exactly `/s/{stream_id}`.
     #[error("stream URL path must be /s/{{stream_id}}")]
     InvalidStreamPath,
@@ -122,8 +160,8 @@ pub enum StreamUrlError {
     /// The fragment key is not a valid permission string.
     #[error("stream URL fragment has invalid permissions")]
     InvalidPermissions(#[from] crate::PermissionsError),
-    /// The fragment contains an empty token value.
-    #[error("stream URL fragment has invalid token")]
+    /// The fragment token is not canonical 256-bit unpadded base64url.
+    #[error("stream URL token must be canonical 43-character unpadded base64url")]
     InvalidToken,
     /// More than one token parameter appears in the fragment.
     #[error("stream URL fragment contains multiple tokens")]
@@ -135,12 +173,13 @@ mod tests {
     use super::*;
 
     const STREAM_ID: &str = "0123456789abcdefghjkmnpqrstvwxyz";
+    const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     #[test]
     fn parses_share_url_token() {
-        let locator = StreamLocator::parse(
-            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=write-token",
-        )
+        let locator = StreamLocator::parse(&format!(
+            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w={TOKEN}"
+        ))
         .expect("stream URL");
 
         assert_eq!(
@@ -149,14 +188,15 @@ mod tests {
         );
         let token = locator.token.expect("token");
         assert_eq!(token.permissions.to_string(), "w");
-        assert_eq!(token.token.expose_secret(), "write-token");
+        assert_eq!(token.token.expose_secret(), TOKEN);
     }
 
     #[test]
     fn parses_percent_encoded_fragment_token_and_ignores_query_params() {
-        let locator = StreamLocator::parse(
-            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz?view=raw#o=owner%2Ftoken",
-        )
+        let encoded_token = format!("%41{}", &TOKEN[1..]);
+        let locator = StreamLocator::parse(&format!(
+            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz?view=raw#o={encoded_token}"
+        ))
         .expect("stream URL");
 
         assert_eq!(
@@ -165,7 +205,7 @@ mod tests {
         );
         let token = locator.token.expect("token");
         assert_eq!(token.permissions.to_string(), "o");
-        assert_eq!(token.token.expose_secret(), "owner/token");
+        assert_eq!(token.token.expose_secret(), TOKEN);
     }
 
     #[test]
@@ -175,7 +215,9 @@ mod tests {
             Err(StreamUrlError::InvalidStreamPath)
         ));
         assert!(matches!(
-            StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#x=token"),
+            StreamLocator::parse(&format!(
+                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#x={TOKEN}"
+            )),
             Err(StreamUrlError::InvalidPermissions(_))
         ));
         assert!(matches!(
@@ -184,23 +226,90 @@ mod tests {
         ));
         assert!(matches!(
             StreamLocator::parse(
-                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=write-token&r=read-token"
+                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=too-short"
             ),
+            Err(StreamUrlError::InvalidToken)
+        ));
+        assert!(matches!(
+            StreamLocator::parse(
+                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"
+            ),
+            Err(StreamUrlError::InvalidToken)
+        ));
+        assert!(matches!(
+            StreamLocator::parse(
+                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            Err(StreamUrlError::InvalidToken)
+        ));
+        assert!(matches!(
+            StreamLocator::parse(&format!(
+                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w={TOKEN}&r={TOKEN}"
+            )),
             Err(StreamUrlError::MultipleTokens)
         ));
     }
 
     #[test]
-    fn builds_percent_encoded_share_url() {
-        let base_url = Url::parse("http://localhost:8787").expect("base URL");
+    fn builds_share_url() {
+        let base_url = Url::parse("http://user:password@localhost:8787/old?query=yes#fragment")
+            .expect("base URL");
         let stream_id = STREAM_ID.parse::<StreamId>().expect("stream id");
-        let token = BearerToken::from("abc-123_456");
+        let token = BearerToken::from(TOKEN);
 
-        let url = stream_url(&base_url, &stream_id, TokenPermissions::owner(), &token);
+        let url = stream_url(&base_url, &stream_id, TokenPermissions::owner(), &token)
+            .expect("valid stream token");
 
         assert_eq!(
             url.as_str(),
-            "http://localhost:8787/s/0123456789abcdefghjkmnpqrstvwxyz#o=abc-123_456"
+            format!("http://localhost:8787/s/0123456789abcdefghjkmnpqrstvwxyz#o={TOKEN}")
         );
+    }
+
+    #[test]
+    fn rejects_invalid_token_when_building_share_url() {
+        let base_url = Url::parse("http://localhost:8787").expect("base URL");
+        let stream_id = STREAM_ID.parse::<StreamId>().expect("stream id");
+
+        assert!(matches!(
+            stream_url(
+                &base_url,
+                &stream_id,
+                TokenPermissions::owner(),
+                &BearerToken::from("too-short")
+            ),
+            Err(StreamUrlError::InvalidToken)
+        ));
+        assert!(matches!(
+            stream_url(
+                &base_url,
+                &stream_id,
+                TokenPermissions::owner(),
+                &BearerToken::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            ),
+            Err(StreamUrlError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_http_share_urls_when_parsing_and_building() {
+        assert!(matches!(
+            StreamLocator::parse(&format!(
+                "ftp://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r={TOKEN}"
+            )),
+            Err(StreamUrlError::InvalidScheme(scheme)) if scheme == "ftp"
+        ));
+
+        let base_url = Url::parse("ftp://tail.surf").expect("base URL");
+        let stream_id = STREAM_ID.parse::<StreamId>().expect("stream id");
+        assert!(matches!(
+            stream_url(
+                &base_url,
+                &stream_id,
+                TokenPermissions::read(),
+                &BearerToken::from(TOKEN)
+            ),
+            Err(StreamUrlError::InvalidScheme(scheme)) if scheme == "ftp"
+        ));
     }
 }

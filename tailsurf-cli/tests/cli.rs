@@ -23,8 +23,8 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    BearerToken, StreamId, TokenId, TokenPermissions, TsfClient, TsfProducerConfig, WriteRecord,
-    WriterId,
+    BearerToken, CreateStreamIdempotencyKey, RetryPolicy, StreamId, TokenId, TokenPermissions,
+    TsfClient, TsfClientConfig, TsfClientError, TsfProducerConfig, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -52,6 +52,8 @@ use tokio::{
 use url::Url;
 
 const FREE_RETENTION_LIMIT_MESSAGE: &str = "Infinite retention is unavailable for free users.";
+const TEST_STREAM_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const UNKNOWN_STREAM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
 
 #[test]
 fn help_and_version_describe_the_cli() {
@@ -102,8 +104,24 @@ fn write_help_describes_implicit_creation() {
 }
 
 #[test]
+fn new_help_describes_mandatory_owner_and_exact_token_files() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["new", "--help"])
+        .output()
+        .expect("tsf new --help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("help UTF-8");
+    assert!(help.contains("The owner link is always issued"));
+    assert!(help.contains("Owner-equivalent recovery key"));
+    assert!(help.contains("exact view-only token secret"));
+    assert!(help.contains("Requires `--link view`"));
+    assert!(help.contains("exact write-only token secret"));
+    assert!(help.contains("Requires `--link write`"));
+}
+
+#[test]
 fn write_rejects_creation_options_with_an_existing_destination() {
-    const WRITE_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=secret";
+    const WRITE_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     let misplaced_public = Command::new(env!("CARGO_BIN_EXE_tsf"))
         .args(["write", WRITE_URL, "--public"])
@@ -125,6 +143,22 @@ fn write_rejects_creation_options_with_an_existing_destination() {
         String::from_utf8(misplaced_retention.stderr)
             .expect("stderr UTF-8")
             .contains("--retention cannot be used when writing to an existing stream")
+    );
+
+    let misplaced_recovery_key = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args([
+            "write",
+            WRITE_URL,
+            "--create-idempotency-key",
+            TEST_STREAM_TOKEN,
+        ])
+        .output()
+        .expect("tsf write URL --create-idempotency-key");
+    assert!(!misplaced_recovery_key.status.success());
+    assert!(
+        String::from_utf8(misplaced_recovery_key.stderr)
+            .expect("stderr UTF-8")
+            .contains("--create-idempotency-key cannot be used when writing to an existing stream")
     );
 }
 
@@ -181,21 +215,15 @@ async fn new_outputs_json_and_token_files() {
     assert!(json["urls"]["o"].as_str().is_some());
     assert!(json["urls"]["r"].as_str().is_some());
     assert!(json["urls"]["w"].as_str().is_some());
-    assert!(
-        !fs::read_to_string(&owner_file)
-            .expect("owner token")
-            .is_empty()
-    );
-    assert!(
-        !fs::read_to_string(&read_file)
-            .expect("read token")
-            .is_empty()
-    );
-    assert!(
-        !fs::read_to_string(&write_file)
-            .expect("write token")
-            .is_empty()
-    );
+    for (path, permission) in [(&owner_file, "o"), (&read_file, "r"), (&write_file, "w")] {
+        let url = json["urls"][permission].as_str().expect("matching URL");
+        let locator = StreamLocator::parse(url).expect("matching URL parses");
+        let expected = locator.token.expect("matching URL token");
+        assert_eq!(
+            fs::read_to_string(path).expect("token file"),
+            expected.token.expose_secret()
+        );
+    }
     #[cfg(unix)]
     for path in [&owner_file, &read_file, &write_file] {
         assert_eq!(
@@ -211,6 +239,158 @@ async fn new_outputs_json_and_token_files() {
     }
 
     fs::remove_dir_all(tmp).expect("cleanup");
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_prints_recovery_links_before_a_token_file_error() {
+    let server = TestServer::start().await;
+    let unwritable_path = std::env::temp_dir().join(format!(
+        "tsf-cli-unwritable-token-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir(&unwritable_path).expect("unwritable token path");
+
+    let output = run_tsf(
+        &server,
+        [
+            "new",
+            "--format",
+            "json",
+            "--owner-token-file",
+            unwritable_path.to_str().expect("token path"),
+        ],
+        None,
+    )
+    .await;
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("recovery JSON");
+    let owner_url = json["urls"]["o"].as_str().expect("owner recovery URL");
+    let locator = StreamLocator::parse(owner_url).expect("owner recovery URL parses");
+    assert!(
+        locator
+            .token_with(|permissions| permissions == TokenPermissions::owner())
+            .is_some()
+    );
+    assert!(
+        output.stderr.contains("failed to write owner token file"),
+        "stderr={}",
+        output.stderr
+    );
+
+    fs::remove_dir(&unwritable_path).expect("cleanup");
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_retries_with_one_canonical_idempotency_key() {
+    let server = TestServer::start_with_create_failures(1).await;
+
+    let output = run_tsf(&server, ["new", "--format", "json"], None).await;
+
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    let keys = server.create_idempotency_keys();
+    assert_eq!(keys.len(), 2);
+    let key = keys[0].as_deref().expect("idempotency key");
+    assert_eq!(keys[1].as_deref(), Some(key));
+    assert_eq!(key.len(), 43);
+    assert!(
+        key.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn create_stream_recovers_a_committed_truncated_response() {
+    let server = TestServer::start().await;
+    server.fail_next_create_body();
+    let key = CreateStreamIdempotencyKey::new_random();
+    let exposed_key = key.expose_secret().to_owned();
+
+    let created = TsfClient::with_api_base_url(server.api_url.clone())
+        .create_stream_with_idempotency_key(&CreateStreamRequest::default(), &key)
+        .await
+        .expect("recover committed create");
+
+    assert_eq!(created.tokens.len(), 3);
+    let observed_keys = server.create_idempotency_keys();
+    assert_eq!(observed_keys.len(), 2);
+    assert!(
+        observed_keys
+            .iter()
+            .all(|observed| observed.as_deref() == Some(exposed_key.as_str()))
+    );
+    assert_eq!(server.stream_count(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
+    let server = TestServer::start_with_create_failures(3).await;
+
+    let failed = run_tsf(&server, ["new", "--format", "json"], None).await;
+
+    assert!(!failed.status.success());
+    let recovery_key = failed
+        .stderr
+        .split("recovery key (keep it secret):\n")
+        .nth(1)
+        .and_then(|suffix| suffix.lines().next())
+        .expect("recovery key in error");
+    recovery_key
+        .parse::<CreateStreamIdempotencyKey>()
+        .expect("canonical recovery key");
+    assert!(failed.stderr.contains("TSF_CREATE_IDEMPOTENCY_KEY"));
+    assert!(!failed.stderr.contains("with --create-idempotency-key"));
+    let failed_keys = server.create_idempotency_keys();
+    assert_eq!(failed_keys.len(), 3);
+    assert!(
+        failed_keys
+            .iter()
+            .all(|observed| observed.as_deref() == Some(recovery_key))
+    );
+
+    let recovered = run_tsf(
+        &server,
+        [
+            "new",
+            "--format",
+            "json",
+            "--create-idempotency-key",
+            recovery_key,
+        ],
+        None,
+    )
+    .await;
+
+    assert!(recovered.status.success(), "stderr={}", recovered.stderr);
+    let recovered_keys = server.create_idempotency_keys();
+    assert_eq!(recovered_keys.len(), 4);
+    assert_eq!(recovered_keys[3].as_deref(), Some(recovery_key));
+    server.abort();
+}
+
+#[tokio::test]
+async fn create_stream_suppresses_configured_rest_authorization() {
+    let server = TestServer::start().await;
+    let client = TsfClient::with_api_base_url_and_rest_bearer_token(
+        server.api_url.clone(),
+        "configured-account-token",
+    );
+
+    client
+        .create_stream(&CreateStreamRequest::default())
+        .await
+        .expect("create stream");
+
+    assert_eq!(server.create_authorizations(), [None]);
     server.abort();
 }
 
@@ -243,9 +423,78 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  view+write <url>\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  view+write <url>\n  owner <url>\n\nLinks are shown once.\n"
     );
-    assert_created_output_urls_parse(&explicit.stdout, &["rw", "r"]);
+    assert_created_output_urls_parse(&explicit.stdout, &["o", "rw", "r"]);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_deduplicates_owner_and_rejects_more_than_three_effective_links() {
+    let server = TestServer::start().await;
+
+    let deduplicated = run_tsf(&server, ["new", "--link", "owner", "--link", "view"], None).await;
+    assert!(
+        deduplicated.status.success(),
+        "stderr={}",
+        deduplicated.stderr
+    );
+    assert_created_output_urls_parse(&deduplicated.stdout, &["o", "r"]);
+
+    let too_many = run_tsf(
+        &server,
+        [
+            "new",
+            "--link",
+            "view",
+            "--link",
+            "write",
+            "--link",
+            "view+write",
+        ],
+        None,
+    )
+    .await;
+    assert!(!too_many.status.success());
+    assert!(
+        too_many
+            .stderr
+            .contains("at most 3 initial links may be issued"),
+        "stderr={}",
+        too_many.stderr
+    );
+    assert_eq!(server.create_idempotency_keys().len(), 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_token_files_require_the_exact_requested_permission() {
+    let server = TestServer::start().await;
+
+    let output = run_tsf(
+        &server,
+        [
+            "new",
+            "--link",
+            "view+write",
+            "--view-token-file",
+            "unused.token",
+        ],
+        None,
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert!(
+        output
+            .stderr
+            .contains("--view-token-file requires --link view"),
+        "stderr={}",
+        output.stderr
+    );
+    assert!(server.create_idempotency_keys().is_empty());
 
     server.abort();
 }
@@ -595,7 +844,7 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let write_url = format!("http://localhost:3000/s/{stream_id}#w=write-secret");
+    let write_url = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -608,8 +857,8 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
     let attempts = server.append_attempts();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].writer_id, attempts[1].writer_id);
-    assert_eq!(attempts[0].bearer_token, "write-secret");
-    assert_eq!(attempts[1].bearer_token, "write-secret");
+    assert_eq!(attempts[0].bearer_token, TEST_STREAM_TOKEN);
+    assert_eq!(attempts[1].bearer_token, TEST_STREAM_TOKEN);
     assert_eq!(attempts[0].writer_seq_num, 0);
     assert_eq!(attempts[1].writer_seq_num, 0);
     assert_eq!(attempts[0].data.as_ref(), b"retry me\n");
@@ -749,7 +998,7 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_until_stdout_contains(
         server.api_url.clone(),
@@ -763,13 +1012,13 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
     assert_eq!(output.stderr, "");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].bearer_token, "read-secret");
-    assert_eq!(attempts[1].bearer_token, "read-secret");
+    assert_eq!(attempts[0].bearer_token, TEST_STREAM_TOKEN);
+    assert_eq!(attempts[1].bearer_token, TEST_STREAM_TOKEN);
     assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
+        attempts[0].query.get("seq_num").map(String::as_str),
         Some("0")
     );
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].query.get("tail_offset"), None);
     assert_eq!(
         attempts[1].query.get("seq_num").map(String::as_str),
         Some("1")
@@ -780,12 +1029,12 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
 }
 
 #[tokio::test]
-async fn tail_selector_flags_are_sent_as_read_query() {
+async fn tail_selector_flags_are_resolved_as_read_query() {
     let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let tail_offset_output = run_tsf_until_stdout_contains(
         tail_offset_server.api_url.clone(),
@@ -800,14 +1049,14 @@ async fn tail_selector_flags_are_sent_as_read_query() {
     let attempts = tail_offset_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
-        Some("25")
+        attempts[0].query.get("seq_num").map(String::as_str),
+        Some("0")
     );
     assert_eq!(
         attempts[0].query.get("count").map(String::as_str),
         Some("7")
     );
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].query.get("tail_offset"), None);
     assert_eq!(attempts[0].query.get("timestamp"), None);
     tail_offset_server.abort();
 
@@ -859,12 +1108,206 @@ async fn tail_selector_flags_are_sent_as_read_query() {
 }
 
 #[tokio::test]
+async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
+
+    let output = run_tsf_until_stdout_contains(
+        server.api_url.clone(),
+        ["tail", "-n", "2", read_url.as_str()],
+        b"stable\n",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(output.stdout, "stable\n");
+    assert_eq!(output.stderr, "");
+    let attempts = server.read_attempts();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| {
+        attempt.query.get("seq_num").map(String::as_str) == Some("5")
+            && !attempt.query.contains_key("tail_offset")
+    }));
+    assert_eq!(
+        server.tail_bearer_tokens(),
+        [Some(TEST_STREAM_TOKEN.to_owned())]
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn default_read_start_reconnect_before_first_record_keeps_tail_minus_eighty() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstDefault).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let record = reader
+        .next_record_with_timeout(Duration::from_secs(5))
+        .await
+        .expect("read record")
+        .expect("record");
+
+    assert_eq!(record.s2_seq_num, 20);
+    assert_eq!(record.data.as_ref(), b"default\n");
+    let attempts = server.read_attempts();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| {
+        attempt.query.get("seq_num").map(String::as_str) == Some("20")
+            && !attempt.query.contains_key("tail_offset")
+    }));
+    assert_eq!(
+        server.tail_bearer_tokens(),
+        [Some(TEST_STREAM_TOKEN.to_owned())]
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn reader_bounds_consecutive_reconnects_without_a_record() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectForever).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone());
+    config.retry_policy = RetryPolicy {
+        max_attempts: 3,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let client = TsfClient::with_config(config);
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::SeqNum(0));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let error = timeout(Duration::from_secs(2), reader.next_record())
+        .await
+        .expect("bounded reconnects")
+        .expect_err("no-progress reconnect limit");
+
+    assert!(matches!(
+        error,
+        TsfClientError::ReadReconnectLimitExceeded {
+            max_connection_attempts: 3
+        }
+    ));
+    assert_eq!(server.read_attempts().len(), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn explicit_read_timeout_covers_reconnect_cycles() {
+    let server = FakeReadServer::start(FakeReadMode::SlowReconnectForever).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone());
+    config.retry_policy = RetryPolicy {
+        max_attempts: 100,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let client = TsfClient::with_config(config);
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::SeqNum(0));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let error = timeout(
+        Duration::from_secs(1),
+        reader.next_record_with_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .expect("absolute read deadline")
+    .expect_err("read timeout");
+
+    assert!(matches!(
+        error,
+        TsfClientError::Timeout {
+            operation: "read stream record"
+        }
+    ));
+    assert!(server.read_attempts().len() >= 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reader_resumes_pending_reconnect_after_caller_timeout() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::TailOffset(2));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let error = reader
+        .next_record_with_timeout(Duration::from_millis(50))
+        .await
+        .expect_err("caller timeout during reconnect backoff");
+    assert!(matches!(
+        error,
+        TsfClientError::Timeout {
+            operation: "read stream record"
+        }
+    ));
+
+    let record = timeout(Duration::from_secs(2), reader.next_record())
+        .await
+        .expect("resumed reconnect")
+        .expect("read record")
+        .expect("record");
+    assert_eq!(record.s2_seq_num, 5);
+    assert_eq!(record.data.as_ref(), b"stable\n");
+    assert_eq!(server.read_attempts().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reader_reconnects_after_configured_idle_timeout() {
+    let server = FakeReadServer::start(FakeReadMode::SilentThenRecord).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone());
+    config.websocket_read_idle_timeout = Some(Duration::from_millis(50));
+    config.retry_policy = RetryPolicy {
+        max_attempts: 3,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let client = TsfClient::with_config(config);
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::SeqNum(0));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let record = timeout(Duration::from_secs(2), reader.next_record())
+        .await
+        .expect("idle reconnect")
+        .expect("read record")
+        .expect("record");
+
+    assert_eq!(record.s2_seq_num, 0);
+    assert_eq!(record.data.as_ref(), b"after idle\n");
+    assert_eq!(server.read_attempts().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
 async fn zero_count_reads_complete_without_opening_a_socket() {
     let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let tail = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -893,7 +1336,7 @@ async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -925,7 +1368,7 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
         .expect("owner URL");
     let bad_owner_url = owner_url
         .split_once("#o=")
-        .map(|(prefix, _token)| format!("{prefix}#o=bad-owner-secret"))
+        .map(|(prefix, _token)| format!("{prefix}#o={UNKNOWN_STREAM_TOKEN}"))
         .expect("owner fragment");
 
     let output = run_tsf(&server, ["visibility", &bad_owner_url, "private"], None).await;
@@ -950,7 +1393,7 @@ async fn replay_rejects_logical_records_above_configured_limit() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -987,7 +1430,7 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let seq_output = run_tsf_with_api_url(
@@ -1078,7 +1521,7 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output =
         run_tsf_bytes_with_api_url(server.api_url.clone(), ["replay", read_url.as_str()]).await;
@@ -1211,9 +1654,16 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_create_failures(0).await
+    }
+
+    async fn start_with_create_failures(create_failures: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let state = Arc::new(TestApiState::default());
+        let state = Arc::new(TestApiState {
+            create_failures_remaining: Mutex::new(create_failures),
+            ..TestApiState::default()
+        });
         let router = Router::new()
             .route("/api/v1/streams", post(test_create_stream))
             .route(
@@ -1253,6 +1703,34 @@ impl TestServer {
             .expect("token list failure lock") += 1;
     }
 
+    fn fail_next_create_body(&self) {
+        *self
+            .state
+            .create_invalid_json_remaining
+            .lock()
+            .expect("create body failure lock") += 1;
+    }
+
+    fn create_idempotency_keys(&self) -> Vec<Option<String>> {
+        self.state
+            .create_idempotency_keys
+            .lock()
+            .expect("create idempotency keys lock")
+            .clone()
+    }
+
+    fn create_authorizations(&self) -> Vec<Option<String>> {
+        self.state
+            .create_authorizations
+            .lock()
+            .expect("create authorizations lock")
+            .clone()
+    }
+
+    fn stream_count(&self) -> usize {
+        self.state.streams.lock().expect("streams lock").len()
+    }
+
     async fn wait_for_records(&self, stream_id: &StreamId, expected: usize) {
         let stream_id = stream_id.to_string();
         timeout(Duration::from_secs(5), async {
@@ -1283,6 +1761,11 @@ impl TestServer {
 struct TestApiState {
     next_stream: Mutex<u64>,
     next_token: Mutex<u64>,
+    create_failures_remaining: Mutex<usize>,
+    create_invalid_json_remaining: Mutex<usize>,
+    create_responses: Mutex<HashMap<String, CreateStreamResponse>>,
+    create_idempotency_keys: Mutex<Vec<Option<String>>>,
+    create_authorizations: Mutex<Vec<Option<String>>>,
     token_list_failures_remaining: Mutex<usize>,
     streams: Mutex<HashMap<String, TestStream>>,
 }
@@ -1316,8 +1799,52 @@ struct TestRecord {
 
 async fn test_create_stream(
     State(state): State<Arc<TestApiState>>,
+    headers: HeaderMap,
     Json(request): Json<CreateStreamRequest>,
 ) -> Response {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    state
+        .create_idempotency_keys
+        .lock()
+        .expect("create idempotency keys lock")
+        .push(idempotency_key.clone());
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    state
+        .create_authorizations
+        .lock()
+        .expect("create authorizations lock")
+        .push(authorization);
+    let mut create_failures = state
+        .create_failures_remaining
+        .lock()
+        .expect("create failures lock");
+    if *create_failures > 0 {
+        *create_failures -= 1;
+        return test_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "retry create",
+        );
+    }
+    drop(create_failures);
+
+    if let Some(response) = idempotency_key.as_ref().and_then(|key| {
+        state
+            .create_responses
+            .lock()
+            .expect("create responses lock")
+            .get(key)
+            .cloned()
+    }) {
+        return Json(response).into_response();
+    }
+
     let retention_secs = match request.retention_secs {
         None => 864_000,
         Some(RequestedRetention::Seconds(seconds)) => seconds,
@@ -1372,13 +1899,30 @@ async fn test_create_stream(
         },
     );
 
-    Json(CreateStreamResponse {
+    let response = CreateStreamResponse {
         stream_id,
         visibility: request.visibility,
         retention_secs,
         tokens: response_tokens,
-    })
-    .into_response()
+    };
+    if let Some(key) = idempotency_key {
+        state
+            .create_responses
+            .lock()
+            .expect("create responses lock")
+            .insert(key, response.clone());
+    }
+    let mut invalid_json = state
+        .create_invalid_json_remaining
+        .lock()
+        .expect("create body failure lock");
+    if *invalid_json > 0 {
+        *invalid_json -= 1;
+        return (StatusCode::OK, [("content-type", "application/json")], "{").into_response();
+    }
+    drop(invalid_json);
+
+    Json(response).into_response()
 }
 
 async fn test_get_stream(
@@ -1718,7 +2262,7 @@ fn test_issue_stream_token(state: &TestApiState, permissions: TokenPermissions) 
     let token_id = format!("{:024x}", *next_token)
         .parse::<TokenId>()
         .expect("token id");
-    let token = BearerToken::from(format!("secret-{:024}", *next_token));
+    let token = BearerToken::from(format!("{:042}A", *next_token));
     *next_token += 1;
     TestToken {
         token_id,
@@ -2379,12 +2923,18 @@ struct ReadAttempt {
 
 struct FakeReadState {
     read_attempts: Mutex<Vec<ReadAttempt>>,
+    tail_bearer_tokens: Mutex<Vec<Option<String>>>,
     mode: FakeReadMode,
 }
 
 #[derive(Clone, Copy)]
 enum FakeReadMode {
     Reconnect,
+    ReconnectBeforeFirstRecord,
+    ReconnectBeforeFirstDefault,
+    ReconnectForever,
+    SlowReconnectForever,
+    SilentThenRecord,
     ReplayTranscript,
     ReplayBinary,
     ReplaySplitRecord,
@@ -2402,6 +2952,7 @@ impl FakeReadServer {
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(FakeReadState {
             read_attempts: Mutex::new(Vec::new()),
+            tail_bearer_tokens: Mutex::new(Vec::new()),
             mode,
         });
         let router = Router::new()
@@ -2426,6 +2977,14 @@ impl FakeReadServer {
             .clone()
     }
 
+    fn tail_bearer_tokens(&self) -> Vec<Option<String>> {
+        self.state
+            .tail_bearer_tokens
+            .lock()
+            .expect("tail bearer tokens lock")
+            .clone()
+    }
+
     fn abort(self) {
         self.task.abort();
     }
@@ -2434,9 +2993,25 @@ impl FakeReadServer {
 async fn fake_read_tail(
     State(state): State<Arc<FakeReadState>>,
     Path(stream_id): Path<String>,
+    headers: HeaderMap,
 ) -> Json<serde_json::Value> {
+    let bearer_token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    state
+        .tail_bearer_tokens
+        .lock()
+        .expect("tail bearer tokens lock")
+        .push(bearer_token);
     let next_s2_seq_num = match state.mode {
-        FakeReadMode::Reconnect => 2,
+        FakeReadMode::Reconnect => 0,
+        FakeReadMode::ReconnectBeforeFirstRecord => 7,
+        FakeReadMode::ReconnectBeforeFirstDefault => 100,
+        FakeReadMode::ReconnectForever
+        | FakeReadMode::SlowReconnectForever
+        | FakeReadMode::SilentThenRecord => 0,
         FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
@@ -2506,6 +3081,48 @@ async fn fake_read_flow(
                 .expect("send reconnect advised");
             } else {
                 send_read_record(&mut socket, 1, 1, b"second\n").await;
+            }
+        }
+        FakeReadMode::ReconnectBeforeFirstRecord => {
+            if attempt_count == 1 {
+                send_server_frame(
+                    &mut socket,
+                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+                )
+                .await
+                .expect("send reconnect advised");
+            } else {
+                send_read_record(&mut socket, 5, 0, b"stable\n").await;
+            }
+        }
+        FakeReadMode::ReconnectBeforeFirstDefault => {
+            if attempt_count == 1 {
+                send_server_frame(
+                    &mut socket,
+                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+                )
+                .await
+                .expect("send reconnect advised");
+            } else {
+                send_read_record(&mut socket, 20, 0, b"default\n").await;
+            }
+        }
+        FakeReadMode::ReconnectForever | FakeReadMode::SlowReconnectForever => {
+            if matches!(state.mode, FakeReadMode::SlowReconnectForever) {
+                sleep(Duration::from_millis(40)).await;
+            }
+            send_server_frame(
+                &mut socket,
+                ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+            )
+            .await
+            .expect("send reconnect advised");
+        }
+        FakeReadMode::SilentThenRecord => {
+            if attempt_count == 1 {
+                sleep(Duration::from_secs(5)).await;
+            } else {
+                send_read_record(&mut socket, 0, 0, b"after idle\n").await;
             }
         }
         FakeReadMode::ReplayTranscript => {

@@ -67,7 +67,7 @@ pub struct CreateStreamRequest {
     /// Requested retention, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_secs: Option<RequestedRetention>,
-    /// Stream-token permissions to issue atomically with creation.
+    /// Requested initial token permissions. The service adds an owner token when absent. At most three effective tokens are allowed, including the owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_tokens: Option<Vec<TokenPermissions>>,
 }

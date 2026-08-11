@@ -17,8 +17,8 @@ use memchr::memchr;
 use secrecy::ExposeSecret;
 use serde::Serialize;
 use tailsurf::{
-    AppendTicket, BearerToken, StreamId, TokenId, TokenPermissions, TsfClient, TsfProducer,
-    TsfReadSession, WriteRecord, WriterId,
+    AppendTicket, BearerToken, CreateStreamIdempotencyKey, StreamId, TokenId, TokenPermissions,
+    TsfClient, TsfProducer, TsfReadSession, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -49,6 +49,7 @@ const TRANSCRIPT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
 const TRANSCRIPT_RECORD_QUEUE: usize = 8;
 /// Stdin read block size for line-framed and raw writes.
 const STDIN_READ_BYTES: usize = 16 * 1024;
+const MAX_INITIAL_TOKENS: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
@@ -114,7 +115,7 @@ struct NewArgs {
     /// Allow anonymous reads.
     #[arg(long)]
     public: bool,
-    /// Issue this link at creation instead of the default owner link. May be repeated.
+    /// Issue an additional link at creation. The owner link is always issued. May be repeated.
     #[arg(long = "link", value_name = "ACCESS")]
     links: Vec<AccessArg>,
     #[arg(
@@ -123,16 +124,19 @@ struct NewArgs {
         help = "Record retention, such as 6h, 7d, or infinite"
     )]
     retention: Option<RetentionArg>,
+    /// Owner-equivalent recovery key for resuming this exact create request.
+    #[arg(long, env = "TSF_CREATE_IDEMPOTENCY_KEY", value_name = "KEY")]
+    create_idempotency_key: Option<CreateStreamIdempotencyKey>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
     /// Write the owner token secret to this file.
     #[arg(long = "owner-token-file", value_name = "PATH")]
     owner_token_file: Option<PathBuf>,
-    /// Write the view token secret to this file.
+    /// Write the exact view-only token secret to this file. Requires `--link view`.
     #[arg(long = "view-token-file", value_name = "PATH")]
     view_token_file: Option<PathBuf>,
-    /// Write the write token secret to this file.
+    /// Write the exact write-only token secret to this file. Requires `--link write`.
     #[arg(long = "write-token-file", value_name = "PATH")]
     write_token_file: Option<PathBuf>,
 }
@@ -151,6 +155,9 @@ struct WriteArgs {
         help = "New-stream record retention, such as 6h, 7d, or infinite"
     )]
     retention: Option<RetentionArg>,
+    /// Owner-equivalent recovery key for an implicitly created stream.
+    #[arg(long, env = "TSF_CREATE_IDEMPOTENCY_KEY", value_name = "KEY")]
+    create_idempotency_key: Option<CreateStreamIdempotencyKey>,
     /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
     #[arg(long)]
     raw: bool,
@@ -509,23 +516,41 @@ fn print_error(error: &eyre::Report) {
 
 async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<()> {
     let visibility = visibility_from_flags(args.public);
-    let issue_tokens = if args.links.is_empty() {
-        vec![TokenPermissions::owner()]
-    } else {
-        args.links.iter().map(|access| access.0).collect()
-    };
+    let issue_tokens = new_stream_tokens(&args)?;
 
     let created = create_stream(
         api_url,
         visibility,
         args.retention.map(Into::into),
         issue_tokens,
+        args.create_idempotency_key.as_ref(),
     )
     .await?;
-    write_token_files(&created.tokens, &args)?;
     print_created_stream(&web_url, &created, args.format, OutputTarget::Stdout)?;
+    write_token_files(&created.tokens, &args)?;
 
     Ok(())
+}
+
+fn new_stream_tokens(args: &NewArgs) -> eyre::Result<Vec<TokenPermissions>> {
+    let mut issue_tokens = vec![TokenPermissions::owner()];
+    for access in &args.links {
+        if !issue_tokens.contains(&access.0) {
+            issue_tokens.push(access.0);
+        }
+    }
+    if issue_tokens.len() > MAX_INITIAL_TOKENS {
+        bail!(
+            "at most {MAX_INITIAL_TOKENS} initial links may be issued, including the mandatory owner link"
+        );
+    }
+    if args.view_token_file.is_some() && !issue_tokens.contains(&TokenPermissions::read()) {
+        bail!("--view-token-file requires --link view");
+    }
+    if args.write_token_file.is_some() && !issue_tokens.contains(&TokenPermissions::write()) {
+        bail!("--write-token-file requires --link write");
+    }
+    Ok(issue_tokens)
 }
 
 async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Result<()> {
@@ -550,6 +575,7 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
             visibility,
             args.retention.map(Into::into),
             write_new_default_links(visibility),
+            args.create_idempotency_key.as_ref(),
         )
         .await?;
         print_created_stream(&web_url, &created, OutputFormat::Text, OutputTarget::Stderr)?;
@@ -560,7 +586,7 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
             .context("created stream did not include a write-capable link")?
             .token
             .clone();
-        let view_link = created_view_link(&web_url, &created)
+        let view_link = created_view_link(&web_url, &created)?
             .context("created stream did not include a view link")?;
         println!("{view_link}");
         (created.stream_id, token, Some(view_link))
@@ -591,6 +617,9 @@ fn validate_write_args(args: &WriteArgs) -> eyre::Result<()> {
     if args.retention.is_some() {
         bail!("--retention cannot be used when writing to an existing stream");
     }
+    if args.create_idempotency_key.is_some() {
+        bail!("--create-idempotency-key cannot be used when writing to an existing stream");
+    }
     Ok(())
 }
 
@@ -599,20 +628,39 @@ async fn create_stream(
     visibility: Visibility,
     retention_secs: Option<RequestedRetention>,
     issue_tokens: Vec<TokenPermissions>,
+    supplied_key: Option<&CreateStreamIdempotencyKey>,
 ) -> eyre::Result<CreateStreamResponse> {
-    TsfClient::with_api_base_url(api_url)
-        .create_stream(&CreateStreamRequest {
-            visibility,
-            retention_secs,
-            issue_tokens: Some(issue_tokens),
-        })
-        .await
-        .context("failed to create stream")
+    let generated_key;
+    let idempotency_key = match supplied_key {
+        Some(key) => key,
+        None => {
+            generated_key = CreateStreamIdempotencyKey::new_random();
+            &generated_key
+        }
+    };
+    let result = TsfClient::with_api_base_url(api_url)
+        .create_stream_with_idempotency_key(
+            &CreateStreamRequest {
+                visibility,
+                retention_secs,
+                issue_tokens: Some(issue_tokens),
+            },
+            idempotency_key,
+        )
+        .await;
+    match result {
+        Ok(created) => Ok(created),
+        Err(error) if error.is_recoverable_create_failure() => Err(error).wrap_err(format!(
+            "stream creation did not complete; recover this exact request by setting TSF_CREATE_IDEMPOTENCY_KEY to this owner-equivalent recovery key (keep it secret):\n{}",
+            idempotency_key.expose_secret()
+        )),
+        Err(error) => Err(error).context("failed to create stream"),
+    }
 }
 
-fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> Option<Url> {
+fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> eyre::Result<Option<Url>> {
     if matches!(created.visibility, Visibility::Public) {
-        return Some(bare_stream_url(web_url, &created.stream_id));
+        return Ok(Some(bare_stream_url(web_url, &created.stream_id)));
     }
 
     created
@@ -627,6 +675,8 @@ fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> Option<Ur
                 &issued.token,
             )
         })
+        .transpose()
+        .map_err(Into::into)
 }
 
 async fn stream_stdin_to_writer(
@@ -1432,22 +1482,22 @@ fn print_created_stream(
                 .tokens
                 .iter()
                 .map(|issued| {
-                    (
+                    Ok((
                         link_label(issued.permissions),
                         stream_url(
                             web_url,
                             &created.stream_id,
                             issued.permissions,
                             &issued.token,
-                        ),
+                        )?,
                         if issued.permissions.allows_owner() {
                             "  (keep private)"
                         } else {
                             ""
                         },
-                    )
+                    ))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, tailsurf::stream_url::StreamUrlError>>()?;
             if matches!(created.visibility, Visibility::Public) {
                 links.push((
                     "view",
@@ -1479,18 +1529,18 @@ fn print_created_stream(
                     .tokens
                     .iter()
                     .map(|issued| {
-                        (
+                        Ok((
                             issued.permissions.to_string(),
                             stream_url(
                                 web_url,
                                 &created.stream_id,
                                 issued.permissions,
                                 &issued.token,
-                            )
+                            )?
                             .to_string(),
-                        )
+                        ))
                     })
-                    .collect(),
+                    .collect::<Result<BTreeMap<_, _>, tailsurf::stream_url::StreamUrlError>>()?,
             };
             target.print_line(&serde_json::to_string_pretty(&output)?);
         }
@@ -1520,7 +1570,7 @@ fn print_issued_token(
     issued: &IssueTokenResponse,
     format: OutputFormat,
 ) -> eyre::Result<()> {
-    let url = stream_url(web_url, stream_id, issued.permissions, &issued.token);
+    let url = stream_url(web_url, stream_id, issued.permissions, &issued.token)?;
     match format {
         OutputFormat::Text => {
             println!("Issued {} link", link_label(issued.permissions));
@@ -1545,19 +1595,19 @@ fn write_token_files(tokens: &[IssuedStreamToken], args: &NewArgs) -> eyre::Resu
     write_token_file(
         &args.owner_token_file,
         tokens,
-        TokenPermissions::allows_owner,
+        TokenPermissions::owner(),
         "owner",
     )?;
     write_token_file(
         &args.view_token_file,
         tokens,
-        TokenPermissions::allows_read,
+        TokenPermissions::read(),
         "view",
     )?;
     write_token_file(
         &args.write_token_file,
         tokens,
-        TokenPermissions::allows_write,
+        TokenPermissions::write(),
         "write",
     )?;
     Ok(())
@@ -1566,7 +1616,7 @@ fn write_token_files(tokens: &[IssuedStreamToken], args: &NewArgs) -> eyre::Resu
 fn write_token_file(
     path: &Option<PathBuf>,
     tokens: &[IssuedStreamToken],
-    allows: impl Fn(TokenPermissions) -> bool,
+    permissions: TokenPermissions,
     label: &str,
 ) -> eyre::Result<()> {
     let Some(path) = path else {
@@ -1574,7 +1624,7 @@ fn write_token_file(
     };
     let token = tokens
         .iter()
-        .find(|token| allows(token.permissions))
+        .find(|token| token.permissions == permissions)
         .with_context(|| format!("created stream did not include a {label} token"))?;
     write_secret_file(path, token.token.expose_secret())
         .with_context(|| format!("failed to write {label} token file {}", path.display()))?;
