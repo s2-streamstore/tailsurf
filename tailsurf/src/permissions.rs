@@ -6,7 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// Valid permissions for a stream token.
 ///
-/// Owner permission implies read and write and cannot be combined with either bit. String and JSON representations are canonicalized to `o`, `r`, `w`, or `rw`.
+/// Owner permission implies read and write and cannot be combined with either bit. String and JSON
+/// representations are canonicalized to `o`, `r`, `w`, or `rw`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TokenPermissions(u8);
 

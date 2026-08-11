@@ -1,9 +1,9 @@
 //! Parsing and construction for human-facing `/s/{stream_id}` share URLs.
 
+use secrecy::ExposeSecret;
 use url::{Url, form_urlencoded};
 
 use crate::{BearerToken, StreamId, TokenPermissions};
-use secrecy::ExposeSecret;
 
 /// Default origin for Tailsurf share URLs.
 pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";

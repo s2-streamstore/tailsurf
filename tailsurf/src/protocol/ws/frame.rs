@@ -1,9 +1,9 @@
 //! Exact binary codec for one-frame-per-message `tsf.v3` WebSocket traffic.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use secrecy::ExposeSecret;
 
 use crate::{BearerToken, WriterId};
-use secrecy::ExposeSecret;
 
 /// Numeric protocol version sent in [`ServerFrame::Hello`].
 pub type ProtocolVersion = u16;
@@ -79,7 +79,8 @@ impl TryFrom<u8> for ServerOp {
 
 /// Packed split-record part index and final-part marker.
 ///
-/// The high bit marks the final part and the low 31 bits contain the zero-based part index. An unsplit record is encoded as index zero with the final bit set.
+/// The high bit marks the final part and the low 31 bits contain the zero-based part index. An
+/// unsplit record is encoded as index zero with the final bit set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartHeader(u32);
 

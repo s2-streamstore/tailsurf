@@ -2,11 +2,13 @@
 
 use bytes::Bytes;
 use serde::Deserialize;
-use tailsurf::protocol::ws::frame::{
-    ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat, ServerFrame,
-    TSF_V3, TSF_WS_PROTOCOL,
+use tailsurf::{
+    BearerToken, WriterId,
+    protocol::ws::frame::{
+        ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat, ServerFrame,
+        TSF_V3, TSF_WS_PROTOCOL,
+    },
 };
-use tailsurf::{BearerToken, WriterId};
 
 const FIXTURES_JSON: &str = include_str!("../fixtures/v3.json");
 
