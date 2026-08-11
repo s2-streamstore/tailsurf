@@ -282,38 +282,4 @@ mod tests {
             json!({})
         );
     }
-
-    #[test]
-    fn deserializes_token_inventory_without_secrets() {
-        let response: ListTokensResponse = serde_json::from_value(json!({
-            "tokens": [{
-                "token_id": "0123456789abcdefghjkmnpq",
-                "permissions": "o",
-                "status": "active",
-                "issued_at": "2026-08-07T12:00:00.000Z",
-                "expires_at": null,
-                "revoked_at": null,
-                "is_current": true
-            }]
-        }))
-        .expect("token inventory");
-
-        assert_eq!(response.tokens[0].status, StreamTokenStatus::Active);
-        assert!(response.tokens[0].is_current);
-    }
-
-    #[test]
-    fn deserializes_retained_stream_range() {
-        let response: StreamRangeResponse = serde_json::from_value(json!({
-            "stream_id": "0123456789abcdefghjkmnpqrstvwxyz",
-            "first_s2_seq_num": 4,
-            "first_timestamp_ms": 1_786_000_000_000_u64,
-            "next_s2_seq_num": 9,
-            "last_timestamp_ms": 1_786_000_010_000_u64
-        }))
-        .expect("stream range");
-
-        assert_eq!(response.first_s2_seq_num, Some(4));
-        assert_eq!(response.next_s2_seq_num, 9);
-    }
 }

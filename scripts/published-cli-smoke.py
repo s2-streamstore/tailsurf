@@ -16,7 +16,6 @@ import tomllib
 from dataclasses import dataclass
 
 
-DEFAULT_PACKAGE = "tailsurf-cli"
 INSTALL_TIMEOUT_SECS = int(os.environ.get("TSF_PUBLISHED_CLI_INSTALL_TIMEOUT_SECS", "300"))
 COMMAND_TIMEOUT_SECS = int(os.environ.get("TSF_PUBLISHED_CLI_COMMAND_TIMEOUT_SECS", "30"))
 
@@ -30,14 +29,15 @@ class CreatedStream:
 
 def main() -> int:
     if sys.argv[1:] == ["--self-test"]:
-        return self_test()
+        self_test()
+        return 0
 
     args = parse_args()
     require(args.api_url, "TSF_API_URL or --api-url")
     require(args.web_url, "TSF_WEB_URL or --web-url")
 
     with tempfile.TemporaryDirectory(prefix="tsf-published-cli-") as temp_dir:
-        tsf_bin = args.tsf_bin or install_published_cli(args, pathlib.Path(temp_dir))
+        tsf_bin = install_published_cli(args.version, pathlib.Path(temp_dir))
         run_command([tsf_bin, "--help"], "tsf --help")
         created = create_stream(tsf_bin, args.api_url, args.web_url)
         message = f"tailsurf published cli smoke {int(time.time())}\n".encode()
@@ -59,7 +59,7 @@ def main() -> int:
             )
             if message not in replayed.stdout:
                 raise PublishedCliSmokeError("tsf replay did not include the smoke record")
-        finally:
+        except Exception:
             run_tsf(
                 tsf_bin,
                 args.api_url,
@@ -68,6 +68,14 @@ def main() -> int:
                 "tsf delete cleanup",
                 expect_success=False,
             )
+            raise
+        run_tsf(
+            tsf_bin,
+            args.api_url,
+            args.web_url,
+            ["delete", created.owner_url],
+            "tsf delete",
+        )
 
     print("published CLI smoke passed")
     return 0
@@ -80,17 +88,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-url", default=os.environ.get("TSF_API_URL"))
     parser.add_argument("--web-url", default=os.environ.get("TSF_WEB_URL"))
     parser.add_argument("--version", default=os.environ.get("TSF_CLI_VERSION") or workspace_version())
-    parser.add_argument("--package", default=os.environ.get("TSF_CLI_PACKAGE", DEFAULT_PACKAGE))
-    parser.add_argument("--cargo", default=os.environ.get("CARGO", "cargo"))
-    parser.add_argument("--tsf-bin", default=os.environ.get("TSF_BIN"), help="Use an existing tsf binary instead of cargo installing from crates.")
-    parser.add_argument("--registry", default=os.environ.get("TSF_CARGO_REGISTRY"), help="Optional cargo registry name.")
-    parser.add_argument("--index", default=os.environ.get("TSF_CARGO_INDEX"), help="Optional cargo registry index URL.")
-    parser.add_argument(
-        "--locked",
-        action="store_true",
-        default=env_enabled("TSF_CARGO_INSTALL_LOCKED"),
-        help="Pass --locked to cargo install.",
-    )
     return parser.parse_args()
 
 
@@ -101,24 +98,18 @@ def workspace_version() -> str:
     return str(manifest["workspace"]["package"]["version"])
 
 
-def install_published_cli(args: argparse.Namespace, temp_dir: pathlib.Path) -> str:
+def install_published_cli(version: str, temp_dir: pathlib.Path) -> str:
     install_root = temp_dir / "install"
     command = [
-        args.cargo,
+        "cargo",
         "install",
-        args.package,
+        "tailsurf-cli",
         "--version",
-        args.version,
+        version,
         "--root",
         str(install_root),
-        "--force",
+        "--locked",
     ]
-    if args.locked:
-        command.append("--locked")
-    if args.registry:
-        command.extend(["--registry", args.registry])
-    if args.index:
-        command.extend(["--index", args.index])
     run_command(command, "cargo install published tailsurf CLI", timeout=INSTALL_TIMEOUT_SECS)
     tsf_bin = install_root / "bin" / ("tsf.exe" if os.name == "nt" else "tsf")
     if not tsf_bin.exists():
@@ -203,43 +194,30 @@ def require(value: str | None, name: str) -> None:
         raise PublishedCliSmokeError(f"{name} must be set")
 
 
-def env_enabled(name: str) -> bool:
-    return os.environ.get(name, "").lower() in {"1", "true", "yes"}
-
-
 def redact(text: str) -> str:
     text = re.sub(r"(https?://[^\s#'\"]+/s/[^\s#'\"]+)#[^\s'\"]+", r"\1#<redacted>", text)
     text = re.sub(r"Bearer\s+[^\s]+", "Bearer <redacted>", text)
     return text
 
 
-def self_test() -> int:
+def self_test() -> None:
     redacted = redact(
-        "failed https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=secret Bearer another-secret"
+        "https://tailsurf.example/s/stream#o=owner-secret Authorization: Bearer bearer-secret"
     )
-    if "secret" in redacted or "another-secret" in redacted:
-        raise PublishedCliSmokeError(f"redaction self-test leaked a secret: {redacted}")
-    created = parse_created_stream(
-        json.dumps(
-            {
-                "urls": {
-                    "o": "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#o=owner",
-                    "w": "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=write",
-                    "r": "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=read",
-                }
-            }
-        ).encode()
-    )
-    if "#o=" not in created.owner_url or "#w=" not in created.write_url or "#r=" not in created.read_url:
-        raise PublishedCliSmokeError("created stream parser self-test failed")
-    try:
-        parse_created_stream(b'{"urls": {"o": "owner"}}')
-    except PublishedCliSmokeError as error:
-        if "owner, write, and read URLs" not in str(error):
-            raise
-    else:
-        raise PublishedCliSmokeError("parser self-test did not reject missing URLs")
-    return 0
+    if "owner-secret" in redacted or "bearer-secret" in redacted:
+        raise PublishedCliSmokeError("redaction self-test failed")
+
+    payload = b'{"urls":{"o":"owner","w":"write","r":"read"}}'
+    if parse_created_stream(payload) != CreatedStream("owner", "write", "read"):
+        raise PublishedCliSmokeError("stream parsing self-test failed")
+    for malformed in (b"not-json", b'{"urls":{"o":"owner"}}'):
+        try:
+            parse_created_stream(malformed)
+        except PublishedCliSmokeError:
+            continue
+        raise PublishedCliSmokeError("malformed stream output was accepted")
+
+    print("published CLI smoke self-test passed")
 
 
 class PublishedCliSmokeError(RuntimeError):

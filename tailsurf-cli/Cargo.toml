@@ -16,7 +16,6 @@ name = "tsf"
 path = "src/main.rs"
 
 [dependencies]
-axoupdater.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true

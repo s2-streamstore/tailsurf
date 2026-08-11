@@ -13,7 +13,6 @@ rust-version = "1.95"
 version = "0.3.0"
 
 [workspace.dependencies]
-axoupdater = { version = "0.10.0", default-features = false, features = ["github_releases"] }
 bytes = "1.12.1"
 clap = "4.6.6"
 eyre = "0.6.12"

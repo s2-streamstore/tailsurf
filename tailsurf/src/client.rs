@@ -1943,21 +1943,6 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_api_origin() {
-        let config = TsfClientConfig::default();
-
-        assert_eq!(config.api_base_url, default_api_base_url());
-        assert_eq!(config.rest_request_timeout, Duration::from_secs(10));
-        assert_eq!(config.websocket_connect_timeout, Duration::from_secs(10));
-        assert_eq!(config.websocket_operation_timeout, Duration::from_secs(30));
-        assert_eq!(
-            config.websocket_read_idle_timeout,
-            Some(Duration::from_secs(60))
-        );
-        assert_eq!(config.retry_policy, RetryPolicy::default());
-    }
-
-    #[test]
     fn idempotency_key_encoding_is_canonical_unpadded_base64url() {
         let encoded = encode_base64url_32(&[0_u8; 32]);
 

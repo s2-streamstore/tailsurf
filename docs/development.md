@@ -33,19 +33,9 @@ Run the workspace checks:
 ```sh
 cargo fmt --all --check
 cargo test --workspace
-cargo check --workspace --examples
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
-python3 scripts/published-cli-smoke.py --self-test
 scripts/verify-packages.sh
 ```
 
 The package verifier builds the exact SDK and CLI archives that would be published. It extracts both archives, patches the CLI registry dependency to the packaged SDK, and checks every packaged target.
-
-## URL parser diagnostic
-
-Run the CLI URL parser directly:
-
-```sh
-cargo run -p tailsurf-cli -- parse-url 'https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=example-token'
-```

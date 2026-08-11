@@ -93,31 +93,6 @@ impl LogicalTranscript {
         }
     }
 
-    /// Returns the complete configured limits.
-    pub const fn limits(&self) -> TranscriptLimits {
-        self.limits
-    }
-
-    /// Returns the configured logical-record byte limit.
-    pub fn max_logical_record_bytes(&self) -> usize {
-        self.limits.max_logical_record_bytes
-    }
-
-    /// Returns the number of retained writer identities.
-    pub fn writer_state_count(&self) -> usize {
-        self.writers.len()
-    }
-
-    /// Returns payload bytes retained across unfinished split records.
-    pub const fn pending_bytes(&self) -> usize {
-        self.pending_bytes
-    }
-
-    /// Returns physical parts retained across unfinished split records.
-    pub const fn pending_parts(&self) -> usize {
-        self.pending_parts
-    }
-
     /// Processes one physical record.
     ///
     /// Returns a complete logical record when one becomes available, or `None` when the input was a duplicate, an incomplete split part, or a malformed partial sequence.
@@ -743,32 +718,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_expose_aggregate_memory_and_writer_bounds() {
-        let transcript = LogicalTranscript::new();
-
-        assert_eq!(transcript.limits(), TranscriptLimits::default());
-        assert_eq!(
-            transcript.max_logical_record_bytes(),
-            DEFAULT_MAX_LOGICAL_RECORD_BYTES
-        );
-        assert_eq!(
-            transcript.limits().max_writer_states,
-            DEFAULT_MAX_WRITER_STATES
-        );
-        assert_eq!(
-            transcript.limits().max_pending_bytes,
-            DEFAULT_MAX_PENDING_BYTES
-        );
-        assert_eq!(
-            transcript.limits().max_pending_parts,
-            DEFAULT_MAX_PENDING_PARTS
-        );
-        assert_eq!(transcript.writer_state_count(), 0);
-        assert_eq!(transcript.pending_bytes(), 0);
-        assert_eq!(transcript.pending_parts(), 0);
-    }
-
-    #[test]
     fn rejects_new_writer_identities_above_the_configured_limit() {
         let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 16, 16));
 
@@ -799,7 +748,7 @@ mod tests {
             error,
             TranscriptError::WriterStateLimitExceeded { actual: 3, max: 2 }
         );
-        assert_eq!(transcript.writer_state_count(), 2);
+        assert_eq!(transcript.writers.len(), 2);
     }
 
     #[test]
@@ -820,8 +769,8 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_bytes(), 3);
-        assert_eq!(transcript.pending_parts(), 1);
+        assert_eq!(transcript.pending_bytes, 3);
+        assert_eq!(transcript.pending_parts, 1);
 
         let error = transcript
             .push_record(record_with_writer(
@@ -835,7 +784,7 @@ mod tests {
             error,
             TranscriptError::PendingBytesLimitExceeded { actual: 5, max: 4 }
         );
-        assert_eq!(transcript.pending_bytes(), 3);
+        assert_eq!(transcript.pending_bytes, 3);
 
         assert_chunked_record(
             push(
@@ -849,8 +798,8 @@ mod tests {
             ),
             b"abcd",
         );
-        assert_eq!(transcript.pending_bytes(), 0);
-        assert_eq!(transcript.pending_parts(), 0);
+        assert_eq!(transcript.pending_bytes, 0);
+        assert_eq!(transcript.pending_parts, 0);
 
         assert_eq!(
             push(
@@ -864,8 +813,8 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_bytes(), 4);
-        assert_eq!(transcript.pending_parts(), 1);
+        assert_eq!(transcript.pending_bytes, 4);
+        assert_eq!(transcript.pending_parts, 1);
     }
 
     #[test]
@@ -898,8 +847,8 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_bytes(), 0);
-        assert_eq!(transcript.pending_parts(), 2);
+        assert_eq!(transcript.pending_bytes, 0);
+        assert_eq!(transcript.pending_parts, 2);
 
         let error = transcript
             .push_record(record_with_writer(
@@ -913,8 +862,8 @@ mod tests {
             error,
             TranscriptError::PendingPartsLimitExceeded { actual: 3, max: 2 }
         );
-        assert_eq!(transcript.pending_bytes(), 0);
-        assert_eq!(transcript.pending_parts(), 1);
+        assert_eq!(transcript.pending_bytes, 0);
+        assert_eq!(transcript.pending_parts, 1);
 
         assert_eq!(
             push(
@@ -931,7 +880,7 @@ mod tests {
                 data: TranscriptData::from_static(b""),
             })
         );
-        assert_eq!(transcript.pending_parts(), 0);
+        assert_eq!(transcript.pending_parts, 0);
     }
 
     #[test]
@@ -945,7 +894,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_parts(), 1);
+        assert_eq!(transcript.pending_parts, 1);
         assert_chunked_record(
             push(
                 &mut transcript,
@@ -953,7 +902,7 @@ mod tests {
             ),
             b"ab",
         );
-        assert_eq!(transcript.pending_parts(), 0);
+        assert_eq!(transcript.pending_parts, 0);
     }
 
     #[test]
@@ -967,8 +916,8 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_bytes(), 3);
-        assert_eq!(transcript.pending_parts(), 1);
+        assert_eq!(transcript.pending_bytes, 3);
+        assert_eq!(transcript.pending_parts, 1);
         assert_eq!(
             push(
                 &mut transcript,
@@ -976,7 +925,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_bytes(), 0);
-        assert_eq!(transcript.pending_parts(), 0);
+        assert_eq!(transcript.pending_bytes, 0);
+        assert_eq!(transcript.pending_parts, 0);
     }
 }
