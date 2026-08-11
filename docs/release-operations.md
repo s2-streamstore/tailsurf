@@ -20,7 +20,11 @@ Release builds, macOS signing and notarization, hosting, and artifact attestatio
 
 ## Updates
 
-Direct installations update by rerunning the installer. Cargo installations update by rerunning `cargo install tailsurf-cli --locked`. Other package-manager installations remain owned by their package manager.
+Axoupdater is embedded in `tsf`. Direct installations use the dist installer receipt for explicit updates through `tsf update`.
+
+`tsf update` and `tsf update --check` contact GitHub Releases. The installer receipt stays local. The CLI does not check for updates in the background.
+
+The updater refuses installations it does not own. Cargo installations remain owned by Cargo. Other package-manager installations remain owned by their package manager.
 
 ## Platform trust
 

@@ -29,7 +29,7 @@ Install it from PowerShell on Windows:
 irm https://tail.surf/install.ps1 | iex
 ```
 
-The direct installer puts `tsf` in `~/.local/bin`.
+The direct installer puts `tsf` in `~/.local/bin`. It writes an installer receipt so `tsf` can update only the files that installer owns.
 
 Cargo remains the Rust-native fallback:
 
@@ -37,7 +37,19 @@ Cargo remains the Rust-native fallback:
 cargo install tailsurf-cli --locked
 ```
 
-Update `tsf` with the same installation method. Direct installer users rerun the installer command above. Cargo users rerun `cargo install tailsurf-cli --locked`. cargo-binstall users rerun `cargo binstall tailsurf-cli`.
+Update a direct installation explicitly:
+
+```sh
+tsf update
+```
+
+Check without installing:
+
+```sh
+tsf update --check
+```
+
+`tsf` does not check for updates in the background. Installations owned by a package manager stay with that manager. Cargo users rerun `cargo install tailsurf-cli --locked`. cargo-binstall users rerun `cargo binstall tailsurf-cli`.
 
 ## SDK quickstart
 

@@ -9,6 +9,7 @@ use std::{
     str::FromStr,
 };
 
+use axoupdater::AxoUpdater;
 use bytes::{Buf, Bytes, BytesMut};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Context, ContextCompat, bail};
@@ -92,6 +93,15 @@ enum Command {
     Visibility(VisibilityArgs),
     /// Manage share links.
     Link(LinkArgs),
+    /// Update an installation managed by the tail.surf installer.
+    Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    /// Check whether an update is available without installing it.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -438,7 +448,48 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         Command::Delete(args) => delete_stream(cli.api_url, args).await,
         Command::Visibility(args) => update_visibility(cli.api_url, args).await,
         Command::Link(args) => link_command(cli.api_url, cli.web_url, args).await,
+        Command::Update(args) => update_cli(args).await,
     }
+}
+
+async fn update_cli(args: UpdateArgs) -> eyre::Result<()> {
+    let mut updater = managed_updater()?;
+
+    if args.check {
+        if updater
+            .is_update_needed()
+            .await
+            .context("failed to check for a tsf update")?
+        {
+            println!("An update is available. Run `tsf update` to install it.");
+        } else {
+            println!("tsf is up to date.");
+        }
+        return Ok(());
+    }
+
+    updater.enable_installer_output();
+    match updater.run().await.context("failed to update tsf")? {
+        Some(_) => eprintln!("Updated tsf."),
+        None => eprintln!("tsf is already up to date."),
+    }
+    Ok(())
+}
+
+fn managed_updater() -> eyre::Result<AxoUpdater> {
+    const OWNERSHIP_ERROR: &str = "this tsf installation is not managed by the tail.surf installer; update it with the package manager that installed it (Cargo: cargo install tailsurf-cli --locked)";
+
+    let mut updater = AxoUpdater::new_for("tailsurf-cli");
+    updater
+        .load_receipt()
+        .map_err(|_| eyre::eyre!(OWNERSHIP_ERROR))?;
+    let owns_executable = updater
+        .check_receipt_is_for_this_executable()
+        .map_err(|_| eyre::eyre!(OWNERSHIP_ERROR))?;
+    if !owns_executable {
+        bail!(OWNERSHIP_ERROR);
+    }
+    Ok(updater)
 }
 
 fn is_broken_pipe(error: &eyre::Report) -> bool {
@@ -1761,6 +1812,20 @@ struct IssuedTokenOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_update_and_check_modes() {
+        for (arguments, expected_check) in [
+            (&["tsf", "update"][..], false),
+            (&["tsf", "update", "--check"][..], true),
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("valid update command");
+            let Command::Update(args) = cli.command else {
+                panic!("expected update command");
+            };
+            assert_eq!(args.check, expected_check);
+        }
+    }
 
     #[test]
     fn classifies_wrapped_broken_pipes_only() {

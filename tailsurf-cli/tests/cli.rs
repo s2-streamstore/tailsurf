@@ -57,6 +57,19 @@ const TEST_STREAM_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const UNKNOWN_STREAM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
 
 #[test]
+fn update_refuses_an_unmanaged_executable() {
+    let update = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .arg("update")
+        .output()
+        .expect("tsf update");
+
+    assert!(!update.status.success());
+    let error = String::from_utf8(update.stderr).expect("stderr UTF-8");
+    assert!(error.contains("not managed by the tail.surf installer"));
+    assert!(error.contains("cargo install tailsurf-cli --locked"));
+}
+
+#[test]
 fn write_rejects_creation_options_with_an_existing_destination() {
     const WRITE_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
