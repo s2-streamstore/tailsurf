@@ -1351,29 +1351,23 @@ async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
 }
 
 async fn delete_stream(api_url: Url, args: OwnerUrlArgs) -> eyre::Result<()> {
-    let (client, locator) = owner_client_from_url(api_url, &args.url)?;
-    let owner_token = locator
-        .token_with(TokenPermissions::allows_owner)
-        .expect("owner URL was validated");
+    let (client, locator, owner_token) = owner_client_from_url(api_url, &args.url)?;
     client
-        .delete_stream(&locator.stream_id, owner_token)
+        .delete_stream(&locator.stream_id, &owner_token)
         .await
         .context("failed to delete stream")?;
     Ok(())
 }
 
 async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<()> {
-    let (client, locator) = owner_client_from_url(api_url, &args.url)?;
-    let owner_token = locator
-        .token_with(TokenPermissions::allows_owner)
-        .expect("owner URL was validated");
+    let (client, locator, owner_token) = owner_client_from_url(api_url, &args.url)?;
     let stream = client
         .update_stream(
             &locator.stream_id,
             &UpdateStreamRequest {
                 visibility: Some(args.visibility.into()),
             },
-            owner_token,
+            &owner_token,
         )
         .await
         .context("failed to update stream visibility")?;
@@ -1390,12 +1384,9 @@ async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Resul
 }
 
 async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
-    let (client, locator) = owner_client_from_url(api_url, &args.url)?;
-    let owner_token = locator
-        .token_with(TokenPermissions::allows_owner)
-        .expect("owner URL was validated");
+    let (client, locator, owner_token) = owner_client_from_url(api_url, &args.url)?;
     let response = client
-        .list_tokens(&locator.stream_id, owner_token)
+        .list_tokens(&locator.stream_id, &owner_token)
         .await
         .context("failed to list links")?;
     match args.format {
@@ -1425,10 +1416,7 @@ fn token_status_label(status: StreamTokenStatus) -> &'static str {
 }
 
 async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Result<()> {
-    let (client, locator) = owner_client_from_url(api_url, &args.url)?;
-    let owner_token = locator
-        .token_with(TokenPermissions::allows_owner)
-        .expect("owner URL was validated");
+    let (client, locator, owner_token) = owner_client_from_url(api_url, &args.url)?;
     let issued = client
         .issue_token(
             &locator.stream_id,
@@ -1436,7 +1424,7 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
                 permissions: args.access.0,
                 expires_at: args.expires.rfc3339(),
             },
-            owner_token,
+            &owner_token,
         )
         .await
         .context("failed to issue link")?;
@@ -1449,12 +1437,9 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
 }
 
 async fn revoke_link(api_url: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
-    let (client, locator) = owner_client_from_url(api_url, &args.url)?;
-    let owner_token = locator
-        .token_with(TokenPermissions::allows_owner)
-        .expect("owner URL was validated");
+    let (client, locator, owner_token) = owner_client_from_url(api_url, &args.url)?;
     client
-        .revoke_token(&locator.stream_id, &args.token_id, owner_token)
+        .revoke_token(&locator.stream_id, &args.token_id, &owner_token)
         .await
         .context("failed to revoke link")?;
     Ok(())
@@ -1575,12 +1560,16 @@ async fn write_transcript_data(
     Ok(())
 }
 
-fn owner_client_from_url(api_url: Url, url: &str) -> eyre::Result<(TsfClient, StreamLocator)> {
+fn owner_client_from_url(
+    api_url: Url,
+    url: &str,
+) -> eyre::Result<(TsfClient, StreamLocator, BearerToken)> {
     let locator = StreamLocator::parse(url).context("invalid stream URL")?;
-    locator
+    let owner_token = locator
         .token_with(TokenPermissions::allows_owner)
-        .context("URL does not grant owner access")?;
-    Ok((TsfClient::with_api_base_url(api_url), locator))
+        .context("URL does not grant owner access")?
+        .clone();
+    Ok((TsfClient::with_api_base_url(api_url), locator, owner_token))
 }
 
 fn print_created_stream(

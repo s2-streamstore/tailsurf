@@ -35,6 +35,7 @@ use url::Url;
 
 use crate::{
     BearerToken, StreamId, TokenId,
+    ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -665,45 +666,6 @@ impl ExposeSecret<str> for CreateStreamIdempotencyKey {
 #[error("create idempotency key must be canonical 43-character unpadded base64url")]
 pub struct InvalidCreateStreamIdempotencyKey;
 
-fn is_canonical_base64url_32(value: &str) -> bool {
-    const FINAL_CHARS: &[u8] = b"AEIMQUYcgkosw048";
-    value.len() == 43
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        && value
-            .as_bytes()
-            .last()
-            .is_some_and(|last| FINAL_CHARS.contains(last))
-}
-
-fn encode_base64url_32(bytes: &[u8; 32]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut encoded = String::with_capacity(43);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
-        encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
-        encoded.push(char::from(
-            ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
-        ));
-        encoded.push(char::from(
-            ALPHABET[usize::from(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6))],
-        ));
-        encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
-    }
-    let remainder = chunks.remainder();
-    debug_assert_eq!(remainder.len(), 2);
-    encoded.push(char::from(ALPHABET[usize::from(remainder[0] >> 2)]));
-    encoded.push(char::from(
-        ALPHABET[usize::from(((remainder[0] & 0x03) << 4) | (remainder[1] >> 4))],
-    ));
-    encoded.push(char::from(
-        ALPHABET[usize::from((remainder[1] & 0x0f) << 2)],
-    ));
-    debug_assert_eq!(encoded.len(), 43);
-    encoded
-}
-
 /// Low-level authenticated write socket without retained-record recovery.
 pub struct TsfAppendSession {
     ws: ClientWebSocket,
@@ -1040,28 +1002,22 @@ pub trait IntoRecordData {
     /// Converts this value into reference-counted immutable bytes.
     fn into_record_data(self) -> Bytes;
 }
+/// Sealed marker for types that own their bytes and implement `Into<Bytes>`.
+trait OwnedIntoBytes: Into<Bytes> {}
+impl OwnedIntoBytes for Bytes {}
+impl OwnedIntoBytes for Vec<u8> {}
+impl OwnedIntoBytes for Box<[u8]> {}
+impl OwnedIntoBytes for String {}
 
-impl IntoRecordData for Bytes {
+impl<T: OwnedIntoBytes> IntoRecordData for T {
     fn into_record_data(self) -> Bytes {
-        self
+        self.into()
     }
 }
 
 impl IntoRecordData for &Bytes {
     fn into_record_data(self) -> Bytes {
         self.clone()
-    }
-}
-
-impl IntoRecordData for Vec<u8> {
-    fn into_record_data(self) -> Bytes {
-        Bytes::from(self)
-    }
-}
-
-impl IntoRecordData for Box<[u8]> {
-    fn into_record_data(self) -> Bytes {
-        Bytes::from(self)
     }
 }
 
@@ -1074,12 +1030,6 @@ impl IntoRecordData for &[u8] {
 impl<const N: usize> IntoRecordData for &[u8; N] {
     fn into_record_data(self) -> Bytes {
         Bytes::copy_from_slice(&self[..])
-    }
-}
-
-impl IntoRecordData for String {
-    fn into_record_data(self) -> Bytes {
-        Bytes::from(self)
     }
 }
 
@@ -1357,34 +1307,32 @@ fn dispatch_ack(
 ) -> Result<(), TsfClientError> {
     let record_count =
         usize::try_from(ack.record_count()?).map_err(|_| TsfClientError::InvalidAppendAck(ack))?;
+    if record_count > pending.len() {
+        return Err(TsfClientError::InvalidAppendAck(ack));
+    }
 
-    for offset in 0..record_count {
-        let offset = u64::try_from(offset).map_err(|_| TsfClientError::InvalidAppendAck(ack))?;
-        let writer_seq_num = ack
-            .writer_seq_start
-            .checked_add(offset)
-            .ok_or(TsfClientError::InvalidAppendAck(ack))?;
-        let s2_seq_num = ack
-            .s2_seq_start
-            .checked_add(offset)
-            .ok_or(TsfClientError::InvalidAppendAck(ack))?;
-        let Some(front) = pending.front() else {
-            return Err(TsfClientError::InvalidAppendAck(ack));
-        };
-        if front.record.writer_seq_num < writer_seq_num {
+    for (item, writer_seq_num) in pending
+        .iter()
+        .take(record_count)
+        .zip(ack.writer_seq_start..=ack.writer_seq_end)
+    {
+        if item.record.writer_seq_num < writer_seq_num {
             return Err(TsfClientError::AppendNotAcknowledged {
-                writer_seq_num: front.record.writer_seq_num,
+                writer_seq_num: item.record.writer_seq_num,
                 ack,
             });
         }
-        if front.record.writer_seq_num > writer_seq_num {
+        if item.record.writer_seq_num > writer_seq_num {
             return Err(TsfClientError::InvalidAppendAck(ack));
         }
+    }
 
-        let pending = pending
-            .pop_front()
-            .expect("pending front should exist after checking it");
-        let _ = pending.ack_tx.send(Ok(AppendReceipt {
+    for ((item, writer_seq_num), s2_seq_num) in pending
+        .drain(..record_count)
+        .zip(ack.writer_seq_start..=ack.writer_seq_end)
+        .zip(ack.s2_seq_start..=ack.s2_seq_end)
+    {
+        let _ = item.ack_tx.send(Ok(AppendReceipt {
             writer_seq_num,
             s2_seq_num,
             ack,
@@ -1960,13 +1908,6 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_key_encoding_is_canonical_unpadded_base64url() {
-        let encoded = encode_base64url_32(&[0_u8; 32]);
-
-        assert_eq!(encoded, "A".repeat(43));
-    }
-
-    #[test]
     fn create_idempotency_keys_validate_and_redact_debug_output() {
         let key = CreateStreamIdempotencyKey::new_random();
         let exposed = key.expose_secret().to_owned();
@@ -2179,6 +2120,69 @@ mod tests {
             ack.record_count(),
             Err(TsfClientError::InvalidAppendAck(error_ack)) if error_ack == ack
         ));
+    }
+
+    #[test]
+    fn dispatch_ack_rejects_more_records_than_are_pending() {
+        let permits = Arc::new(Semaphore::new(2));
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let record = WriteRecord::new(7, PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new());
+        let mut pending = VecDeque::from([PendingAppend {
+            record,
+            ack_tx,
+            _byte_permit: permits.clone().try_acquire_owned().expect("byte permit"),
+            _record_permit: permits.try_acquire_owned().expect("record permit"),
+        }]);
+        let ack = AppendAck {
+            writer_seq_start: 7,
+            writer_seq_end: 8,
+            s2_seq_start: 42,
+            s2_seq_end: 43,
+        };
+
+        assert!(matches!(
+            dispatch_ack(ack, &mut pending),
+            Err(TsfClientError::InvalidAppendAck(error_ack)) if error_ack == ack
+        ));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_ack_validates_the_full_range_before_draining() {
+        let permits = Arc::new(Semaphore::new(4));
+        let mut pending = VecDeque::new();
+        for writer_seq_num in [7, 9] {
+            let (ack_tx, _ack_rx) = oneshot::channel();
+            pending.push_back(PendingAppend {
+                record: WriteRecord::new(
+                    writer_seq_num,
+                    PartHeader::unsplit(),
+                    RecordFormat::Bytes,
+                    Bytes::new(),
+                ),
+                ack_tx,
+                _byte_permit: permits.clone().try_acquire_owned().expect("byte permit"),
+                _record_permit: permits.clone().try_acquire_owned().expect("record permit"),
+            });
+        }
+        let ack = AppendAck {
+            writer_seq_start: 7,
+            writer_seq_end: 8,
+            s2_seq_start: 42,
+            s2_seq_end: 43,
+        };
+
+        assert!(matches!(
+            dispatch_ack(ack, &mut pending),
+            Err(TsfClientError::InvalidAppendAck(error_ack)) if error_ack == ack
+        ));
+        assert_eq!(
+            pending
+                .iter()
+                .map(|item| item.record.writer_seq_num)
+                .collect::<Vec<_>>(),
+            [7, 9]
+        );
     }
 
     #[test]
