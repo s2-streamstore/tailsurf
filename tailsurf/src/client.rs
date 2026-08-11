@@ -1309,6 +1309,8 @@ pub struct TsfReadSession {
     last_observed_tail: Option<ReadTail>,
     no_progress_reconnects: usize,
     reconnect_backoff: Duration,
+    pending_reconnect_backoff: Duration,
+    reconnect_needed: bool,
 }
 
 impl TsfReadSession {
@@ -1322,6 +1324,8 @@ impl TsfReadSession {
             last_observed_tail: None,
             no_progress_reconnects: 0,
             reconnect_backoff,
+            pending_reconnect_backoff: Duration::ZERO,
+            reconnect_needed: false,
         }
     }
 
@@ -1349,6 +1353,9 @@ impl TsfReadSession {
                 self.finished = true;
                 return Ok(None);
             }
+            if self.reconnect_needed {
+                self.reconnect().await?;
+            }
 
             match self.socket.next_outcome().await {
                 Ok(ReadSocketOutcome::Record(record)) => {
@@ -1359,6 +1366,7 @@ impl TsfReadSession {
                     self.last_observed_tail = Some(tail);
                 }
                 Ok(ReadSocketOutcome::ReconnectAdvised) => {
+                    self.require_reconnect()?;
                     self.reconnect().await?;
                 }
                 Ok(ReadSocketOutcome::Closed) => {
@@ -1366,6 +1374,7 @@ impl TsfReadSession {
                     return Ok(None);
                 }
                 Err(error) if error.is_resumable_read_interruption() => {
+                    self.require_reconnect()?;
                     self.reconnect().await?;
                 }
                 Err(error) => return Err(error),
@@ -1374,6 +1383,24 @@ impl TsfReadSession {
     }
 
     async fn reconnect(&mut self) -> Result<(), TsfClientError> {
+        debug_assert!(self.reconnect_needed);
+        if !self.pending_reconnect_backoff.is_zero() {
+            sleep(self.pending_reconnect_backoff).await;
+        }
+        let socket = self
+            .client
+            .connect_read_socket(self.options.clone())
+            .await?;
+        self.socket = socket;
+        self.pending_reconnect_backoff = Duration::ZERO;
+        self.reconnect_needed = false;
+        Ok(())
+    }
+
+    fn require_reconnect(&mut self) -> Result<(), TsfClientError> {
+        if self.reconnect_needed {
+            return Ok(());
+        }
         let retry_policy = self.client.config.retry_policy;
         let max_reconnects = retry_policy.attempt_count().saturating_sub(1);
         if self.no_progress_reconnects >= max_reconnects {
@@ -1381,21 +1408,18 @@ impl TsfReadSession {
                 max_connection_attempts: retry_policy.attempt_count(),
             });
         }
-        if !self.reconnect_backoff.is_zero() {
-            sleep(self.reconnect_backoff).await;
-        }
         self.no_progress_reconnects += 1;
+        self.pending_reconnect_backoff = self.reconnect_backoff;
         self.reconnect_backoff = retry_policy.next_backoff(self.reconnect_backoff);
-        self.socket = self
-            .client
-            .connect_read_socket(self.options.clone())
-            .await?;
+        self.reconnect_needed = true;
         Ok(())
     }
 
     fn record_delivered(&mut self, s2_seq_num: u64) {
         self.no_progress_reconnects = 0;
         self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
+        self.pending_reconnect_backoff = Duration::ZERO;
+        self.reconnect_needed = false;
         match s2_seq_num.checked_add(1) {
             Some(next_seq_num) => self.options.start = Some(ReadStart::SeqNum(next_seq_num)),
             None => self.finished = true,
@@ -1743,6 +1767,7 @@ impl TsfClientError {
 
     fn is_resumable_read_interruption(&self) -> bool {
         match self {
+            Self::Timeout { .. } => true,
             Self::WebSocket(error) => is_retryable_websocket_error(error),
             Self::WebSocketClosed => true,
             Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),

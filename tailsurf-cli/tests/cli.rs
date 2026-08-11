@@ -1152,6 +1152,69 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
 }
 
 #[tokio::test]
+async fn reader_resumes_pending_reconnect_after_caller_timeout() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::TailOffset(2));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let error = reader
+        .next_record_with_timeout(Duration::from_millis(50))
+        .await
+        .expect_err("caller timeout during reconnect backoff");
+    assert!(matches!(
+        error,
+        TsfClientError::Timeout {
+            operation: "read stream record"
+        }
+    ));
+
+    let record = timeout(Duration::from_secs(2), reader.next_record())
+        .await
+        .expect("resumed reconnect")
+        .expect("read record")
+        .expect("record");
+    assert_eq!(record.s2_seq_num, 5);
+    assert_eq!(record.data.as_ref(), b"stable\n");
+    assert_eq!(server.read_attempts().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reader_reconnects_after_configured_idle_timeout() {
+    let server = FakeReadServer::start(FakeReadMode::SilentThenRecord).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone());
+    config.websocket_read_idle_timeout = Some(Duration::from_millis(50));
+    config.retry_policy = RetryPolicy {
+        max_attempts: 3,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let client = TsfClient::with_config(config);
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::SeqNum(0));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let record = timeout(Duration::from_secs(2), reader.next_record())
+        .await
+        .expect("idle reconnect")
+        .expect("read record")
+        .expect("record");
+
+    assert_eq!(record.s2_seq_num, 0);
+    assert_eq!(record.data.as_ref(), b"after idle\n");
+    assert_eq!(server.read_attempts().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
 async fn zero_count_reads_complete_without_opening_a_socket() {
     let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
@@ -2742,6 +2805,7 @@ enum FakeReadMode {
     ReconnectBeforeFirstDefault,
     ReconnectForever,
     SlowReconnectForever,
+    SilentThenRecord,
     ReplayTranscript,
     ReplayBinary,
     ReplaySplitRecord,
@@ -2816,7 +2880,9 @@ async fn fake_read_tail(
         FakeReadMode::Reconnect => 0,
         FakeReadMode::ReconnectBeforeFirstRecord => 7,
         FakeReadMode::ReconnectBeforeFirstDefault => 100,
-        FakeReadMode::ReconnectForever | FakeReadMode::SlowReconnectForever => 0,
+        FakeReadMode::ReconnectForever
+        | FakeReadMode::SlowReconnectForever
+        | FakeReadMode::SilentThenRecord => 0,
         FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
@@ -2922,6 +2988,13 @@ async fn fake_read_flow(
             )
             .await
             .expect("send reconnect advised");
+        }
+        FakeReadMode::SilentThenRecord => {
+            if attempt_count == 1 {
+                sleep(Duration::from_secs(5)).await;
+            } else {
+                send_read_record(&mut socket, 0, 0, b"after idle\n").await;
+            }
         }
         FakeReadMode::ReplayTranscript => {
             send_read_record(&mut socket, 0, 0, b"dedupe\n").await;
