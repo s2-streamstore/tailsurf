@@ -22,7 +22,9 @@ Release builds, macOS signing and notarization, hosting, and artifact attestatio
 
 Axoupdater is embedded in `tsf`. Direct installations use the dist installer receipt for explicit updates through `tsf update`.
 
-`tsf update` and `tsf update --check` contact GitHub Releases. The installer receipt stays local. The CLI does not check for updates in the background.
+`tsf update` and `tsf update --check` contact GitHub Releases. The installer receipt stays local.
+
+After a successful service command against `https://tail.surf`, an installer-owned binary may check GitHub Releases and print a generic hint. The check runs only when stderr is a terminal. It runs at most once per 24 hours and times out after 500 milliseconds. Failures are ignored. The cache attempt happens before the request, so an unwritable cache disables the check. `CI`, `TSF_NO_UPDATE_CHECK`, and `DO_NOT_TRACK` disable automatic checks. The hint never installs an update.
 
 The updater refuses installations it does not own. Cargo installations remain owned by Cargo. Other package-manager installations remain owned by their package manager.
 

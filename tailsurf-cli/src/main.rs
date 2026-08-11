@@ -2,11 +2,12 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::OpenOptions,
-    io::ErrorKind,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, IsTerminal},
     path::{Path, PathBuf},
     process::{ExitCode, ExitStatus, Stdio},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axoupdater::AxoUpdater;
@@ -37,7 +38,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     process::Command as TokioCommand,
     sync::mpsc,
-    time::{Duration, Instant, sleep_until},
+    time::{Duration, Instant, sleep_until, timeout},
 };
 use url::Url;
 
@@ -50,6 +51,9 @@ const TRANSCRIPT_RECORD_QUEUE: usize = 8;
 /// Stdin read block size for line-framed and raw writes.
 const STDIN_READ_BYTES: usize = 16 * 1024;
 const MAX_INITIAL_TOKENS: usize = 3;
+const UPDATE_HINT_CACHE_FILE: &str = ".tailsurf-cli-update-check";
+const UPDATE_HINT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const UPDATE_HINT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
@@ -428,8 +432,20 @@ impl WriterState {
 // One socket, one stdin, one stdout: worker threads only add wakeup and handoff cost.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
-        Ok(()) => ExitCode::SUCCESS,
+    let cli = Cli::parse();
+    let check_for_update = should_check_for_update_hint(
+        &cli.command,
+        &cli.api_url,
+        std::io::stderr().is_terminal(),
+        automatic_update_checks_disabled(),
+    );
+    match run(cli).await {
+        Ok(()) => {
+            if check_for_update {
+                maybe_print_update_hint().await;
+            }
+            ExitCode::SUCCESS
+        }
         Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(error) => {
             print_error(&error);
@@ -490,6 +506,61 @@ fn managed_updater() -> eyre::Result<AxoUpdater> {
         bail!(OWNERSHIP_ERROR);
     }
     Ok(updater)
+}
+
+fn should_check_for_update_hint(
+    command: &Command,
+    api_url: &Url,
+    stderr_is_terminal: bool,
+    disabled: bool,
+) -> bool {
+    stderr_is_terminal
+        && !disabled
+        && !matches!(command, Command::Update(_))
+        && api_url.as_str() == "https://tail.surf/"
+}
+
+fn automatic_update_checks_disabled() -> bool {
+    ["CI", "TSF_NO_UPDATE_CHECK", "DO_NOT_TRACK"]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+async fn maybe_print_update_hint() {
+    let Ok(mut updater) = managed_updater() else {
+        return;
+    };
+    let Ok(install_root) = updater.install_prefix_root() else {
+        return;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return;
+    };
+    let cache_path = install_root.join(UPDATE_HINT_CACHE_FILE);
+    if !claim_update_hint_check(cache_path.as_std_path(), now.as_secs()) {
+        return;
+    }
+
+    if matches!(
+        timeout(UPDATE_HINT_TIMEOUT, updater.is_update_needed()).await,
+        Ok(Ok(true))
+    ) {
+        eprintln!("A tsf update is available. Run `tsf update` to install it.");
+    }
+}
+
+fn claim_update_hint_check(cache_path: &Path, now: u64) -> bool {
+    let last_check = fs::read_to_string(cache_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if !update_hint_check_is_due(last_check, now) {
+        return false;
+    }
+    fs::write(cache_path, format!("{now}\n")).is_ok()
+}
+
+fn update_hint_check_is_due(last_check: Option<u64>, now: u64) -> bool {
+    last_check.is_none_or(|last_check| last_check.abs_diff(now) >= UPDATE_HINT_INTERVAL.as_secs())
 }
 
 fn is_broken_pipe(error: &eyre::Report) -> bool {
@@ -1813,6 +1884,8 @@ struct IssuedTokenOutput {
 mod tests {
     use super::*;
 
+    const VIEW_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
     #[test]
     fn parses_update_and_check_modes() {
         for (arguments, expected_check) in [
@@ -1825,6 +1898,38 @@ mod tests {
             };
             assert_eq!(args.check, expected_check);
         }
+    }
+
+    #[test]
+    fn update_hints_require_a_successful_interactive_production_command() {
+        let production = Url::parse("https://tail.surf").expect("production URL");
+        let non_production = Url::parse("https://api.example").expect("custom URL");
+        let service = Cli::try_parse_from(["tsf", "tail", VIEW_URL])
+            .expect("valid streaming service command");
+        let check = |command, api_url, terminal, disabled| {
+            should_check_for_update_hint(command, api_url, terminal, disabled)
+        };
+        assert!(check(&service.command, &production, true, false));
+        assert!(!check(&service.command, &production, false, false));
+        assert!(!check(&service.command, &production, true, true));
+        assert!(!check(&service.command, &non_production, true, false));
+
+        let update = Cli::try_parse_from(["tsf", "update"]).expect("valid update command");
+        assert!(!check(&update.command, &production, true, false));
+    }
+
+    #[test]
+    fn update_hint_cache_has_a_bounded_daily_interval() {
+        const NOW: u64 = 2_000_000;
+        let interval = UPDATE_HINT_INTERVAL.as_secs();
+
+        assert!(update_hint_check_is_due(None, NOW));
+        assert!(!update_hint_check_is_due(Some(NOW), NOW));
+        assert!(!update_hint_check_is_due(Some(NOW - interval + 1), NOW));
+        assert!(update_hint_check_is_due(Some(NOW - interval), NOW));
+        assert!(!update_hint_check_is_due(Some(NOW + interval - 1), NOW));
+        assert!(update_hint_check_is_due(Some(NOW + interval), NOW));
+        assert!(!claim_update_hint_check(Path::new("."), NOW));
     }
 
     #[test]
