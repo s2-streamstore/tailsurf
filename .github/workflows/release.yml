@@ -154,8 +154,8 @@ jobs:
             dist_sha256: aa343b2ff78ec2981f17a65140250c5ad6062c74072163f68c5c2686d94763a7
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-musl
-            dist_host: aarch64-unknown-linux-musl
-            dist_sha256: 16d4394af9b91366ca92cb4601a72dd0a209a49301ef535749e2141039e26ed6
+            dist_host: aarch64-unknown-linux-gnu
+            dist_sha256: d29bcffeb3f8b0c517b4ce0dd2470926ed5cb0bb29d78c6bdd5f88d76ee14a6a
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             dist_host: x86_64-apple-darwin
@@ -166,8 +166,8 @@ jobs:
             dist_sha256: 26e845cabff12a92911ce960af73a86c8f9b2b2d9072b01dfe5b662acf044fa3
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-musl
-            dist_host: x86_64-unknown-linux-musl
-            dist_sha256: 0d9dc001b0e937e9cc18e0dc11784aa7a3fd566656b07828d5e1d10ce1c1c48c
+            dist_host: x86_64-unknown-linux-gnu
+            dist_sha256: eb52f9fae0d0506774e9f1801c1168f87fa2c87a45e2d64d3ae7c89401929946
     runs-on: ${{ matrix.runner }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
