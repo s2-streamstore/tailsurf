@@ -19,35 +19,30 @@ permissions:
 
 env:
   CARGO_DIST_VERSION: "0.32.0"
-  CARGO_DIST_SH_SHA256: "b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5"
-  CARGO_DIST_PS1_SHA256: "a3435e9944f1a1297add11c6a8ac1f543c14a5ea88879ee05b24ff8218d46d87"
+  CARGO_DIST_PLAN_SHA256: "eb52f9fae0d0506774e9f1801c1168f87fa2c87a45e2d64d3ae7c89401929946"
 
-# Pull requests plan releases without publishing. A dispatch accepts `dry-run` or an exact
-# `vMAJOR.MINOR.PATCH` SemVer tag. Publishing requires the workflow ref to be that tag.
+# Pull requests plan releases without publishing. Repository dispatch always loads this workflow
+# from the default branch. Its payload accepts `dry-run` or an exact SemVer release tag.
 on:
   pull_request:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Release Tag
-        required: true
-        default: dry-run
-        type: string
+  repository_dispatch:
+    types: [release]
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
     outputs:
-      val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
       publishing: ${{ steps.release.outputs.publishing }}
       dry_run: ${{ steps.release.outputs.dry_run }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Validate release tag
@@ -55,29 +50,45 @@ jobs:
         shell: bash
         env:
           WORKFLOW_REF: ${{ github.ref }}
-          INPUT_TAG: ${{ inputs.tag || '' }}
+          INPUT_TAG: ${{ github.event.client_payload.tag || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
           if [[ -z "$INPUT_TAG" ]]; then
             {
               echo "tag="
+              echo "commit=$GITHUB_SHA"
               echo "publishing=false"
               echo "dry_run=false"
             } >> "$GITHUB_OUTPUT"
           elif [[ "$INPUT_TAG" == "dry-run" ]]; then
+            if [[ "$WORKFLOW_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+              echo "Dry runs must execute the default-branch workflow." >&2
+              exit 1
+            fi
             {
               echo "tag="
+              echo "commit=$GITHUB_SHA"
               echo "publishing=false"
               echo "dry_run=true"
             } >> "$GITHUB_OUTPUT"
           elif [[ "$INPUT_TAG" =~ $tag_pattern ]]; then
-            if [[ "$WORKFLOW_REF" != "refs/tags/$INPUT_TAG" ]]; then
-              echo "Publishing requires workflow ref refs/tags/$INPUT_TAG, got $WORKFLOW_REF." >&2
+            if [[ "$WORKFLOW_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+              echo "Publishing must execute the default-branch workflow." >&2
               exit 1
             fi
+            git fetch --force --tags origin
+            git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+            release_commit="$(git rev-parse --verify "refs/tags/${INPUT_TAG}^{commit}")"
+            if ! git merge-base --is-ancestor "$release_commit" "refs/remotes/origin/$DEFAULT_BRANCH"; then
+              echo "Release tag $INPUT_TAG is not reachable from $DEFAULT_BRANCH." >&2
+              exit 1
+            fi
+            git checkout --detach "$release_commit"
             {
               echo "tag=$INPUT_TAG"
+              echo "commit=$release_commit"
               echo "publishing=true"
               echo "dry_run=false"
             } >> "$GITHUB_OUTPUT"
@@ -89,24 +100,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
-          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${CARGO_DIST_VERSION}/cargo-dist-installer.sh" -o "$installer"
-          actual_sha256="$(sha256sum "$installer" | awk '{print $1}')"
-          if [[ "$actual_sha256" != "$CARGO_DIST_SH_SHA256" ]]; then
-            echo "cargo-dist installer checksum mismatch" >&2
+          target="x86_64-unknown-linux-gnu"
+          archive="$RUNNER_TEMP/cargo-dist-${target}.tar.xz"
+          extracted="$RUNNER_TEMP/cargo-dist-plan"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${CARGO_DIST_VERSION}/cargo-dist-${target}.tar.xz" -o "$archive"
+          actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          if [[ "$actual_sha256" != "$CARGO_DIST_PLAN_SHA256" ]]; then
+            echo "cargo-dist archive checksum mismatch" >&2
             exit 1
           fi
-          sh "$installer"
+          mkdir -p "$extracted" "$HOME/.cargo/bin"
+          tar -xJf "$archive" -C "$extracted"
+          install -m 0755 "$extracted/cargo-dist-${target}/dist" "$HOME/.cargo/bin/dist"
+          dist --version
       - name: Cache dist
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
-      # sure would be cool if github gave us proper conditionals...
-      # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
-      # functionality based on whether this is a pull_request, and whether it's from a fork.
-      # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
-      # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         shell: bash
         env:
@@ -120,47 +131,55 @@ jobs:
           fi
           echo "dist ran successfully"
           cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
-    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
-    # Let the initial task tell us to not run (currently very blunt)
+    name: build-local-artifacts (${{ matrix.target }})
     needs:
       - plan
-    if: ${{ (fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload')) || needs.plan.outputs.dry_run == 'true' }}
+    if: ${{ github.event_name == 'repository_dispatch' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.dry_run == 'true') }}
+    environment: release
     strategy:
       fail-fast: false
-      # Target platforms/runners are computed by dist in create-release.
-      # Each member of the matrix has the following arguments:
-      #
-      # - runner: the github runner
-      # - dist-args: cli flags to pass to dist
-      # - install-dist: expression to run to install dist on the runner
-      #
-      # Typically there will be:
-      # - 1 "global" task that builds universal installers
-      # - N "local" tasks that build each platform's binaries and platform-specific installers
-      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            dist_host: aarch64-apple-darwin
+            dist_sha256: aa343b2ff78ec2981f17a65140250c5ad6062c74072163f68c5c2686d94763a7
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            dist_host: aarch64-unknown-linux-musl
+            dist_sha256: 16d4394af9b91366ca92cb4601a72dd0a209a49301ef535749e2141039e26ed6
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            dist_host: x86_64-apple-darwin
+            dist_sha256: 6243464a8389e006b9256ee548bc795638f1a17113c1b6669c0e05ce89fd05c5
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            dist_host: x86_64-pc-windows-msvc
+            dist_sha256: 26e845cabff12a92911ce960af73a86c8f9b2b2d9072b01dfe5b662acf044fa3
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            dist_host: x86_64-unknown-linux-musl
+            dist_sha256: 0d9dc001b0e937e9cc18e0dc11784aa7a3fd566656b07828d5e1d10ce1c1c48c
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      CODESIGN_CERTIFICATE: ${{ secrets.CODESIGN_CERTIFICATE }}
-      CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.CODESIGN_CERTIFICATE_PASSWORD }}
-      CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ matrix.target }}-dist-manifest.json
     steps:
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: "Require macOS signing credentials"
@@ -185,35 +204,51 @@ jobs:
       - name: Install dist (Unix)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          DIST_HOST: ${{ matrix.dist_host }}
+          DIST_SHA256: ${{ matrix.dist_sha256 }}
         run: |
           set -euo pipefail
-          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
-          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${CARGO_DIST_VERSION}/cargo-dist-installer.sh" -o "$installer"
+          archive="$RUNNER_TEMP/cargo-dist-${DIST_HOST}.tar.xz"
+          extracted="$RUNNER_TEMP/cargo-dist-local"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${CARGO_DIST_VERSION}/cargo-dist-${DIST_HOST}.tar.xz" -o "$archive"
           if command -v sha256sum >/dev/null 2>&1; then
-            actual_sha256="$(sha256sum "$installer" | awk '{print $1}')"
+            actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
           else
-            actual_sha256="$(shasum -a 256 "$installer" | awk '{print $1}')"
+            actual_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
           fi
-          if [[ "$actual_sha256" != "$CARGO_DIST_SH_SHA256" ]]; then
-            echo "cargo-dist installer checksum mismatch" >&2
+          if [[ "$actual_sha256" != "$DIST_SHA256" ]]; then
+            echo "cargo-dist archive checksum mismatch" >&2
             exit 1
           fi
-          sh "$installer"
+          mkdir -p "$extracted" "$HOME/.cargo/bin"
+          tar -xJf "$archive" -C "$extracted"
+          install -m 0755 "$extracted/cargo-dist-${DIST_HOST}/dist" "$HOME/.cargo/bin/dist"
+          dist --version
       - name: Install dist (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          DIST_HOST: ${{ matrix.dist_host }}
+          DIST_SHA256: ${{ matrix.dist_sha256 }}
         run: |
-          $installer = Join-Path $env:RUNNER_TEMP "cargo-dist-installer.ps1"
-          $uri = "https://github.com/axodotdev/cargo-dist/releases/download/v$env:CARGO_DIST_VERSION/cargo-dist-installer.ps1"
-          Invoke-WebRequest -Uri $uri -OutFile $installer
-          $actualSha256 = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $env:CARGO_DIST_PS1_SHA256) {
-            throw "cargo-dist installer checksum mismatch"
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "cargo-dist-$($env:DIST_HOST).zip"
+          $extracted = Join-Path $env:RUNNER_TEMP "cargo-dist-local"
+          $uri = "https://github.com/axodotdev/cargo-dist/releases/download/v$($env:CARGO_DIST_VERSION)/cargo-dist-$($env:DIST_HOST).zip"
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $env:DIST_SHA256) {
+            throw "cargo-dist archive checksum mismatch"
           }
-          & $installer
+          Expand-Archive -Path $archive -DestinationPath $extracted
+          $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+          New-Item -ItemType Directory -Force -Path $cargoBin | Out-Null
+          Copy-Item -Force -Path (Join-Path $extracted "dist.exe") -Destination (Join-Path $cargoBin "dist.exe")
+          & (Join-Path $cargoBin "dist.exe") --version
       # Get the dist-manifest
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -229,25 +264,29 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
-          DIST_TARGETS: ${{ join(matrix.targets, ' ') }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          DIST_TARGET: ${{ matrix.target }}
+          CODESIGN_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.CODESIGN_CERTIFICATE || '' }}
+          CODESIGN_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.CODESIGN_CERTIFICATE_PASSWORD || '' }}
+          CODESIGN_IDENTITY: ${{ runner.os == 'macOS' && secrets.CODESIGN_IDENTITY || '' }}
         run: |
           set -euo pipefail
-          read -r -a targets <<< "$DIST_TARGETS"
-          if [[ "${#targets[@]}" -eq 0 ]]; then
-            echo "dist target matrix is empty" >&2
-            exit 1
+          case "$DIST_TARGET" in
+            aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-musl|x86_64-unknown-linux-musl|x86_64-pc-windows-msvc) ;;
+            *)
+              echo "Unexpected dist target: $DIST_TARGET" >&2
+              exit 1
+              ;;
+          esac
+          dist_args=("--artifacts=local" "--target=$DIST_TARGET")
+          if [[ -n "$RELEASE_TAG" ]]; then
+            git fetch --force --tags origin
+            current_tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [[ "$current_tag_commit" != "$RELEASE_COMMIT" ]]; then
+              echo "Release tag moved after validation." >&2
+              exit 1
+            fi
           fi
-          dist_args=("--artifacts=local")
-          for target in "${targets[@]}"; do
-            case "$target" in
-              aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-musl|x86_64-unknown-linux-musl|x86_64-pc-windows-msvc) ;;
-              *)
-                echo "Unexpected dist target: $target" >&2
-                exit 1
-                ;;
-            esac
-            dist_args+=("--target=$target")
-          done
           # Actually do builds and make zips and whatnot
           if [[ -n "$RELEASE_TAG" ]]; then
             dist build "--tag=$RELEASE_TAG" --print=linkage --output-format=json "${dist_args[@]}" > dist-manifest.json
@@ -262,6 +301,7 @@ jobs:
         # inconsistent syntax between shell and powershell.
         shell: bash
         run: |
+          set -euo pipefail
           # Parse out what we just built and upload it to scratch storage
           {
             echo "paths<<EOF"
@@ -271,9 +311,9 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          name: artifacts-build-local-${{ matrix.target }}
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
@@ -283,24 +323,27 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+    if: ${{ github.event_name == 'repository_dispatch' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.dry_run == 'true') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -309,9 +352,16 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
         run: |
           set -euo pipefail
           if [[ -n "$RELEASE_TAG" ]]; then
+            git fetch --force --tags origin
+            current_tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [[ "$current_tag_commit" != "$RELEASE_COMMIT" ]]; then
+              echo "Release tag moved after validation." >&2
+              exit 1
+            fi
             dist build "--tag=$RELEASE_TAG" --output-format=json "--artifacts=global" > dist-manifest.json
           else
             dist build --output-format=json "--artifacts=global" > dist-manifest.json
@@ -327,7 +377,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: artifacts-build-global
           path: |
@@ -338,10 +388,8 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+    if: ${{ github.event_name == 'repository_dispatch' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.dry_run == 'true') }}
     uses: ./.github/workflows/notarize-macos.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
   # Determines if we should publish/announce
   host:
     needs:
@@ -350,30 +398,31 @@ jobs:
       - build-global-artifacts
       - custom-notarize-macos
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-notarize-macos.result == 'skipped' || needs.custom-notarize-macos.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && github.event_name == 'repository_dispatch' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-notarize-macos.result == 'skipped' || needs.custom-notarize-macos.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
-    outputs:
-      val: ${{ steps.host.outputs.manifest }}
     permissions:
       "attestations": "write"
       "contents": "write"
       "id-token": "write"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Fetch artifacts from scratch-storage
       - name: Fetch artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -382,10 +431,17 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
         run: |
           set -euo pipefail
-          if [[ -z "$RELEASE_TAG" ]]; then
-            echo "Validated release tag is missing" >&2
+          if [[ -z "$RELEASE_TAG" || -z "$RELEASE_COMMIT" ]]; then
+            echo "Validated release tag or commit is missing" >&2
+            exit 1
+          fi
+          git fetch --force --tags origin
+          current_tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$current_tag_commit" != "$RELEASE_COMMIT" ]]; then
+            echo "Release tag moved after validation." >&2
             exit 1
           fi
           dist host "--tag=$RELEASE_TAG" --steps=upload --steps=release --output-format=json > dist-manifest.json
@@ -393,14 +449,14 @@ jobs:
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: artifacts-*
           path: artifacts
@@ -410,7 +466,7 @@ jobs:
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
       - name: Attest
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: |
             artifacts/*
@@ -420,7 +476,7 @@ jobs:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_COMMIT: "${{ needs.plan.outputs.commit }}"
         run: |
           set -euo pipefail
           if [[ -z "$RELEASE_TAG" ]]; then
@@ -438,20 +494,3 @@ jobs:
             echo "Invalid prerelease flag" >&2
             exit 1
           fi
-
-  announce:
-    needs:
-      - plan
-      - host
-    # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
