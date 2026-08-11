@@ -14,6 +14,7 @@ version = "0.4.0"
 
 [workspace.dependencies]
 axoupdater = { version = "0.10.0", default-features = false, features = ["github_releases"] }
+base64 = "0.22.1"
 bytes = "1.12.1"
 clap = "4.6.6"
 eyre = "0.6.12"

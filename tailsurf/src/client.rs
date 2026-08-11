@@ -35,6 +35,7 @@ use url::Url;
 
 use crate::{
     BearerToken, StreamId, TokenId,
+    ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -664,45 +665,6 @@ impl ExposeSecret<str> for CreateStreamIdempotencyKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("create idempotency key must be canonical 43-character unpadded base64url")]
 pub struct InvalidCreateStreamIdempotencyKey;
-
-fn is_canonical_base64url_32(value: &str) -> bool {
-    const FINAL_CHARS: &[u8] = b"AEIMQUYcgkosw048";
-    value.len() == 43
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        && value
-            .as_bytes()
-            .last()
-            .is_some_and(|last| FINAL_CHARS.contains(last))
-}
-
-fn encode_base64url_32(bytes: &[u8; 32]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut encoded = String::with_capacity(43);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
-        encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
-        encoded.push(char::from(
-            ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
-        ));
-        encoded.push(char::from(
-            ALPHABET[usize::from(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6))],
-        ));
-        encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
-    }
-    let remainder = chunks.remainder();
-    debug_assert_eq!(remainder.len(), 2);
-    encoded.push(char::from(ALPHABET[usize::from(remainder[0] >> 2)]));
-    encoded.push(char::from(
-        ALPHABET[usize::from(((remainder[0] & 0x03) << 4) | (remainder[1] >> 4))],
-    ));
-    encoded.push(char::from(
-        ALPHABET[usize::from((remainder[1] & 0x0f) << 2)],
-    ));
-    debug_assert_eq!(encoded.len(), 43);
-    encoded
-}
 
 /// Low-level authenticated write socket without retained-record recovery.
 pub struct TsfAppendSession {
@@ -1939,13 +1901,6 @@ mod tests {
             .expect("connect WebSocket client");
 
         (client, server.await.expect("join WebSocket server"))
-    }
-
-    #[test]
-    fn idempotency_key_encoding_is_canonical_unpadded_base64url() {
-        let encoded = encode_base64url_32(&[0_u8; 32]);
-
-        assert_eq!(encoded, "A".repeat(43));
     }
 
     #[test]

@@ -3,14 +3,12 @@
 use secrecy::ExposeSecret;
 use url::{Url, form_urlencoded};
 
-use crate::{BearerToken, StreamId, TokenPermissions};
+use crate::{BearerToken, StreamId, TokenPermissions, ids::is_canonical_base64url_32};
 
 /// Default origin for Tailsurf share URLs.
 pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";
 /// Encoded length of a 256-bit stream token.
-pub const STREAM_TOKEN_ENCODED_LENGTH: usize = 43;
-const STREAM_TOKEN_FINAL_CHARS: &[u8] = b"AEIMQUYcgkosw048";
-
+pub const STREAM_TOKEN_ENCODED_LENGTH: usize = crate::ids::BASE64URL_32_ENCODED_LEN;
 /// Permission label and secret value decoded from a share URL fragment.
 #[derive(Clone, Debug)]
 pub struct StreamTokenParam {
@@ -112,19 +110,9 @@ fn parse_fragment(fragment: &str) -> Result<Option<StreamTokenParam>, StreamUrlE
 }
 
 fn validate_stream_token(token: &str) -> Result<(), StreamUrlError> {
-    if token.len() == STREAM_TOKEN_ENCODED_LENGTH
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        && token
-            .as_bytes()
-            .last()
-            .is_some_and(|last| STREAM_TOKEN_FINAL_CHARS.contains(last))
-    {
-        Ok(())
-    } else {
-        Err(StreamUrlError::InvalidToken)
-    }
+    is_canonical_base64url_32(token)
+        .then_some(())
+        .ok_or(StreamUrlError::InvalidToken)
 }
 
 fn validate_share_scheme(url: &Url) -> Result<(), StreamUrlError> {
