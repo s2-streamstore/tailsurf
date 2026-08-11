@@ -1311,13 +1311,11 @@ fn dispatch_ack(
         return Err(TsfClientError::InvalidAppendAck(ack));
     }
 
-    // Any error is fatal to the producer task, so draining eagerly is safe:
-    // unprocessed drained elements are dropped, but the producer is already dead.
-    for (offset, item) in pending.drain(..record_count).enumerate() {
-        let offset = offset as u64;
-        let writer_seq_num = ack.writer_seq_start + offset;
-        let s2_seq_num = ack.s2_seq_start + offset;
-
+    for (item, writer_seq_num) in pending
+        .iter()
+        .take(record_count)
+        .zip(ack.writer_seq_start..=ack.writer_seq_end)
+    {
         if item.record.writer_seq_num < writer_seq_num {
             return Err(TsfClientError::AppendNotAcknowledged {
                 writer_seq_num: item.record.writer_seq_num,
@@ -1327,7 +1325,13 @@ fn dispatch_ack(
         if item.record.writer_seq_num > writer_seq_num {
             return Err(TsfClientError::InvalidAppendAck(ack));
         }
+    }
 
+    for ((item, writer_seq_num), s2_seq_num) in pending
+        .drain(..record_count)
+        .zip(ack.writer_seq_start..=ack.writer_seq_end)
+        .zip(ack.s2_seq_start..=ack.s2_seq_end)
+    {
         let _ = item.ack_tx.send(Ok(AppendReceipt {
             writer_seq_num,
             s2_seq_num,
@@ -2116,6 +2120,69 @@ mod tests {
             ack.record_count(),
             Err(TsfClientError::InvalidAppendAck(error_ack)) if error_ack == ack
         ));
+    }
+
+    #[test]
+    fn dispatch_ack_rejects_more_records_than_are_pending() {
+        let permits = Arc::new(Semaphore::new(2));
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let record = WriteRecord::new(7, PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new());
+        let mut pending = VecDeque::from([PendingAppend {
+            record,
+            ack_tx,
+            _byte_permit: permits.clone().try_acquire_owned().expect("byte permit"),
+            _record_permit: permits.try_acquire_owned().expect("record permit"),
+        }]);
+        let ack = AppendAck {
+            writer_seq_start: 7,
+            writer_seq_end: 8,
+            s2_seq_start: 42,
+            s2_seq_end: 43,
+        };
+
+        assert!(matches!(
+            dispatch_ack(ack, &mut pending),
+            Err(TsfClientError::InvalidAppendAck(error_ack)) if error_ack == ack
+        ));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_ack_validates_the_full_range_before_draining() {
+        let permits = Arc::new(Semaphore::new(4));
+        let mut pending = VecDeque::new();
+        for writer_seq_num in [7, 9] {
+            let (ack_tx, _ack_rx) = oneshot::channel();
+            pending.push_back(PendingAppend {
+                record: WriteRecord::new(
+                    writer_seq_num,
+                    PartHeader::unsplit(),
+                    RecordFormat::Bytes,
+                    Bytes::new(),
+                ),
+                ack_tx,
+                _byte_permit: permits.clone().try_acquire_owned().expect("byte permit"),
+                _record_permit: permits.clone().try_acquire_owned().expect("record permit"),
+            });
+        }
+        let ack = AppendAck {
+            writer_seq_start: 7,
+            writer_seq_end: 8,
+            s2_seq_start: 42,
+            s2_seq_end: 43,
+        };
+
+        assert!(matches!(
+            dispatch_ack(ack, &mut pending),
+            Err(TsfClientError::InvalidAppendAck(error_ack)) if error_ack == ack
+        ));
+        assert_eq!(
+            pending
+                .iter()
+                .map(|item| item.record.writer_seq_num)
+                .collect::<Vec<_>>(),
+            [7, 9]
+        );
     }
 
     #[test]
