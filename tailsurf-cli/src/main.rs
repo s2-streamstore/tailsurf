@@ -59,6 +59,9 @@ const UPDATE_HINT_TIMEOUT: Duration = Duration::from_millis(500);
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
 #[command(version, about = "Create, write, and read tail.surf streams")]
+#[command(
+    after_help = "With piped input and no subcommand, tsf behaves like tsf write:\n  anything | tsf"
+)]
 struct Cli {
     /// Tailsurf API origin.
     #[arg(
@@ -76,8 +79,9 @@ struct Cli {
         global = true
     )]
     web_url: Url,
+    /// Optional so piped input can default to `write`; resolved before dispatch.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -433,14 +437,21 @@ impl WriterState {
 // One socket, one stdin, one stdout: worker threads only add wakeup and handoff cost.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let Some(Cli {
+        api_url,
+        web_url,
+        command: Some(command),
+    }) = resolve_cli()
+    else {
+        return ExitCode::from(2);
+    };
     let check_for_update = should_check_for_update_hint(
-        &cli.command,
-        &cli.api_url,
+        &command,
+        &api_url,
         std::io::stderr().is_terminal(),
         automatic_update_checks_disabled(),
     );
-    match run(cli).await {
+    match run(api_url, web_url, command).await {
         Ok(()) => {
             if check_for_update {
                 maybe_print_update_hint().await;
@@ -455,16 +466,36 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> eyre::Result<()> {
-    match cli.command {
-        Command::New(args) => new_stream(cli.api_url, cli.web_url, args).await,
-        Command::Write(args) => write_stream(cli.api_url, cli.web_url, args).await,
-        Command::Tail(args) => tail_stream(cli.api_url, args).await,
-        Command::Replay(args) => replay_stream(cli.api_url, args).await,
-        Command::Info(args) => stream_info(cli.api_url, args).await,
-        Command::Delete(args) => delete_stream(cli.api_url, args).await,
-        Command::Visibility(args) => update_visibility(cli.api_url, args).await,
-        Command::Link(args) => link_command(cli.api_url, cli.web_url, args).await,
+/// Parses the command line, defaulting piped input without a subcommand to `write`.
+///
+/// Returns `None` when there is no subcommand and stdin is a terminal; the caller
+/// exits with a usage error after help has been printed to stderr.
+fn resolve_cli() -> Option<Cli> {
+    let cli = Cli::parse();
+    if cli.command.is_some() {
+        return Some(cli);
+    }
+    if std::io::stdin().is_terminal() {
+        let help = <Cli as clap::CommandFactory>::command().render_help();
+        eprint!("{help}");
+        return None;
+    }
+    // Reparse with an implicit `write` so clap applies its env vars and defaults.
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    argv.push("write".into());
+    Some(Cli::parse_from(argv))
+}
+
+async fn run(api_url: Url, web_url: Url, command: Command) -> eyre::Result<()> {
+    match command {
+        Command::New(args) => new_stream(api_url, web_url, args).await,
+        Command::Write(args) => write_stream(api_url, web_url, args).await,
+        Command::Tail(args) => tail_stream(api_url, args).await,
+        Command::Replay(args) => replay_stream(api_url, args).await,
+        Command::Info(args) => stream_info(api_url, args).await,
+        Command::Delete(args) => delete_stream(api_url, args).await,
+        Command::Visibility(args) => update_visibility(api_url, args).await,
+        Command::Link(args) => link_command(api_url, web_url, args).await,
         Command::Update(args) => update_cli(args).await,
     }
 }
@@ -1894,7 +1925,7 @@ mod tests {
             (&["tsf", "update", "--check"][..], true),
         ] {
             let cli = Cli::try_parse_from(arguments).expect("valid update command");
-            let Command::Update(args) = cli.command else {
+            let Some(Command::Update(args)) = cli.command else {
                 panic!("expected update command");
             };
             assert_eq!(args.check, expected_check);
@@ -1906,17 +1937,22 @@ mod tests {
         let production = Url::parse("https://tail.surf").expect("production URL");
         let non_production = Url::parse("https://api.example").expect("custom URL");
         let service = Cli::try_parse_from(["tsf", "tail", VIEW_URL])
-            .expect("valid streaming service command");
+            .expect("valid streaming service command")
+            .command
+            .expect("tail subcommand");
         let check = |command, api_url, terminal, disabled| {
             should_check_for_update_hint(command, api_url, terminal, disabled)
         };
-        assert!(check(&service.command, &production, true, false));
-        assert!(!check(&service.command, &production, false, false));
-        assert!(!check(&service.command, &production, true, true));
-        assert!(!check(&service.command, &non_production, true, false));
+        assert!(check(&service, &production, true, false));
+        assert!(!check(&service, &production, false, false));
+        assert!(!check(&service, &production, true, true));
+        assert!(!check(&service, &non_production, true, false));
 
-        let update = Cli::try_parse_from(["tsf", "update"]).expect("valid update command");
-        assert!(!check(&update.command, &production, true, false));
+        let update = Cli::try_parse_from(["tsf", "update"])
+            .expect("valid update command")
+            .command
+            .expect("update subcommand");
+        assert!(!check(&update, &production, true, false));
     }
 
     #[test]

@@ -99,8 +99,10 @@ make test | tsf write --retention 6h
 Stream command output into a new URL:
 
 ```sh
-make test | tsf write
+make test | tsf
 ```
+
+Piped input without a subcommand behaves like `tsf write`. With no piped input and no subcommand, `tsf` prints help.
 
 `tsf write` creates a stream when no URL is supplied. It prints the view URL to stdout. Creation details, the owner link, and durability status go to stderr.
 
