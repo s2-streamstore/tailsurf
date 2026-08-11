@@ -1345,34 +1345,28 @@ fn dispatch_ack(
 ) -> Result<(), TsfClientError> {
     let record_count =
         usize::try_from(ack.record_count()?).map_err(|_| TsfClientError::InvalidAppendAck(ack))?;
+    if record_count > pending.len() {
+        return Err(TsfClientError::InvalidAppendAck(ack));
+    }
 
-    for offset in 0..record_count {
-        let offset = u64::try_from(offset).map_err(|_| TsfClientError::InvalidAppendAck(ack))?;
-        let writer_seq_num = ack
-            .writer_seq_start
-            .checked_add(offset)
-            .ok_or(TsfClientError::InvalidAppendAck(ack))?;
-        let s2_seq_num = ack
-            .s2_seq_start
-            .checked_add(offset)
-            .ok_or(TsfClientError::InvalidAppendAck(ack))?;
-        let Some(front) = pending.front() else {
-            return Err(TsfClientError::InvalidAppendAck(ack));
-        };
-        if front.record.writer_seq_num < writer_seq_num {
+    // Any error is fatal to the producer task, so draining eagerly is safe:
+    // unprocessed drained elements are dropped, but the producer is already dead.
+    for (offset, item) in pending.drain(..record_count).enumerate() {
+        let offset = offset as u64;
+        let writer_seq_num = ack.writer_seq_start + offset;
+        let s2_seq_num = ack.s2_seq_start + offset;
+
+        if item.record.writer_seq_num < writer_seq_num {
             return Err(TsfClientError::AppendNotAcknowledged {
-                writer_seq_num: front.record.writer_seq_num,
+                writer_seq_num: item.record.writer_seq_num,
                 ack,
             });
         }
-        if front.record.writer_seq_num > writer_seq_num {
+        if item.record.writer_seq_num > writer_seq_num {
             return Err(TsfClientError::InvalidAppendAck(ack));
         }
 
-        let pending = pending
-            .pop_front()
-            .expect("pending front should exist after checking it");
-        let _ = pending.ack_tx.send(Ok(AppendReceipt {
+        let _ = item.ack_tx.send(Ok(AppendReceipt {
             writer_seq_num,
             s2_seq_num,
             ack,
