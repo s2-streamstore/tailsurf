@@ -42,13 +42,13 @@ The `crates-io` environment identifies trusted-publisher jobs. Both crates.io tr
 
 The `release` environment identifies binary build, signing, notarization, and hosting jobs.
 
-Both environments accept deployments only from `main`. Both require approval from `shikhar`. Self-approval is allowed because the repository has one maintainer.
+Both environments accept deployments only from `main`. Both require approval from `shikhar`. Self-approval is allowed because the repository has one maintainer. Administrators cannot bypass approval.
 
 The default branch accepts only squash merges from pull requests. The `rust`, `msrv`, `lint`, and `plan` checks must pass against the latest commit. Review threads must be resolved. Force pushes and deletion are blocked.
 
 Release tags matching `v*` cannot be rewritten or deleted.
 
-GitHub Actions may use GitHub-owned actions and the four third-party action repositories referenced by the workflows. Every action must use a full commit SHA. The default workflow token is read-only and cannot approve pull requests.
+GitHub Actions may use GitHub-owned actions and an explicit third-party repository allowlist. The allowlist includes the transitive actions required by Release-plz. Every action must use a full commit SHA. The default workflow token is read-only and cannot approve pull requests.
 
 ## Required release secrets
 
