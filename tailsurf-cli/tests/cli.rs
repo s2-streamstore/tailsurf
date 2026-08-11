@@ -23,8 +23,8 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    BearerToken, StreamId, TokenId, TokenPermissions, TsfClient, TsfProducerConfig, WriteRecord,
-    WriterId,
+    BearerToken, RetryPolicy, StreamId, TokenId, TokenPermissions, TsfClient, TsfClientConfig,
+    TsfClientError, TsfProducerConfig, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -1049,6 +1049,105 @@ async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position()
         [Some(TEST_STREAM_TOKEN.to_owned())]
     );
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn default_read_start_reconnect_before_first_record_keeps_tail_minus_eighty() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstDefault).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let record = reader
+        .next_record_with_timeout(Duration::from_secs(5))
+        .await
+        .expect("read record")
+        .expect("record");
+
+    assert_eq!(record.s2_seq_num, 20);
+    assert_eq!(record.data.as_ref(), b"default\n");
+    let attempts = server.read_attempts();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| {
+        attempt.query.get("seq_num").map(String::as_str) == Some("20")
+            && !attempt.query.contains_key("tail_offset")
+    }));
+    assert_eq!(
+        server.tail_bearer_tokens(),
+        [Some(TEST_STREAM_TOKEN.to_owned())]
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn reader_bounds_consecutive_reconnects_without_a_record() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectForever).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone());
+    config.retry_policy = RetryPolicy {
+        max_attempts: 3,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let client = TsfClient::with_config(config);
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::SeqNum(0));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let error = timeout(Duration::from_secs(2), reader.next_record())
+        .await
+        .expect("bounded reconnects")
+        .expect_err("no-progress reconnect limit");
+
+    assert!(matches!(
+        error,
+        TsfClientError::ReadReconnectLimitExceeded {
+            max_connection_attempts: 3
+        }
+    ));
+    assert_eq!(server.read_attempts().len(), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn explicit_read_timeout_covers_reconnect_cycles() {
+    let server = FakeReadServer::start(FakeReadMode::SlowReconnectForever).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone());
+    config.retry_policy = RetryPolicy {
+        max_attempts: 100,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let client = TsfClient::with_config(config);
+    let mut request = ReadStreamOptions::new(stream_id).with_bearer_token(TEST_STREAM_TOKEN);
+    request.start = Some(ReadStart::SeqNum(0));
+    let mut reader = client.connect_reader(request).await.expect("reader");
+
+    let error = timeout(
+        Duration::from_secs(1),
+        reader.next_record_with_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .expect("absolute read deadline")
+    .expect_err("read timeout");
+
+    assert!(matches!(
+        error,
+        TsfClientError::Timeout {
+            operation: "read stream record"
+        }
+    ));
+    assert!(server.read_attempts().len() >= 2);
     server.abort();
 }
 
@@ -2640,6 +2739,9 @@ struct FakeReadState {
 enum FakeReadMode {
     Reconnect,
     ReconnectBeforeFirstRecord,
+    ReconnectBeforeFirstDefault,
+    ReconnectForever,
+    SlowReconnectForever,
     ReplayTranscript,
     ReplayBinary,
     ReplaySplitRecord,
@@ -2713,6 +2815,8 @@ async fn fake_read_tail(
     let next_s2_seq_num = match state.mode {
         FakeReadMode::Reconnect => 0,
         FakeReadMode::ReconnectBeforeFirstRecord => 7,
+        FakeReadMode::ReconnectBeforeFirstDefault => 100,
+        FakeReadMode::ReconnectForever | FakeReadMode::SlowReconnectForever => 0,
         FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
@@ -2795,6 +2899,29 @@ async fn fake_read_flow(
             } else {
                 send_read_record(&mut socket, 5, 0, b"stable\n").await;
             }
+        }
+        FakeReadMode::ReconnectBeforeFirstDefault => {
+            if attempt_count == 1 {
+                send_server_frame(
+                    &mut socket,
+                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+                )
+                .await
+                .expect("send reconnect advised");
+            } else {
+                send_read_record(&mut socket, 20, 0, b"default\n").await;
+            }
+        }
+        FakeReadMode::ReconnectForever | FakeReadMode::SlowReconnectForever => {
+            if matches!(state.mode, FakeReadMode::SlowReconnectForever) {
+                sleep(Duration::from_millis(40)).await;
+            }
+            send_server_frame(
+                &mut socket,
+                ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+            )
+            .await
+            .expect("send reconnect advised");
         }
         FakeReadMode::ReplayTranscript => {
             send_read_record(&mut socket, 0, 0, b"dedupe\n").await;

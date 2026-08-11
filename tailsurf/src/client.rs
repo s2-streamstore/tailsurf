@@ -53,6 +53,7 @@ use secrecy::ExposeSecret;
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const API_PREFIX: &str = "/api/v1";
+const DEFAULT_READ_TAIL_OFFSET: u64 = 80;
 
 /// Timeouts, retry behavior, API origin, and optional account authorization for [`TsfClient`].
 #[derive(Clone, Debug)]
@@ -67,7 +68,7 @@ pub struct TsfClientConfig {
     pub websocket_operation_timeout: Duration,
     /// Optional idle timeout while waiting for a read frame. Protocol heartbeats reset the timer. `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
-    /// Retry policy for idempotent metadata reads and initial socket setup.
+    /// Retry policy for idempotent metadata reads, socket setup, and consecutive read reconnects without a delivered record.
     pub retry_policy: RetryPolicy,
     /// Optional account bearer token sent on REST requests.
     pub rest_bearer_token: Option<BearerToken>,
@@ -369,12 +370,17 @@ impl TsfClient {
 
     /// Connects a resumable read session at the requested position and bounds.
     ///
-    /// A relative tail offset is resolved to an absolute S2 sequence number before the first socket is opened. Reconnects therefore resume from the same position even if the stream advances before a record arrives.
+    /// An explicit tail offset, or the service-default offset of 80 records, is resolved to an absolute S2 sequence number before the first socket is opened. Reconnects therefore resume from the same position even if the stream advances before a record arrives.
     pub async fn connect_reader(
         &self,
         mut options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
-        if let Some(ReadStart::TailOffset(offset)) = options.start {
+        let tail_offset = match options.start {
+            None => Some(DEFAULT_READ_TAIL_OFFSET),
+            Some(ReadStart::TailOffset(offset)) => Some(offset),
+            Some(ReadStart::SeqNum(_) | ReadStart::TimestampMs(_)) => None,
+        };
+        if let Some(offset) = tail_offset {
             let tail = self
                 .get_stream_tail_with_bearer(&options.stream_id, options.bearer_token.as_ref())
                 .await?;
@@ -1301,16 +1307,21 @@ pub struct TsfReadSession {
     socket: ReadSocket,
     finished: bool,
     last_observed_tail: Option<ReadTail>,
+    no_progress_reconnects: usize,
+    reconnect_backoff: Duration,
 }
 
 impl TsfReadSession {
     fn new(client: TsfClient, options: ReadStreamOptions, socket: ReadSocket) -> Self {
+        let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
             client,
             options,
             socket,
             finished: false,
             last_observed_tail: None,
+            no_progress_reconnects: 0,
+            reconnect_backoff,
         }
     }
 
@@ -1321,7 +1332,7 @@ impl TsfReadSession {
 
     /// Waits for the next physical record using the configured idle timeout.
     pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
-        self.next_record_inner(None).await
+        self.next_record_inner().await
     }
 
     /// Waits for the next physical record with a caller-supplied timeout for this operation.
@@ -1329,20 +1340,17 @@ impl TsfReadSession {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<ReadRecord>, TsfClientError> {
-        self.next_record_inner(Some(timeout)).await
+        with_timeout(timeout, "read stream record", self.next_record_inner()).await
     }
 
-    async fn next_record_inner(
-        &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<Option<ReadRecord>, TsfClientError> {
+    async fn next_record_inner(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
         loop {
             if self.finished || read_options_exhausted(&self.options) {
                 self.finished = true;
                 return Ok(None);
             }
 
-            match self.next_socket_outcome(timeout).await {
+            match self.socket.next_outcome().await {
                 Ok(ReadSocketOutcome::Record(record)) => {
                     self.record_delivered(record.s2_seq_num);
                     return Ok(Some(record));
@@ -1365,18 +1373,19 @@ impl TsfReadSession {
         }
     }
 
-    async fn next_socket_outcome(
-        &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<ReadSocketOutcome, TsfClientError> {
-        if let Some(timeout) = timeout {
-            self.socket.next_outcome_with_timeout(timeout).await
-        } else {
-            self.socket.next_outcome().await
-        }
-    }
-
     async fn reconnect(&mut self) -> Result<(), TsfClientError> {
+        let retry_policy = self.client.config.retry_policy;
+        let max_reconnects = retry_policy.attempt_count().saturating_sub(1);
+        if self.no_progress_reconnects >= max_reconnects {
+            return Err(TsfClientError::ReadReconnectLimitExceeded {
+                max_connection_attempts: retry_policy.attempt_count(),
+            });
+        }
+        if !self.reconnect_backoff.is_zero() {
+            sleep(self.reconnect_backoff).await;
+        }
+        self.no_progress_reconnects += 1;
+        self.reconnect_backoff = retry_policy.next_backoff(self.reconnect_backoff);
         self.socket = self
             .client
             .connect_read_socket(self.options.clone())
@@ -1385,6 +1394,8 @@ impl TsfReadSession {
     }
 
     fn record_delivered(&mut self, s2_seq_num: u64) {
+        self.no_progress_reconnects = 0;
+        self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
         match s2_seq_num.checked_add(1) {
             Some(next_seq_num) => self.options.start = Some(ReadStart::SeqNum(next_seq_num)),
             None => self.finished = true,
@@ -1433,18 +1444,6 @@ impl ReadSocket {
                 return Ok(outcome);
             }
         }
-    }
-
-    async fn next_outcome_with_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<ReadSocketOutcome, TsfClientError> {
-        with_timeout(
-            timeout,
-            "read stream record",
-            next_read_socket_outcome(&mut self.ws),
-        )
-        .await
     }
 }
 
@@ -1571,16 +1570,6 @@ async fn next_server_frame(
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Text(_) => return Err(TsfClientError::UnexpectedTextMessage),
             Message::Frame(_) => {}
-        }
-    }
-}
-
-async fn next_read_socket_outcome(
-    ws: &mut ClientWebSocket,
-) -> Result<ReadSocketOutcome, TsfClientError> {
-    loop {
-        if let Some(outcome) = next_read_socket_frame(ws).await? {
-            return Ok(outcome);
         }
     }
 }
@@ -1720,6 +1709,14 @@ pub enum TsfClientError {
     /// A private read requested authentication but no token was configured.
     #[error("private stream read requires a bearer token")]
     MissingReadToken,
+    /// Consecutive read connections ended or requested reconnect without delivering a record.
+    #[error(
+        "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"
+    )]
+    ReadReconnectLimitExceeded {
+        /// Configured maximum consecutive connection attempts, including the initial connection.
+        max_connection_attempts: usize,
+    },
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
@@ -1880,9 +1877,12 @@ mod tests {
             read_idle_timeout: Some(Duration::from_secs(1)),
         };
 
-        let result = socket
-            .next_outcome_with_timeout(Duration::from_millis(100))
-            .await;
+        let result = with_timeout(
+            Duration::from_millis(100),
+            "read stream record",
+            socket.next_outcome(),
+        )
+        .await;
 
         assert!(matches!(
             result,
