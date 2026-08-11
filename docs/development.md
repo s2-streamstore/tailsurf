@@ -37,8 +37,10 @@ cargo check --workspace --examples
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 python3 scripts/published-cli-smoke.py --self-test
-cargo package --workspace
+scripts/verify-packages.sh
 ```
+
+The package verifier builds the exact SDK and CLI archives that would be published. It extracts both archives, patches the CLI registry dependency to the packaged SDK, and checks every packaged target.
 
 ## URL parser diagnostic
 
