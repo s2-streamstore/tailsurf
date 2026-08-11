@@ -42,7 +42,13 @@ The `crates-io` environment identifies trusted-publisher jobs. Both crates.io tr
 
 The `release` environment identifies binary build, signing, notarization, and hosting jobs.
 
-Neither environment currently has reviewer or branch restrictions. The default branch and `v*` tags are also unprotected.
+Both environments accept deployments only from `main`. Both require approval from `shikhar`. Self-approval is allowed because the repository has one maintainer.
+
+The default branch accepts only squash merges from pull requests. The `rust`, `msrv`, `lint`, and `plan` checks must pass against the latest commit. Review threads must be resolved. Force pushes and deletion are blocked.
+
+Release tags matching `v*` cannot be rewritten or deleted.
+
+GitHub Actions may use GitHub-owned actions and the four third-party action repositories referenced by the workflows. Every action must use a full commit SHA. The default workflow token is read-only and cannot approve pull requests.
 
 ## Required release secrets
 
@@ -59,6 +65,8 @@ They also store these Apple notarization credentials:
 - `APPLE_NOTARY_PRIVATE_KEY`
 
 The reusable notarization workflow receives its three credentials through an explicit secret map. Release builds fail when any required signing or notarization credential is missing.
+
+The environments store no duplicate secrets. Their approval rules gate the jobs that consume repository credentials.
 
 ## Validate without publishing
 
