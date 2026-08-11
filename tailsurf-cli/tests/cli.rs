@@ -340,18 +340,15 @@ async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
     assert!(!failed.status.success());
     let recovery_key = failed
         .stderr
-        .split("--create-idempotency-key ")
+        .split("recovery key (keep it secret):\n")
         .nth(1)
-        .and_then(|suffix| suffix.split_whitespace().next())
+        .and_then(|suffix| suffix.lines().next())
         .expect("recovery key in error");
     recovery_key
         .parse::<CreateStreamIdempotencyKey>()
         .expect("canonical recovery key");
-    assert!(
-        failed
-            .stderr
-            .contains("owner-equivalent key must remain secret")
-    );
+    assert!(failed.stderr.contains("TSF_CREATE_IDEMPOTENCY_KEY"));
+    assert!(!failed.stderr.contains("with --create-idempotency-key"));
     let failed_keys = server.create_idempotency_keys();
     assert_eq!(failed_keys.len(), 3);
     assert!(

@@ -643,7 +643,7 @@ async fn create_stream(
     match result {
         Ok(created) => Ok(created),
         Err(error) if error.is_recoverable_create_failure() => Err(error).wrap_err(format!(
-            "stream creation did not complete; recover this exact request with --create-idempotency-key {} (this owner-equivalent key must remain secret)",
+            "stream creation did not complete; recover this exact request by setting TSF_CREATE_IDEMPOTENCY_KEY to this owner-equivalent recovery key (keep it secret):\n{}",
             idempotency_key.expose_secret()
         )),
         Err(error) => Err(error).context("failed to create stream"),

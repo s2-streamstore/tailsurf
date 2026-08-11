@@ -69,7 +69,7 @@ pub struct TsfClientConfig {
     pub websocket_operation_timeout: Duration,
     /// Optional idle timeout while waiting for a read frame. Protocol heartbeats reset the timer. `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
-    /// Retry policy for idempotent metadata reads, socket setup, and consecutive read reconnects without a delivered record.
+    /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and consecutive read reconnects without a delivered record.
     pub retry_policy: RetryPolicy,
     /// Optional account bearer token sent on REST requests.
     pub rest_bearer_token: Option<BearerToken>,
@@ -141,7 +141,7 @@ impl Default for RetryPolicy {
 
 /// Cloneable TSF control-plane and v3 data-plane client.
 ///
-/// Mutating REST operations are not retried because a timeout may occur after the service applies the mutation. Metadata reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by [`TsfProducer`].
+/// Anonymous stream creation is retried with one idempotency key. Other mutating REST operations are not retried because a timeout may occur after the service applies the mutation. Metadata reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by [`TsfProducer`].
 #[derive(Clone)]
 pub struct TsfClient {
     config: TsfClientConfig,
