@@ -104,6 +104,21 @@ fn write_help_describes_implicit_creation() {
 }
 
 #[test]
+fn new_help_describes_mandatory_owner_and_exact_token_files() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["new", "--help"])
+        .output()
+        .expect("tsf new --help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("help UTF-8");
+    assert!(help.contains("The owner link is always issued"));
+    assert!(help.contains("exact view-only token secret"));
+    assert!(help.contains("Requires `--link view`"));
+    assert!(help.contains("exact write-only token secret"));
+    assert!(help.contains("Requires `--link write`"));
+}
+
+#[test]
 fn write_rejects_creation_options_with_an_existing_destination() {
     const WRITE_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
@@ -183,21 +198,15 @@ async fn new_outputs_json_and_token_files() {
     assert!(json["urls"]["o"].as_str().is_some());
     assert!(json["urls"]["r"].as_str().is_some());
     assert!(json["urls"]["w"].as_str().is_some());
-    assert!(
-        !fs::read_to_string(&owner_file)
-            .expect("owner token")
-            .is_empty()
-    );
-    assert!(
-        !fs::read_to_string(&read_file)
-            .expect("read token")
-            .is_empty()
-    );
-    assert!(
-        !fs::read_to_string(&write_file)
-            .expect("write token")
-            .is_empty()
-    );
+    for (path, permission) in [(&owner_file, "o"), (&read_file, "r"), (&write_file, "w")] {
+        let url = json["urls"][permission].as_str().expect("matching URL");
+        let locator = StreamLocator::parse(url).expect("matching URL parses");
+        let expected = locator.token.expect("matching URL token");
+        assert_eq!(
+            fs::read_to_string(path).expect("token file"),
+            expected.token.expose_secret()
+        );
+    }
     #[cfg(unix)]
     for path in [&owner_file, &read_file, &write_file] {
         assert_eq!(
@@ -265,9 +274,78 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  view+write <url>\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  view+write <url>\n  owner <url>\n\nLinks are shown once.\n"
     );
-    assert_created_output_urls_parse(&explicit.stdout, &["rw", "r"]);
+    assert_created_output_urls_parse(&explicit.stdout, &["o", "rw", "r"]);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_deduplicates_owner_and_rejects_more_than_three_effective_links() {
+    let server = TestServer::start().await;
+
+    let deduplicated = run_tsf(&server, ["new", "--link", "owner", "--link", "view"], None).await;
+    assert!(
+        deduplicated.status.success(),
+        "stderr={}",
+        deduplicated.stderr
+    );
+    assert_created_output_urls_parse(&deduplicated.stdout, &["o", "r"]);
+
+    let too_many = run_tsf(
+        &server,
+        [
+            "new",
+            "--link",
+            "view",
+            "--link",
+            "write",
+            "--link",
+            "view+write",
+        ],
+        None,
+    )
+    .await;
+    assert!(!too_many.status.success());
+    assert!(
+        too_many
+            .stderr
+            .contains("at most 3 initial links may be issued"),
+        "stderr={}",
+        too_many.stderr
+    );
+    assert_eq!(server.create_idempotency_keys().len(), 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_token_files_require_the_exact_requested_permission() {
+    let server = TestServer::start().await;
+
+    let output = run_tsf(
+        &server,
+        [
+            "new",
+            "--link",
+            "view+write",
+            "--view-token-file",
+            "unused.token",
+        ],
+        None,
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert!(
+        output
+            .stderr
+            .contains("--view-token-file requires --link view"),
+        "stderr={}",
+        output.stderr
+    );
+    assert!(server.create_idempotency_keys().is_empty());
 
     server.abort();
 }

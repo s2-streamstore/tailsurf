@@ -42,6 +42,7 @@ use url::Url;
 
 const INTERRUPT_EXIT_CODE: i32 = 130;
 const RAW_LINGER: Duration = Duration::from_millis(10);
+const MAX_INITIAL_TOKENS: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
@@ -107,7 +108,7 @@ struct NewArgs {
     /// Allow anonymous reads.
     #[arg(long)]
     public: bool,
-    /// Issue this link at creation instead of the default owner link. May be repeated.
+    /// Issue an additional link at creation. The owner link is always issued. May be repeated.
     #[arg(long = "link", value_name = "ACCESS")]
     links: Vec<AccessArg>,
     #[arg(
@@ -122,10 +123,10 @@ struct NewArgs {
     /// Write the owner token secret to this file.
     #[arg(long = "owner-token-file", value_name = "PATH")]
     owner_token_file: Option<PathBuf>,
-    /// Write the view token secret to this file.
+    /// Write the exact view-only token secret to this file. Requires `--link view`.
     #[arg(long = "view-token-file", value_name = "PATH")]
     view_token_file: Option<PathBuf>,
-    /// Write the write token secret to this file.
+    /// Write the exact write-only token secret to this file. Requires `--link write`.
     #[arg(long = "write-token-file", value_name = "PATH")]
     write_token_file: Option<PathBuf>,
 }
@@ -501,11 +502,7 @@ fn print_error(error: &eyre::Report) {
 
 async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<()> {
     let visibility = visibility_from_flags(args.public);
-    let issue_tokens = if args.links.is_empty() {
-        vec![TokenPermissions::owner()]
-    } else {
-        args.links.iter().map(|access| access.0).collect()
-    };
+    let issue_tokens = new_stream_tokens(&args)?;
 
     let created = create_stream(
         api_url,
@@ -518,6 +515,27 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
     print_created_stream(&web_url, &created, args.format, OutputTarget::Stdout)?;
 
     Ok(())
+}
+
+fn new_stream_tokens(args: &NewArgs) -> eyre::Result<Vec<TokenPermissions>> {
+    let mut issue_tokens = vec![TokenPermissions::owner()];
+    for access in &args.links {
+        if !issue_tokens.contains(&access.0) {
+            issue_tokens.push(access.0);
+        }
+    }
+    if issue_tokens.len() > MAX_INITIAL_TOKENS {
+        bail!(
+            "at most {MAX_INITIAL_TOKENS} initial links may be issued, including the mandatory owner link"
+        );
+    }
+    if args.view_token_file.is_some() && !issue_tokens.contains(&TokenPermissions::read()) {
+        bail!("--view-token-file requires --link view");
+    }
+    if args.write_token_file.is_some() && !issue_tokens.contains(&TokenPermissions::write()) {
+        bail!("--write-token-file requires --link write");
+    }
+    Ok(issue_tokens)
 }
 
 async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Result<()> {
@@ -1467,19 +1485,19 @@ fn write_token_files(tokens: &[IssuedStreamToken], args: &NewArgs) -> eyre::Resu
     write_token_file(
         &args.owner_token_file,
         tokens,
-        TokenPermissions::allows_owner,
+        TokenPermissions::owner(),
         "owner",
     )?;
     write_token_file(
         &args.view_token_file,
         tokens,
-        TokenPermissions::allows_read,
+        TokenPermissions::read(),
         "view",
     )?;
     write_token_file(
         &args.write_token_file,
         tokens,
-        TokenPermissions::allows_write,
+        TokenPermissions::write(),
         "write",
     )?;
     Ok(())
@@ -1488,7 +1506,7 @@ fn write_token_files(tokens: &[IssuedStreamToken], args: &NewArgs) -> eyre::Resu
 fn write_token_file(
     path: &Option<PathBuf>,
     tokens: &[IssuedStreamToken],
-    allows: impl Fn(TokenPermissions) -> bool,
+    permissions: TokenPermissions,
     label: &str,
 ) -> eyre::Result<()> {
     let Some(path) = path else {
@@ -1496,7 +1514,7 @@ fn write_token_file(
     };
     let token = tokens
         .iter()
-        .find(|token| allows(token.permissions))
+        .find(|token| token.permissions == permissions)
         .with_context(|| format!("created stream did not include a {label} token"))?;
     write_secret_file(path, token.token.expose_secret())
         .with_context(|| format!("failed to write {label} token file {}", path.display()))?;
