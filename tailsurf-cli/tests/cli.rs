@@ -246,6 +246,23 @@ async fn new_retries_with_one_canonical_idempotency_key() {
 }
 
 #[tokio::test]
+async fn create_stream_suppresses_configured_rest_authorization() {
+    let server = TestServer::start().await;
+    let client = TsfClient::with_api_base_url_and_rest_bearer_token(
+        server.api_url.clone(),
+        "configured-account-token",
+    );
+
+    client
+        .create_stream(&CreateStreamRequest::default())
+        .await
+        .expect("create stream");
+
+    assert_eq!(server.create_authorizations(), [None]);
+    server.abort();
+}
+
+#[tokio::test]
 async fn new_text_output_covers_visibility_and_explicit_tokens() {
     let server = TestServer::start().await;
 
@@ -1400,6 +1417,14 @@ impl TestServer {
             .clone()
     }
 
+    fn create_authorizations(&self) -> Vec<Option<String>> {
+        self.state
+            .create_authorizations
+            .lock()
+            .expect("create authorizations lock")
+            .clone()
+    }
+
     async fn wait_for_records(&self, stream_id: &StreamId, expected: usize) {
         let stream_id = stream_id.to_string();
         timeout(Duration::from_secs(5), async {
@@ -1432,6 +1457,7 @@ struct TestApiState {
     next_token: Mutex<u64>,
     create_failures_remaining: Mutex<usize>,
     create_idempotency_keys: Mutex<Vec<Option<String>>>,
+    create_authorizations: Mutex<Vec<Option<String>>>,
     token_list_failures_remaining: Mutex<usize>,
     streams: Mutex<HashMap<String, TestStream>>,
 }
@@ -1477,6 +1503,15 @@ async fn test_create_stream(
         .lock()
         .expect("create idempotency keys lock")
         .push(idempotency_key);
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    state
+        .create_authorizations
+        .lock()
+        .expect("create authorizations lock")
+        .push(authorization);
     let mut create_failures = state
         .create_failures_remaining
         .lock()

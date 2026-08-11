@@ -194,12 +194,13 @@ impl TsfClient {
     ) -> Result<CreateStreamResponse, TsfClientError> {
         let idempotency_key = new_idempotency_key();
         self.retry_transient(|| {
-            self.send_json(
+            self.send_json_with_bearer(
                 self.http
                     .post(self.rest_url("/streams"))
                     .header("Idempotency-Key", &idempotency_key)
                     .json(request),
                 "create stream",
+                None,
             )
         })
         .await
@@ -451,7 +452,7 @@ impl TsfClient {
         request: reqwest::RequestBuilder,
         bearer_token: Option<&BearerToken>,
     ) -> reqwest::RequestBuilder {
-        if let Some(token) = bearer_token.or(self.config.rest_bearer_token.as_ref()) {
+        if let Some(token) = bearer_token {
             request.bearer_auth(token.expose_secret())
         } else {
             request
@@ -508,6 +509,7 @@ impl TsfClient {
         bearer_token: Option<&BearerToken>,
     ) -> Result<T, TsfClientError> {
         let url = self.rest_url(&path);
+        let bearer_token = bearer_token.or(self.config.rest_bearer_token.as_ref());
         self.retry_transient(|| {
             self.send_json_with_bearer(self.http.get(url.clone()), operation, bearer_token)
         })
@@ -519,7 +521,8 @@ impl TsfClient {
         request: reqwest::RequestBuilder,
         operation: &'static str,
     ) -> Result<T, TsfClientError> {
-        self.send_json_with_bearer(request, operation, None).await
+        self.send_json_with_bearer(request, operation, self.config.rest_bearer_token.as_ref())
+            .await
     }
 
     async fn send_json_with_bearer<T: DeserializeOwned>(
@@ -542,7 +545,7 @@ impl TsfClient {
         operation: &'static str,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request, None)
+            .apply_rest_auth(request, self.config.rest_bearer_token.as_ref())
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
