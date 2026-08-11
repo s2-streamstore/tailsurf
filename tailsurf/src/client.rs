@@ -1040,28 +1040,22 @@ pub trait IntoRecordData {
     /// Converts this value into reference-counted immutable bytes.
     fn into_record_data(self) -> Bytes;
 }
+/// Sealed marker for types that own their bytes and implement `Into<Bytes>`.
+trait OwnedIntoBytes: Into<Bytes> {}
+impl OwnedIntoBytes for Bytes {}
+impl OwnedIntoBytes for Vec<u8> {}
+impl OwnedIntoBytes for Box<[u8]> {}
+impl OwnedIntoBytes for String {}
 
-impl IntoRecordData for Bytes {
+impl<T: OwnedIntoBytes> IntoRecordData for T {
     fn into_record_data(self) -> Bytes {
-        self
+        self.into()
     }
 }
 
 impl IntoRecordData for &Bytes {
     fn into_record_data(self) -> Bytes {
         self.clone()
-    }
-}
-
-impl IntoRecordData for Vec<u8> {
-    fn into_record_data(self) -> Bytes {
-        Bytes::from(self)
-    }
-}
-
-impl IntoRecordData for Box<[u8]> {
-    fn into_record_data(self) -> Bytes {
-        Bytes::from(self)
     }
 }
 
@@ -1074,12 +1068,6 @@ impl IntoRecordData for &[u8] {
 impl<const N: usize> IntoRecordData for &[u8; N] {
     fn into_record_data(self) -> Bytes {
         Bytes::copy_from_slice(&self[..])
-    }
-}
-
-impl IntoRecordData for String {
-    fn into_record_data(self) -> Bytes {
-        Bytes::from(self)
     }
 }
 
