@@ -392,6 +392,10 @@ jobs:
     permissions:
       actions: read
       contents: read
+    secrets:
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
     uses: ./.github/workflows/notarize-macos.yml
   # Determines if we should publish/announce
   host:

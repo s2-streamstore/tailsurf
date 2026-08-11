@@ -4,11 +4,11 @@ on:
   workflow_call:
     secrets:
       APPLE_NOTARY_ISSUER_ID:
-        required: false
+        required: true
       APPLE_NOTARY_KEY_ID:
-        required: false
+        required: true
       APPLE_NOTARY_PRIVATE_KEY:
-        required: false
+        required: true
 
 jobs:
   notarize:
