@@ -217,7 +217,7 @@ impl LogicalTranscript {
         if record.part.is_final() {
             return Ok(Some(TranscriptRecord {
                 format: pending.format,
-                data: TranscriptData::from_ordered_chunks(pending.chunks),
+                data: TranscriptData::from_ordered_chunks(pending.chunks, pending.len),
             }));
         }
         let pending_parts =
@@ -283,11 +283,11 @@ impl TranscriptData {
         }
     }
 
-    fn from_ordered_chunks(chunks: Vec<Bytes>) -> Self {
+    fn from_ordered_chunks(chunks: Vec<Bytes>, len: usize) -> Self {
         match chunks.len() {
             0 => Self::Single(Bytes::new()),
             1 => Self::Single(chunks.into_iter().next().expect("single chunk")),
-            _ => Self::Chunked(ChunkedBytes::new(chunks)),
+            _ => Self::Chunked(ChunkedBytes::new(chunks, len)),
         }
     }
 }
@@ -331,9 +331,9 @@ pub struct ChunkedBytes {
 }
 
 impl ChunkedBytes {
-    fn new(chunks: Vec<Bytes>) -> Self {
+    fn new(chunks: Vec<Bytes>, remaining: usize) -> Self {
         debug_assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
-        let remaining = chunks.iter().map(Bytes::len).sum();
+        debug_assert_eq!(remaining, chunks.iter().map(Bytes::len).sum::<usize>());
         Self {
             chunks,
             index: 0,
@@ -344,6 +344,11 @@ impl ChunkedBytes {
 
     /// Coalesces the remaining chunks into one contiguous byte value.
     pub fn into_bytes(self) -> Bytes {
+        // A fully consumed prefix leaves the payload contiguous, so the tail chunk can be shared.
+        if let [chunk] = &self.chunks[self.index..] {
+            return chunk.slice(self.offset..);
+        }
+
         let mut data = BytesMut::with_capacity(self.remaining);
         for chunk in self.chunks.into_iter().skip(self.index) {
             let bytes = if data.is_empty() && self.offset > 0 {
@@ -579,10 +584,10 @@ mod tests {
 
     #[test]
     fn chunked_transcript_data_advances_across_parts() {
-        let mut data = TranscriptData::from_ordered_chunks(vec![
-            Bytes::from_static(b"hel"),
-            Bytes::from_static(b"lo"),
-        ]);
+        let mut data = TranscriptData::from_ordered_chunks(
+            vec![Bytes::from_static(b"hel"), Bytes::from_static(b"lo")],
+            5,
+        );
 
         assert_eq!(data.remaining(), 5);
         assert_eq!(data.chunk(), b"hel");
@@ -593,6 +598,33 @@ mod tests {
         data.advance(2);
         assert_eq!(data.remaining(), 0);
         assert_eq!(data.chunk(), b"");
+    }
+
+    #[test]
+    fn partially_consumed_chunks_coalesce_remaining_bytes() {
+        let mut data = TranscriptData::from_ordered_chunks(
+            vec![
+                Bytes::from_static(b"hel"),
+                Bytes::from_static(b"lo "),
+                Bytes::from_static(b"world"),
+            ],
+            11,
+        );
+
+        // Several chunks remain: the payload has to be copied out from the consumed offset.
+        data.advance(4);
+        assert_eq!(data.clone().into_bytes(), Bytes::from_static(b"o world"));
+
+        // One chunk remains at offset zero, so it is shared as-is.
+        data.advance(2);
+        assert_eq!(data.clone().into_bytes(), Bytes::from_static(b"world"));
+
+        // One chunk remains mid-way through, so the shared slice must start at the offset.
+        data.advance(1);
+        assert_eq!(data.clone().into_bytes(), Bytes::from_static(b"orld"));
+
+        data.advance(4);
+        assert_eq!(data.into_bytes(), Bytes::new());
     }
 
     #[test]
