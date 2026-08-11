@@ -4,6 +4,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
+    str::FromStr,
     sync::Arc,
     task::{Context, Poll},
     time::Duration,
@@ -193,17 +194,32 @@ impl TsfClient {
         &self,
         request: &CreateStreamRequest,
     ) -> Result<CreateStreamResponse, TsfClientError> {
-        let idempotency_key = new_idempotency_key();
-        self.retry_transient(|| {
-            self.send_json_with_bearer(
-                self.http
-                    .post(self.rest_url("/streams"))
-                    .header("Idempotency-Key", &idempotency_key)
-                    .json(request),
-                "create stream",
-                None,
-            )
-        })
+        let idempotency_key = CreateStreamIdempotencyKey::new_random();
+        self.create_stream_with_idempotency_key(request, &idempotency_key)
+            .await
+    }
+
+    /// Creates or recovers a logical stream creation using a caller-owned idempotency key.
+    ///
+    /// The key is owner-equivalent recovery material. Generate and persist it securely before the first request, then reuse it with the identical request after cancellation, process loss, or an ambiguous response.
+    pub async fn create_stream_with_idempotency_key(
+        &self,
+        request: &CreateStreamRequest,
+        idempotency_key: &CreateStreamIdempotencyKey,
+    ) -> Result<CreateStreamResponse, TsfClientError> {
+        self.retry_when(
+            || {
+                self.send_json_with_bearer(
+                    self.http
+                        .post(self.rest_url("/streams"))
+                        .header("Idempotency-Key", idempotency_key.expose_secret())
+                        .json(request),
+                    "create stream",
+                    None,
+                )
+            },
+            TsfClientError::is_recoverable_create_failure,
+        )
         .await
     }
 
@@ -566,9 +582,17 @@ impl TsfClient {
         })
     }
 
-    async fn retry_transient<T, Fut>(
+    async fn retry_transient<T, Fut>(&self, run: impl FnMut() -> Fut) -> Result<T, TsfClientError>
+    where
+        Fut: Future<Output = Result<T, TsfClientError>>,
+    {
+        self.retry_when(run, TsfClientError::is_retryable).await
+    }
+
+    async fn retry_when<T, Fut>(
         &self,
         mut run: impl FnMut() -> Fut,
+        should_retry: impl Fn(&TsfClientError) -> bool,
     ) -> Result<T, TsfClientError>
     where
         Fut: Future<Output = Result<T, TsfClientError>>,
@@ -580,7 +604,7 @@ impl TsfClient {
         for attempt in 1..=attempts {
             match run().await {
                 Ok(value) => return Ok(value),
-                Err(error) if attempt < attempts && error.is_retryable() => {
+                Err(error) if attempt < attempts && should_retry(&error) => {
                     if !backoff.is_zero() {
                         sleep(backoff).await;
                     }
@@ -605,10 +629,52 @@ pub fn default_api_base_url() -> Url {
     Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
 }
 
-fn new_idempotency_key() -> String {
-    let mut bytes = [0_u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    encode_base64url_32(&bytes)
+/// Owner-equivalent recovery key for one logical stream-creation request.
+#[derive(Clone, Debug)]
+pub struct CreateStreamIdempotencyKey(BearerToken);
+
+impl CreateStreamIdempotencyKey {
+    /// Generates a cryptographically random canonical 256-bit key.
+    pub fn new_random() -> Self {
+        let mut bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        Self(encode_base64url_32(&bytes).into())
+    }
+}
+
+impl FromStr for CreateStreamIdempotencyKey {
+    type Err = InvalidCreateStreamIdempotencyKey;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_canonical_base64url_32(value) {
+            Ok(Self(value.into()))
+        } else {
+            Err(InvalidCreateStreamIdempotencyKey)
+        }
+    }
+}
+
+impl ExposeSecret<str> for CreateStreamIdempotencyKey {
+    fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+/// Error returned for a malformed stream-creation idempotency key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("create idempotency key must be canonical 43-character unpadded base64url")]
+pub struct InvalidCreateStreamIdempotencyKey;
+
+fn is_canonical_base64url_32(value: &str) -> bool {
+    const FINAL_CHARS: &[u8] = b"AEIMQUYcgkosw048";
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|last| FINAL_CHARS.contains(last))
 }
 
 fn encode_base64url_32(bytes: &[u8; 32]) -> String {
@@ -1753,6 +1819,17 @@ pub enum TsfClientError {
 }
 
 impl TsfClientError {
+    /// Returns whether retrying a failed create with the same idempotency key and request is safe and may succeed.
+    pub fn is_recoverable_create_failure(&self) -> bool {
+        match self {
+            Self::Http(error) => {
+                error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
+            }
+            Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
+            _ => false,
+        }
+    }
+
     fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
@@ -1839,6 +1916,26 @@ mod tests {
         let encoded = encode_base64url_32(&[0_u8; 32]);
 
         assert_eq!(encoded, "A".repeat(43));
+    }
+
+    #[test]
+    fn create_idempotency_keys_validate_and_redact_debug_output() {
+        let key = CreateStreamIdempotencyKey::new_random();
+        let exposed = key.expose_secret().to_owned();
+
+        assert!(is_canonical_base64url_32(&exposed));
+        assert_eq!(
+            exposed
+                .parse::<CreateStreamIdempotencyKey>()
+                .expect("canonical key")
+                .expose_secret(),
+            exposed
+        );
+        assert!(!format!("{key:?}").contains(&exposed));
+        assert!(matches!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse::<CreateStreamIdempotencyKey>(),
+            Err(InvalidCreateStreamIdempotencyKey)
+        ));
     }
 
     #[tokio::test]

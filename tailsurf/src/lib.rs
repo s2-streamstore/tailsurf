@@ -16,9 +16,10 @@ pub mod stream_url;
 pub mod transcript;
 
 pub use client::{
-    AppendAck, AppendReceipt, AppendTicket, IntoRecordData, RetryPolicy, TsfAppendSession,
-    TsfClient, TsfClientConfig, TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession,
-    WritePermit, WriteRecord, default_api_base_url,
+    AppendAck, AppendReceipt, AppendTicket, CreateStreamIdempotencyKey, IntoRecordData,
+    InvalidCreateStreamIdempotencyKey, RetryPolicy, TsfAppendSession, TsfClient, TsfClientConfig,
+    TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession, WritePermit, WriteRecord,
+    default_api_base_url,
 };
 pub use ids::{BearerToken, StreamId, TokenId, WriterId};
 pub use permissions::{PermissionsError, TokenPermissions};

@@ -23,8 +23,8 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    BearerToken, RetryPolicy, StreamId, TokenId, TokenPermissions, TsfClient, TsfClientConfig,
-    TsfClientError, TsfProducerConfig, WriteRecord, WriterId,
+    BearerToken, CreateStreamIdempotencyKey, RetryPolicy, StreamId, TokenId, TokenPermissions,
+    TsfClient, TsfClientConfig, TsfClientError, TsfProducerConfig, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -112,6 +112,7 @@ fn new_help_describes_mandatory_owner_and_exact_token_files() {
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).expect("help UTF-8");
     assert!(help.contains("The owner link is always issued"));
+    assert!(help.contains("Owner-equivalent recovery key"));
     assert!(help.contains("exact view-only token secret"));
     assert!(help.contains("Requires `--link view`"));
     assert!(help.contains("exact write-only token secret"));
@@ -142,6 +143,22 @@ fn write_rejects_creation_options_with_an_existing_destination() {
         String::from_utf8(misplaced_retention.stderr)
             .expect("stderr UTF-8")
             .contains("--retention cannot be used when writing to an existing stream")
+    );
+
+    let misplaced_recovery_key = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args([
+            "write",
+            WRITE_URL,
+            "--create-idempotency-key",
+            TEST_STREAM_TOKEN,
+        ])
+        .output()
+        .expect("tsf write URL --create-idempotency-key");
+    assert!(!misplaced_recovery_key.status.success());
+    assert!(
+        String::from_utf8(misplaced_recovery_key.stderr)
+            .expect("stderr UTF-8")
+            .contains("--create-idempotency-key cannot be used when writing to an existing stream")
     );
 }
 
@@ -287,6 +304,79 @@ async fn new_retries_with_one_canonical_idempotency_key() {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     );
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn create_stream_recovers_a_committed_truncated_response() {
+    let server = TestServer::start().await;
+    server.fail_next_create_body();
+    let key = CreateStreamIdempotencyKey::new_random();
+    let exposed_key = key.expose_secret().to_owned();
+
+    let created = TsfClient::with_api_base_url(server.api_url.clone())
+        .create_stream_with_idempotency_key(&CreateStreamRequest::default(), &key)
+        .await
+        .expect("recover committed create");
+
+    assert_eq!(created.tokens.len(), 3);
+    let observed_keys = server.create_idempotency_keys();
+    assert_eq!(observed_keys.len(), 2);
+    assert!(
+        observed_keys
+            .iter()
+            .all(|observed| observed.as_deref() == Some(exposed_key.as_str()))
+    );
+    assert_eq!(server.stream_count(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
+    let server = TestServer::start_with_create_failures(3).await;
+
+    let failed = run_tsf(&server, ["new", "--format", "json"], None).await;
+
+    assert!(!failed.status.success());
+    let recovery_key = failed
+        .stderr
+        .split("--create-idempotency-key ")
+        .nth(1)
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .expect("recovery key in error");
+    recovery_key
+        .parse::<CreateStreamIdempotencyKey>()
+        .expect("canonical recovery key");
+    assert!(
+        failed
+            .stderr
+            .contains("owner-equivalent key must remain secret")
+    );
+    let failed_keys = server.create_idempotency_keys();
+    assert_eq!(failed_keys.len(), 3);
+    assert!(
+        failed_keys
+            .iter()
+            .all(|observed| observed.as_deref() == Some(recovery_key))
+    );
+
+    let recovered = run_tsf(
+        &server,
+        [
+            "new",
+            "--format",
+            "json",
+            "--create-idempotency-key",
+            recovery_key,
+        ],
+        None,
+    )
+    .await;
+
+    assert!(recovered.status.success(), "stderr={}", recovered.stderr);
+    let recovered_keys = server.create_idempotency_keys();
+    assert_eq!(recovered_keys.len(), 4);
+    assert_eq!(recovered_keys[3].as_deref(), Some(recovery_key));
     server.abort();
 }
 
@@ -1616,6 +1706,14 @@ impl TestServer {
             .expect("token list failure lock") += 1;
     }
 
+    fn fail_next_create_body(&self) {
+        *self
+            .state
+            .create_invalid_json_remaining
+            .lock()
+            .expect("create body failure lock") += 1;
+    }
+
     fn create_idempotency_keys(&self) -> Vec<Option<String>> {
         self.state
             .create_idempotency_keys
@@ -1630,6 +1728,10 @@ impl TestServer {
             .lock()
             .expect("create authorizations lock")
             .clone()
+    }
+
+    fn stream_count(&self) -> usize {
+        self.state.streams.lock().expect("streams lock").len()
     }
 
     async fn wait_for_records(&self, stream_id: &StreamId, expected: usize) {
@@ -1663,6 +1765,8 @@ struct TestApiState {
     next_stream: Mutex<u64>,
     next_token: Mutex<u64>,
     create_failures_remaining: Mutex<usize>,
+    create_invalid_json_remaining: Mutex<usize>,
+    create_responses: Mutex<HashMap<String, CreateStreamResponse>>,
     create_idempotency_keys: Mutex<Vec<Option<String>>>,
     create_authorizations: Mutex<Vec<Option<String>>>,
     token_list_failures_remaining: Mutex<usize>,
@@ -1709,7 +1813,7 @@ async fn test_create_stream(
         .create_idempotency_keys
         .lock()
         .expect("create idempotency keys lock")
-        .push(idempotency_key);
+        .push(idempotency_key.clone());
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -1732,6 +1836,17 @@ async fn test_create_stream(
         );
     }
     drop(create_failures);
+
+    if let Some(response) = idempotency_key.as_ref().and_then(|key| {
+        state
+            .create_responses
+            .lock()
+            .expect("create responses lock")
+            .get(key)
+            .cloned()
+    }) {
+        return Json(response).into_response();
+    }
 
     let retention_secs = match request.retention_secs {
         None => 864_000,
@@ -1787,13 +1902,30 @@ async fn test_create_stream(
         },
     );
 
-    Json(CreateStreamResponse {
+    let response = CreateStreamResponse {
         stream_id,
         visibility: request.visibility,
         retention_secs,
         tokens: response_tokens,
-    })
-    .into_response()
+    };
+    if let Some(key) = idempotency_key {
+        state
+            .create_responses
+            .lock()
+            .expect("create responses lock")
+            .insert(key, response.clone());
+    }
+    let mut invalid_json = state
+        .create_invalid_json_remaining
+        .lock()
+        .expect("create body failure lock");
+    if *invalid_json > 0 {
+        *invalid_json -= 1;
+        return (StatusCode::OK, [("content-type", "application/json")], "{").into_response();
+    }
+    drop(invalid_json);
+
+    Json(response).into_response()
 }
 
 async fn test_get_stream(

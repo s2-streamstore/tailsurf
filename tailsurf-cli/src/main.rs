@@ -16,8 +16,8 @@ use eyre::{Context, ContextCompat, bail};
 use secrecy::ExposeSecret;
 use serde::Serialize;
 use tailsurf::{
-    AppendTicket, BearerToken, StreamId, TokenId, TokenPermissions, TsfClient, TsfProducer,
-    WriteRecord, WriterId,
+    AppendTicket, BearerToken, CreateStreamIdempotencyKey, StreamId, TokenId, TokenPermissions,
+    TsfClient, TsfProducer, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
@@ -117,6 +117,9 @@ struct NewArgs {
         help = "Record retention, such as 6h, 7d, or infinite"
     )]
     retention: Option<RetentionArg>,
+    /// Owner-equivalent recovery key for resuming this exact create request.
+    #[arg(long, env = "TSF_CREATE_IDEMPOTENCY_KEY", value_name = "KEY")]
+    create_idempotency_key: Option<CreateStreamIdempotencyKey>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -145,6 +148,9 @@ struct WriteArgs {
         help = "New-stream record retention, such as 6h, 7d, or infinite"
     )]
     retention: Option<RetentionArg>,
+    /// Owner-equivalent recovery key for an implicitly created stream.
+    #[arg(long, env = "TSF_CREATE_IDEMPOTENCY_KEY", value_name = "KEY")]
+    create_idempotency_key: Option<CreateStreamIdempotencyKey>,
     /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
     #[arg(long)]
     raw: bool,
@@ -509,6 +515,7 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
         visibility,
         args.retention.map(Into::into),
         issue_tokens,
+        args.create_idempotency_key.as_ref(),
     )
     .await?;
     print_created_stream(&web_url, &created, args.format, OutputTarget::Stdout)?;
@@ -560,6 +567,7 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
             visibility,
             args.retention.map(Into::into),
             write_new_default_links(visibility),
+            args.create_idempotency_key.as_ref(),
         )
         .await?;
         print_created_stream(&web_url, &created, OutputFormat::Text, OutputTarget::Stderr)?;
@@ -601,6 +609,9 @@ fn validate_write_args(args: &WriteArgs) -> eyre::Result<()> {
     if args.retention.is_some() {
         bail!("--retention cannot be used when writing to an existing stream");
     }
+    if args.create_idempotency_key.is_some() {
+        bail!("--create-idempotency-key cannot be used when writing to an existing stream");
+    }
     Ok(())
 }
 
@@ -609,15 +620,34 @@ async fn create_stream(
     visibility: Visibility,
     retention_secs: Option<RequestedRetention>,
     issue_tokens: Vec<TokenPermissions>,
+    supplied_key: Option<&CreateStreamIdempotencyKey>,
 ) -> eyre::Result<CreateStreamResponse> {
-    TsfClient::with_api_base_url(api_url)
-        .create_stream(&CreateStreamRequest {
-            visibility,
-            retention_secs,
-            issue_tokens: Some(issue_tokens),
-        })
-        .await
-        .context("failed to create stream")
+    let generated_key;
+    let idempotency_key = match supplied_key {
+        Some(key) => key,
+        None => {
+            generated_key = CreateStreamIdempotencyKey::new_random();
+            &generated_key
+        }
+    };
+    let result = TsfClient::with_api_base_url(api_url)
+        .create_stream_with_idempotency_key(
+            &CreateStreamRequest {
+                visibility,
+                retention_secs,
+                issue_tokens: Some(issue_tokens),
+            },
+            idempotency_key,
+        )
+        .await;
+    match result {
+        Ok(created) => Ok(created),
+        Err(error) if error.is_recoverable_create_failure() => Err(error).wrap_err(format!(
+            "stream creation did not complete; recover this exact request with --create-idempotency-key {} (this owner-equivalent key must remain secret)",
+            idempotency_key.expose_secret()
+        )),
+        Err(error) => Err(error).context("failed to create stream"),
+    }
 }
 
 fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> eyre::Result<Option<Url>> {
