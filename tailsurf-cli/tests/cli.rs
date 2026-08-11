@@ -226,6 +226,51 @@ async fn new_outputs_json_and_token_files() {
 }
 
 #[tokio::test]
+async fn new_prints_recovery_links_before_a_token_file_error() {
+    let server = TestServer::start().await;
+    let unwritable_path = std::env::temp_dir().join(format!(
+        "tsf-cli-unwritable-token-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir(&unwritable_path).expect("unwritable token path");
+
+    let output = run_tsf(
+        &server,
+        [
+            "new",
+            "--format",
+            "json",
+            "--owner-token-file",
+            unwritable_path.to_str().expect("token path"),
+        ],
+        None,
+    )
+    .await;
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("recovery JSON");
+    let owner_url = json["urls"]["o"].as_str().expect("owner recovery URL");
+    let locator = StreamLocator::parse(owner_url).expect("owner recovery URL parses");
+    assert!(
+        locator
+            .token_with(|permissions| permissions == TokenPermissions::owner())
+            .is_some()
+    );
+    assert!(
+        output.stderr.contains("failed to write owner token file"),
+        "stderr={}",
+        output.stderr
+    );
+
+    fs::remove_dir(&unwritable_path).expect("cleanup");
+    server.abort();
+}
+
+#[tokio::test]
 async fn new_retries_with_one_canonical_idempotency_key() {
     let server = TestServer::start_with_create_failures(1).await;
 

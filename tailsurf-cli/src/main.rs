@@ -511,8 +511,8 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
         issue_tokens,
     )
     .await?;
-    write_token_files(&created.tokens, &args)?;
     print_created_stream(&web_url, &created, args.format, OutputTarget::Stdout)?;
+    write_token_files(&created.tokens, &args)?;
 
     Ok(())
 }
