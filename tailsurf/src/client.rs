@@ -56,7 +56,7 @@ type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const API_PREFIX: &str = "/api/v1";
 const DEFAULT_READ_TAIL_OFFSET: u64 = 80;
 
-/// Timeouts, retry behavior, API origin, and optional account authorization for [`TsfClient`].
+/// Timeouts, retry behavior, and API origin for [`TsfClient`].
 #[derive(Clone, Debug)]
 pub struct TsfClientConfig {
     /// Service origin without the `/api/v1` namespace.
@@ -71,8 +71,6 @@ pub struct TsfClientConfig {
     pub websocket_read_idle_timeout: Option<Duration>,
     /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and consecutive read reconnects without a delivered record.
     pub retry_policy: RetryPolicy,
-    /// Optional account bearer token sent on REST requests.
-    pub rest_bearer_token: Option<BearerToken>,
 }
 
 impl TsfClientConfig {
@@ -85,7 +83,6 @@ impl TsfClientConfig {
             websocket_operation_timeout: Duration::from_secs(30),
             websocket_read_idle_timeout: Some(Duration::from_secs(60)),
             retry_policy: RetryPolicy::default(),
-            rest_bearer_token: None,
         }
     }
 }
@@ -159,16 +156,6 @@ impl TsfClient {
         Self::with_config(TsfClientConfig::new(api_base_url))
     }
 
-    /// Creates a client with an explicit API origin and account bearer token for REST requests.
-    pub fn with_api_base_url_and_rest_bearer_token(
-        api_base_url: Url,
-        bearer_token: impl Into<BearerToken>,
-    ) -> Self {
-        let mut config = TsfClientConfig::new(api_base_url);
-        config.rest_bearer_token = Some(bearer_token.into());
-        Self::with_config(config)
-    }
-
     /// Creates a client from a complete configuration.
     pub fn with_config(config: TsfClientConfig) -> Self {
         Self {
@@ -224,30 +211,47 @@ impl TsfClient {
     }
 
     /// Retrieves current stream metadata, retrying transient failures according to policy.
+    ///
+    /// Private streams require a read-capable stream token. Public streams may pass `None`.
     pub async fn get_stream(
         &self,
         stream_id: &StreamId,
+        bearer_token: Option<&BearerToken>,
     ) -> Result<StreamInfoResponse, TsfClientError> {
-        self.get_json(format!("/streams/{stream_id}"), "get stream")
+        self.get_json_with_bearer(format!("/streams/{stream_id}"), "get stream", bearer_token)
             .await
     }
 
     /// Retrieves the current durable stream tail, retrying transient failures according to policy.
+    ///
+    /// Private streams require a read-capable stream token. Public streams may pass `None`.
     pub async fn get_stream_tail(
         &self,
         stream_id: &StreamId,
+        bearer_token: Option<&BearerToken>,
     ) -> Result<StreamTailResponse, TsfClientError> {
-        self.get_json(format!("/streams/{stream_id}/tail"), "check stream tail")
-            .await
+        self.get_json_with_bearer(
+            format!("/streams/{stream_id}/tail"),
+            "check stream tail",
+            bearer_token,
+        )
+        .await
     }
 
     /// Retrieves retained stream bounds, retrying transient failures according to policy.
+    ///
+    /// Private streams require a read-capable stream token. Public streams may pass `None`.
     pub async fn get_stream_range(
         &self,
         stream_id: &StreamId,
+        bearer_token: Option<&BearerToken>,
     ) -> Result<StreamRangeResponse, TsfClientError> {
-        self.get_json(format!("/streams/{stream_id}/range"), "check stream range")
-            .await
+        self.get_json_with_bearer(
+            format!("/streams/{stream_id}/range"),
+            "check stream range",
+            bearer_token,
+        )
+        .await
     }
 
     /// Updates owner-controlled stream settings.
@@ -257,12 +261,14 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
         request: &UpdateStreamRequest,
+        owner_token: &BearerToken,
     ) -> Result<StreamInfoResponse, TsfClientError> {
-        self.send_json(
+        self.send_json_with_bearer(
             self.http
                 .patch(self.rest_url(&format!("/streams/{stream_id}")))
                 .json(request),
             "update stream",
+            Some(owner_token),
         )
         .await
     }
@@ -270,11 +276,16 @@ impl TsfClient {
     /// Permanently deletes a stream.
     ///
     /// This mutation is attempted once and is not transparently retried.
-    pub async fn delete_stream(&self, stream_id: &StreamId) -> Result<(), TsfClientError> {
+    pub async fn delete_stream(
+        &self,
+        stream_id: &StreamId,
+        owner_token: &BearerToken,
+    ) -> Result<(), TsfClientError> {
         self.send_empty(
             self.http
                 .delete(self.rest_url(&format!("/streams/{stream_id}"))),
             "delete stream",
+            Some(owner_token),
         )
         .await
     }
@@ -286,12 +297,14 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
         request: &IssueTokenRequest,
+        owner_token: &BearerToken,
     ) -> Result<IssueTokenResponse, TsfClientError> {
-        self.send_json(
+        self.send_json_with_bearer(
             self.http
                 .post(self.rest_url(&format!("/streams/{stream_id}/tokens")))
                 .json(request),
             "issue token",
+            Some(owner_token),
         )
         .await
     }
@@ -300,9 +313,14 @@ impl TsfClient {
     pub async fn list_tokens(
         &self,
         stream_id: &StreamId,
+        owner_token: &BearerToken,
     ) -> Result<ListTokensResponse, TsfClientError> {
-        self.get_json(format!("/streams/{stream_id}/tokens"), "list tokens")
-            .await
+        self.get_json_with_bearer(
+            format!("/streams/{stream_id}/tokens"),
+            "list tokens",
+            Some(owner_token),
+        )
+        .await
     }
 
     /// Revokes a stream token by its non-secret identifier.
@@ -312,6 +330,7 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
         token_id: &TokenId,
+        owner_token: &BearerToken,
     ) -> Result<(), TsfClientError> {
         let request = RevokeTokenRequest {
             token_id: *token_id,
@@ -321,6 +340,7 @@ impl TsfClient {
                 .delete(self.rest_url(&format!("/streams/{stream_id}/tokens")))
                 .json(&request),
             "revoke token",
+            Some(owner_token),
         )
         .await
     }
@@ -398,7 +418,7 @@ impl TsfClient {
         };
         if let Some(offset) = tail_offset {
             let tail = self
-                .get_stream_tail_with_bearer(&options.stream_id, options.bearer_token.as_ref())
+                .get_stream_tail(&options.stream_id, options.bearer_token.as_ref())
                 .await?;
             options.start = Some(ReadStart::SeqNum(
                 tail.next_s2_seq_num.saturating_sub(offset),
@@ -503,27 +523,6 @@ impl TsfClient {
         Ok(url)
     }
 
-    async fn get_json<T: DeserializeOwned>(
-        &self,
-        path: String,
-        operation: &'static str,
-    ) -> Result<T, TsfClientError> {
-        self.get_json_with_bearer(path, operation, None).await
-    }
-
-    async fn get_stream_tail_with_bearer(
-        &self,
-        stream_id: &StreamId,
-        bearer_token: Option<&BearerToken>,
-    ) -> Result<StreamTailResponse, TsfClientError> {
-        self.get_json_with_bearer(
-            format!("/streams/{stream_id}/tail"),
-            "check stream tail",
-            bearer_token,
-        )
-        .await
-    }
-
     async fn get_json_with_bearer<T: DeserializeOwned>(
         &self,
         path: String,
@@ -531,20 +530,10 @@ impl TsfClient {
         bearer_token: Option<&BearerToken>,
     ) -> Result<T, TsfClientError> {
         let url = self.rest_url(&path);
-        let bearer_token = bearer_token.or(self.config.rest_bearer_token.as_ref());
         self.retry_transient(|| {
             self.send_json_with_bearer(self.http.get(url.clone()), operation, bearer_token)
         })
         .await
-    }
-
-    async fn send_json<T: DeserializeOwned>(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: &'static str,
-    ) -> Result<T, TsfClientError> {
-        self.send_json_with_bearer(request, operation, self.config.rest_bearer_token.as_ref())
-            .await
     }
 
     async fn send_json_with_bearer<T: DeserializeOwned>(
@@ -565,9 +554,10 @@ impl TsfClient {
         &self,
         request: reqwest::RequestBuilder,
         operation: &'static str,
+        bearer_token: Option<&BearerToken>,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request, self.config.rest_bearer_token.as_ref())
+            .apply_rest_auth(request, bearer_token)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -710,12 +700,21 @@ pub struct TsfAppendSession {
     operation_timeout: Duration,
 }
 
+/// Maximum payload bytes a producer may retain before acknowledgement.
+///
+/// This matches the TSF writer socket's hard queued-payload bound.
+pub const MAX_PRODUCER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum records a producer may retain before acknowledgement.
+///
+/// This matches the TSF writer socket's hard queued-message bound.
+pub const MAX_PRODUCER_UNACKED_RECORDS: usize = 128;
+
 /// Memory, concurrency, and reconnect bounds for [`TsfProducer`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TsfProducerConfig {
-    /// Maximum total payload bytes retained until durability acknowledgement.
+    /// Maximum total payload bytes retained until durability acknowledgement. Must not exceed [`MAX_PRODUCER_UNACKED_PAYLOAD_BYTES`].
     pub max_unacked_bytes: usize,
-    /// Maximum number of records retained until durability acknowledgement.
+    /// Maximum number of records retained until durability acknowledgement. Must not exceed [`MAX_PRODUCER_UNACKED_RECORDS`].
     pub max_unacked_records: usize,
     /// Maximum consecutive producer reconnect attempts before failing pending records.
     pub max_reconnect_attempts: usize,
@@ -728,10 +727,10 @@ impl TsfProducerConfig {
                 "max_unacked_bytes must be greater than zero".to_owned(),
             ));
         }
-        if self.max_unacked_bytes > u32::MAX as usize {
+        if self.max_unacked_bytes > MAX_PRODUCER_UNACKED_PAYLOAD_BYTES {
             return Err(TsfClientError::InvalidProducerConfig(format!(
                 "max_unacked_bytes must not exceed {}",
-                u32::MAX
+                MAX_PRODUCER_UNACKED_PAYLOAD_BYTES
             )));
         }
         if self.max_unacked_records == 0 {
@@ -739,10 +738,10 @@ impl TsfProducerConfig {
                 "max_unacked_records must be greater than zero".to_owned(),
             ));
         }
-        if self.max_unacked_records >= Semaphore::MAX_PERMITS {
+        if self.max_unacked_records > MAX_PRODUCER_UNACKED_RECORDS {
             return Err(TsfClientError::InvalidProducerConfig(format!(
-                "max_unacked_records must be less than {}",
-                Semaphore::MAX_PERMITS
+                "max_unacked_records must not exceed {}",
+                MAX_PRODUCER_UNACKED_RECORDS
             )));
         }
         Ok(self)
@@ -752,8 +751,8 @@ impl TsfProducerConfig {
 impl Default for TsfProducerConfig {
     fn default() -> Self {
         Self {
-            max_unacked_bytes: 5 * 1024 * 1024,
-            max_unacked_records: 128,
+            max_unacked_bytes: MAX_PRODUCER_UNACKED_PAYLOAD_BYTES,
+            max_unacked_records: MAX_PRODUCER_UNACKED_RECORDS,
             max_reconnect_attempts: 3,
         }
     }
@@ -1956,7 +1955,6 @@ mod tests {
             Some(Duration::from_secs(60))
         );
         assert_eq!(config.retry_policy, RetryPolicy::default());
-        assert!(config.rest_bearer_token.is_none());
     }
 
     #[test]
@@ -2095,6 +2093,33 @@ mod tests {
         };
 
         assert_eq!(retry_policy.attempt_count(), 1);
+    }
+
+    #[test]
+    fn producer_window_cannot_exceed_server_queue_contract() {
+        let default = TsfProducerConfig::default();
+        assert_eq!(
+            default.max_unacked_bytes,
+            MAX_PRODUCER_UNACKED_PAYLOAD_BYTES
+        );
+        assert_eq!(default.max_unacked_records, MAX_PRODUCER_UNACKED_RECORDS);
+        assert!(default.validate().is_ok());
+
+        for config in [
+            TsfProducerConfig {
+                max_unacked_bytes: MAX_PRODUCER_UNACKED_PAYLOAD_BYTES + 1,
+                ..TsfProducerConfig::default()
+            },
+            TsfProducerConfig {
+                max_unacked_records: MAX_PRODUCER_UNACKED_RECORDS + 1,
+                ..TsfProducerConfig::default()
+            },
+        ] {
+            assert!(matches!(
+                config.validate(),
+                Err(TsfClientError::InvalidProducerConfig(_))
+            ));
+        }
     }
 
     #[test]

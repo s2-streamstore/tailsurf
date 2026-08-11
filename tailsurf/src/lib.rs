@@ -17,7 +17,8 @@ pub mod transcript;
 
 pub use client::{
     AppendAck, AppendReceipt, AppendTicket, CreateStreamIdempotencyKey, IntoRecordData,
-    InvalidCreateStreamIdempotencyKey, RetryPolicy, TsfAppendSession, TsfClient, TsfClientConfig,
+    InvalidCreateStreamIdempotencyKey, MAX_PRODUCER_UNACKED_PAYLOAD_BYTES,
+    MAX_PRODUCER_UNACKED_RECORDS, RetryPolicy, TsfAppendSession, TsfClient, TsfClientConfig,
     TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession, WritePermit, WriteRecord,
     default_api_base_url,
 };

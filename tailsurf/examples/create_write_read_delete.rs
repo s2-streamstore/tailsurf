@@ -2,7 +2,6 @@
 
 use std::env;
 
-use secrecy::ExposeSecret;
 use tailsurf::{
     TokenPermissions, TsfClient, WriterId,
     protocol::{
@@ -82,11 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("{}", String::from_utf8_lossy(&record.data));
     }
 
-    let owner_client = TsfClient::with_api_base_url_and_rest_bearer_token(
-        client.api_base_url().clone(),
-        owner_token.expose_secret(),
-    );
-    owner_client.delete_stream(&created.stream_id).await?;
+    client
+        .delete_stream(&created.stream_id, &owner_token)
+        .await?;
 
     Ok(())
 }

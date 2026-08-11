@@ -41,6 +41,7 @@ use tailsurf::{
         },
     },
     stream_url::StreamLocator,
+    transcript::DEFAULT_MAX_LOGICAL_RECORD_BYTES,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -378,12 +379,9 @@ async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
 }
 
 #[tokio::test]
-async fn create_stream_suppresses_configured_rest_authorization() {
+async fn create_stream_is_always_anonymous() {
     let server = TestServer::start().await;
-    let client = TsfClient::with_api_base_url_and_rest_bearer_token(
-        server.api_url.clone(),
-        "configured-account-token",
-    );
+    let client = TsfClient::with_api_base_url(server.api_url.clone());
 
     client
         .create_stream(&CreateStreamRequest::default())
@@ -661,6 +659,33 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     assert_eq!(records[2].part, PartHeader::unsplit());
     assert_eq!(records[2].format, RecordFormat::Transcript);
     assert_eq!(records[2].data.as_ref(), b"tail\n");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() {
+    let server = TestServer::start().await;
+    let mut input = "x".repeat(DEFAULT_MAX_LOGICAL_RECORD_BYTES);
+    input.push('\n');
+
+    let output = run_tsf(&server, ["write"], Some(input.as_str())).await;
+
+    assert!(!output.status.success());
+    assert!(
+        output.stderr.contains(&format!(
+            "input line exceeds the configured {DEFAULT_MAX_LOGICAL_RECORD_BYTES}-byte logical record limit"
+        )),
+        "stderr={}",
+        output.stderr
+    );
+    let read_url = output
+        .stderr
+        .lines()
+        .find_map(|line| extract_link_line(line, "view"))
+        .expect("read URL is printed before writing");
+    let locator = StreamLocator::parse(read_url).expect("valid read URL");
+    assert_eq!(server.record_count(&locator.stream_id), 0);
 
     server.abort();
 }
@@ -1729,6 +1754,15 @@ impl TestServer {
 
     fn stream_count(&self) -> usize {
         self.state.streams.lock().expect("streams lock").len()
+    }
+
+    fn record_count(&self, stream_id: &StreamId) -> usize {
+        self.state
+            .streams
+            .lock()
+            .expect("streams lock")
+            .get(&stream_id.to_string())
+            .map_or(0, |stream| stream.records.len())
     }
 
     async fn wait_for_records(&self, stream_id: &StreamId, expected: usize) {

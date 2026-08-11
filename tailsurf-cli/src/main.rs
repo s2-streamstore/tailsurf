@@ -161,6 +161,9 @@ struct WriteArgs {
     /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
     #[arg(long)]
     raw: bool,
+    /// Maximum logical line size. Readers use the same default.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_LOGICAL_RECORD_BYTES)]
+    max_logical_record_bytes: usize,
     /// Command to run. Its stdout and stderr are written to the stream.
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<String>,
@@ -593,9 +596,26 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
     };
 
     if command.is_empty() {
-        stream_stdin_to_writer(api_url, stream_id, token, buffering, view_link).await
+        stream_stdin_to_writer(
+            api_url,
+            stream_id,
+            token,
+            buffering,
+            args.max_logical_record_bytes,
+            view_link,
+        )
+        .await
     } else {
-        stream_command_to_writer(api_url, stream_id, token, buffering, command, view_link).await
+        stream_command_to_writer(
+            api_url,
+            stream_id,
+            token,
+            buffering,
+            args.max_logical_record_bytes,
+            command,
+            view_link,
+        )
+        .await
     }
 }
 
@@ -684,6 +704,7 @@ async fn stream_stdin_to_writer(
     stream_id: StreamId,
     token: BearerToken,
     buffering: WriteBuffering,
+    max_logical_record_bytes: usize,
     view_link: Option<Url>,
 ) -> eyre::Result<()> {
     let client = TsfClient::with_api_base_url(api_url);
@@ -699,7 +720,9 @@ async fn stream_stdin_to_writer(
 
     let interrupted = match buffering {
         WriteBuffering::Raw => stream_raw_stdin_to_writer(&writer, &mut state).await,
-        WriteBuffering::Lines => stream_lines_to_writer(&writer, &mut state).await,
+        WriteBuffering::Lines => {
+            stream_lines_to_writer(&writer, &mut state, max_logical_record_bytes).await
+        }
     }?;
     writer.close().await.context("failed to close writer")?;
     print_write_summary(state.next_writer_seq, view_link.as_ref());
@@ -764,10 +787,11 @@ async fn stream_raw_stdin_to_writer(
 async fn stream_lines_to_writer(
     writer: &TsfProducer,
     state: &mut WriterState,
+    max_logical_record_bytes: usize,
 ) -> eyre::Result<bool> {
     let mut stdin = tokio::io::stdin();
     let mut read_buffer = BytesMut::with_capacity(STDIN_READ_BYTES);
-    let mut line_appender = LineRecordAppender::new();
+    let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
     let mut session = WriterSession {
         writer,
         state,
@@ -803,6 +827,7 @@ async fn stream_command_to_writer(
     stream_id: StreamId,
     token: BearerToken,
     buffering: WriteBuffering,
+    max_logical_record_bytes: usize,
     command: Vec<String>,
     view_link: Option<Url>,
 ) -> eyre::Result<()> {
@@ -822,7 +847,9 @@ async fn stream_command_to_writer(
             state: &mut state,
             pending_tickets: VecDeque::new(),
         };
-        let outcome = stream_child_command_output(&mut session, buffering, command).await?;
+        let outcome =
+            stream_child_command_output(&mut session, buffering, max_logical_record_bytes, command)
+                .await?;
         session.finish().await?;
         outcome
     };
@@ -846,6 +873,7 @@ struct ChildCommandOutcome {
 async fn stream_child_command_output(
     session: &mut WriterSession<'_>,
     buffering: WriteBuffering,
+    max_logical_record_bytes: usize,
     command: Vec<String>,
 ) -> eyre::Result<ChildCommandOutcome> {
     let program = command
@@ -874,7 +902,7 @@ async fn stream_child_command_output(
         match buffering {
             WriteBuffering::Raw => stream_raw_chunks_to_writer(session, &mut chunk_rx).await?,
             WriteBuffering::Lines => {
-                let mut line_appender = LineRecordAppender::new();
+                let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
                 while let Some(chunk) = chunk_rx.recv().await {
                     line_appender.push_bytes(session, chunk?).await?;
                 }
@@ -1018,14 +1046,18 @@ async fn stream_raw_chunks_to_writer(
 
 struct LineRecordAppender {
     pending: BytesMut,
-    split_part_index: u32,
+    pending_parts: Vec<Bytes>,
+    logical_record_bytes: usize,
+    max_logical_record_bytes: usize,
 }
 
 impl LineRecordAppender {
-    fn new() -> Self {
+    fn new(max_logical_record_bytes: usize) -> Self {
         Self {
             pending: BytesMut::with_capacity(MAX_RECORD_BYTES),
-            split_part_index: 0,
+            pending_parts: Vec::new(),
+            logical_record_bytes: 0,
+            max_logical_record_bytes,
         }
     }
 
@@ -1035,60 +1067,62 @@ impl LineRecordAppender {
         mut bytes: Bytes,
     ) -> eyre::Result<()> {
         while !bytes.is_empty() {
-            if self.pending.len() == MAX_RECORD_BYTES {
-                self.flush(session, false).await?;
+            let newline = memchr(b'\n', &bytes);
+            let take = newline.map_or(bytes.len(), |index| index + 1);
+            let logical_record_bytes = self
+                .logical_record_bytes
+                .checked_add(take)
+                .context("input line length overflowed while enforcing the logical record limit")?;
+            if logical_record_bytes > self.max_logical_record_bytes {
+                bail!(
+                    "input line exceeds the configured {}-byte logical record limit; raise --max-logical-record-bytes only when readers use the same limit",
+                    self.max_logical_record_bytes
+                );
             }
-
-            let available = MAX_RECORD_BYTES - self.pending.len();
-            let window_len = available.min(bytes.len());
-            let newline = memchr(b'\n', &bytes[..window_len]);
-            let take = newline.map_or(window_len, |index| index + 1);
-
-            // A line that arrived whole is already contiguous, so send the slice itself.
-            if self.pending.is_empty() && newline.is_some() {
-                let line = bytes.split_to(take);
-                self.send_part(session, line, true).await?;
-                continue;
-            }
-
-            self.pending.extend_from_slice(&bytes[..take]);
+            self.logical_record_bytes = logical_record_bytes;
+            self.buffer(&bytes[..take]);
             bytes.advance(take);
             if newline.is_some() {
-                self.flush(session, true).await?;
+                self.send_line(session).await?;
             }
         }
         Ok(())
     }
 
     async fn finish(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
-        if !self.pending.is_empty() {
-            self.flush(session, true).await?;
+        if self.logical_record_bytes > 0 {
+            self.send_line(session).await?;
         }
         Ok(())
     }
 
-    async fn flush(&mut self, session: &mut WriterSession<'_>, is_final: bool) -> eyre::Result<()> {
-        let data = self.pending.split().freeze();
-        self.send_part(session, data, is_final).await
+    fn buffer(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let available = MAX_RECORD_BYTES - self.pending.len();
+            let take = available.min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.pending.len() == MAX_RECORD_BYTES {
+                self.pending_parts.push(self.pending.split().freeze());
+            }
+        }
     }
 
-    /// Sends one physical part and advances or resets the split index.
-    async fn send_part(
-        &mut self,
-        session: &mut WriterSession<'_>,
-        data: Bytes,
-        is_final: bool,
-    ) -> eyre::Result<()> {
-        session
-            .append_line_part(self.split_part_index, is_final, data)
-            .await?;
-        if is_final {
-            self.split_part_index = 0;
-        } else {
-            self.split_part_index = self
-                .split_part_index
-                .checked_add(1)
-                .context("line split part index overflowed")?;
+    async fn send_line(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
+        if !self.pending.is_empty() {
+            self.pending_parts.push(self.pending.split().freeze());
+        }
+        let parts = std::mem::take(&mut self.pending_parts);
+        self.logical_record_bytes = 0;
+        let last_part = parts
+            .len()
+            .checked_sub(1)
+            .context("logical line is empty")?;
+        for (index, part) in parts.into_iter().enumerate() {
+            let part_index = u32::try_from(index).context("line split part index overflowed")?;
+            session
+                .append_line_part(part_index, index == last_part, part)
+                .await?;
         }
         Ok(())
     }
@@ -1180,13 +1214,9 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
         return Ok(());
     }
     let read_token = locator.token_with(TokenPermissions::allows_read);
-    let read_client = if let Some(token) = read_token {
-        TsfClient::with_api_base_url_and_rest_bearer_token(api_url.clone(), token.expose_secret())
-    } else {
-        TsfClient::with_api_base_url(api_url.clone())
-    };
+    let read_client = TsfClient::with_api_base_url(api_url.clone());
     let tail = read_client
-        .get_stream_tail(&locator.stream_id)
+        .get_stream_tail(&locator.stream_id, read_token)
         .await
         .context("failed to check stream tail")?;
     if tail.next_s2_seq_num == 0 {
@@ -1213,13 +1243,12 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
 
 async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(&args.url).context("invalid stream URL")?;
-    let client = if let Some(token) = locator.token.as_ref() {
-        TsfClient::with_api_base_url_and_rest_bearer_token(api_url, token.token.expose_secret())
-    } else {
-        TsfClient::with_api_base_url(api_url)
-    };
+    let client = TsfClient::with_api_base_url(api_url);
     let stream = client
-        .get_stream(&locator.stream_id)
+        .get_stream(
+            &locator.stream_id,
+            locator.token.as_ref().map(|token| &token.token),
+        )
         .await
         .context("failed to get stream")?;
     print_stream_info(&stream, args.format)
@@ -1227,8 +1256,11 @@ async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
 
 async fn delete_stream(api_url: Url, args: OwnerUrlArgs) -> eyre::Result<()> {
     let (client, locator) = owner_client_from_url(api_url, &args.url)?;
+    let owner_token = locator
+        .token_with(TokenPermissions::allows_owner)
+        .expect("owner URL was validated");
     client
-        .delete_stream(&locator.stream_id)
+        .delete_stream(&locator.stream_id, owner_token)
         .await
         .context("failed to delete stream")?;
     Ok(())
@@ -1236,12 +1268,16 @@ async fn delete_stream(api_url: Url, args: OwnerUrlArgs) -> eyre::Result<()> {
 
 async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<()> {
     let (client, locator) = owner_client_from_url(api_url, &args.url)?;
+    let owner_token = locator
+        .token_with(TokenPermissions::allows_owner)
+        .expect("owner URL was validated");
     let stream = client
         .update_stream(
             &locator.stream_id,
             &UpdateStreamRequest {
                 visibility: Some(args.visibility.into()),
             },
+            owner_token,
         )
         .await
         .context("failed to update stream visibility")?;
@@ -1259,8 +1295,11 @@ async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Resul
 
 async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
     let (client, locator) = owner_client_from_url(api_url, &args.url)?;
+    let owner_token = locator
+        .token_with(TokenPermissions::allows_owner)
+        .expect("owner URL was validated");
     let response = client
-        .list_tokens(&locator.stream_id)
+        .list_tokens(&locator.stream_id, owner_token)
         .await
         .context("failed to list links")?;
     match args.format {
@@ -1291,6 +1330,9 @@ fn token_status_label(status: StreamTokenStatus) -> &'static str {
 
 async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Result<()> {
     let (client, locator) = owner_client_from_url(api_url, &args.url)?;
+    let owner_token = locator
+        .token_with(TokenPermissions::allows_owner)
+        .expect("owner URL was validated");
     let issued = client
         .issue_token(
             &locator.stream_id,
@@ -1298,6 +1340,7 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
                 permissions: args.access.0,
                 expires_at: args.expires.rfc3339(),
             },
+            owner_token,
         )
         .await
         .context("failed to issue link")?;
@@ -1311,8 +1354,11 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
 
 async fn revoke_link(api_url: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
     let (client, locator) = owner_client_from_url(api_url, &args.url)?;
+    let owner_token = locator
+        .token_with(TokenPermissions::allows_owner)
+        .expect("owner URL was validated");
     client
-        .revoke_token(&locator.stream_id, &args.token_id)
+        .revoke_token(&locator.stream_id, &args.token_id, owner_token)
         .await
         .context("failed to revoke link")?;
     Ok(())
@@ -1453,12 +1499,10 @@ fn parse_url(url: &str) -> eyre::Result<()> {
 
 fn owner_client_from_url(api_url: Url, url: &str) -> eyre::Result<(TsfClient, StreamLocator)> {
     let locator = StreamLocator::parse(url).context("invalid stream URL")?;
-    let owner_token = locator
+    locator
         .token_with(TokenPermissions::allows_owner)
         .context("URL does not grant owner access")?;
-    let client =
-        TsfClient::with_api_base_url_and_rest_bearer_token(api_url, owner_token.expose_secret());
-    Ok((client, locator))
+    Ok((TsfClient::with_api_base_url(api_url), locator))
 }
 
 fn print_created_stream(

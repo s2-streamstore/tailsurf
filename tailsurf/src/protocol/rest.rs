@@ -8,7 +8,7 @@ use crate::{BearerToken, StreamId, TokenId, TokenPermissions};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
-    /// Reads require an account bearer token or a read-capable stream token.
+    /// Reads require a read-capable stream token.
     #[default]
     Private,
     /// Reads are anonymous; writes and management still require authorization.

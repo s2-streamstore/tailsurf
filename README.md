@@ -65,6 +65,10 @@ Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession`
 
 SDK readers and producers retry bounded transient WebSocket interruptions while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes fail immediately.
 
+REST authorization is stream-scoped. Read methods accept an optional read-capable stream token because public streams need none. Management methods require an owner token on each call. The client never retains one stream credential as implicit authorization for later REST requests.
+
+The default producer window is capped at the service's hard writer-queue contract: 128 records and 5 MiB of payload. Applications may configure smaller windows.
+
 ## CLI quickstart
 
 Create a private stream:
@@ -110,6 +114,8 @@ By default, `tsf write` makes line boundaries transcript record boundaries and m
 make test | tsf write
 make test | tsf write '{write-url}'
 ```
+
+One logical line is limited to 16 MiB by default. This is the same default used by `tail` and `replay`. Set `--max-logical-record-bytes` on both the writer and reader only when a larger application-specific limit is required.
 
 Use raw mode when you want to send stdin as byte records instead of line-framed transcript records. Raw mode flushes at the physical record size limit, after a short linger, and at EOF:
 
