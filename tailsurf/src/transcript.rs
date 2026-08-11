@@ -209,8 +209,6 @@ impl LogicalTranscript {
         )?;
         check_logical_record_len(logical_record_len, limits.max_logical_record_bytes)?;
         let part_count = pending.part_count.saturating_add(1);
-        let pending_parts =
-            checked_pending_parts(self.pending_parts, part_count, limits.max_pending_parts)?;
         pending.len = logical_record_len;
         pending.part_count = part_count;
         if !record.data.is_empty() {
@@ -222,6 +220,8 @@ impl LogicalTranscript {
                 data: TranscriptData::from_ordered_chunks(pending.chunks),
             }));
         }
+        let pending_parts =
+            checked_pending_parts(self.pending_parts, part_count, limits.max_pending_parts)?;
 
         let Some(next_part_index) = part_index.checked_add(1) else {
             return Ok(None);
@@ -898,6 +898,28 @@ mod tests {
                 format: RecordFormat::Transcript,
                 data: TranscriptData::from_static(b""),
             })
+        );
+        assert_eq!(transcript.pending_parts(), 0);
+    }
+
+    #[test]
+    fn pending_part_limit_does_not_prevent_completion_at_the_boundary() {
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 1, 16, 1));
+
+        assert_eq!(
+            push(
+                &mut transcript,
+                record(0, PartHeader::new(0, false).expect("part"), b"a"),
+            ),
+            None
+        );
+        assert_eq!(transcript.pending_parts(), 1);
+        assert_chunked_record(
+            push(
+                &mut transcript,
+                record(1, PartHeader::new(1, true).expect("part"), b"b"),
+            ),
+            b"ab",
         );
         assert_eq!(transcript.pending_parts(), 0);
     }
