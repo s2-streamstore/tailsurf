@@ -11,6 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
 use tokio::{
@@ -186,15 +187,21 @@ impl TsfClient {
 
     /// Creates a stream and returns its metadata and newly issued secret tokens.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// The client generates one idempotency key for this logical call and reuses it while retrying transient failures according to policy.
     pub async fn create_stream(
         &self,
         request: &CreateStreamRequest,
     ) -> Result<CreateStreamResponse, TsfClientError> {
-        self.send_json(
-            self.http.post(self.rest_url("/streams")).json(request),
-            "create stream",
-        )
+        let idempotency_key = new_idempotency_key();
+        self.retry_transient(|| {
+            self.send_json(
+                self.http
+                    .post(self.rest_url("/streams"))
+                    .header("Idempotency-Key", &idempotency_key)
+                    .json(request),
+                "create stream",
+            )
+        })
         .await
     }
 
@@ -587,6 +594,39 @@ impl Default for TsfClient {
 /// Returns the default `https://tail.surf` API origin.
 pub fn default_api_base_url() -> Url {
     Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
+}
+
+fn new_idempotency_key() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    encode_base64url_32(&bytes)
+}
+
+fn encode_base64url_32(bytes: &[u8; 32]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(43);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
+        ));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6))],
+        ));
+        encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
+    }
+    let remainder = chunks.remainder();
+    debug_assert_eq!(remainder.len(), 2);
+    encoded.push(char::from(ALPHABET[usize::from(remainder[0] >> 2)]));
+    encoded.push(char::from(
+        ALPHABET[usize::from(((remainder[0] & 0x03) << 4) | (remainder[1] >> 4))],
+    ));
+    encoded.push(char::from(
+        ALPHABET[usize::from((remainder[1] & 0x0f) << 2)],
+    ));
+    debug_assert_eq!(encoded.len(), 43);
+    encoded
 }
 
 /// Low-level authenticated write socket without retained-record recovery.
@@ -1767,6 +1807,13 @@ mod tests {
         );
         assert_eq!(config.retry_policy, RetryPolicy::default());
         assert!(config.rest_bearer_token.is_none());
+    }
+
+    #[test]
+    fn idempotency_key_encoding_is_canonical_unpadded_base64url() {
+        let encoded = encode_base64url_32(&[0_u8; 32]);
+
+        assert_eq!(encoded, "A".repeat(43));
     }
 
     #[tokio::test]

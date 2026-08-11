@@ -215,6 +215,26 @@ async fn new_outputs_json_and_token_files() {
 }
 
 #[tokio::test]
+async fn new_retries_with_one_canonical_idempotency_key() {
+    let server = TestServer::start_with_create_failures(1).await;
+
+    let output = run_tsf(&server, ["new", "--format", "json"], None).await;
+
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    let keys = server.create_idempotency_keys();
+    assert_eq!(keys.len(), 2);
+    let key = keys[0].as_deref().expect("idempotency key");
+    assert_eq!(keys[1].as_deref(), Some(key));
+    assert_eq!(key.len(), 43);
+    assert!(
+        key.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn new_text_output_covers_visibility_and_explicit_tokens() {
     let server = TestServer::start().await;
 
@@ -1243,9 +1263,16 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_create_failures(0).await
+    }
+
+    async fn start_with_create_failures(create_failures: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let state = Arc::new(TestApiState::default());
+        let state = Arc::new(TestApiState {
+            create_failures_remaining: Mutex::new(create_failures),
+            ..TestApiState::default()
+        });
         let router = Router::new()
             .route("/api/v1/streams", post(test_create_stream))
             .route(
@@ -1285,6 +1312,14 @@ impl TestServer {
             .expect("token list failure lock") += 1;
     }
 
+    fn create_idempotency_keys(&self) -> Vec<Option<String>> {
+        self.state
+            .create_idempotency_keys
+            .lock()
+            .expect("create idempotency keys lock")
+            .clone()
+    }
+
     async fn wait_for_records(&self, stream_id: &StreamId, expected: usize) {
         let stream_id = stream_id.to_string();
         timeout(Duration::from_secs(5), async {
@@ -1315,6 +1350,8 @@ impl TestServer {
 struct TestApiState {
     next_stream: Mutex<u64>,
     next_token: Mutex<u64>,
+    create_failures_remaining: Mutex<usize>,
+    create_idempotency_keys: Mutex<Vec<Option<String>>>,
     token_list_failures_remaining: Mutex<usize>,
     streams: Mutex<HashMap<String, TestStream>>,
 }
@@ -1348,8 +1385,32 @@ struct TestRecord {
 
 async fn test_create_stream(
     State(state): State<Arc<TestApiState>>,
+    headers: HeaderMap,
     Json(request): Json<CreateStreamRequest>,
 ) -> Response {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    state
+        .create_idempotency_keys
+        .lock()
+        .expect("create idempotency keys lock")
+        .push(idempotency_key);
+    let mut create_failures = state
+        .create_failures_remaining
+        .lock()
+        .expect("create failures lock");
+    if *create_failures > 0 {
+        *create_failures -= 1;
+        return test_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "retry create",
+        );
+    }
+    drop(create_failures);
+
     let retention_secs = match request.retention_secs {
         None => 864_000,
         Some(RequestedRetention::Seconds(seconds)) => seconds,
