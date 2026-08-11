@@ -31,7 +31,7 @@ export TSF_WEB_URL=http://localhost:3000
 Run the workspace checks:
 
 ```sh
-cargo fmt --all --check
+cargo +nightly fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps

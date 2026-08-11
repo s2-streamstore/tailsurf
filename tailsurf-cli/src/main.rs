@@ -1,4 +1,5 @@
-//! `tsf` command-line client for creating, writing, replaying, tailing, and managing Tailsurf streams.
+//! `tsf` command-line client for creating, writing, replaying, tailing, and managing Tailsurf
+//! streams.
 
 use std::{
     collections::{BTreeMap, VecDeque},

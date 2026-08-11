@@ -61,7 +61,9 @@ impl Default for TranscriptLimits {
 
 /// Per-writer duplicate suppression and split-record reassembly state.
 ///
-/// Records are processed in delivery order. Reused or decreasing writer sequence numbers are suppressed, malformed partial sequences are dropped, and a read beginning mid-split waits for the next complete logical record.
+/// Records are processed in delivery order. Reused or decreasing writer sequence numbers are
+/// suppressed, malformed partial sequences are dropped, and a read beginning mid-split waits for
+/// the next complete logical record.
 pub struct LogicalTranscript {
     limits: TranscriptLimits,
     writers: HashMap<WriterId, WriterState>,
@@ -83,7 +85,8 @@ impl LogicalTranscript {
         })
     }
 
-    /// Creates transcript state with explicit record, writer, pending-byte, and pending-part limits.
+    /// Creates transcript state with explicit record, writer, pending-byte, and pending-part
+    /// limits.
     pub fn with_limits(limits: TranscriptLimits) -> Self {
         Self {
             limits,
@@ -95,7 +98,8 @@ impl LogicalTranscript {
 
     /// Processes one physical record.
     ///
-    /// Returns a complete logical record when one becomes available, or `None` when the input was a duplicate, an incomplete split part, or a malformed partial sequence.
+    /// Returns a complete logical record when one becomes available, or `None` when the input was a
+    /// duplicate, an incomplete split part, or a malformed partial sequence.
     pub fn push_record(
         &mut self,
         record: ReadRecord,
