@@ -360,10 +360,20 @@ impl TsfClient {
     }
 
     /// Connects a resumable read session at the requested position and bounds.
+    ///
+    /// A relative tail offset is resolved to an absolute S2 sequence number before the first socket is opened. Reconnects therefore resume from the same position even if the stream advances before a record arrives.
     pub async fn connect_reader(
         &self,
-        options: ReadStreamOptions,
+        mut options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
+        if let Some(ReadStart::TailOffset(offset)) = options.start {
+            let tail = self
+                .get_stream_tail_with_bearer(&options.stream_id, options.bearer_token.as_ref())
+                .await?;
+            options.start = Some(ReadStart::SeqNum(
+                tail.next_s2_seq_num.saturating_sub(offset),
+            ));
+        }
         let socket = self.connect_read_socket(options.clone()).await?;
         Ok(TsfReadSession::new(self.clone(), options, socket))
     }
@@ -429,8 +439,12 @@ impl TsfClient {
         url
     }
 
-    fn apply_rest_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(token) = &self.config.rest_bearer_token {
+    fn apply_rest_auth(
+        &self,
+        request: reqwest::RequestBuilder,
+        bearer_token: Option<&BearerToken>,
+    ) -> reqwest::RequestBuilder {
+        if let Some(token) = bearer_token.or(self.config.rest_bearer_token.as_ref()) {
             request.bearer_auth(token.expose_secret())
         } else {
             request
@@ -464,9 +478,33 @@ impl TsfClient {
         path: String,
         operation: &'static str,
     ) -> Result<T, TsfClientError> {
+        self.get_json_with_bearer(path, operation, None).await
+    }
+
+    async fn get_stream_tail_with_bearer(
+        &self,
+        stream_id: &StreamId,
+        bearer_token: Option<&BearerToken>,
+    ) -> Result<StreamTailResponse, TsfClientError> {
+        self.get_json_with_bearer(
+            format!("/streams/{stream_id}/tail"),
+            "check stream tail",
+            bearer_token,
+        )
+        .await
+    }
+
+    async fn get_json_with_bearer<T: DeserializeOwned>(
+        &self,
+        path: String,
+        operation: &'static str,
+        bearer_token: Option<&BearerToken>,
+    ) -> Result<T, TsfClientError> {
         let url = self.rest_url(&path);
-        self.retry_transient(|| self.send_json(self.http.get(url.clone()), operation))
-            .await
+        self.retry_transient(|| {
+            self.send_json_with_bearer(self.http.get(url.clone()), operation, bearer_token)
+        })
+        .await
     }
 
     async fn send_json<T: DeserializeOwned>(
@@ -474,8 +512,17 @@ impl TsfClient {
         request: reqwest::RequestBuilder,
         operation: &'static str,
     ) -> Result<T, TsfClientError> {
+        self.send_json_with_bearer(request, operation, None).await
+    }
+
+    async fn send_json_with_bearer<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+        bearer_token: Option<&BearerToken>,
+    ) -> Result<T, TsfClientError> {
         let response = self
-            .apply_rest_auth(request)
+            .apply_rest_auth(request, bearer_token)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -488,7 +535,7 @@ impl TsfClient {
         operation: &'static str,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request)
+            .apply_rest_auth(request, None)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;

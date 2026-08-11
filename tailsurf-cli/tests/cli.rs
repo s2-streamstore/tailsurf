@@ -766,10 +766,10 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
     assert_eq!(attempts[0].bearer_token, "read-secret");
     assert_eq!(attempts[1].bearer_token, "read-secret");
     assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
+        attempts[0].query.get("seq_num").map(String::as_str),
         Some("0")
     );
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].query.get("tail_offset"), None);
     assert_eq!(
         attempts[1].query.get("seq_num").map(String::as_str),
         Some("1")
@@ -780,7 +780,7 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
 }
 
 #[tokio::test]
-async fn tail_selector_flags_are_sent_as_read_query() {
+async fn tail_selector_flags_are_resolved_as_read_query() {
     let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -800,14 +800,14 @@ async fn tail_selector_flags_are_sent_as_read_query() {
     let attempts = tail_offset_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
-        Some("25")
+        attempts[0].query.get("seq_num").map(String::as_str),
+        Some("0")
     );
     assert_eq!(
         attempts[0].query.get("count").map(String::as_str),
         Some("7")
     );
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].query.get("tail_offset"), None);
     assert_eq!(attempts[0].query.get("timestamp"), None);
     tail_offset_server.abort();
 
@@ -856,6 +856,38 @@ async fn tail_selector_flags_are_sent_as_read_query() {
     assert_eq!(attempts[0].query.get("tail_offset"), None);
     assert_eq!(attempts[0].query.get("seq_num"), None);
     timestamp_server.abort();
+}
+
+#[tokio::test]
+async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+
+    let output = run_tsf_until_stdout_contains(
+        server.api_url.clone(),
+        ["tail", "-n", "2", read_url.as_str()],
+        b"stable\n",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(output.stdout, "stable\n");
+    assert_eq!(output.stderr, "");
+    let attempts = server.read_attempts();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| {
+        attempt.query.get("seq_num").map(String::as_str) == Some("5")
+            && !attempt.query.contains_key("tail_offset")
+    }));
+    assert_eq!(
+        server.tail_bearer_tokens(),
+        [Some("read-secret".to_owned())]
+    );
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -2379,12 +2411,14 @@ struct ReadAttempt {
 
 struct FakeReadState {
     read_attempts: Mutex<Vec<ReadAttempt>>,
+    tail_bearer_tokens: Mutex<Vec<Option<String>>>,
     mode: FakeReadMode,
 }
 
 #[derive(Clone, Copy)]
 enum FakeReadMode {
     Reconnect,
+    ReconnectBeforeFirstRecord,
     ReplayTranscript,
     ReplayBinary,
     ReplaySplitRecord,
@@ -2402,6 +2436,7 @@ impl FakeReadServer {
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(FakeReadState {
             read_attempts: Mutex::new(Vec::new()),
+            tail_bearer_tokens: Mutex::new(Vec::new()),
             mode,
         });
         let router = Router::new()
@@ -2426,6 +2461,14 @@ impl FakeReadServer {
             .clone()
     }
 
+    fn tail_bearer_tokens(&self) -> Vec<Option<String>> {
+        self.state
+            .tail_bearer_tokens
+            .lock()
+            .expect("tail bearer tokens lock")
+            .clone()
+    }
+
     fn abort(self) {
         self.task.abort();
     }
@@ -2434,9 +2477,21 @@ impl FakeReadServer {
 async fn fake_read_tail(
     State(state): State<Arc<FakeReadState>>,
     Path(stream_id): Path<String>,
+    headers: HeaderMap,
 ) -> Json<serde_json::Value> {
+    let bearer_token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    state
+        .tail_bearer_tokens
+        .lock()
+        .expect("tail bearer tokens lock")
+        .push(bearer_token);
     let next_s2_seq_num = match state.mode {
-        FakeReadMode::Reconnect => 2,
+        FakeReadMode::Reconnect => 0,
+        FakeReadMode::ReconnectBeforeFirstRecord => 7,
         FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
@@ -2506,6 +2561,18 @@ async fn fake_read_flow(
                 .expect("send reconnect advised");
             } else {
                 send_read_record(&mut socket, 1, 1, b"second\n").await;
+            }
+        }
+        FakeReadMode::ReconnectBeforeFirstRecord => {
+            if attempt_count == 1 {
+                send_server_frame(
+                    &mut socket,
+                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+                )
+                .await
+                .expect("send reconnect advised");
+            } else {
+                send_read_record(&mut socket, 5, 0, b"stable\n").await;
             }
         }
         FakeReadMode::ReplayTranscript => {
