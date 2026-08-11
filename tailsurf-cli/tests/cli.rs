@@ -53,7 +53,7 @@ use url::Url;
 
 const FREE_RETENTION_LIMIT_MESSAGE: &str = "Infinite retention is unavailable for free users.";
 const TEST_STREAM_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const UNKNOWN_STREAM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const UNKNOWN_STREAM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
 
 #[test]
 fn help_and_version_describe_the_cli() {
@@ -1926,7 +1926,7 @@ fn test_issue_stream_token(state: &TestApiState, permissions: TokenPermissions) 
     let token_id = format!("{:024x}", *next_token)
         .parse::<TokenId>()
         .expect("token id");
-    let token = BearerToken::from(format!("{:043}", *next_token));
+    let token = BearerToken::from(format!("{:042}A", *next_token));
     *next_token += 1;
     TestToken {
         token_id,
