@@ -58,7 +58,9 @@ const UPDATE_HINT_TIMEOUT: Duration = Duration::from_millis(500);
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
 #[command(version, about = "Create, write, and read tail.surf streams")]
-#[command(after_help = "With piped input and no subcommand, tsf behaves like tsf write:\n  anything | tsf")]
+#[command(
+    after_help = "With piped input and no subcommand, tsf behaves like tsf write:\n  anything | tsf"
+)]
 struct Cli {
     /// Tailsurf API origin.
     #[arg(
@@ -434,7 +436,12 @@ impl WriterState {
 // One socket, one stdin, one stdout: worker threads only add wakeup and handoff cost.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let Some(Cli { api_url, web_url, command: Some(command) }) = resolve_cli() else {
+    let Some(Cli {
+        api_url,
+        web_url,
+        command: Some(command),
+    }) = resolve_cli()
+    else {
         return ExitCode::from(2);
     };
     let check_for_update = should_check_for_update_hint(
