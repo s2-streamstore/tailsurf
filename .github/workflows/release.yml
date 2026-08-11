@@ -389,6 +389,9 @@ jobs:
       - plan
       - build-local-artifacts
     if: ${{ github.event_name == 'repository_dispatch' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.dry_run == 'true') }}
+    permissions:
+      actions: read
+      contents: read
     uses: ./.github/workflows/notarize-macos.yml
   # Determines if we should publish/announce
   host:
