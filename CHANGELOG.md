@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/s2-streamstore/tailsurf/compare/v0.2.0...v0.3.0) - 2026-08-11
+
+### Other
+
+- Reduce hot path allocations and syscalls ([#8](https://github.com/s2-streamstore/tailsurf/pull/8))
+- keep create recovery keys out of argv guidance
+- expose recoverable stream creation
+- preserve reader reconnect state
+- allow transcript completion at part limit
+- bound resumable reader reconnects
+- canonicalize stream share URLs
+- omit authorization from stream creation
+- bound transcript pending parts
+- keep owner access on stream creation
+- validate canonical stream tokens
+- retry stream creation idempotently
+- stabilize tail offsets across reconnects
+- bound transcript reassembly state
+- Reset read idle timeouts on heartbeats and simplify the client ([#7](https://github.com/s2-streamstore/tailsurf/pull/7))
+- Make tsf write create streams by default
+- print create recovery before file writes
+
 ### Changed
 
 - [**breaking**] `tsf write` creates a stream when no URL is supplied; remove `--new`
