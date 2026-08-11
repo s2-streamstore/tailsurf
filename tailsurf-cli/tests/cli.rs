@@ -499,6 +499,24 @@ async fn write_without_url_prints_a_public_view_url_on_stdout() {
 }
 
 #[tokio::test]
+async fn piped_input_without_a_subcommand_writes_like_write() {
+    let server = TestServer::start().await;
+    let output = run_tsf(&server, [], Some("implicit write\n")).await;
+
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    assert_eq!(output.stdout.lines().count(), 1);
+    assert!(output.stderr.contains("Created private stream"));
+    let read_url = output.stdout.trim();
+    StreamLocator::parse(read_url).expect("valid read URL");
+
+    let replay = run_tsf(&server, ["replay", read_url], None).await;
+    assert!(replay.status.success(), "stderr={}", replay.stderr);
+    assert_eq!(replay.stdout, "implicit write\n");
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn write_without_url_then_replay_round_trips_command_output() {
     let server = TestServer::start().await;
     let output = run_tsf(&server, ["write"], Some("hello from cli integration\n")).await;
