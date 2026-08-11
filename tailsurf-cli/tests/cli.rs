@@ -52,6 +52,8 @@ use tokio::{
 use url::Url;
 
 const FREE_RETENTION_LIMIT_MESSAGE: &str = "Infinite retention is unavailable for free users.";
+const TEST_STREAM_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const UNKNOWN_STREAM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
 #[test]
 fn help_and_version_describe_the_cli() {
@@ -103,7 +105,7 @@ fn write_help_describes_implicit_creation() {
 
 #[test]
 fn write_rejects_creation_options_with_an_existing_destination() {
-    const WRITE_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=secret";
+    const WRITE_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     let misplaced_public = Command::new(env!("CARGO_BIN_EXE_tsf"))
         .args(["write", WRITE_URL, "--public"])
@@ -615,7 +617,7 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let write_url = format!("http://localhost:3000/s/{stream_id}#w=write-secret");
+    let write_url = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -628,8 +630,8 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
     let attempts = server.append_attempts();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].writer_id, attempts[1].writer_id);
-    assert_eq!(attempts[0].bearer_token, "write-secret");
-    assert_eq!(attempts[1].bearer_token, "write-secret");
+    assert_eq!(attempts[0].bearer_token, TEST_STREAM_TOKEN);
+    assert_eq!(attempts[1].bearer_token, TEST_STREAM_TOKEN);
     assert_eq!(attempts[0].writer_seq_num, 0);
     assert_eq!(attempts[1].writer_seq_num, 0);
     assert_eq!(attempts[0].data.as_ref(), b"retry me\n");
@@ -769,7 +771,7 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_until_stdout_contains(
         server.api_url.clone(),
@@ -783,8 +785,8 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
     assert_eq!(output.stderr, "");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].bearer_token, "read-secret");
-    assert_eq!(attempts[1].bearer_token, "read-secret");
+    assert_eq!(attempts[0].bearer_token, TEST_STREAM_TOKEN);
+    assert_eq!(attempts[1].bearer_token, TEST_STREAM_TOKEN);
     assert_eq!(
         attempts[0].query.get("seq_num").map(String::as_str),
         Some("0")
@@ -805,7 +807,7 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let tail_offset_output = run_tsf_until_stdout_contains(
         tail_offset_server.api_url.clone(),
@@ -884,7 +886,7 @@ async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position()
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_until_stdout_contains(
         server.api_url.clone(),
@@ -904,7 +906,7 @@ async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position()
     }));
     assert_eq!(
         server.tail_bearer_tokens(),
-        [Some("read-secret".to_owned())]
+        [Some(TEST_STREAM_TOKEN.to_owned())]
     );
 
     server.abort();
@@ -916,7 +918,7 @@ async fn zero_count_reads_complete_without_opening_a_socket() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let tail = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -945,7 +947,7 @@ async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -977,7 +979,7 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
         .expect("owner URL");
     let bad_owner_url = owner_url
         .split_once("#o=")
-        .map(|(prefix, _token)| format!("{prefix}#o=bad-owner-secret"))
+        .map(|(prefix, _token)| format!("{prefix}#o={UNKNOWN_STREAM_TOKEN}"))
         .expect("owner fragment");
 
     let output = run_tsf(&server, ["visibility", &bad_owner_url, "private"], None).await;
@@ -1002,7 +1004,7 @@ async fn replay_rejects_logical_records_above_configured_limit() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
@@ -1039,7 +1041,7 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let seq_output = run_tsf_with_api_url(
@@ -1130,7 +1132,7 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let read_url = format!("http://localhost:3000/s/{stream_id}#r=read-secret");
+    let read_url = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_TOKEN}");
 
     let output =
         run_tsf_bytes_with_api_url(server.api_url.clone(), ["replay", read_url.as_str()]).await;
@@ -1811,7 +1813,7 @@ fn test_issue_stream_token(state: &TestApiState, permissions: TokenPermissions) 
     let token_id = format!("{:024x}", *next_token)
         .parse::<TokenId>()
         .expect("token id");
-    let token = BearerToken::from(format!("secret-{:024}", *next_token));
+    let token = BearerToken::from(format!("{:043}", *next_token));
     *next_token += 1;
     TestToken {
         token_id,

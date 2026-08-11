@@ -552,7 +552,7 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
             .context("created stream did not include a write-capable link")?
             .token
             .clone();
-        let view_link = created_view_link(&web_url, &created)
+        let view_link = created_view_link(&web_url, &created)?
             .context("created stream did not include a view link")?;
         println!("{view_link}");
         (created.stream_id, token, Some(view_link))
@@ -602,9 +602,9 @@ async fn create_stream(
         .context("failed to create stream")
 }
 
-fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> Option<Url> {
+fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> eyre::Result<Option<Url>> {
     if matches!(created.visibility, Visibility::Public) {
-        return Some(bare_stream_url(web_url, &created.stream_id));
+        return Ok(Some(bare_stream_url(web_url, &created.stream_id)));
     }
 
     created
@@ -619,6 +619,8 @@ fn created_view_link(web_url: &Url, created: &CreateStreamResponse) -> Option<Ur
                 &issued.token,
             )
         })
+        .transpose()
+        .map_err(Into::into)
 }
 
 async fn stream_stdin_to_writer(
@@ -1352,22 +1354,22 @@ fn print_created_stream(
                 .tokens
                 .iter()
                 .map(|issued| {
-                    (
+                    Ok((
                         link_label(issued.permissions),
                         stream_url(
                             web_url,
                             &created.stream_id,
                             issued.permissions,
                             &issued.token,
-                        ),
+                        )?,
                         if issued.permissions.allows_owner() {
                             "  (keep private)"
                         } else {
                             ""
                         },
-                    )
+                    ))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, tailsurf::stream_url::StreamUrlError>>()?;
             if matches!(created.visibility, Visibility::Public) {
                 links.push((
                     "view",
@@ -1399,18 +1401,18 @@ fn print_created_stream(
                     .tokens
                     .iter()
                     .map(|issued| {
-                        (
+                        Ok((
                             issued.permissions.to_string(),
                             stream_url(
                                 web_url,
                                 &created.stream_id,
                                 issued.permissions,
                                 &issued.token,
-                            )
+                            )?
                             .to_string(),
-                        )
+                        ))
                     })
-                    .collect(),
+                    .collect::<Result<BTreeMap<_, _>, tailsurf::stream_url::StreamUrlError>>()?,
             };
             target.print_line(&serde_json::to_string_pretty(&output)?);
         }
@@ -1440,7 +1442,7 @@ fn print_issued_token(
     issued: &IssueTokenResponse,
     format: OutputFormat,
 ) -> eyre::Result<()> {
-    let url = stream_url(web_url, stream_id, issued.permissions, &issued.token);
+    let url = stream_url(web_url, stream_id, issued.permissions, &issued.token)?;
     match format {
         OutputFormat::Text => {
             println!("Issued {} link", link_label(issued.permissions));
