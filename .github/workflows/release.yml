@@ -397,8 +397,8 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
       - custom-notarize-macos
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && github.event_name == 'repository_dispatch' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-notarize-macos.result == 'skipped' || needs.custom-notarize-macos.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # Publishing requires every build and notarization prerequisite to complete successfully.
+    if: ${{ always() && github.event_name == 'repository_dispatch' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-local-artifacts.result == 'success' && needs.build-global-artifacts.result == 'success' && needs.custom-notarize-macos.result == 'success' }}
     environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
