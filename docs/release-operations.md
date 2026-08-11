@@ -34,31 +34,31 @@ macOS executables use Developer ID signing with hardened runtime and Apple notar
 
 Windows executables are unsigned. Linux and Windows artifacts rely on SHA-256 checksums and GitHub attestations.
 
-## Protected environments
+## Release environments
 
-Two GitHub environments are required before publishing.
+Release workflows use two GitHub environments.
 
-Configure the `crates-io` environment with required reviewers and allow deployments only from the protected default branch. Both crates.io trusted-publisher configurations name this environment exactly.
+The `crates-io` environment identifies trusted-publisher jobs. Both crates.io trusted-publisher configurations name this environment exactly.
 
-Configure the `release` environment with required reviewers and allow deployments only from the protected default branch. This environment protects binary builds, signing, notarization, and hosting.
+The `release` environment identifies binary build, signing, notarization, and hosting jobs.
 
-Prevent reviewers from approving their own deployments. Protect `v*` tags from updates and deletion. Store no release secrets at repository or organization scope.
+Neither environment currently has reviewer or branch restrictions. The default branch and `v*` tags are also unprotected.
 
 ## Required release secrets
 
-The `release` environment stores these macOS signing secrets:
+Repository Actions secrets store these macOS signing credentials:
 
 - `CODESIGN_CERTIFICATE`
 - `CODESIGN_CERTIFICATE_PASSWORD`
 - `CODESIGN_IDENTITY`
 
-It also stores these Apple notarization secrets:
+They also store these Apple notarization credentials:
 
 - `APPLE_NOTARY_ISSUER_ID`
 - `APPLE_NOTARY_KEY_ID`
 - `APPLE_NOTARY_PRIVATE_KEY`
 
-Release builds fail when any required signing or notarization credential is missing. These values are not repository-level or organization-level secrets.
+The reusable notarization workflow receives its three credentials through an explicit secret map. Release builds fail when any required signing or notarization credential is missing.
 
 ## Validate without publishing
 
