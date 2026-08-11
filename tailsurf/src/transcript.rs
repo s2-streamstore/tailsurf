@@ -11,13 +11,54 @@ use crate::{
 
 /// Default maximum reassembled logical-record size: 16 MiB.
 pub const DEFAULT_MAX_LOGICAL_RECORD_BYTES: usize = MAX_RECORD_BYTES * 32;
+/// Default maximum writer identities retained for deduplication and reassembly.
+pub const DEFAULT_MAX_WRITER_STATES: usize = 4_096;
+/// Default maximum payload bytes retained across all unfinished split records: 64 MiB.
+pub const DEFAULT_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+
+/// Memory and cardinality limits for one logical transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptLimits {
+    /// Maximum size of one reassembled logical record.
+    pub max_logical_record_bytes: usize,
+    /// Maximum writer identities retained for deduplication and reassembly.
+    pub max_writer_states: usize,
+    /// Maximum payload bytes retained across all unfinished split records.
+    pub max_pending_bytes: usize,
+}
+
+impl TranscriptLimits {
+    /// Creates explicit transcript limits.
+    pub const fn new(
+        max_logical_record_bytes: usize,
+        max_writer_states: usize,
+        max_pending_bytes: usize,
+    ) -> Self {
+        Self {
+            max_logical_record_bytes,
+            max_writer_states,
+            max_pending_bytes,
+        }
+    }
+}
+
+impl Default for TranscriptLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_LOGICAL_RECORD_BYTES,
+            DEFAULT_MAX_WRITER_STATES,
+            DEFAULT_MAX_PENDING_BYTES,
+        )
+    }
+}
 
 /// Per-writer duplicate suppression and split-record reassembly state.
 ///
 /// Records are processed in delivery order. Reused or decreasing writer sequence numbers are suppressed, malformed partial sequences are dropped, and a read beginning mid-split waits for the next complete logical record.
 pub struct LogicalTranscript {
-    max_logical_record_bytes: usize,
+    limits: TranscriptLimits,
     writers: HashMap<WriterId, WriterState>,
+    pending_bytes: usize,
 }
 
 impl LogicalTranscript {
@@ -28,15 +69,39 @@ impl LogicalTranscript {
 
     /// Creates transcript state with an explicit logical-record byte limit.
     pub fn with_max_logical_record_bytes(max_logical_record_bytes: usize) -> Self {
-        Self {
+        Self::with_limits(TranscriptLimits {
             max_logical_record_bytes,
+            ..TranscriptLimits::default()
+        })
+    }
+
+    /// Creates transcript state with explicit record, writer, and aggregate pending-byte limits.
+    pub fn with_limits(limits: TranscriptLimits) -> Self {
+        Self {
+            limits,
             writers: HashMap::new(),
+            pending_bytes: 0,
         }
+    }
+
+    /// Returns the complete configured limits.
+    pub const fn limits(&self) -> TranscriptLimits {
+        self.limits
     }
 
     /// Returns the configured logical-record byte limit.
     pub fn max_logical_record_bytes(&self) -> usize {
-        self.max_logical_record_bytes
+        self.limits.max_logical_record_bytes
+    }
+
+    /// Returns the number of retained writer identities.
+    pub fn writer_state_count(&self) -> usize {
+        self.writers.len()
+    }
+
+    /// Returns payload bytes retained across unfinished split records.
+    pub const fn pending_bytes(&self) -> usize {
+        self.pending_bytes
     }
 
     /// Processes one physical record.
@@ -46,7 +111,16 @@ impl LogicalTranscript {
         &mut self,
         record: ReadRecord,
     ) -> Result<Option<TranscriptRecord>, TranscriptError> {
-        let max_logical_record_bytes = self.max_logical_record_bytes;
+        let limits = self.limits;
+        if !self.writers.contains_key(&record.writer_id)
+            && self.writers.len() >= limits.max_writer_states
+        {
+            return Err(TranscriptError::WriterStateLimitExceeded {
+                actual: self.writers.len().saturating_add(1),
+                max: limits.max_writer_states,
+            });
+        }
+
         let writer = self.writers.entry(record.writer_id).or_default();
         if writer
             .highest_seq
@@ -57,8 +131,8 @@ impl LogicalTranscript {
         writer.highest_seq = Some(record.writer_seq_num);
 
         if record.part == PartHeader::unsplit() {
-            writer.pending = None;
-            check_logical_record_len(record.data.len(), max_logical_record_bytes)?;
+            clear_pending(writer, &mut self.pending_bytes);
+            check_logical_record_len(record.data.len(), limits.max_logical_record_bytes)?;
             return Ok(Some(TranscriptRecord {
                 format: record.format,
                 data: TranscriptData::from(record.data),
@@ -69,14 +143,19 @@ impl LogicalTranscript {
             .writer_seq_num
             .checked_sub(u64::from(record.part.index()))
         else {
-            writer.pending = None;
+            clear_pending(writer, &mut self.pending_bytes);
             return Ok(None);
         };
 
         let part_index = record.part.index();
         if part_index == 0 {
-            writer.pending = None;
-            check_logical_record_len(record.data.len(), max_logical_record_bytes)?;
+            clear_pending(writer, &mut self.pending_bytes);
+            check_logical_record_len(record.data.len(), limits.max_logical_record_bytes)?;
+            self.pending_bytes = checked_pending_bytes(
+                self.pending_bytes,
+                record.data.len(),
+                limits.max_pending_bytes,
+            )?;
             let mut pending = PendingRecord {
                 start_seq_num,
                 next_part_index: 1,
@@ -91,7 +170,7 @@ impl LogicalTranscript {
             return Ok(None);
         }
 
-        let Some(mut pending) = writer.pending.take() else {
+        let Some(mut pending) = take_pending(writer, &mut self.pending_bytes) else {
             return Ok(None);
         };
         if pending.start_seq_num != start_seq_num
@@ -104,10 +183,10 @@ impl LogicalTranscript {
         let logical_record_len = pending.len.checked_add(record.data.len()).ok_or(
             TranscriptError::LogicalRecordTooLarge {
                 len: usize::MAX,
-                max: max_logical_record_bytes,
+                max: limits.max_logical_record_bytes,
             },
         )?;
-        check_logical_record_len(logical_record_len, max_logical_record_bytes)?;
+        check_logical_record_len(logical_record_len, limits.max_logical_record_bytes)?;
         pending.len = logical_record_len;
         if !record.data.is_empty() {
             pending.chunks.push(record.data);
@@ -123,6 +202,8 @@ impl LogicalTranscript {
             return Ok(None);
         };
         pending.next_part_index = next_part_index;
+        self.pending_bytes =
+            checked_pending_bytes(self.pending_bytes, pending.len, limits.max_pending_bytes)?;
         writer.pending = Some(pending);
         Ok(None)
     }
@@ -130,7 +211,7 @@ impl LogicalTranscript {
 
 impl Default for LogicalTranscript {
     fn default() -> Self {
-        Self::with_max_logical_record_bytes(DEFAULT_MAX_LOGICAL_RECORD_BYTES)
+        Self::with_limits(TranscriptLimits::default())
     }
 }
 
@@ -294,6 +375,22 @@ pub enum TranscriptError {
         /// Configured maximum logical length.
         max: usize,
     },
+    /// Retaining a new writer identity would exceed the configured cardinality limit.
+    #[error("transcript has {actual} writer states; maximum is {max}")]
+    WriterStateLimitExceeded {
+        /// Writer-state count after the attempted insertion.
+        actual: usize,
+        /// Configured writer-state limit.
+        max: usize,
+    },
+    /// Retaining an unfinished split record would exceed the aggregate pending-byte limit.
+    #[error("transcript would retain {actual} pending bytes; maximum is {max}")]
+    PendingBytesLimitExceeded {
+        /// Aggregate pending payload bytes after the attempted update.
+        actual: usize,
+        /// Configured aggregate pending-byte limit.
+        max: usize,
+    },
 }
 
 #[derive(Default)]
@@ -316,6 +413,30 @@ fn check_logical_record_len(len: usize, max: usize) -> Result<(), TranscriptErro
     } else {
         Ok(())
     }
+}
+
+fn checked_pending_bytes(
+    current: usize,
+    added: usize,
+    max: usize,
+) -> Result<usize, TranscriptError> {
+    let actual = current.saturating_add(added);
+    if actual > max {
+        Err(TranscriptError::PendingBytesLimitExceeded { actual, max })
+    } else {
+        Ok(actual)
+    }
+}
+
+fn take_pending(writer: &mut WriterState, pending_bytes: &mut usize) -> Option<PendingRecord> {
+    let pending = writer.pending.take()?;
+    debug_assert!(*pending_bytes >= pending.len);
+    *pending_bytes = pending_bytes.saturating_sub(pending.len);
+    Some(pending)
+}
+
+fn clear_pending(writer: &mut WriterState, pending_bytes: &mut usize) {
+    drop(take_pending(writer, pending_bytes));
 }
 
 #[cfg(test)]
@@ -533,5 +654,145 @@ mod tests {
                 data: TranscriptData::from_static(b"next")
             })
         );
+    }
+
+    #[test]
+    fn defaults_expose_aggregate_memory_and_writer_bounds() {
+        let transcript = LogicalTranscript::new();
+
+        assert_eq!(transcript.limits(), TranscriptLimits::default());
+        assert_eq!(
+            transcript.max_logical_record_bytes(),
+            DEFAULT_MAX_LOGICAL_RECORD_BYTES
+        );
+        assert_eq!(
+            transcript.limits().max_writer_states,
+            DEFAULT_MAX_WRITER_STATES
+        );
+        assert_eq!(
+            transcript.limits().max_pending_bytes,
+            DEFAULT_MAX_PENDING_BYTES
+        );
+        assert_eq!(transcript.writer_state_count(), 0);
+        assert_eq!(transcript.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn rejects_new_writer_identities_above_the_configured_limit() {
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 16));
+
+        for writer_byte in [1, 2] {
+            assert!(
+                push(
+                    &mut transcript,
+                    record_with_writer(
+                        WriterId::from_bytes([writer_byte; WriterId::BYTE_LEN]),
+                        0,
+                        PartHeader::unsplit(),
+                        b"ok",
+                    ),
+                )
+                .is_some()
+            );
+        }
+
+        let error = transcript
+            .push_record(record_with_writer(
+                WriterId::from_bytes([3; WriterId::BYTE_LEN]),
+                0,
+                PartHeader::unsplit(),
+                b"rejected",
+            ))
+            .expect_err("writer-state limit");
+        assert_eq!(
+            error,
+            TranscriptError::WriterStateLimitExceeded { actual: 3, max: 2 }
+        );
+        assert_eq!(transcript.writer_state_count(), 2);
+    }
+
+    #[test]
+    fn bounds_aggregate_pending_bytes_across_writers_and_releases_completed_state() {
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 4, 4));
+        let first_writer = WriterId::from_bytes([1; WriterId::BYTE_LEN]);
+        let second_writer = WriterId::from_bytes([2; WriterId::BYTE_LEN]);
+
+        assert_eq!(
+            push(
+                &mut transcript,
+                record_with_writer(
+                    first_writer,
+                    0,
+                    PartHeader::new(0, false).expect("part"),
+                    b"abc",
+                ),
+            ),
+            None
+        );
+        assert_eq!(transcript.pending_bytes(), 3);
+
+        let error = transcript
+            .push_record(record_with_writer(
+                second_writer,
+                0,
+                PartHeader::new(0, false).expect("part"),
+                b"de",
+            ))
+            .expect_err("aggregate pending-byte limit");
+        assert_eq!(
+            error,
+            TranscriptError::PendingBytesLimitExceeded { actual: 5, max: 4 }
+        );
+        assert_eq!(transcript.pending_bytes(), 3);
+
+        assert_chunked_record(
+            push(
+                &mut transcript,
+                record_with_writer(
+                    first_writer,
+                    1,
+                    PartHeader::new(1, true).expect("part"),
+                    b"d",
+                ),
+            ),
+            b"abcd",
+        );
+        assert_eq!(transcript.pending_bytes(), 0);
+
+        assert_eq!(
+            push(
+                &mut transcript,
+                record_with_writer(
+                    second_writer,
+                    1,
+                    PartHeader::new(0, false).expect("part"),
+                    b"wxyz",
+                ),
+            ),
+            None
+        );
+        assert_eq!(transcript.pending_bytes(), 4);
+    }
+
+    #[test]
+    fn malformed_sequence_releases_its_aggregate_pending_bytes() {
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 4));
+
+        assert_eq!(
+            push(
+                &mut transcript,
+                record(0, PartHeader::new(0, false).expect("part"), b"abc"),
+            ),
+            None
+        );
+        assert_eq!(transcript.pending_bytes(), 3);
+        assert_eq!(
+            push(
+                &mut transcript,
+                record(2, PartHeader::new(2, true).expect("part"), b"d"),
+            ),
+            None
+        );
+        assert_eq!(transcript.pending_bytes(), 0);
     }
 }
