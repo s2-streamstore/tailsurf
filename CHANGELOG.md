@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/s2-streamstore/tailsurf/compare/v0.3.0...v0.4.0) - 2026-08-11
+
+### Added
+
+- *(cli)* hint when updates are available
+
+### Fixed
+
+- *(cli)* restore explicit installer updates
+- align client authorization and write limits
+
+### Other
+
+- [**breaking**] trim CLI and SDK surface
+
 ## [0.3.0](https://github.com/s2-streamstore/tailsurf/compare/v0.2.0...v0.3.0) - 2026-08-11
 
 ### Other
