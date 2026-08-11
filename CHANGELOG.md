@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/s2-streamstore/tailsurf/compare/v0.4.0...v0.5.0) - 2026-08-11
+
+### Added
+
+- *(cli)* make piped input to bare tsf behave like tsf write ([#16](https://github.com/s2-streamstore/tailsurf/pull/16))
+
+### Other
+
+- [**breaking**] clean up stream token extraction, record traits, base64 helpers, and ack dispatch ([#15](https://github.com/s2-streamstore/tailsurf/pull/15))
+- require nightly Rustfmt ([#17](https://github.com/s2-streamstore/tailsurf/pull/17))
+
 ## [0.4.0](https://github.com/s2-streamstore/tailsurf/compare/v0.3.0...v0.4.0) - 2026-08-11
 
 ### Added
