@@ -14,6 +14,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use reqwest::StatusCode;
+use secrecy::ExposeSecret;
 use serde::{Deserialize, de::DeserializeOwned};
 use tokio::{
     net::TcpStream,
@@ -49,7 +50,6 @@ use crate::{
         },
     },
 };
-use secrecy::ExposeSecret;
 
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -67,9 +67,11 @@ pub struct TsfClientConfig {
     pub websocket_connect_timeout: Duration,
     /// Timeout for authentication, frame sends, and append acknowledgements.
     pub websocket_operation_timeout: Duration,
-    /// Optional idle timeout while waiting for a read frame. Protocol heartbeats reset the timer. `None` waits indefinitely.
+    /// Optional idle timeout while waiting for a read frame. Protocol heartbeats reset the timer.
+    /// `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
-    /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and consecutive read reconnects without a delivered record.
+    /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and
+    /// consecutive read reconnects without a delivered record.
     pub retry_policy: RetryPolicy,
 }
 
@@ -138,7 +140,10 @@ impl Default for RetryPolicy {
 
 /// Cloneable TSF control-plane and v3 data-plane client.
 ///
-/// Anonymous stream creation is retried with one idempotency key. Other mutating REST operations are not retried because a timeout may occur after the service applies the mutation. Metadata reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by [`TsfProducer`].
+/// Anonymous stream creation is retried with one idempotency key. Other mutating REST operations
+/// are not retried because a timeout may occur after the service applies the mutation. Metadata
+/// reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by
+/// [`TsfProducer`].
 #[derive(Clone)]
 pub struct TsfClient {
     config: TsfClientConfig,
@@ -176,7 +181,8 @@ impl TsfClient {
 
     /// Creates a stream and returns its metadata and newly issued secret tokens.
     ///
-    /// The client generates one idempotency key for this logical call and reuses it while retrying transient failures according to policy.
+    /// The client generates one idempotency key for this logical call and reuses it while retrying
+    /// transient failures according to policy.
     pub async fn create_stream(
         &self,
         request: &CreateStreamRequest,
@@ -188,7 +194,9 @@ impl TsfClient {
 
     /// Creates or recovers a logical stream creation using a caller-owned idempotency key.
     ///
-    /// The key is owner-equivalent recovery material. Generate and persist it securely before the first request, then reuse it with the identical request after cancellation, process loss, or an ambiguous response.
+    /// The key is owner-equivalent recovery material. Generate and persist it securely before the
+    /// first request, then reuse it with the identical request after cancellation, process loss, or
+    /// an ambiguous response.
     pub async fn create_stream_with_idempotency_key(
         &self,
         request: &CreateStreamRequest,
@@ -406,7 +414,9 @@ impl TsfClient {
 
     /// Connects a resumable read session at the requested position and bounds.
     ///
-    /// An explicit tail offset, or the service-default offset of 80 records, is resolved to an absolute S2 sequence number before the first socket is opened. Reconnects therefore resume from the same position even if the stream advances before a record arrives.
+    /// An explicit tail offset, or the service-default offset of 80 records, is resolved to an
+    /// absolute S2 sequence number before the first socket is opened. Reconnects therefore resume
+    /// from the same position even if the stream advances before a record arrives.
     pub async fn connect_reader(
         &self,
         mut options: ReadStreamOptions,
@@ -712,9 +722,11 @@ pub const MAX_PRODUCER_UNACKED_RECORDS: usize = 128;
 /// Memory, concurrency, and reconnect bounds for [`TsfProducer`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TsfProducerConfig {
-    /// Maximum total payload bytes retained until durability acknowledgement. Must not exceed [`MAX_PRODUCER_UNACKED_PAYLOAD_BYTES`].
+    /// Maximum total payload bytes retained until durability acknowledgement. Must not exceed
+    /// [`MAX_PRODUCER_UNACKED_PAYLOAD_BYTES`].
     pub max_unacked_bytes: usize,
-    /// Maximum number of records retained until durability acknowledgement. Must not exceed [`MAX_PRODUCER_UNACKED_RECORDS`].
+    /// Maximum number of records retained until durability acknowledgement. Must not exceed
+    /// [`MAX_PRODUCER_UNACKED_RECORDS`].
     pub max_unacked_records: usize,
     /// Maximum consecutive producer reconnect attempts before failing pending records.
     pub max_reconnect_attempts: usize,
@@ -883,7 +895,8 @@ impl Future for AppendTicket {
     }
 }
 
-/// Bounded durable producer that retains unacknowledged records and resends them across transient interruptions.
+/// Bounded durable producer that retains unacknowledged records and resends them across transient
+/// interruptions.
 pub struct TsfProducer {
     cmd_tx: mpsc::Sender<ProducerCommand>,
     byte_permits: Arc<Semaphore>,
@@ -958,7 +971,8 @@ impl TsfProducer {
         })
     }
 
-    /// Stops accepting records, waits for every pending durability acknowledgement, and joins the producer task.
+    /// Stops accepting records, waits for every pending durability acknowledgement, and joins the
+    /// producer task.
     pub async fn close(mut self) -> Result<(), TsfClientError> {
         let (done_tx, done_rx) = oneshot::channel();
         self.cmd_tx
@@ -1406,7 +1420,8 @@ fn inclusive_range_len(start: u64, end: u64) -> Option<u64> {
 
 /// Resumable reader that advances its sequence position after every delivered record.
 ///
-/// Transient transport and service interruptions reconnect from the next S2 sequence number. Normal completion and configured bounds return `None`; protocol and policy failures surface as errors.
+/// Transient transport and service interruptions reconnect from the next S2 sequence number. Normal
+/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
 pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
@@ -1865,7 +1880,8 @@ pub enum TsfClientError {
 }
 
 impl TsfClientError {
-    /// Returns whether retrying a failed create with the same idempotency key and request is safe and may succeed.
+    /// Returns whether retrying a failed create with the same idempotency key and request is safe
+    /// and may succeed.
     pub fn is_recoverable_create_failure(&self) -> bool {
         match self {
             Self::Http(error) => {
@@ -1921,8 +1937,9 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio_tungstenite::connect_async;
+
+    use super::*;
 
     async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

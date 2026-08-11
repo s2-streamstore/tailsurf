@@ -1,6 +1,8 @@
 //! Async Rust SDK and shared TSF v3 protocol types for [tail.surf](https://tail.surf).
 //!
-//! Use [`TsfClient`] for control-plane requests, [`TsfProducer`] for durable reconnecting writes, and [`TsfReadSession`] for resumable reads. Share URLs and transcript reconstruction are available in [`stream_url`] and [`transcript`].
+//! Use [`TsfClient`] for control-plane requests, [`TsfProducer`] for durable reconnecting writes,
+//! and [`TsfReadSession`] for resumable reads. Share URLs and transcript reconstruction are
+//! available in [`stream_url`] and [`transcript`].
 
 /// HTTP and WebSocket clients, retry policy, and durable producer types.
 pub mod client;
