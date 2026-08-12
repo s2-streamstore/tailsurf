@@ -112,6 +112,21 @@ fn write_rejects_creation_options_with_an_existing_destination() {
     );
 }
 
+#[test]
+fn renew_rejects_an_overflowing_expiry() {
+    const OWNER_URL: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#o=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    let renewed = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["renew", OWNER_URL, "--expires", "18446744073709551615s"])
+        .output()
+        .expect("tsf renew with overflowing expiry");
+
+    assert!(!renewed.status.success());
+    let error = String::from_utf8(renewed.stderr).expect("stderr UTF-8");
+    assert!(error.contains("stream expiry is too large"));
+    assert!(!error.contains("panicked"));
+}
+
 #[tokio::test]
 async fn new_outputs_json_and_token_files() {
     let server = TestServer::start().await;

@@ -14,7 +14,7 @@ use std::{
 use axoupdater::AxoUpdater;
 use bytes::{Buf, Bytes, BytesMut};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use eyre::{Context, ContextCompat, bail};
+use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use secrecy::ExposeSecret;
 use serde::Serialize;
@@ -353,8 +353,11 @@ impl StreamExpiryArg {
         self.0.as_secs()
     }
 
-    fn rfc3339(self) -> String {
-        humantime::format_rfc3339_seconds(SystemTime::now() + self.0).to_string()
+    fn rfc3339(self) -> eyre::Result<String> {
+        let expires_at = SystemTime::now()
+            .checked_add(self.0)
+            .ok_or_else(|| eyre!("stream expiry is too large"))?;
+        Ok(humantime::format_rfc3339_seconds(expires_at).to_string())
     }
 }
 
@@ -1394,7 +1397,7 @@ async fn renew_stream(api_url: Url, args: RenewArgs) -> eyre::Result<()> {
             &locator.stream_id,
             &UpdateStreamRequest {
                 visibility: None,
-                expires_at: Some(args.expires.rfc3339()),
+                expires_at: Some(args.expires.rfc3339()?),
             },
             &owner_token,
         )
