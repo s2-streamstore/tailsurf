@@ -28,9 +28,9 @@ use tailsurf::{
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
-            IssuedStreamToken, ListTokensResponse, RequestedRetention, RevokeTokenRequest,
-            StreamInfoResponse, StreamTailResponse, StreamTokenStatus, StreamTokenSummary,
-            UpdateStreamRequest, Visibility,
+            IssuedStreamToken, ListTokensResponse, RevokeTokenRequest, StreamInfoResponse,
+            StreamTailResponse, StreamTokenStatus, StreamTokenSummary, UpdateStreamRequest,
+            Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -52,7 +52,7 @@ use tokio::{
 };
 use url::Url;
 
-const FREE_RETENTION_LIMIT_MESSAGE: &str = "Infinite retention is unavailable for free users.";
+const FREE_EXPIRY_LIMIT_MESSAGE: &str = "Free streams can expire at most 10 days from now.";
 const TEST_STREAM_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const UNKNOWN_STREAM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
 
@@ -84,15 +84,15 @@ fn write_rejects_creation_options_with_an_existing_destination() {
             .contains("--public cannot be used when writing to an existing stream")
     );
 
-    let misplaced_retention = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["write", WRITE_URL, "--retention", "6h"])
+    let misplaced_expiry = Command::new(env!("CARGO_BIN_EXE_tsf"))
+        .args(["write", WRITE_URL, "--expires", "6h"])
         .output()
-        .expect("tsf write URL --retention 6h");
-    assert!(!misplaced_retention.status.success());
+        .expect("tsf write URL --expires 6h");
+    assert!(!misplaced_expiry.status.success());
     assert!(
-        String::from_utf8(misplaced_retention.stderr)
+        String::from_utf8(misplaced_expiry.stderr)
             .expect("stderr UTF-8")
-            .contains("--retention cannot be used when writing to an existing stream")
+            .contains("--expires cannot be used when writing to an existing stream")
     );
 
     let misplaced_recovery_key = Command::new(env!("CARGO_BIN_EXE_tsf"))
@@ -161,7 +161,7 @@ async fn new_outputs_json_and_token_files() {
     let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("json output");
     assert!(json["stream_id"].as_str().is_some());
     assert_eq!(json["visibility"], "private");
-    assert_eq!(json["retention_secs"], 864_000);
+    assert!(json["expires_at"].as_str().is_some());
     assert!(json["urls"]["o"].as_str().is_some());
     assert!(json["urls"]["r"].as_str().is_some());
     assert!(json["urls"]["w"].as_str().is_some());
@@ -349,7 +349,7 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(private.status.success(), "stderr={}", private.stderr);
     assert_eq!(
         normalize_created_stream_output(&private.stdout),
-        "Created private stream <stream_id>\nRetention: <retention>\n\n  owner <url>\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nExpires: <timestamp>\n\n  owner <url>\n\nLinks are shown once.\n"
     );
     assert_created_output_urls_parse(&private.stdout, &["o"]);
 
@@ -357,7 +357,7 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(public.status.success(), "stderr={}", public.stderr);
     assert_eq!(
         normalize_created_stream_output(&public.stdout),
-        "Created public stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n"
+        "Created public stream <stream_id>\nExpires: <timestamp>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n"
     );
     assert_created_output_urls_parse(&public.stdout, &["o"]);
 
@@ -370,7 +370,7 @@ async fn new_text_output_covers_visibility_and_explicit_tokens() {
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  view+write <url>\n  owner <url>\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nExpires: <timestamp>\n\n  view <url>\n  view+write <url>\n  owner <url>\n\nLinks are shown once.\n"
     );
     assert_created_output_urls_parse(&explicit.stdout, &["o", "rw", "r"]);
 
@@ -447,30 +447,30 @@ async fn new_token_files_require_the_exact_requested_permission() {
 }
 
 #[tokio::test]
-async fn new_and_url_less_write_accept_human_retention_and_surface_free_limits() {
+async fn new_and_url_less_write_accept_human_expiry_and_surface_free_limits() {
     let server = TestServer::start().await;
 
     let finite = run_tsf(
         &server,
-        ["new", "--retention", "7d", "--format", "json"],
+        ["new", "--expires", "7d", "--format", "json"],
         None,
     )
     .await;
     assert!(finite.status.success(), "stderr={}", finite.stderr);
     let finite_json: serde_json::Value =
         serde_json::from_str(&finite.stdout).expect("finite JSON output");
-    assert_eq!(finite_json["retention_secs"], 604_800);
+    assert!(finite_json["expires_at"].as_str().is_some());
 
-    let write = run_tsf(&server, ["write", "--retention", "6h"], Some("retained\n")).await;
+    let write = run_tsf(&server, ["write", "--expires", "6h"], Some("retained\n")).await;
     assert!(write.status.success(), "stderr={}", write.stderr);
-    assert!(write.stderr.contains("Retention: 6 hours"));
+    assert!(write.stderr.contains("Expires: "));
 
-    let denied = run_tsf(&server, ["new", "--retention", "infinite"], None).await;
+    let denied = run_tsf(&server, ["new", "--expires", "864001s"], None).await;
     assert!(!denied.status.success());
     assert!(
         denied
             .stderr
-            .contains(&format!("free_plan_limit: {FREE_RETENTION_LIMIT_MESSAGE}")),
+            .contains(&format!("free_plan_limit: {FREE_EXPIRY_LIMIT_MESSAGE}")),
         "stderr={}",
         denied.stderr
     );
@@ -524,7 +524,7 @@ async fn write_without_url_then_replay_round_trips_command_output() {
     assert_eq!(output.stdout.lines().count(), 1);
     assert_eq!(
         normalize_created_stream_output(&output.stderr),
-        "Created private stream <stream_id>\nRetention: <retention>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n<records> durable · view <url>\n"
+        "Created private stream <stream_id>\nExpires: <timestamp>\n\n  view <url>\n  owner <url>\n\nLinks are shown once.\n<records> durable · view <url>\n"
     );
     assert!(
         output.stderr.contains("1 record durable · view "),
@@ -1537,7 +1537,12 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
 #[tokio::test]
 async fn owner_commands_manage_visibility_tokens_and_deletion() {
     let server = TestServer::start().await;
-    let created = run_tsf(&server, ["new", "--format", "json"], None).await;
+    let created = run_tsf(
+        &server,
+        ["new", "--expires", "1d", "--format", "json"],
+        None,
+    )
+    .await;
     assert!(created.status.success(), "stderr={}", created.stderr);
     let created_json: serde_json::Value =
         serde_json::from_str(&created.stdout).expect("create output");
@@ -1550,7 +1555,18 @@ async fn owner_commands_manage_visibility_tokens_and_deletion() {
     assert_eq!(info_json["stream_id"], created_json["stream_id"]);
     assert_eq!(info_json["visibility"], "private");
     assert_eq!(info_json["state"], "active");
-    assert_eq!(info_json["retention_secs"], 864_000);
+    assert_eq!(info_json["expires_at"], created_json["expires_at"]);
+
+    let renewed = run_tsf(
+        &server,
+        ["renew", owner_url, "--expires", "2d", "--format", "json"],
+        None,
+    )
+    .await;
+    assert!(renewed.status.success(), "stderr={}", renewed.stderr);
+    let renewed_json: serde_json::Value =
+        serde_json::from_str(&renewed.stdout).expect("renew output");
+    assert_ne!(renewed_json["expires_at"], created_json["expires_at"]);
 
     let visibility = run_tsf(
         &server,
@@ -1774,6 +1790,7 @@ struct TestApiState {
 struct TestStream {
     stream_id: StreamId,
     visibility: Visibility,
+    expires_at: String,
     deleted: bool,
     tokens: Vec<TestToken>,
     records: Vec<TestRecord>,
@@ -1846,17 +1863,17 @@ async fn test_create_stream(
         return Json(response).into_response();
     }
 
-    let retention_secs = match request.retention_secs {
-        None => 864_000,
-        Some(RequestedRetention::Seconds(seconds)) => seconds,
-        Some(RequestedRetention::Infinite) => {
-            return test_error(
-                StatusCode::FORBIDDEN,
-                "free_plan_limit",
-                FREE_RETENTION_LIMIT_MESSAGE,
-            );
-        }
-    };
+    let expires_in_secs = request.expires_in_secs.unwrap_or(864_000);
+    if expires_in_secs > 864_000 {
+        return test_error(
+            StatusCode::FORBIDDEN,
+            "free_plan_limit",
+            FREE_EXPIRY_LIMIT_MESSAGE,
+        );
+    }
+    let expires_at =
+        humantime::format_rfc3339_seconds(SystemTime::now() + Duration::from_secs(expires_in_secs))
+            .to_string();
     let stream_id = {
         let mut next_stream = state.next_stream.lock().expect("next stream lock");
         let stream_id = format!("{:032x}", *next_stream)
@@ -1894,6 +1911,7 @@ async fn test_create_stream(
         TestStream {
             stream_id,
             visibility: request.visibility,
+            expires_at: expires_at.clone(),
             deleted: false,
             tokens,
             records: Vec::new(),
@@ -1903,7 +1921,7 @@ async fn test_create_stream(
     let response = CreateStreamResponse {
         stream_id,
         visibility: request.visibility,
-        retention_secs,
+        expires_at,
         tokens: response_tokens,
     };
     if let Some(key) = idempotency_key {
@@ -1964,6 +1982,9 @@ async fn test_update_stream(
     }
     if let Some(visibility) = request.visibility {
         stream.visibility = visibility;
+    }
+    if let Some(expires_at) = request.expires_at {
+        stream.expires_at = expires_at;
     }
     Json(test_get_stream_response(stream)).into_response()
 }
@@ -2279,7 +2300,7 @@ fn test_get_stream_response(stream: &TestStream) -> StreamInfoResponse {
         basin: "test-basin".to_owned(),
         visibility: stream.visibility,
         state: if stream.deleted { "deleted" } else { "active" }.to_owned(),
-        retention_secs: 864_000,
+        expires_at: stream.expires_at.clone(),
         active_token_count: stream.tokens.iter().filter(|token| token.active).count(),
     }
 }
@@ -2510,8 +2531,8 @@ fn normalize_created_stream_output(output: &str) -> String {
             if let Some(rest) = line.strip_prefix("Created ") {
                 let visibility = rest.split_whitespace().next().unwrap_or_default();
                 format!("Created {visibility} stream <stream_id>")
-            } else if line.starts_with("Retention:") {
-                "Retention: <retention>".to_owned()
+            } else if line.starts_with("Expires:") {
+                "Expires: <timestamp>".to_owned()
             } else if line.starts_with(|c: char| c.is_ascii_digit()) && line.contains(" durable") {
                 if line.contains(" · view ") {
                     "<records> durable · view <url>".to_owned()

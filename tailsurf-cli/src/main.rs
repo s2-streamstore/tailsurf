@@ -24,8 +24,8 @@ use tailsurf::{
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
-            IssuedStreamToken, RequestedRetention, StreamInfoResponse, StreamTokenStatus,
-            UpdateStreamRequest, Visibility,
+            IssuedStreamToken, StreamInfoResponse, StreamTokenStatus, UpdateStreamRequest,
+            Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -90,9 +90,9 @@ enum Command {
     New(NewArgs),
     /// Stream stdin or a command's output to a stream.
     Write(WriteArgs),
-    /// Follow a stream, optionally starting from retained records.
+    /// Follow a stream, optionally starting from existing records.
     Tail(TailArgs),
-    /// Print a bounded snapshot of retained records.
+    /// Print a bounded snapshot of existing records.
     Replay(ReplayArgs),
     /// Show current stream metadata.
     Info(InfoArgs),
@@ -100,6 +100,8 @@ enum Command {
     Delete(OwnerUrlArgs),
     /// Change stream visibility.
     Visibility(VisibilityArgs),
+    /// Extend a stream's expiration.
+    Renew(RenewArgs),
     /// Manage share links.
     Link(LinkArgs),
     /// Update an installation managed by the tail.surf installer.
@@ -124,9 +126,9 @@ struct NewArgs {
     #[arg(
         long,
         value_name = "DURATION",
-        help = "Record retention, such as 6h, 7d, or infinite"
+        help = "Stream lifetime, such as 6h or 7d"
     )]
-    retention: Option<RetentionArg>,
+    expires: Option<StreamExpiryArg>,
     /// Owner-equivalent recovery key for resuming this exact create request.
     #[arg(long, env = "TSF_CREATE_IDEMPOTENCY_KEY", value_name = "KEY")]
     create_idempotency_key: Option<CreateStreamIdempotencyKey>,
@@ -155,9 +157,9 @@ struct WriteArgs {
     #[arg(
         long,
         value_name = "DURATION",
-        help = "New-stream record retention, such as 6h, 7d, or infinite"
+        help = "New-stream lifetime, such as 6h or 7d"
     )]
-    retention: Option<RetentionArg>,
+    expires: Option<StreamExpiryArg>,
     /// Owner-equivalent recovery key for an implicitly created stream.
     #[arg(long, env = "TSF_CREATE_IDEMPOTENCY_KEY", value_name = "KEY")]
     create_idempotency_key: Option<CreateStreamIdempotencyKey>,
@@ -177,7 +179,7 @@ struct TailArgs {
     /// Read-capable or public stream share URL.
     #[arg(value_name = "STREAM_URL")]
     url: String,
-    /// Start this many retained records before the live tail.
+    /// Start this many records before the live tail.
     #[arg(short = 'n', long, conflicts_with_all = ["seq_num", "timestamp"])]
     tail_offset: Option<u64>,
     #[command(flatten)]
@@ -233,6 +235,19 @@ struct VisibilityArgs {
     url: String,
     /// New visibility.
     visibility: VisibilityArg,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct RenewArgs {
+    /// Owner stream share URL.
+    #[arg(value_name = "OWNER_URL")]
+    url: String,
+    /// New lifetime from now, such as 6h or 7d.
+    #[arg(long, value_name = "DURATION")]
+    expires: StreamExpiryArg,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -315,36 +330,31 @@ enum OutputFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetentionArg {
-    Seconds(u64),
-    Infinite,
-}
+struct StreamExpiryArg(Duration);
 
-impl FromStr for RetentionArg {
+impl FromStr for StreamExpiryArg {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.eq_ignore_ascii_case("infinite") {
-            return Ok(Self::Infinite);
-        }
         let duration = humantime::parse_duration(value)
-            .map_err(|error| format!("invalid retention duration: {error}"))?;
+            .map_err(|error| format!("invalid stream expiry duration: {error}"))?;
         if duration.is_zero() {
-            return Err("retention must be at least one second".to_owned());
+            return Err("stream expiry must be at least one second".to_owned());
         }
         if duration.subsec_nanos() != 0 {
-            return Err("retention must be a whole number of seconds".to_owned());
+            return Err("stream expiry must be a whole number of seconds".to_owned());
         }
-        Ok(Self::Seconds(duration.as_secs()))
+        Ok(Self(duration))
     }
 }
 
-impl From<RetentionArg> for RequestedRetention {
-    fn from(value: RetentionArg) -> Self {
-        match value {
-            RetentionArg::Seconds(seconds) => Self::Seconds(seconds),
-            RetentionArg::Infinite => Self::Infinite,
-        }
+impl StreamExpiryArg {
+    fn seconds(self) -> u64 {
+        self.0.as_secs()
+    }
+
+    fn rfc3339(self) -> String {
+        humantime::format_rfc3339_seconds(SystemTime::now() + self.0).to_string()
     }
 }
 
@@ -495,6 +505,7 @@ async fn run(api_url: Url, web_url: Url, command: Command) -> eyre::Result<()> {
         Command::Info(args) => stream_info(api_url, args).await,
         Command::Delete(args) => delete_stream(api_url, args).await,
         Command::Visibility(args) => update_visibility(api_url, args).await,
+        Command::Renew(args) => renew_stream(api_url, args).await,
         Command::Link(args) => link_command(api_url, web_url, args).await,
         Command::Update(args) => update_cli(args).await,
     }
@@ -620,7 +631,7 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
     let created = create_stream(
         api_url,
         visibility,
-        args.retention.map(Into::into),
+        args.expires.map(StreamExpiryArg::seconds),
         issue_tokens,
         args.create_idempotency_key.as_ref(),
     )
@@ -672,7 +683,7 @@ async fn write_stream(api_url: Url, web_url: Url, args: WriteArgs) -> eyre::Resu
         let created = create_stream(
             api_url.clone(),
             visibility,
-            args.retention.map(Into::into),
+            args.expires.map(StreamExpiryArg::seconds),
             write_new_default_links(visibility),
             args.create_idempotency_key.as_ref(),
         )
@@ -730,8 +741,8 @@ fn validate_write_args(args: &WriteArgs) -> eyre::Result<()> {
     if args.public {
         bail!("--public cannot be used when writing to an existing stream");
     }
-    if args.retention.is_some() {
-        bail!("--retention cannot be used when writing to an existing stream");
+    if args.expires.is_some() {
+        bail!("--expires cannot be used when writing to an existing stream");
     }
     if args.create_idempotency_key.is_some() {
         bail!("--create-idempotency-key cannot be used when writing to an existing stream");
@@ -742,7 +753,7 @@ fn validate_write_args(args: &WriteArgs) -> eyre::Result<()> {
 async fn create_stream(
     api_url: Url,
     visibility: Visibility,
-    retention_secs: Option<RequestedRetention>,
+    expires_in_secs: Option<u64>,
     issue_tokens: Vec<TokenPermissions>,
     supplied_key: Option<&CreateStreamIdempotencyKey>,
 ) -> eyre::Result<CreateStreamResponse> {
@@ -758,7 +769,7 @@ async fn create_stream(
         .create_stream_with_idempotency_key(
             &CreateStreamRequest {
                 visibility,
-                retention_secs,
+                expires_in_secs,
                 issue_tokens: Some(issue_tokens),
             },
             idempotency_key,
@@ -1366,11 +1377,29 @@ async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<(
             &locator.stream_id,
             &UpdateStreamRequest {
                 visibility: Some(args.visibility.into()),
+                expires_at: None,
             },
             &owner_token,
         )
         .await
         .context("failed to update stream visibility")?;
+    print_stream_info(&stream, args.format)?;
+    Ok(())
+}
+
+async fn renew_stream(api_url: Url, args: RenewArgs) -> eyre::Result<()> {
+    let (client, locator, owner_token) = owner_client_from_url(api_url, &args.url)?;
+    let stream = client
+        .update_stream(
+            &locator.stream_id,
+            &UpdateStreamRequest {
+                visibility: None,
+                expires_at: Some(args.expires.rfc3339()),
+            },
+            &owner_token,
+        )
+        .await
+        .context("failed to renew stream")?;
     print_stream_info(&stream, args.format)?;
     Ok(())
 }
@@ -1585,10 +1614,7 @@ fn print_created_stream(
                 visibility_label(created.visibility),
                 created.stream_id
             ));
-            target.print_line(&format!(
-                "Retention: {}",
-                humanize_retention(created.retention_secs)
-            ));
+            target.print_line(&format!("Expires: {}", created.expires_at));
             let mut links = created
                 .tokens
                 .iter()
@@ -1635,7 +1661,7 @@ fn print_created_stream(
             let output = CreatedStreamOutput {
                 stream_id: created.stream_id.to_string(),
                 visibility: visibility_label(created.visibility),
-                retention_secs: created.retention_secs,
+                expires_at: created.expires_at.clone(),
                 urls: created
                     .tokens
                     .iter()
@@ -1665,7 +1691,7 @@ fn print_stream_info(stream: &StreamInfoResponse, format: OutputFormat) -> eyre:
             println!("Stream {}", stream.stream_id);
             println!("Visibility: {}", visibility_label(stream.visibility));
             println!("State: {}", stream.state);
-            println!("Retention: {}", humanize_retention(stream.retention_secs));
+            println!("Expires: {}", stream.expires_at);
             println!("Active links: {}", stream.active_token_count);
         }
         OutputFormat::Json => {
@@ -1812,27 +1838,6 @@ fn link_rank(label: &str) -> usize {
     }
 }
 
-fn humanize_retention(secs: u64) -> String {
-    if secs == u64::MAX {
-        return "infinite".to_owned();
-    }
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-    let unit =
-        |count: u64, name: &str| format!("{count} {name}{}", if count == 1 { "" } else { "s" });
-    if secs >= DAY && secs.is_multiple_of(DAY) {
-        return unit(secs / DAY, "day");
-    }
-    if secs >= HOUR && secs.is_multiple_of(HOUR) {
-        return unit(secs / HOUR, "hour");
-    }
-    if secs >= MINUTE && secs.is_multiple_of(MINUTE) {
-        return unit(secs / MINUTE, "minute");
-    }
-    unit(secs, "second")
-}
-
 fn selected_read_start(
     seq_num: Option<u64>,
     timestamp: Option<u64>,
@@ -1889,7 +1894,7 @@ impl OutputTarget {
 struct CreatedStreamOutput {
     stream_id: String,
     visibility: &'static str,
-    retention_secs: u64,
+    expires_at: String,
     urls: BTreeMap<String, String>,
 }
 

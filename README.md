@@ -85,16 +85,16 @@ Create a public stream:
 tsf new --public
 ```
 
-Choose record retention with a human duration:
+Choose a shorter initial lifetime with a human duration:
 
 ```sh
-tsf new --retention 7d
-make test | tsf write --retention 6h
+tsf new --expires 7d
+make test | tsf write --expires 6h
 ```
 
-`--retention infinite` explicitly requests infinite retention. The service enforces the current free-user limit and returns a clear error when a requested policy is unavailable.
+Streams expire after 10 days by default. Their complete history remains readable until expiry.
 
-`tsf new` prints the stream ID, retention, and an owner link. Issue more links at creation with `--link view`, `--link write`, `--link view+write`, or `--link owner`. Links are shown once.
+`tsf new` prints the stream ID, expiry, and an owner link. Issue more links at creation with `--link view`, `--link write`, `--link view+write`, or `--link owner`. Links are shown once.
 
 Stream command output into a new URL:
 
@@ -153,13 +153,14 @@ Owner URLs contain `#o=` and can manage the stream:
 
 ```sh
 tsf visibility '{owner-url}' public
+tsf renew '{owner-url}' --expires 7d
 tsf link issue '{owner-url}' --access view --expires 7d
 tsf link list '{owner-url}'
 tsf link revoke '{owner-url}' '{link_id}'
 tsf delete '{owner-url}'
 ```
 
-Access levels are `view`, `write`, `view+write`, and `owner`. `--expires` accepts durations such as `1h` or `7d`, or `never` (the default).
+Renewal extends an active stream from the current time. Access levels are `view`, `write`, `view+write`, and `owner`. Link expiry accepts durations such as `1h` or `7d`, or `never` by default.
 
 Token file options write only the secret value. On Unix, `tsf` creates and tightens these files to mode `0600`.
 
