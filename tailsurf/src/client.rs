@@ -34,12 +34,12 @@ use tokio_tungstenite::{
 use url::Url;
 
 use crate::{
-    BearerToken, StreamId, TokenId,
+    LinkId, LinkSecret, StreamId,
     ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::{
         rest::{
-            CreateStreamRequest, CreateStreamResponse, IssueTokenRequest, IssueTokenResponse,
-            ListTokensResponse, RevokeTokenRequest, StreamInfoResponse, StreamRangeResponse,
+            CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
+            ListLinksResponse, RenameLinkRequest, StreamInfoResponse, StreamRangeResponse,
             StreamTailResponse, UpdateStreamRequest,
         },
         ws::{
@@ -180,7 +180,7 @@ impl TsfClient {
         &self.config
     }
 
-    /// Creates a stream and returns its metadata and newly issued secret tokens.
+    /// Creates a stream and returns its metadata and newly issued secret links.
     ///
     /// The client generates one idempotency key for this logical call and reuses it while retrying
     /// transient failures according to policy.
@@ -221,44 +221,44 @@ impl TsfClient {
 
     /// Retrieves current stream metadata, retrying transient failures according to policy.
     ///
-    /// Private streams require a read-capable stream token. Public streams may pass `None`.
+    /// Private streams require a read-capable stream link. Public streams may pass `None`.
     pub async fn get_stream(
         &self,
         stream_id: &StreamId,
-        bearer_token: Option<&BearerToken>,
+        link_secret: Option<&LinkSecret>,
     ) -> Result<StreamInfoResponse, TsfClientError> {
-        self.get_json_with_bearer(format!("/streams/{stream_id}"), "get stream", bearer_token)
+        self.get_json_with_bearer(format!("/streams/{stream_id}"), "get stream", link_secret)
             .await
     }
 
     /// Retrieves the current durable stream tail, retrying transient failures according to policy.
     ///
-    /// Private streams require a read-capable stream token. Public streams may pass `None`.
+    /// Private streams require a read-capable stream link. Public streams may pass `None`.
     pub async fn get_stream_tail(
         &self,
         stream_id: &StreamId,
-        bearer_token: Option<&BearerToken>,
+        link_secret: Option<&LinkSecret>,
     ) -> Result<StreamTailResponse, TsfClientError> {
         self.get_json_with_bearer(
             format!("/streams/{stream_id}/tail"),
             "check stream tail",
-            bearer_token,
+            link_secret,
         )
         .await
     }
 
     /// Retrieves stream bounds, retrying transient failures according to policy.
     ///
-    /// Private streams require a read-capable stream token. Public streams may pass `None`.
+    /// Private streams require a read-capable stream link. Public streams may pass `None`.
     pub async fn get_stream_range(
         &self,
         stream_id: &StreamId,
-        bearer_token: Option<&BearerToken>,
+        link_secret: Option<&LinkSecret>,
     ) -> Result<StreamRangeResponse, TsfClientError> {
         self.get_json_with_bearer(
             format!("/streams/{stream_id}/range"),
             "check stream range",
-            bearer_token,
+            link_secret,
         )
         .await
     }
@@ -270,14 +270,14 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
         request: &UpdateStreamRequest,
-        owner_token: &BearerToken,
+        owner_link_secret: &LinkSecret,
     ) -> Result<StreamInfoResponse, TsfClientError> {
         self.send_json_with_bearer(
             self.http
                 .patch(self.rest_url(&format!("/streams/{stream_id}")))
                 .json(request),
             "update stream",
-            Some(owner_token),
+            Some(owner_link_secret),
         )
         .await
     }
@@ -288,68 +288,82 @@ impl TsfClient {
     pub async fn delete_stream(
         &self,
         stream_id: &StreamId,
-        owner_token: &BearerToken,
+        owner_link_secret: &LinkSecret,
     ) -> Result<(), TsfClientError> {
         self.send_empty(
             self.http
                 .delete(self.rest_url(&format!("/streams/{stream_id}"))),
             "delete stream",
-            Some(owner_token),
+            Some(owner_link_secret),
         )
         .await
     }
 
-    /// Issues a new secret stream token.
+    /// Issues a new secret stream link.
     ///
     /// This mutation is attempted once and is not transparently retried.
-    pub async fn issue_token(
+    pub async fn issue_link(
         &self,
         stream_id: &StreamId,
-        request: &IssueTokenRequest,
-        owner_token: &BearerToken,
-    ) -> Result<IssueTokenResponse, TsfClientError> {
+        request: &IssueLinkRequest,
+        owner_link_secret: &LinkSecret,
+    ) -> Result<IssueLinkResponse, TsfClientError> {
         self.send_json_with_bearer(
             self.http
-                .post(self.rest_url(&format!("/streams/{stream_id}/tokens")))
+                .post(self.rest_url(&format!("/streams/{stream_id}/links")))
                 .json(request),
-            "issue token",
-            Some(owner_token),
+            "issue link",
+            Some(owner_link_secret),
         )
         .await
     }
 
-    /// Lists retained, non-secret token metadata, retrying transient failures according to policy.
-    pub async fn list_tokens(
+    /// Lists retained, non-secret link metadata, retrying transient failures according to policy.
+    pub async fn list_links(
         &self,
         stream_id: &StreamId,
-        owner_token: &BearerToken,
-    ) -> Result<ListTokensResponse, TsfClientError> {
+        owner_link_secret: &LinkSecret,
+    ) -> Result<ListLinksResponse, TsfClientError> {
         self.get_json_with_bearer(
-            format!("/streams/{stream_id}/tokens"),
-            "list tokens",
-            Some(owner_token),
+            format!("/streams/{stream_id}/links"),
+            "list links",
+            Some(owner_link_secret),
         )
         .await
     }
 
-    /// Revokes a stream token by its non-secret identifier.
-    ///
-    /// This mutation is attempted once and is not transparently retried.
-    pub async fn revoke_token(
+    /// Renames a stream link without changing its identity, secret, permissions, or expiry.
+    pub async fn rename_link(
         &self,
         stream_id: &StreamId,
-        token_id: &TokenId,
-        owner_token: &BearerToken,
+        link_id: &LinkId,
+        request: &RenameLinkRequest,
+        owner_link_secret: &LinkSecret,
     ) -> Result<(), TsfClientError> {
-        let request = RevokeTokenRequest {
-            token_id: *token_id,
-        };
         self.send_empty(
             self.http
-                .delete(self.rest_url(&format!("/streams/{stream_id}/tokens")))
-                .json(&request),
-            "revoke token",
-            Some(owner_token),
+                .patch(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}")))
+                .json(request),
+            "rename link",
+            Some(owner_link_secret),
+        )
+        .await
+    }
+
+    /// Revokes a stream link by its non-secret identifier.
+    ///
+    /// This mutation is attempted once and is not transparently retried.
+    pub async fn revoke_link(
+        &self,
+        stream_id: &StreamId,
+        link_id: &LinkId,
+        owner_link_secret: &LinkSecret,
+    ) -> Result<(), TsfClientError> {
+        self.send_empty(
+            self.http
+                .delete(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}"))),
+            "revoke link",
+            Some(owner_link_secret),
         )
         .await
     }
@@ -397,7 +411,7 @@ impl TsfClient {
                         &mut ws,
                         ClientFrame::AuthWrite {
                             writer_id: options.writer_id,
-                            bearer_token: options.bearer_token,
+                            link_secret: options.link_secret,
                         },
                     ),
                 )
@@ -429,7 +443,7 @@ impl TsfClient {
         };
         if let Some(offset) = tail_offset {
             let tail = self
-                .get_stream_tail(&options.stream_id, options.bearer_token.as_ref())
+                .get_stream_tail(&options.stream_id, options.link_secret.as_ref())
                 .await?;
             options.start = Some(ReadStart::SeqNum(
                 tail.next_s2_seq_num.saturating_sub(offset),
@@ -451,7 +465,7 @@ impl TsfClient {
 
         self.retry_transient(|| {
             let url = url.clone();
-            let bearer_token = options.bearer_token.clone();
+            let link_secret = options.link_secret.clone();
 
             async move {
                 let mut ws = connect_websocket(url, connect_timeout).await?;
@@ -465,11 +479,11 @@ impl TsfClient {
                 {
                     Some(ServerFrame::Hello { version }) => ensure_protocol_version(version)?,
                     Some(ServerFrame::AuthRequired) => {
-                        let bearer_token = bearer_token.ok_or(TsfClientError::MissingReadToken)?;
+                        let link_secret = link_secret.ok_or(TsfClientError::MissingReadLink)?;
                         with_timeout(
                             operation_timeout,
                             "authenticate reader",
-                            send_client_frame(&mut ws, ClientFrame::AuthRead { bearer_token }),
+                            send_client_frame(&mut ws, ClientFrame::AuthRead { link_secret }),
                         )
                         .await?;
                         with_timeout(operation_timeout, "reader hello", expect_hello(&mut ws))
@@ -503,10 +517,10 @@ impl TsfClient {
     fn apply_rest_auth(
         &self,
         request: reqwest::RequestBuilder,
-        bearer_token: Option<&BearerToken>,
+        link_secret: Option<&LinkSecret>,
     ) -> reqwest::RequestBuilder {
-        if let Some(token) = bearer_token {
-            request.bearer_auth(token.expose_secret())
+        if let Some(secret) = link_secret {
+            request.bearer_auth(secret.expose_secret())
         } else {
             request
         }
@@ -538,11 +552,11 @@ impl TsfClient {
         &self,
         path: String,
         operation: &'static str,
-        bearer_token: Option<&BearerToken>,
+        link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
         let url = self.rest_url(&path);
         self.retry_transient(|| {
-            self.send_json_with_bearer(self.http.get(url.clone()), operation, bearer_token)
+            self.send_json_with_bearer(self.http.get(url.clone()), operation, link_secret)
         })
         .await
     }
@@ -551,10 +565,10 @@ impl TsfClient {
         &self,
         request: reqwest::RequestBuilder,
         operation: &'static str,
-        bearer_token: Option<&BearerToken>,
+        link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
         let response = self
-            .apply_rest_auth(request, bearer_token)
+            .apply_rest_auth(request, link_secret)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -565,10 +579,10 @@ impl TsfClient {
         &self,
         request: reqwest::RequestBuilder,
         operation: &'static str,
-        bearer_token: Option<&BearerToken>,
+        link_secret: Option<&LinkSecret>,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request, bearer_token)
+            .apply_rest_auth(request, link_secret)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -632,7 +646,7 @@ pub fn default_api_base_url() -> Url {
 
 /// Owner-equivalent recovery key for one logical stream-creation request.
 #[derive(Clone, Debug)]
-pub struct CreateStreamIdempotencyKey(BearerToken);
+pub struct CreateStreamIdempotencyKey(LinkSecret);
 
 impl CreateStreamIdempotencyKey {
     /// Generates a cryptographically random canonical 256-bit key.
@@ -1805,9 +1819,9 @@ pub enum TsfClientError {
     /// The producer background task failed or could not be joined.
     #[error("append producer failed: {0}")]
     AppendProducerFailed(String),
-    /// A private read requested authentication but no token was configured.
-    #[error("private stream read requires a bearer token")]
-    MissingReadToken,
+    /// A private read requested authentication but no link was configured.
+    #[error("private stream read requires a read link")]
+    MissingReadLink,
     /// Consecutive read connections ended or requested reconnect without delivering a record.
     #[error(
         "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"
@@ -2187,11 +2201,11 @@ mod tests {
 
     #[test]
     fn api_error_message_extracts_stable_code_and_message() {
-        let body = r#"{"error":{"code":"forbidden","message":"owner token required"}}"#;
+        let body = r#"{"error":{"code":"forbidden","message":"owner link required"}}"#;
 
         assert_eq!(
             api_error_message(body).as_deref(),
-            Some("forbidden: owner token required")
+            Some("forbidden: owner link required")
         );
     }
 

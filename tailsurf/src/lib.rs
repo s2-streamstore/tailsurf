@@ -1,18 +1,22 @@
 //! Async Rust SDK and shared TSF v3 protocol types for [tail.surf](https://tail.surf).
 //!
 //! Use [`TsfClient`] for control-plane requests, [`TsfProducer`] for durable reconnecting writes,
-//! and [`TsfReadSession`] for resumable reads. Share URLs and transcript reconstruction are
+//! and [`TsfReadSession`] for resumable reads. Stream links and transcript reconstruction are
 //! available in [`stream_url`] and [`transcript`].
 
 /// HTTP and WebSocket clients, retry policy, and durable producer types.
 pub mod client;
-/// Stream, token, bearer-token, and writer identifiers.
+/// Stream and link IDs, link secrets, and writer identities.
 pub mod ids;
-/// Stream-token permission parsing and validation.
+/// User-provided stream link labels.
+pub mod link_label;
+/// Stream-link permission parsing and validation.
 pub mod permissions;
 /// TSF REST models and v3 binary WebSocket protocol types.
 pub mod protocol;
-/// Human-facing stream share URL parsing and construction.
+/// User-provided stream titles.
+pub mod stream_title;
+/// Human-facing stream link parsing and construction.
 pub mod stream_url;
 /// Duplicate suppression and split-record transcript reconstruction.
 pub mod transcript;
@@ -24,6 +28,8 @@ pub use client::{
     TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession, WritePermit, WriteRecord,
     default_api_base_url,
 };
-pub use ids::{BearerToken, StreamId, TokenId, WriterId};
-pub use permissions::{PermissionsError, TokenPermissions};
+pub use ids::{LinkId, LinkSecret, StreamId, WriterId};
+pub use link_label::{LinkLabel, LinkLabelError, MAX_LINK_LABEL_CODE_POINTS};
+pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::ws::frame::{ReadRecord, ReadTail};
+pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

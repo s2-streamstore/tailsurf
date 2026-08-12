@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use serde::Deserialize;
 use tailsurf::{
-    BearerToken, WriterId,
+    LinkSecret, WriterId,
     protocol::ws::frame::{
         ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat, ServerFrame,
         TSF_V3, TSF_WS_PROTOCOL,
@@ -32,11 +32,11 @@ struct FrameFixture<T> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientFixture {
     AuthRead {
-        bearer_token: String,
+        link_secret: String,
     },
     AuthWrite {
         writer_id_hex: String,
-        bearer_token: String,
+        link_secret: String,
     },
     AppendRecord {
         writer_seq_num: String,
@@ -131,15 +131,15 @@ fn fixtures() -> Fixtures {
 
 fn client_frame(fixture: ClientFixture) -> ClientFrame {
     match fixture {
-        ClientFixture::AuthRead { bearer_token } => ClientFrame::AuthRead {
-            bearer_token: BearerToken::from(bearer_token),
+        ClientFixture::AuthRead { link_secret } => ClientFrame::AuthRead {
+            link_secret: LinkSecret::from(link_secret),
         },
         ClientFixture::AuthWrite {
             writer_id_hex,
-            bearer_token,
+            link_secret,
         } => ClientFrame::AuthWrite {
             writer_id: decode_writer_id(&writer_id_hex),
-            bearer_token: BearerToken::from(bearer_token),
+            link_secret: LinkSecret::from(link_secret),
         },
         ClientFixture::AppendRecord {
             writer_seq_num,

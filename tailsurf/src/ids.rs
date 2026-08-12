@@ -1,4 +1,4 @@
-//! Identifiers and secret bearer-token values used by the TSF API.
+//! Identifiers and link secret values used by the TSF API.
 
 use base64::{Engine as _, alphabet, engine};
 use rand::Rng;
@@ -8,11 +8,11 @@ use serde::{Serialize, Serializer};
 /// Stable 160-bit identifier for a stream.
 pub type StreamId = ubid::Ubid160;
 
-/// Stable 120-bit identifier for an issued stream token.
-pub type TokenId = ubid::Ubid120;
+/// Stable 120-bit identifier for an issued stream link.
+pub type LinkId = ubid::Ubid120;
 
-/// Secret account or stream bearer token.
-pub type BearerToken = secrecy::SecretString;
+/// Secret value carried by a stream link.
+pub type LinkSecret = secrecy::SecretString;
 
 /// Stable 128-bit identity assigned by a writer and reused across reconnects.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -53,14 +53,14 @@ impl Serialize for WriterId {
     }
 }
 
-pub(crate) fn serialize_bearer_token<S>(
-    token: &BearerToken,
+pub(crate) fn serialize_link_secret<S>(
+    secret: &LinkSecret,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    serializer.serialize_str(token.expose_secret())
+    serializer.serialize_str(secret.expose_secret())
 }
 
 /// Length of the canonical unpadded base64url encoding of a 256-bit value.
@@ -114,8 +114,8 @@ mod tests {
         let mut chars: Vec<char> = canonical.chars().collect();
         for bad in ['B', 'C', 'D'] {
             chars[42] = bad;
-            let token: String = chars.iter().collect();
-            assert!(!is_canonical_base64url_32(&token), "token={token}");
+            let link: String = chars.iter().collect();
+            assert!(!is_canonical_base64url_32(&link), "link={link}");
         }
     }
 }

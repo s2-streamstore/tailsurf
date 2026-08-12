@@ -3,7 +3,7 @@
 /// Binary TSF v3 frames and their codec.
 pub mod frame;
 
-use crate::{BearerToken, StreamId, WriterId};
+use crate::{LinkSecret, StreamId, WriterId};
 
 /// Position, bounds, and authorization for one read WebSocket.
 #[derive(Clone, Debug)]
@@ -16,8 +16,8 @@ pub struct ReadStreamOptions {
     pub count: Option<u64>,
     /// Optional inclusive ending S2 sequence number.
     pub until: Option<u64>,
-    /// Account or read-capable stream bearer token for private streams.
-    pub bearer_token: Option<BearerToken>,
+    /// Secret from a read-capable stream link for private streams.
+    pub link_secret: Option<LinkSecret>,
 }
 
 impl ReadStreamOptions {
@@ -28,19 +28,19 @@ impl ReadStreamOptions {
             start: None,
             count: None,
             until: None,
-            bearer_token: None,
+            link_secret: None,
         }
     }
 
-    /// Sets an owned account or stream bearer token.
-    pub fn with_bearer_token(mut self, bearer_token: impl Into<BearerToken>) -> Self {
-        self.bearer_token = Some(bearer_token.into());
+    /// Sets an owned stream link secret.
+    pub fn with_link_secret(mut self, link_secret: impl Into<LinkSecret>) -> Self {
+        self.link_secret = Some(link_secret.into());
         self
     }
 
-    /// Sets a cloned stream token without exposing its secret value.
-    pub fn with_stream_token(self, token: &BearerToken) -> Self {
-        self.with_bearer_token(token.clone())
+    /// Sets a cloned stream link without exposing its secret value.
+    pub fn with_stream_link(self, link: &LinkSecret) -> Self {
+        self.with_link_secret(link.clone())
     }
 
     pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
@@ -83,30 +83,26 @@ pub struct WriteStreamOptions {
     pub stream_id: StreamId,
     /// Stable writer identity reused with sequence numbers across reconnects.
     pub writer_id: WriterId,
-    /// Account or write-capable stream bearer token.
-    pub bearer_token: BearerToken,
+    /// Secret from a write-capable stream link.
+    pub link_secret: LinkSecret,
 }
 
 impl WriteStreamOptions {
-    /// Creates write options from an owned account or stream bearer token.
+    /// Creates write options from an owned stream link secret.
     pub fn new(
         stream_id: StreamId,
         writer_id: WriterId,
-        bearer_token: impl Into<BearerToken>,
+        link_secret: impl Into<LinkSecret>,
     ) -> Self {
         Self {
             stream_id,
             writer_id,
-            bearer_token: bearer_token.into(),
+            link_secret: link_secret.into(),
         }
     }
 
-    /// Creates write options by cloning a stream token without exposing it.
-    pub fn with_stream_token(
-        stream_id: StreamId,
-        writer_id: WriterId,
-        token: &BearerToken,
-    ) -> Self {
-        Self::new(stream_id, writer_id, token.clone())
+    /// Creates write options by cloning a stream link without exposing it.
+    pub fn with_stream_link(stream_id: StreamId, writer_id: WriterId, link: &LinkSecret) -> Self {
+        Self::new(stream_id, writer_id, link.clone())
     }
 }

@@ -55,7 +55,7 @@ Installations owned by a package manager do not check or print the hint. Cargo u
 
 ## SDK quickstart
 
-The [`create_write_read_delete`](https://github.com/s2-streamstore/tailsurf/blob/main/tailsurf/examples/create_write_read_delete.rs) example creates a private stream, writes one durable record through the reconnecting producer, reads it back, and deletes the stream with its owner token:
+The [`create_write_read_delete`](https://github.com/s2-streamstore/tailsurf/blob/main/tailsurf/examples/create_write_read_delete.rs) example creates a private stream, writes one durable record through the reconnecting producer, reads it back, and deletes the stream with its owner link:
 
 ```sh
 cargo run -p tailsurf --example create_write_read_delete
@@ -67,7 +67,9 @@ Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession`
 
 SDK readers and producers retry bounded transient WebSocket interruptions while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes fail immediately.
 
-REST authorization is stream-scoped. Read methods accept an optional read-capable stream token because public streams need none. Management methods require an owner token on each call. The client never retains one stream credential as implicit authorization for later REST requests.
+REST authorization is stream-scoped. Read methods accept an optional link secret because public streams need none. Management methods require an owner link secret on each call. The client never retains a link secret as implicit authorization for later REST requests.
+
+The permission in a link fragment selects the intended client mode. The server resolves authoritative permissions from the secret. Changing the fragment cannot elevate permission, and clients do not need a remote permission preflight before choosing their initial mode.
 
 The default producer window is capped at the service's hard writer-queue contract: 128 records and 5 MiB of payload. Applications may configure smaller windows.
 
@@ -76,7 +78,7 @@ The default producer window is capped at the service's hard writer-queue contrac
 Create a private stream:
 
 ```sh
-tsf new
+tsf new --title 'Production deploy'
 ```
 
 Create a public stream:
@@ -89,34 +91,38 @@ Choose a shorter initial lifetime with a human duration:
 
 ```sh
 tsf new --expires 7d
-make test | tsf write --expires 6h
+make test | tsf --title 'Test run' --expires 6h
 ```
 
 Streams expire after 10 days by default. Their complete history remains readable until expiry.
 
-`tsf new` prints the stream ID, expiry, and an owner link. Issue more links at creation with `--link view`, `--link write`, `--link view+write`, or `--link owner`. Links are shown once.
+`tsf new` prints the title, Stream ID, expiry, and an owner link. The title is optional. Issue more labeled links at creation with `--link 'Build reader=read'`, `--link 'Deploy writer=write'`, `--link 'Operator=read-write'`, or `--link 'Backup owner=owner'`. Links are shown once.
 
-Stream command output into a new URL:
+Stream command output into a new stream:
 
 ```sh
 make test | tsf
 ```
 
-Piped input without a subcommand behaves like `tsf write`. With no piped input and no subcommand, `tsf` prints help.
+Bare `tsf` captures piped input in a new stream. With terminal input and no command or capture options, it prints help.
 
-`tsf write` creates a stream when no URL is supplied. It prints the view URL to stdout. Creation details, the owner link, and durability status go to stderr.
+Private capture creates an owner link and a read link. The owner link writes the captured data. The read link is the single stdout result. Creation details, the owner link, and durability status go to stderr.
+
+Public capture creates only an owner link. It prints the public stream URL to stdout.
+
+Use `--to` to capture into an existing stream. It accepts a write-capable link and creates no links.
 
 Run a command through `tsf` when you want `tsf` to propagate the command exit status:
 
 ```sh
-tsf write -- make test
+tsf -- make test
 ```
 
-By default, `tsf write` makes line boundaries transcript record boundaries and marks records as transcript-oriented:
+By default, `tsf` makes line boundaries transcript record boundaries and marks records as transcript-oriented:
 
 ```sh
-make test | tsf write
-make test | tsf write '{write-url}'
+make test | tsf
+make test | tsf --to '{write-link}'
 ```
 
 One logical line is limited to 16 MiB by default. This is the same default used by `tail` and `replay`. Set `--max-logical-record-bytes` on both the writer and reader only when a larger application-specific limit is required.
@@ -124,12 +130,12 @@ One logical line is limited to 16 MiB by default. This is the same default used 
 Use raw mode when you want to send stdin as byte records instead of line-framed transcript records. Raw mode flushes at the physical record size limit, after a short linger, and at EOF:
 
 ```sh
-cat artifact.bin | tsf write --raw
+cat artifact.bin | tsf --raw
 ```
 
-On Ctrl-C, `tsf write` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the producer, and exits with status 130.
+On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the producer, and exits with status 130.
 
-Tail or replay a URL:
+Tail or replay a link or public stream URL:
 
 ```sh
 tsf tail '{url}'
@@ -149,20 +155,29 @@ tsf info '{url}'
 tsf info '{url}' --format json
 ```
 
-Owner URLs contain `#o=` and can manage the stream:
+Owner links contain `#o=` and can manage the stream:
 
 ```sh
-tsf visibility '{owner-url}' public
-tsf renew '{owner-url}' --expires 7d
-tsf link issue '{owner-url}' --access view --expires 7d
-tsf link list '{owner-url}'
-tsf link revoke '{owner-url}' '{link_id}'
-tsf delete '{owner-url}'
+tsf visibility '{owner-link}' public
+tsf title '{owner-link}' 'Production deploy — west'
+tsf title '{owner-link}' --clear
+tsf renew '{owner-link}' --expires 7d
+tsf link issue '{owner-link}' 'Deploy reader' --permission read --expires 7d
+tsf link list '{owner-link}'
+tsf link rename '{owner-link}' '{link_id}' 'CI reader'
+tsf link revoke '{owner-link}' '{link_id}'
+tsf delete '{owner-link}'
 ```
 
-Renewal extends an active stream from the current time. Access levels are `view`, `write`, `view+write`, and `owner`. Link expiry accepts durations such as `1h` or `7d`, or `never` by default.
+Renewal extends an active stream from the current time. Link permissions are `read`, `write`, `read-write`, and `owner`. Link expiry accepts durations such as `1h` or `7d`, or `never` by default.
 
-Token file options write only the secret value. On Unix, `tsf` creates and tightens these files to mode `0600`.
+A stream title contains 1 to 120 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Titles may be duplicated, changed, or cleared. The immutable Stream ID remains the stream identity and URL component.
+
+Every link has a required owner-visible label. Labels contain 1 to 64 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Labels may be renamed and do not need to be unique.
+
+Each link also has an immutable generated Link ID. The CLI uses it for rename and revoke commands. Renaming does not change the secret, permissions, expiry, or established sessions.
+
+Link file options write only the secret value. On Unix, `tsf` creates and tightens these files to mode `0600`.
 
 ## Development
 

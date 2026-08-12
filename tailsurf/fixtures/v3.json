@@ -7,18 +7,18 @@
       "name": "auth read",
       "frame": {
         "type": "auth_read",
-        "bearer_token": "read-token"
+        "link_secret": "read-link"
       },
-      "hex": "01726561642d746f6b656e"
+      "hex": "01726561642d6c696e6b"
     },
     {
       "name": "auth write",
       "frame": {
         "type": "auth_write",
         "writer_id_hex": "000102030405060708090a0b0c0d0e0f",
-        "bearer_token": "write-token"
+        "link_secret": "write-link"
       },
-      "hex": "02000102030405060708090a0b0c0d0e0f77726974652d746f6b656e"
+      "hex": "02000102030405060708090a0b0c0d0e0f77726974652d6c696e6b"
     },
     {
       "name": "append transcript record",
