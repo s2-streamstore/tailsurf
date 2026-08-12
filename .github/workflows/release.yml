@@ -21,10 +21,9 @@ env:
   CARGO_DIST_VERSION: "0.32.0"
   CARGO_DIST_PLAN_SHA256: "eb52f9fae0d0506774e9f1801c1168f87fa2c87a45e2d64d3ae7c89401929946"
 
-# Pull requests plan releases without publishing. Repository dispatch always loads this workflow
-# from the default branch. Its payload accepts `dry-run` or an exact SemVer release tag.
+# Repository dispatch always loads this workflow from the default branch. Its payload accepts
+# `dry-run` or an exact SemVer release tag.
 on:
-  pull_request:
   repository_dispatch:
     types: [release]
 

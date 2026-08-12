@@ -1,0 +1,50 @@
+name: Release plan
+
+permissions:
+  contents: read
+
+env:
+  CARGO_DIST_VERSION: "0.32.0"
+  CARGO_DIST_PLAN_SHA256: "eb52f9fae0d0506774e9f1801c1168f87fa2c87a45e2d64d3ae7c89401929946"
+
+# Pull requests validate that cargo-dist can plan the release graph without building or publishing
+# artifacts.
+on:
+  pull_request:
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - name: Install dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="x86_64-unknown-linux-gnu"
+          archive="$RUNNER_TEMP/cargo-dist-${target}.tar.xz"
+          extracted="$RUNNER_TEMP/cargo-dist-plan"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${CARGO_DIST_VERSION}/cargo-dist-${target}.tar.xz" -o "$archive"
+          actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          if [[ "$actual_sha256" != "$CARGO_DIST_PLAN_SHA256" ]]; then
+            echo "cargo-dist archive checksum mismatch" >&2
+            exit 1
+          fi
+          mkdir -p "$extracted" "$HOME/.cargo/bin"
+          tar -xJf "$archive" -C "$extracted"
+          install -m 0755 "$extracted/cargo-dist-${target}/dist" "$HOME/.cargo/bin/dist"
+          dist --version
+      - name: Plan release
+        shell: bash
+        run: dist plan --output-format=json > plan-dist-manifest.json
+      - name: Upload dist manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: artifacts-plan-dist-manifest
+          path: plan-dist-manifest.json
