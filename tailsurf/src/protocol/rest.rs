@@ -1,6 +1,6 @@
 //! JSON request and response models for the REST v1 control plane.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use serde::{Deserialize, Serialize};
 
 use crate::{BearerToken, StreamId, TokenId, TokenPermissions};
 
@@ -15,58 +15,15 @@ pub enum Visibility {
     Public,
 }
 
-/// Requested S2 record retention for a new stream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestedRetention {
-    /// Automatically trim records older than this many seconds.
-    Seconds(u64),
-    /// Retain records indefinitely.
-    Infinite,
-}
-
-impl Serialize for RequestedRetention {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Seconds(seconds) => serializer.serialize_u64(*seconds),
-            Self::Infinite => serializer.serialize_str("infinite"),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for RequestedRetention {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum WireRetention {
-            Seconds(u64),
-            Name(String),
-        }
-
-        match WireRetention::deserialize(deserializer)? {
-            WireRetention::Seconds(seconds) => Ok(Self::Seconds(seconds)),
-            WireRetention::Name(name) if name == "infinite" => Ok(Self::Infinite),
-            WireRetention::Name(_) => Err(D::Error::custom(
-                "retention must be seconds or \"infinite\"",
-            )),
-        }
-    }
-}
-
 /// Options for creating a stream.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
     /// Initial stream visibility. Defaults to private.
     #[serde(default)]
     pub visibility: Visibility,
-    /// Requested retention, or the service default when absent.
+    /// Requested lifetime in seconds, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retention_secs: Option<RequestedRetention>,
+    pub expires_in_secs: Option<u64>,
     /// Requested initial token permissions. The service adds an owner token when absent. At most
     /// three effective tokens are allowed, including the owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,8 +49,8 @@ pub struct CreateStreamResponse {
     pub stream_id: StreamId,
     /// Initial visibility.
     pub visibility: Visibility,
-    /// Effective retention in seconds.
-    pub retention_secs: u64,
+    /// Absolute RFC 3339 stream expiration timestamp.
+    pub expires_at: String,
     /// Newly issued secret tokens.
     pub tokens: Vec<IssuedStreamToken>,
 }
@@ -176,8 +133,8 @@ pub struct StreamInfoResponse {
     pub visibility: Visibility,
     /// Current lifecycle state.
     pub state: String,
-    /// Effective retention in seconds.
-    pub retention_secs: u64,
+    /// Absolute RFC 3339 stream expiration timestamp.
+    pub expires_at: String,
     /// Number of non-revoked stream tokens.
     pub active_token_count: usize,
 }
@@ -188,6 +145,9 @@ pub struct UpdateStreamRequest {
     /// New visibility when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
+    /// Later absolute RFC 3339 expiration timestamp when renewing the stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 /// Current durable tail position for a stream.
@@ -197,22 +157,22 @@ pub struct StreamTailResponse {
     pub stream_id: StreamId,
     /// Sequence number assigned to the next durable append.
     pub next_s2_seq_num: u64,
-    /// Timestamp of the last retained record, or `None` for an empty stream.
+    /// Timestamp of the last record, or `None` for an empty stream.
     pub last_timestamp_ms: Option<u64>,
 }
 
-/// Retained timestamp and sequence bounds for a stream.
+/// Timestamp and sequence bounds for a stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamRangeResponse {
     /// Stable stream identifier.
     pub stream_id: StreamId,
-    /// Sequence number of the first retained record, or `None` when empty.
+    /// Sequence number of the first record, or `None` when empty.
     pub first_s2_seq_num: Option<u64>,
-    /// Timestamp of the first retained record, or `None` when empty.
+    /// Timestamp of the first record, or `None` when empty.
     pub first_timestamp_ms: Option<u64>,
     /// Sequence number assigned to the next durable append.
     pub next_s2_seq_num: u64,
-    /// Timestamp of the last retained record, or `None` when empty.
+    /// Timestamp of the last record, or `None` when empty.
     pub last_timestamp_ms: Option<u64>,
 }
 
@@ -233,31 +193,18 @@ mod tests {
     }
 
     #[test]
-    fn serializes_finite_and_infinite_retention_requests() {
-        for (retention, expected) in [
-            (RequestedRetention::Seconds(604_800), json!(604_800)),
-            (RequestedRetention::Infinite, json!("infinite")),
-        ] {
-            let request = CreateStreamRequest {
-                retention_secs: Some(retention),
-                ..CreateStreamRequest::default()
-            };
-            let value = serde_json::to_value(request).expect("serialize create request");
-            assert_eq!(value["retention_secs"], expected);
-            assert_eq!(
-                serde_json::from_value::<CreateStreamRequest>(value)
-                    .expect("deserialize create request")
-                    .retention_secs,
-                Some(retention)
-            );
-        }
-
-        assert!(
-            serde_json::from_value::<CreateStreamRequest>(json!({
-                "visibility": "private",
-                "retention_secs": "forever"
-            }))
-            .is_err()
+    fn serializes_requested_stream_lifetime() {
+        let request = CreateStreamRequest {
+            expires_in_secs: Some(604_800),
+            ..CreateStreamRequest::default()
+        };
+        let value = serde_json::to_value(request).expect("serialize create request");
+        assert_eq!(value["expires_in_secs"], json!(604_800));
+        assert_eq!(
+            serde_json::from_value::<CreateStreamRequest>(value)
+                .expect("deserialize create request")
+                .expires_in_secs,
+            Some(604_800)
         );
     }
 

@@ -72,7 +72,7 @@ pub enum ReadStart {
     SeqNum(u64),
     /// First record whose timestamp is at least this Unix epoch millisecond value.
     TimestampMs(u64),
-    /// Start this many records before the current tail, saturating at retained history.
+    /// Start this many records before the current tail, saturating at the stream start.
     TailOffset(u64),
 }
 

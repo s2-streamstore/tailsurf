@@ -247,7 +247,7 @@ impl TsfClient {
         .await
     }
 
-    /// Retrieves retained stream bounds, retrying transient failures according to policy.
+    /// Retrieves stream bounds, retrying transient failures according to policy.
     ///
     /// Private streams require a read-capable stream token. Public streams may pass `None`.
     pub async fn get_stream_range(
@@ -1250,7 +1250,7 @@ fn drain_submissions(
     }
 }
 
-/// Writes the retained records from `from` onwards under one operation timeout and one flush.
+/// Writes the records from `from` onwards under one operation timeout and one flush.
 async fn send_retained(
     session: &mut TsfAppendSession,
     pending: &VecDeque<PendingAppend>,

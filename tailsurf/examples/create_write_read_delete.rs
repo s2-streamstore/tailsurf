@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let created = client
         .create_stream(&CreateStreamRequest {
             visibility: Visibility::Private,
-            retention_secs: None,
+            expires_in_secs: None,
             issue_tokens: Some(vec![
                 TokenPermissions::owner(),
                 TokenPermissions::write(),
