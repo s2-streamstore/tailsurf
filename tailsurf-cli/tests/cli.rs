@@ -2397,7 +2397,7 @@ async fn test_read_flow(
     let Ok(ClientFrame::AuthRead { link_secret }) = ClientFrame::decode_bytes(auth) else {
         return;
     };
-    let (cursor, records) = {
+    let (stream_info, cursor, tail, records) = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
             return;
@@ -2419,15 +2419,33 @@ async fn test_read_flow(
                 .map_or(80, |value| value.parse().expect("tail offset"));
             Some((stream.records.len() as u64).saturating_sub(tail_offset))
         };
-        (cursor, test_select_records(stream, &query))
+        let tail = ReadTail {
+            next_s2_seq_num: stream.records.len() as u64,
+            timestamp_ms: stream
+                .records
+                .last()
+                .map_or(0, |record| record.timestamp_ms),
+        };
+        (
+            test_get_stream_response(stream),
+            cursor,
+            tail,
+            test_select_records(stream, &query),
+        )
     };
     send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
+    send_server_frame(&mut socket, ServerFrame::StreamInfo(stream_info))
+        .await
+        .expect("send stream info");
     if let Some(seq_num) = cursor {
         send_server_frame(&mut socket, ServerFrame::ReadCursor { seq_num })
             .await
             .expect("send read cursor");
+        send_server_frame(&mut socket, ServerFrame::ReadTail(tail))
+            .await
+            .expect("send initial read tail");
     }
     for record in records {
         send_server_frame(
@@ -3243,17 +3261,32 @@ const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
     }
 }
 
+fn fake_stream_info(stream_id: &str) -> StreamInfoResponse {
+    StreamInfoResponse {
+        stream_id: stream_id.parse().expect("fake stream ID"),
+        title: None,
+        basin: "test-basin".to_owned(),
+        visibility: Visibility::Private,
+        state: "active".to_owned(),
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
+        expires_at: "2026-08-23T00:00:00Z".to_owned(),
+        active_link_count: 1,
+    }
+}
+
 async fn fake_read_socket(
     State(state): State<Arc<FakeReadState>>,
+    Path(stream_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     ws.protocols([TSF_WS_PROTOCOL])
-        .on_upgrade(move |socket| fake_read_flow(state, query, socket))
+        .on_upgrade(move |socket| fake_read_flow(state, stream_id, query, socket))
 }
 
 async fn fake_read_flow(
     state: Arc<FakeReadState>,
+    stream_id: String,
     query: HashMap<String, String>,
     mut socket: WebSocket,
 ) {
@@ -3286,20 +3319,36 @@ async fn fake_read_flow(
     send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
+    send_server_frame(
+        &mut socket,
+        ServerFrame::StreamInfo(fake_stream_info(&stream_id)),
+    )
+    .await
+    .expect("send stream info");
     if let Some(seq_num) = cursor {
         send_server_frame(&mut socket, ServerFrame::ReadCursor { seq_num })
             .await
             .expect("send read cursor");
+        send_server_frame(
+            &mut socket,
+            ServerFrame::ReadTail(ReadTail {
+                next_s2_seq_num: fake_read_next_seq_num(state.mode),
+                timestamp_ms: 1_781_717_406_010,
+            }),
+        )
+        .await
+        .expect("send initial read tail");
+    } else {
+        send_server_frame(
+            &mut socket,
+            ServerFrame::ReadTail(ReadTail {
+                next_s2_seq_num: 10,
+                timestamp_ms: 1_781_717_406_010,
+            }),
+        )
+        .await
+        .expect("send read tail");
     }
-    send_server_frame(
-        &mut socket,
-        ServerFrame::ReadTail(ReadTail {
-            next_s2_seq_num: 10,
-            timestamp_ms: 1_781_717_406_010,
-        }),
-    )
-    .await
-    .expect("send read tail");
 
     match state.mode {
         FakeReadMode::Reconnect => {

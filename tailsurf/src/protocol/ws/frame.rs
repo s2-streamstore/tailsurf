@@ -3,7 +3,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 
-use crate::{LinkSecret, WriterId};
+use crate::{LinkSecret, WriterId, protocol::rest::StreamInfoResponse};
 
 /// Numeric protocol version sent in [`ServerFrame::Hello`].
 pub type ProtocolVersion = u16;
@@ -52,6 +52,7 @@ enum ServerOp {
     ReconnectAdvised = 0x85,
     ReadTail = 0x86,
     ReadCursor = 0x87,
+    StreamInfo = 0x88,
 }
 
 impl ServerOp {
@@ -72,6 +73,7 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::ReconnectAdvised.byte() => Ok(Self::ReconnectAdvised),
             value if value == Self::ReadTail.byte() => Ok(Self::ReadTail),
             value if value == Self::ReadCursor.byte() => Ok(Self::ReadCursor),
+            value if value == Self::StreamInfo.byte() => Ok(Self::StreamInfo),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
@@ -247,6 +249,8 @@ pub enum ServerFrame {
         /// First S2 sequence number the server will read.
         seq_num: u64,
     },
+    /// Supplies stream metadata from the read authorization result.
+    StreamInfo(StreamInfoResponse),
 }
 
 impl ClientFrame {
@@ -328,12 +332,13 @@ impl ServerFrame {
                 validate_record_len(record.data.len())?;
                 Ok(Self::READ_RECORD_HEADER_LEN + record.data.len())
             }
+            Self::StreamInfo(_) => Ok(1),
             _ => Ok(Self::MAX_FIXED_FRAME_LEN),
         }
     }
 
     /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
-    fn encode_into(&self, output: &mut BytesMut) {
+    fn encode_into(&self, output: &mut BytesMut) -> Result<(), FrameCodecError> {
         match self {
             Self::Hello { version } => {
                 output.put_u8(ServerOp::Hello.byte());
@@ -375,13 +380,20 @@ impl ServerFrame {
                 output.put_u8(ServerOp::ReadCursor.byte());
                 output.put_u64(*seq_num);
             }
+            Self::StreamInfo(stream) => {
+                let payload =
+                    serde_json::to_vec(stream).map_err(FrameCodecError::InvalidStreamInfo)?;
+                output.put_u8(ServerOp::StreamInfo.byte());
+                output.put_slice(&payload);
+            }
         }
+        Ok(())
     }
 
     /// Encodes one server frame into a complete WebSocket binary message.
     pub fn encode(&self) -> Result<Bytes, FrameCodecError> {
         let mut output = BytesMut::with_capacity(self.encoded_len()?);
-        self.encode_into(&mut output);
+        self.encode_into(&mut output)?;
         Ok(output.freeze())
     }
 
@@ -527,6 +539,9 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::ReadCursor { seq_num })
         }
+        ServerOp::StreamInfo => serde_json::from_slice(body)
+            .map(ServerFrame::StreamInfo)
+            .map_err(FrameCodecError::InvalidStreamInfo),
     }
 }
 
@@ -618,6 +633,9 @@ pub enum FrameCodecError {
     /// A link-secret tail was not valid UTF-8.
     #[error("link secret is not valid UTF-8: {0}")]
     InvalidUtf8(#[source] std::str::Utf8Error),
+    /// A stream metadata frame did not contain the expected JSON object.
+    #[error("stream info frame is invalid: {0}")]
+    InvalidStreamInfo(#[source] serde_json::Error),
     /// A physical record payload exceeded [`MAX_RECORD_BYTES`].
     #[error("record is {actual} bytes; maximum is {max}")]
     RecordTooLarge {

@@ -4,9 +4,12 @@ use bytes::Bytes;
 use serde::Deserialize;
 use tailsurf::{
     LinkSecret, WriterId,
-    protocol::ws::frame::{
-        ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat, ServerFrame,
-        TSF_V3, TSF_WS_PROTOCOL,
+    protocol::{
+        rest::{StreamInfoResponse, Visibility},
+        ws::frame::{
+            ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat,
+            ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
+        },
     },
 };
 
@@ -77,6 +80,16 @@ enum ServerFixture {
     },
     ReadCursor {
         seq_num: String,
+    },
+    StreamInfo {
+        stream_id: String,
+        title: Option<String>,
+        basin: String,
+        visibility: Visibility,
+        state: String,
+        created_at: String,
+        expires_at: String,
+        active_link_count: usize,
     },
 }
 
@@ -202,6 +215,25 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
         ServerFixture::ReadCursor { seq_num } => ServerFrame::ReadCursor {
             seq_num: parse_u64(&seq_num),
         },
+        ServerFixture::StreamInfo {
+            stream_id,
+            title,
+            basin,
+            visibility,
+            state,
+            created_at,
+            expires_at,
+            active_link_count,
+        } => ServerFrame::StreamInfo(StreamInfoResponse {
+            stream_id: stream_id.parse().expect("fixture stream ID"),
+            title: title.map(|title| title.parse().expect("fixture stream title")),
+            basin,
+            visibility,
+            state,
+            created_at,
+            expires_at,
+            active_link_count,
+        }),
     }
 }
 

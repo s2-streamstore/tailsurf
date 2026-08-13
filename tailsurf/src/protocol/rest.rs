@@ -248,15 +248,6 @@ pub struct StreamTailResponse {
     pub last_timestamp_ms: Option<u64>,
 }
 
-/// Metadata and durable tail needed to open one stream workspace.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamBootstrapResponse {
-    /// Current stream metadata.
-    pub stream: StreamInfoResponse,
-    /// Current durable stream tail.
-    pub tail: StreamTailResponse,
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -331,30 +322,5 @@ mod tests {
                 .title,
             StreamTitleUpdate::Clear
         );
-    }
-
-    #[test]
-    fn deserializes_workspace_metadata_and_tail() {
-        let response = serde_json::from_value::<StreamBootstrapResponse>(json!({
-            "stream": {
-                "stream_id": "0123456789abcdefghjkmnpqrstvwxyz",
-                "title": null,
-                "basin": "test",
-                "visibility": "private",
-                "state": "active",
-                "created_at": "2026-08-13T00:00:00Z",
-                "expires_at": "2026-08-23T00:00:00Z",
-                "active_link_count": 1
-            },
-            "tail": {
-                "stream_id": "0123456789abcdefghjkmnpqrstvwxyz",
-                "next_s2_seq_num": 4,
-                "last_timestamp_ms": 1_786_579_200_000_u64
-            }
-        }))
-        .expect("deserialize bootstrap response");
-
-        assert_eq!(response.stream.created_at, "2026-08-13T00:00:00Z");
-        assert_eq!(response.tail.next_s2_seq_num, 4);
     }
 }

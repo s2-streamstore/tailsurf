@@ -39,8 +39,8 @@ use crate::{
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
-            ListLinksResponse, RenameLinkRequest, StreamBootstrapResponse, StreamInfoResponse,
-            StreamTailResponse, UpdateStreamRequest,
+            ListLinksResponse, RenameLinkRequest, StreamInfoResponse, StreamTailResponse,
+            UpdateStreamRequest,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -246,22 +246,6 @@ impl TsfClient {
         .await
     }
 
-    /// Retrieves workspace metadata and its durable tail with one authorization lookup.
-    ///
-    /// Private streams require a read-capable stream link. Public streams may pass `None`.
-    pub async fn get_stream_bootstrap(
-        &self,
-        stream_id: &StreamId,
-        link_secret: Option<&LinkSecret>,
-    ) -> Result<StreamBootstrapResponse, TsfClientError> {
-        self.get_json_with_bearer(
-            format!("/streams/{stream_id}/bootstrap"),
-            "bootstrap stream",
-            link_secret,
-        )
-        .await
-    }
-
     /// Updates owner-controlled stream settings.
     ///
     /// This mutation is attempted once and is not transparently retried.
@@ -435,11 +419,22 @@ impl TsfClient {
         &self,
         mut options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
-        let connected = self.connect_read_socket(options.clone()).await?;
-        if let Some(cursor) = connected.cursor {
+        let ConnectedReadSocket {
+            socket,
+            stream_info,
+            cursor,
+            tail,
+        } = self.connect_read_socket(options.clone()).await?;
+        if let Some(cursor) = cursor {
             options.start = Some(ReadStart::SeqNum(cursor));
         }
-        Ok(TsfReadSession::new(self.clone(), options, connected.socket))
+        Ok(TsfReadSession::new(
+            self.clone(),
+            options,
+            socket,
+            stream_info,
+            tail,
+        ))
     }
 
     async fn connect_read_socket(
@@ -469,7 +464,7 @@ impl TsfClient {
                     )
                     .await?;
                 }
-                let cursor = with_timeout(
+                let handshake = with_timeout(
                     operation_timeout,
                     "reader handshake",
                     expect_read_handshake(&mut ws, establishes_cursor),
@@ -481,7 +476,9 @@ impl TsfClient {
                         ws,
                         read_idle_timeout,
                     },
-                    cursor,
+                    stream_info: handshake.stream_info,
+                    cursor: handshake.cursor,
+                    tail: handshake.tail,
                 })
             }
         })
@@ -1370,6 +1367,7 @@ pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
     socket: ReadSocket,
+    stream_info: StreamInfoResponse,
     finished: bool,
     last_observed_tail: Option<ReadTail>,
     no_progress_reconnects: usize,
@@ -1379,14 +1377,21 @@ pub struct TsfReadSession {
 }
 
 impl TsfReadSession {
-    fn new(client: TsfClient, options: ReadStreamOptions, socket: ReadSocket) -> Self {
+    fn new(
+        client: TsfClient,
+        options: ReadStreamOptions,
+        socket: ReadSocket,
+        stream_info: StreamInfoResponse,
+        last_observed_tail: Option<ReadTail>,
+    ) -> Self {
         let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
             client,
             options,
             socket,
+            stream_info,
             finished: false,
-            last_observed_tail: None,
+            last_observed_tail,
             no_progress_reconnects: 0,
             reconnect_backoff,
             pending_reconnect_backoff: Duration::ZERO,
@@ -1397,6 +1402,11 @@ impl TsfReadSession {
     /// Returns the latest tail reported by the active read session.
     pub const fn last_observed_tail(&self) -> Option<ReadTail> {
         self.last_observed_tail
+    }
+
+    /// Returns metadata supplied by the latest successful read handshake.
+    pub const fn stream_info(&self) -> &StreamInfoResponse {
+        &self.stream_info
     }
 
     /// Waits for the next physical record using the configured idle timeout.
@@ -1452,14 +1462,23 @@ impl TsfReadSession {
         if !self.pending_reconnect_backoff.is_zero() {
             sleep(self.pending_reconnect_backoff).await;
         }
-        let connected = self
+        let ConnectedReadSocket {
+            socket,
+            stream_info,
+            cursor,
+            tail,
+        } = self
             .client
             .connect_read_socket(self.options.clone())
             .await?;
-        if let Some(cursor) = connected.cursor {
+        if let Some(cursor) = cursor {
             self.options.start = Some(ReadStart::SeqNum(cursor));
         }
-        self.socket = connected.socket;
+        self.socket = socket;
+        self.stream_info = stream_info;
+        if tail.is_some() {
+            self.last_observed_tail = tail;
+        }
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
         Ok(())
@@ -1521,7 +1540,9 @@ struct ReadSocket {
 
 struct ConnectedReadSocket {
     socket: ReadSocket,
+    stream_info: StreamInfoResponse,
     cursor: Option<u64>,
+    tail: Option<ReadTail>,
 }
 
 impl ReadSocket {
@@ -1705,18 +1726,53 @@ async fn expect_hello(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
 async fn expect_read_handshake(
     ws: &mut ClientWebSocket,
     establishes_cursor: bool,
-) -> Result<Option<u64>, TsfClientError> {
+) -> Result<ReadHandshake, TsfClientError> {
     expect_hello(ws).await?;
+    let stream_info = match next_server_frame(ws).await? {
+        Some(ServerFrame::StreamInfo(stream_info)) => stream_info,
+        Some(frame) => {
+            return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+                &frame,
+            )));
+        }
+        None => return Err(TsfClientError::WebSocketClosed),
+    };
     if !establishes_cursor {
-        return Ok(None);
+        return Ok(ReadHandshake {
+            stream_info,
+            cursor: None,
+            tail: None,
+        });
     }
-    match next_server_frame(ws).await? {
-        Some(ServerFrame::ReadCursor { seq_num }) => Ok(Some(seq_num)),
-        Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-            &frame,
-        ))),
-        None => Err(TsfClientError::WebSocketClosed),
-    }
+    let cursor = match next_server_frame(ws).await? {
+        Some(ServerFrame::ReadCursor { seq_num }) => seq_num,
+        Some(frame) => {
+            return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+                &frame,
+            )));
+        }
+        None => return Err(TsfClientError::WebSocketClosed),
+    };
+    let tail = match next_server_frame(ws).await? {
+        Some(ServerFrame::ReadTail(tail)) => tail,
+        Some(frame) => {
+            return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+                &frame,
+            )));
+        }
+        None => return Err(TsfClientError::WebSocketClosed),
+    };
+    Ok(ReadHandshake {
+        stream_info,
+        cursor: Some(cursor),
+        tail: Some(tail),
+    })
+}
+
+struct ReadHandshake {
+    stream_info: StreamInfoResponse,
+    cursor: Option<u64>,
+    tail: Option<ReadTail>,
 }
 
 fn ensure_protocol_version(version: u16) -> Result<(), TsfClientError> {
@@ -1736,6 +1792,7 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::ReconnectAdvised { .. } => "reconnect advised",
         ServerFrame::ReadTail(_) => "read tail",
         ServerFrame::ReadCursor { .. } => "read cursor",
+        ServerFrame::StreamInfo(_) => "stream info",
     }
 }
 
@@ -1943,6 +2000,57 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse::<CreateStreamIdempotencyKey>(),
             Err(InvalidCreateStreamIdempotencyKey)
         ));
+    }
+
+    #[tokio::test]
+    async fn read_handshake_returns_metadata_cursor_and_tail() {
+        let (mut client, mut server) = connected_websockets().await;
+        let stream_info = StreamInfoResponse {
+            stream_id: "00000000000000000000000000000000"
+                .parse()
+                .expect("stream ID"),
+            title: None,
+            basin: "test-basin".to_owned(),
+            visibility: crate::protocol::rest::Visibility::Private,
+            state: "active".to_owned(),
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+            expires_at: "2026-08-23T00:00:00Z".to_owned(),
+            active_link_count: 1,
+        };
+        let expected_stream_info = stream_info.clone();
+        let sender = tokio::spawn(async move {
+            for frame in [
+                ServerFrame::Hello { version: TSF_V3 },
+                ServerFrame::StreamInfo(stream_info),
+                ServerFrame::ReadCursor { seq_num: 42 },
+                ServerFrame::ReadTail(ReadTail {
+                    next_s2_seq_num: 50,
+                    timestamp_ms: 1_786_377_600_000,
+                }),
+            ] {
+                server
+                    .send(Message::Binary(
+                        frame.encode().expect("encode handshake frame"),
+                    ))
+                    .await
+                    .expect("send handshake frame");
+            }
+        });
+
+        let handshake = expect_read_handshake(&mut client, true)
+            .await
+            .expect("read handshake");
+
+        assert_eq!(handshake.stream_info, expected_stream_info);
+        assert_eq!(handshake.cursor, Some(42));
+        assert_eq!(
+            handshake.tail,
+            Some(ReadTail {
+                next_s2_seq_num: 50,
+                timestamp_ms: 1_786_377_600_000,
+            })
+        );
+        sender.await.expect("join handshake sender");
     }
 
     #[tokio::test]

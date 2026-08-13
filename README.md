@@ -67,6 +67,8 @@ Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession`
 
 SDK readers and producers retry bounded transient WebSocket interruptions while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes fail immediately.
 
+Every read handshake returns stream metadata. Tail-relative reads also return the absolute cursor and the tail used to calculate it. `TsfReadSession::stream_info()` and `last_observed_tail()` expose these values without a REST request.
+
 REST authorization is stream-scoped. Read methods accept an optional link secret because public streams need none. Management methods require an owner link secret on each call. The client never retains a link secret as implicit authorization for later REST requests.
 
 The permission in a link fragment selects the intended client mode. The server resolves authoritative permissions from the secret. Changing the fragment cannot elevate permission, and clients do not need a remote permission preflight before choosing their initial mode.
