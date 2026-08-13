@@ -14,7 +14,7 @@ pub struct ReadStreamOptions {
     pub start: Option<ReadStart>,
     /// Optional maximum number of physical records to deliver.
     pub count: Option<u64>,
-    /// Optional inclusive ending S2 sequence number.
+    /// Optional inclusive ending sequence number.
     pub until: Option<u64>,
     /// Secret from a read-capable stream link for private streams.
     pub link_secret: Option<LinkSecret>,
@@ -71,7 +71,7 @@ impl ReadStreamOptions {
 /// Initial read position. At most one selector can be sent per connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadStart {
-    /// First record whose S2 sequence number is at least this value.
+    /// First record whose absolute sequence number is at least this value.
     SeqNum(u64),
     /// First record whose timestamp is at least this Unix epoch millisecond value.
     TimestampMs(u64),

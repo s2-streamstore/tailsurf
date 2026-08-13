@@ -411,29 +411,20 @@ impl TsfClient {
     }
 
     /// Connects a resumable read session at the requested position and bounds.
-    ///
-    /// The read socket establishes an absolute S2 sequence number for a tail-relative start before
-    /// this method returns. Reconnects therefore resume from the same position even if the stream
-    /// advances before a record arrives.
     pub async fn connect_reader(
         &self,
-        mut options: ReadStreamOptions,
+        options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
         let ConnectedReadSocket {
             socket,
             stream_info,
-            cursor,
-            tail,
         } = self.connect_read_socket(options.clone()).await?;
-        if let Some(cursor) = cursor {
-            options.start = Some(ReadStart::SeqNum(cursor));
-        }
         Ok(TsfReadSession::new(
             self.clone(),
             options,
             socket,
             stream_info,
-            tail,
+            None,
         ))
     }
 
@@ -441,8 +432,6 @@ impl TsfClient {
         &self,
         options: ReadStreamOptions,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
-        let establishes_cursor = options.count != Some(0)
-            && matches!(options.start, None | Some(ReadStart::TailOffset(_)));
         let query = options.query_pairs();
         let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id), &query)?;
         let connect_timeout = self.config.websocket_connect_timeout;
@@ -464,10 +453,10 @@ impl TsfClient {
                     )
                     .await?;
                 }
-                let handshake = with_timeout(
+                let stream_info = with_timeout(
                     operation_timeout,
                     "reader handshake",
-                    expect_read_handshake(&mut ws, establishes_cursor),
+                    expect_read_handshake(&mut ws),
                 )
                 .await?;
 
@@ -476,9 +465,7 @@ impl TsfClient {
                         ws,
                         read_idle_timeout,
                     },
-                    stream_info: handshake.stream_info,
-                    cursor: handshake.cursor,
-                    tail: handshake.tail,
+                    stream_info,
                 })
             }
         })
@@ -770,17 +757,17 @@ impl WriteRecord {
     }
 }
 
-/// Server acknowledgement mapping a contiguous writer range to durable S2 sequence numbers.
+/// Server acknowledgement mapping a contiguous writer range to durable sequence numbers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppendAck {
     /// First acknowledged writer-local sequence number.
     pub writer_seq_start: u64,
     /// Last acknowledged writer-local sequence number, inclusive.
     pub writer_seq_end: u64,
-    /// S2 sequence number assigned to the first acknowledged record.
-    pub s2_seq_start: u64,
-    /// S2 sequence number assigned to the last acknowledged record, inclusive.
-    pub s2_seq_end: u64,
+    /// Durable sequence number assigned to the first acknowledged record.
+    pub seq_start: u64,
+    /// Durable sequence number assigned to the last acknowledged record, inclusive.
+    pub seq_end: u64,
 }
 
 impl AppendAck {
@@ -789,13 +776,13 @@ impl AppendAck {
         self.writer_seq_start <= writer_seq_num && writer_seq_num <= self.writer_seq_end
     }
 
-    /// Returns the number of records when writer and S2 ranges are valid and equal in length.
+    /// Returns the number of records when writer and durable ranges are valid and equal in length.
     pub fn record_count(self) -> Result<u64, TsfClientError> {
         let writer_count = inclusive_range_len(self.writer_seq_start, self.writer_seq_end)
             .ok_or(TsfClientError::InvalidAppendAck(self))?;
-        let s2_count = inclusive_range_len(self.s2_seq_start, self.s2_seq_end)
+        let durable_count = inclusive_range_len(self.seq_start, self.seq_end)
             .ok_or(TsfClientError::InvalidAppendAck(self))?;
-        if writer_count != s2_count {
+        if writer_count != durable_count {
             return Err(TsfClientError::InvalidAppendAck(self));
         }
         Ok(writer_count)
@@ -812,8 +799,8 @@ impl AppendAck {
 pub struct AppendReceipt {
     /// Submitted writer-local sequence number.
     pub writer_seq_num: u64,
-    /// Durable S2 sequence number assigned by the service.
-    pub s2_seq_num: u64,
+    /// Durable sequence number assigned by the service.
+    pub seq_num: u64,
     /// Ack range that covered this record.
     pub ack: AppendAck,
 }
@@ -1077,13 +1064,13 @@ impl TsfAppendSession {
             Some(ServerFrame::Ack {
                 writer_seq_start,
                 writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
+                seq_start,
+                seq_end,
             }) => AppendAck {
                 writer_seq_start,
                 writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
+                seq_start,
+                seq_end,
             }
             .validate()
             .map(Some),
@@ -1320,14 +1307,14 @@ fn dispatch_ack(
         }
     }
 
-    for ((item, writer_seq_num), s2_seq_num) in pending
+    for ((item, writer_seq_num), seq_num) in pending
         .drain(..record_count)
         .zip(ack.writer_seq_start..=ack.writer_seq_end)
-        .zip(ack.s2_seq_start..=ack.s2_seq_end)
+        .zip(ack.seq_start..=ack.seq_end)
     {
         let _ = item.ack_tx.send(Ok(AppendReceipt {
             writer_seq_num,
-            s2_seq_num,
+            seq_num,
             ack,
         }));
     }
@@ -1361,7 +1348,7 @@ fn inclusive_range_len(start: u64, end: u64) -> Option<u64> {
 
 /// Resumable reader that advances its sequence position after every delivered record.
 ///
-/// Transient transport and service interruptions reconnect from the next S2 sequence number. Normal
+/// Transient transport and service interruptions reconnect from the next sequence number. Normal
 /// completion and configured bounds return `None`; protocol and policy failures surface as errors.
 pub struct TsfReadSession {
     client: TsfClient,
@@ -1434,10 +1421,11 @@ impl TsfReadSession {
 
             match self.socket.next_outcome().await {
                 Ok(ReadSocketOutcome::Record(record)) => {
-                    self.record_delivered(record.s2_seq_num);
+                    self.record_delivered(record.seq_num);
                     return Ok(Some(record));
                 }
                 Ok(ReadSocketOutcome::Tail(tail)) => {
+                    self.options.start = Some(ReadStart::SeqNum(tail.next_seq_num));
                     self.last_observed_tail = Some(tail);
                 }
                 Ok(ReadSocketOutcome::ReconnectAdvised) => {
@@ -1465,20 +1453,12 @@ impl TsfReadSession {
         let ConnectedReadSocket {
             socket,
             stream_info,
-            cursor,
-            tail,
         } = self
             .client
             .connect_read_socket(self.options.clone())
             .await?;
-        if let Some(cursor) = cursor {
-            self.options.start = Some(ReadStart::SeqNum(cursor));
-        }
         self.socket = socket;
         self.stream_info = stream_info;
-        if tail.is_some() {
-            self.last_observed_tail = tail;
-        }
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
         Ok(())
@@ -1502,12 +1482,12 @@ impl TsfReadSession {
         Ok(())
     }
 
-    fn record_delivered(&mut self, s2_seq_num: u64) {
+    fn record_delivered(&mut self, seq_num: u64) {
         self.no_progress_reconnects = 0;
         self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
-        match s2_seq_num.checked_add(1) {
+        match seq_num.checked_add(1) {
             Some(next_seq_num) => self.options.start = Some(ReadStart::SeqNum(next_seq_num)),
             None => self.finished = true,
         }
@@ -1519,7 +1499,7 @@ impl TsfReadSession {
             }
         }
 
-        if self.options.until.is_some_and(|until| s2_seq_num >= until) {
+        if self.options.until.is_some_and(|until| seq_num >= until) {
             self.finished = true;
         }
     }
@@ -1541,8 +1521,6 @@ struct ReadSocket {
 struct ConnectedReadSocket {
     socket: ReadSocket,
     stream_info: StreamInfoResponse,
-    cursor: Option<u64>,
-    tail: Option<ReadTail>,
 }
 
 impl ReadSocket {
@@ -1725,8 +1703,7 @@ async fn expect_hello(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
 
 async fn expect_read_handshake(
     ws: &mut ClientWebSocket,
-    establishes_cursor: bool,
-) -> Result<ReadHandshake, TsfClientError> {
+) -> Result<StreamInfoResponse, TsfClientError> {
     expect_hello(ws).await?;
     let stream_info = match next_server_frame(ws).await? {
         Some(ServerFrame::StreamInfo(stream_info)) => stream_info,
@@ -1737,42 +1714,7 @@ async fn expect_read_handshake(
         }
         None => return Err(TsfClientError::WebSocketClosed),
     };
-    if !establishes_cursor {
-        return Ok(ReadHandshake {
-            stream_info,
-            cursor: None,
-            tail: None,
-        });
-    }
-    let cursor = match next_server_frame(ws).await? {
-        Some(ServerFrame::ReadCursor { seq_num }) => seq_num,
-        Some(frame) => {
-            return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-                &frame,
-            )));
-        }
-        None => return Err(TsfClientError::WebSocketClosed),
-    };
-    let tail = match next_server_frame(ws).await? {
-        Some(ServerFrame::ReadTail(tail)) => tail,
-        Some(frame) => {
-            return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-                &frame,
-            )));
-        }
-        None => return Err(TsfClientError::WebSocketClosed),
-    };
-    Ok(ReadHandshake {
-        stream_info,
-        cursor: Some(cursor),
-        tail: Some(tail),
-    })
-}
-
-struct ReadHandshake {
-    stream_info: StreamInfoResponse,
-    cursor: Option<u64>,
-    tail: Option<ReadTail>,
+    Ok(stream_info)
 }
 
 fn ensure_protocol_version(version: u16) -> Result<(), TsfClientError> {
@@ -1791,7 +1733,6 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::ReconnectAdvised { .. } => "reconnect advised",
         ServerFrame::ReadTail(_) => "read tail",
-        ServerFrame::ReadCursor { .. } => "read cursor",
         ServerFrame::StreamInfo(_) => "stream info",
     }
 }
@@ -2003,7 +1944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_handshake_returns_metadata_cursor_and_tail() {
+    async fn read_handshake_returns_metadata() {
         let (mut client, mut server) = connected_websockets().await;
         let stream_info = StreamInfoResponse {
             stream_id: "00000000000000000000000000000000"
@@ -2022,11 +1963,6 @@ mod tests {
             for frame in [
                 ServerFrame::Hello { version: TSF_V3 },
                 ServerFrame::StreamInfo(stream_info),
-                ServerFrame::ReadCursor { seq_num: 42 },
-                ServerFrame::ReadTail(ReadTail {
-                    next_s2_seq_num: 50,
-                    timestamp_ms: 1_786_377_600_000,
-                }),
             ] {
                 server
                     .send(Message::Binary(
@@ -2037,19 +1973,11 @@ mod tests {
             }
         });
 
-        let handshake = expect_read_handshake(&mut client, true)
+        let handshake = expect_read_handshake(&mut client)
             .await
             .expect("read handshake");
 
-        assert_eq!(handshake.stream_info, expected_stream_info);
-        assert_eq!(handshake.cursor, Some(42));
-        assert_eq!(
-            handshake.tail,
-            Some(ReadTail {
-                next_s2_seq_num: 50,
-                timestamp_ms: 1_786_377_600_000,
-            })
-        );
+        assert_eq!(handshake, expected_stream_info);
         sender.await.expect("join handshake sender");
     }
 
@@ -2069,7 +1997,7 @@ mod tests {
             server
                 .send(Message::Binary(
                     ServerFrame::ReadTail(ReadTail {
-                        next_s2_seq_num: 42,
+                        next_seq_num: 42,
                         timestamp_ms: 1_786_377_600_000,
                     })
                     .encode()
@@ -2088,7 +2016,7 @@ mod tests {
         assert!(matches!(
             outcome,
             ReadSocketOutcome::Tail(ReadTail {
-                next_s2_seq_num: 42,
+                next_seq_num: 42,
                 timestamp_ms: 1_786_377_600_000,
             })
         ));
@@ -2225,8 +2153,8 @@ mod tests {
         let ack = AppendAck {
             writer_seq_start: 7,
             writer_seq_end: 9,
-            s2_seq_start: 42,
-            s2_seq_end: 44,
+            seq_start: 42,
+            seq_end: 44,
         };
 
         assert_eq!(ack.record_count().expect("record count"), 3);
@@ -2238,8 +2166,8 @@ mod tests {
         let ack = AppendAck {
             writer_seq_start: 7,
             writer_seq_end: 9,
-            s2_seq_start: 42,
-            s2_seq_end: 43,
+            seq_start: 42,
+            seq_end: 43,
         };
 
         assert!(matches!(
@@ -2262,8 +2190,8 @@ mod tests {
         let ack = AppendAck {
             writer_seq_start: 7,
             writer_seq_end: 8,
-            s2_seq_start: 42,
-            s2_seq_end: 43,
+            seq_start: 42,
+            seq_end: 43,
         };
 
         assert!(matches!(
@@ -2294,8 +2222,8 @@ mod tests {
         let ack = AppendAck {
             writer_seq_start: 7,
             writer_seq_end: 8,
-            s2_seq_start: 42,
-            s2_seq_end: 43,
+            seq_start: 42,
+            seq_end: 43,
         };
 
         assert!(matches!(

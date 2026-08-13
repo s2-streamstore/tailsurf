@@ -1009,7 +1009,7 @@ async fn producer_reconnect_resends_every_unacknowledged_record_in_order() {
 }
 
 #[tokio::test]
-async fn tail_reconnect_resumes_after_last_s2_sequence() {
+async fn tail_reconnect_resumes_after_last_sequence() {
     let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1137,7 +1137,7 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
 }
 
 #[tokio::test]
-async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position() {
+async fn empty_tail_establishes_the_reconnect_position() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1172,7 +1172,7 @@ async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position()
 }
 
 #[tokio::test]
-async fn default_read_start_reconnect_before_first_record_keeps_tail_minus_eighty() {
+async fn default_read_start_reconnect_before_first_record_retries_the_default() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstDefault).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1187,16 +1187,13 @@ async fn default_read_start_reconnect_before_first_record_keeps_tail_minus_eight
         .expect("read record")
         .expect("record");
 
-    assert_eq!(record.s2_seq_num, 20);
+    assert_eq!(record.seq_num, 20);
     assert_eq!(record.data.as_ref(), b"default\n");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].query.get("seq_num"), None);
     assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(
-        attempts[1].query.get("seq_num").map(String::as_str),
-        Some("20")
-    );
+    assert_eq!(attempts[1].query.get("seq_num"), None);
     assert_eq!(attempts[1].query.get("tail_offset"), None);
     assert!(server.tail_link_secrets().is_empty());
 
@@ -1297,7 +1294,7 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
         .expect("resumed reconnect")
         .expect("read record")
         .expect("record");
-    assert_eq!(record.s2_seq_num, 5);
+    assert_eq!(record.seq_num, 5);
     assert_eq!(record.data.as_ref(), b"stable\n");
     assert_eq!(server.read_attempts().len(), 2);
     server.abort();
@@ -1327,7 +1324,7 @@ async fn reader_reconnects_after_configured_idle_timeout() {
         .expect("read record")
         .expect("record");
 
-    assert_eq!(record.s2_seq_num, 0);
+    assert_eq!(record.seq_num, 0);
     assert_eq!(record.data.as_ref(), b"after idle\n");
     assert_eq!(server.read_attempts().len(), 2);
     server.abort();
@@ -1936,7 +1933,7 @@ struct TestLink {
 
 #[derive(Clone)]
 struct TestRecord {
-    s2_seq_num: u64,
+    seq_num: u64,
     timestamp_ms: u64,
     writer_id: WriterId,
     writer_seq_num: u64,
@@ -2151,7 +2148,7 @@ async fn test_get_stream_tail(
     }
     Json(StreamTailResponse {
         stream_id: stream.stream_id,
-        next_s2_seq_num: stream.records.len() as u64,
+        next_seq_num: stream.records.len() as u64,
         last_timestamp_ms: stream.records.last().map(|_| 1_781_717_406_000),
     })
     .into_response()
@@ -2341,30 +2338,30 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
         else {
             return;
         };
-        let s2_seq_num = {
+        let seq_num = {
             let mut streams = state.streams.lock().expect("streams lock");
             let Some(stream) = streams.get_mut(&stream_id) else {
                 return;
             };
-            let s2_seq_num = stream.records.len() as u64;
+            let seq_num = stream.records.len() as u64;
             stream.records.push(TestRecord {
-                s2_seq_num,
-                timestamp_ms: 1_781_717_406_000 + s2_seq_num,
+                seq_num,
+                timestamp_ms: 1_781_717_406_000 + seq_num,
                 writer_id,
                 writer_seq_num,
                 part,
                 format,
                 data,
             });
-            s2_seq_num
+            seq_num
         };
         send_server_frame(
             &mut socket,
             ServerFrame::Ack {
                 writer_seq_start: writer_seq_num,
                 writer_seq_end: writer_seq_num,
-                s2_seq_start: s2_seq_num,
-                s2_seq_end: s2_seq_num,
+                seq_start: seq_num,
+                seq_end: seq_num,
             },
         )
         .await
@@ -2397,7 +2394,7 @@ async fn test_read_flow(
     let Ok(ClientFrame::AuthRead { link_secret }) = ClientFrame::decode_bytes(auth) else {
         return;
     };
-    let (stream_info, cursor, tail, records) = {
+    let (stream_info, tail, records) = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
             return;
@@ -2411,16 +2408,8 @@ async fn test_read_flow(
         {
             return;
         }
-        let cursor = if query.contains_key("seq_num") || query.contains_key("timestamp") {
-            None
-        } else {
-            let tail_offset = query
-                .get("tail_offset")
-                .map_or(80, |value| value.parse().expect("tail offset"));
-            Some((stream.records.len() as u64).saturating_sub(tail_offset))
-        };
         let tail = ReadTail {
-            next_s2_seq_num: stream.records.len() as u64,
+            next_seq_num: stream.records.len() as u64,
             timestamp_ms: stream
                 .records
                 .last()
@@ -2428,7 +2417,6 @@ async fn test_read_flow(
         };
         (
             test_get_stream_response(stream),
-            cursor,
             tail,
             test_select_records(stream, &query),
         )
@@ -2439,19 +2427,11 @@ async fn test_read_flow(
     send_server_frame(&mut socket, ServerFrame::StreamInfo(stream_info))
         .await
         .expect("send stream info");
-    if let Some(seq_num) = cursor {
-        send_server_frame(&mut socket, ServerFrame::ReadCursor { seq_num })
-            .await
-            .expect("send read cursor");
-        send_server_frame(&mut socket, ServerFrame::ReadTail(tail))
-            .await
-            .expect("send initial read tail");
-    }
     for record in records {
         send_server_frame(
             &mut socket,
             ServerFrame::ReadRecord(ReadRecord {
-                s2_seq_num: record.s2_seq_num,
+                seq_num: record.seq_num,
                 timestamp_ms: record.timestamp_ms,
                 writer_id: record.writer_id,
                 writer_seq_num: record.writer_seq_num,
@@ -2463,6 +2443,9 @@ async fn test_read_flow(
         .await
         .expect("send record");
     }
+    send_server_frame(&mut socket, ServerFrame::ReadTail(tail))
+        .await
+        .expect("send read tail");
     socket
         .send(Message::Close(None))
         .await
@@ -2549,7 +2532,7 @@ fn test_select_records(stream: &TestStream, query: &HashMap<String, String>) -> 
         .get("seq_num")
         .and_then(|value| value.parse::<u64>().ok())
     {
-        records.retain(|record| record.s2_seq_num >= seq_num);
+        records.retain(|record| record.seq_num >= seq_num);
     } else if let Some(tail_offset) = query
         .get("tail_offset")
         .and_then(|value| value.parse::<usize>().ok())
@@ -2561,7 +2544,7 @@ fn test_select_records(stream: &TestStream, query: &HashMap<String, String>) -> 
         .get("until")
         .and_then(|value| value.parse::<u64>().ok())
     {
-        records.retain(|record| record.s2_seq_num <= until);
+        records.retain(|record| record.seq_num <= until);
     }
     if let Some(count) = query
         .get("count")
@@ -3013,8 +2996,8 @@ async fn send_test_ack(socket: &mut WebSocket, start: u64, end: u64) -> Result<(
         ServerFrame::Ack {
             writer_seq_start: start,
             writer_seq_end: end,
-            s2_seq_start: start,
-            s2_seq_end: end,
+            seq_start: start,
+            seq_end: end,
         },
     )
     .await
@@ -3141,8 +3124,8 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
         ServerFrame::Ack {
             writer_seq_start: writer_seq_num,
             writer_seq_end: writer_seq_num,
-            s2_seq_start: 0,
-            s2_seq_end: 0,
+            seq_start: 0,
+            seq_end: 0,
         },
     )
     .await
@@ -3239,10 +3222,10 @@ async fn fake_read_tail(
         .lock()
         .expect("tail bearer links lock")
         .push(link_secret);
-    let next_s2_seq_num = fake_read_next_seq_num(state.mode);
+    let next_seq_num = fake_read_next_seq_num(state.mode);
     Json(serde_json::json!({
         "stream_id": stream_id,
-        "next_s2_seq_num": next_s2_seq_num,
+        "next_seq_num": next_seq_num,
         "last_timestamp_ms": 1781717406000_u64
     }))
 }
@@ -3300,14 +3283,6 @@ async fn fake_read_flow(
     else {
         return;
     };
-    let cursor = if query.contains_key("seq_num") || query.contains_key("timestamp") {
-        None
-    } else {
-        let tail_offset = query
-            .get("tail_offset")
-            .map_or(80, |value| value.parse().expect("tail offset"));
-        Some(fake_read_next_seq_num(state.mode).saturating_sub(tail_offset))
-    };
     let attempt_count = {
         let mut attempts = state.read_attempts.lock().expect("read attempts lock");
         attempts.push(ReadAttempt {
@@ -3325,31 +3300,6 @@ async fn fake_read_flow(
     )
     .await
     .expect("send stream info");
-    if let Some(seq_num) = cursor {
-        send_server_frame(&mut socket, ServerFrame::ReadCursor { seq_num })
-            .await
-            .expect("send read cursor");
-        send_server_frame(
-            &mut socket,
-            ServerFrame::ReadTail(ReadTail {
-                next_s2_seq_num: fake_read_next_seq_num(state.mode),
-                timestamp_ms: 1_781_717_406_010,
-            }),
-        )
-        .await
-        .expect("send initial read tail");
-    } else {
-        send_server_frame(
-            &mut socket,
-            ServerFrame::ReadTail(ReadTail {
-                next_s2_seq_num: 10,
-                timestamp_ms: 1_781_717_406_010,
-            }),
-        )
-        .await
-        .expect("send read tail");
-    }
-
     match state.mode {
         FakeReadMode::Reconnect => {
             if attempt_count == 1 {
@@ -3366,6 +3316,15 @@ async fn fake_read_flow(
         }
         FakeReadMode::ReconnectBeforeFirstRecord => {
             if attempt_count == 1 {
+                send_server_frame(
+                    &mut socket,
+                    ServerFrame::ReadTail(ReadTail {
+                        next_seq_num: 5,
+                        timestamp_ms: 1_781_717_406_010,
+                    }),
+                )
+                .await
+                .expect("send empty read tail");
                 send_server_frame(
                     &mut socket,
                     ServerFrame::ReconnectAdvised { deadline_secs: 0 },
@@ -3467,15 +3426,10 @@ async fn fake_read_flow(
     }
 }
 
-async fn send_read_record(
-    socket: &mut WebSocket,
-    s2_seq_num: u64,
-    writer_seq_num: u64,
-    data: &[u8],
-) {
+async fn send_read_record(socket: &mut WebSocket, seq_num: u64, writer_seq_num: u64, data: &[u8]) {
     send_read_record_with_format(
         socket,
-        s2_seq_num,
+        seq_num,
         writer_seq_num,
         PartHeader::unsplit(),
         RecordFormat::Transcript,
@@ -3486,7 +3440,7 @@ async fn send_read_record(
 
 async fn send_read_record_with_format(
     socket: &mut WebSocket,
-    s2_seq_num: u64,
+    seq_num: u64,
     writer_seq_num: u64,
     part: PartHeader,
     format: RecordFormat,
@@ -3495,8 +3449,8 @@ async fn send_read_record_with_format(
     send_server_frame(
         socket,
         ServerFrame::ReadRecord(ReadRecord {
-            s2_seq_num,
-            timestamp_ms: 1_781_717_406_000 + s2_seq_num,
+            seq_num,
+            timestamp_ms: 1_781_717_406_000 + seq_num,
             writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
             writer_seq_num,
             part,

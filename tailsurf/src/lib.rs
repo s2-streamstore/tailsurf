@@ -31,6 +31,8 @@ pub use client::{
 pub use ids::{LinkId, LinkSecret, StreamId, WriterId};
 pub use link_label::{LinkLabel, LinkLabelError, MAX_LINK_LABEL_CODE_POINTS};
 pub use permissions::{LinkPermissions, PermissionsError};
-pub use protocol::rest::StreamInfoResponse;
-pub use protocol::ws::frame::{ReadRecord, ReadTail};
+pub use protocol::{
+    rest::StreamInfoResponse,
+    ws::frame::{ReadRecord, ReadTail},
+};
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

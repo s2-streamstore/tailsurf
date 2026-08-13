@@ -51,8 +51,7 @@ enum ServerOp {
     Heartbeat = 0x84,
     ReconnectAdvised = 0x85,
     ReadTail = 0x86,
-    ReadCursor = 0x87,
-    StreamInfo = 0x88,
+    StreamInfo = 0x87,
 }
 
 impl ServerOp {
@@ -72,7 +71,6 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::ReconnectAdvised.byte() => Ok(Self::ReconnectAdvised),
             value if value == Self::ReadTail.byte() => Ok(Self::ReadTail),
-            value if value == Self::ReadCursor.byte() => Ok(Self::ReadCursor),
             value if value == Self::StreamInfo.byte() => Ok(Self::StreamInfo),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
@@ -161,9 +159,9 @@ impl TryFrom<u8> for RecordFormat {
 /// One physical stream record delivered by the read data plane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadRecord {
-    /// Durable sequence number assigned by S2.
-    pub s2_seq_num: u64,
-    /// S2 record timestamp as Unix epoch milliseconds.
+    /// Durable absolute sequence number.
+    pub seq_num: u64,
+    /// Record timestamp as Unix epoch milliseconds.
     pub timestamp_ms: u64,
     /// Stable identity of the producer that wrote this record.
     pub writer_id: WriterId,
@@ -181,7 +179,7 @@ pub struct ReadRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadTail {
     /// Sequence number assigned to the next appended record.
-    pub next_s2_seq_num: u64,
+    pub next_seq_num: u64,
     /// Timestamp of the last record, or zero for an empty stream.
     pub timestamp_ms: u64,
 }
@@ -228,10 +226,10 @@ pub enum ServerFrame {
         writer_seq_start: u64,
         /// Last acknowledged writer-local sequence number, inclusive.
         writer_seq_end: u64,
-        /// S2 sequence number assigned to the first acknowledged record.
-        s2_seq_start: u64,
-        /// S2 sequence number assigned to the last acknowledged record, inclusive.
-        s2_seq_end: u64,
+        /// Durable sequence number assigned to the first acknowledged record.
+        seq_start: u64,
+        /// Durable sequence number assigned to the last acknowledged record, inclusive.
+        seq_end: u64,
     },
     /// Delivers one physical stream record.
     ReadRecord(ReadRecord),
@@ -244,11 +242,6 @@ pub enum ServerFrame {
     },
     /// Reports the latest tail observed by the underlying read session.
     ReadTail(ReadTail),
-    /// Establishes the absolute sequence number for a tail-relative read.
-    ReadCursor {
-        /// First S2 sequence number the server will read.
-        seq_num: u64,
-    },
     /// Supplies stream metadata from the read authorization result.
     StreamInfo(StreamInfoResponse),
 }
@@ -347,18 +340,18 @@ impl ServerFrame {
             Self::Ack {
                 writer_seq_start,
                 writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
+                seq_start,
+                seq_end,
             } => {
                 output.put_u8(ServerOp::Ack.byte());
                 output.put_u64(*writer_seq_start);
                 output.put_u64(*writer_seq_end);
-                output.put_u64(*s2_seq_start);
-                output.put_u64(*s2_seq_end);
+                output.put_u64(*seq_start);
+                output.put_u64(*seq_end);
             }
             Self::ReadRecord(record) => {
                 output.put_u8(ServerOp::ReadRecord.byte());
-                output.put_u64(record.s2_seq_num);
+                output.put_u64(record.seq_num);
                 output.put_u64(record.timestamp_ms);
                 output.put_slice(record.writer_id.as_bytes());
                 output.put_u64(record.writer_seq_num);
@@ -373,12 +366,8 @@ impl ServerFrame {
             }
             Self::ReadTail(tail) => {
                 output.put_u8(ServerOp::ReadTail.byte());
-                output.put_u64(tail.next_s2_seq_num);
+                output.put_u64(tail.next_seq_num);
                 output.put_u64(tail.timestamp_ms);
-            }
-            Self::ReadCursor { seq_num } => {
-                output.put_u8(ServerOp::ReadCursor.byte());
-                output.put_u64(*seq_num);
             }
             Self::StreamInfo(stream) => {
                 let payload =
@@ -482,18 +471,18 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
         ServerOp::Ack => {
             let (writer_seq_start, body) = read_u64(body)?;
             let (writer_seq_end, body) = read_u64(body)?;
-            let (s2_seq_start, body) = read_u64(body)?;
-            let (s2_seq_end, body) = read_u64(body)?;
+            let (seq_start, body) = read_u64(body)?;
+            let (seq_end, body) = read_u64(body)?;
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::Ack {
                 writer_seq_start,
                 writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
+                seq_start,
+                seq_end,
             })
         }
         ServerOp::ReadRecord => {
-            let (s2_seq_num, body) = read_u64(body)?;
+            let (seq_num, body) = read_u64(body)?;
             let (timestamp_ms, body) = read_u64(body)?;
             let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
             let (writer_seq_num, body) = read_u64(body)?;
@@ -503,7 +492,7 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             let data_start = bytes.len() - data.len();
             let data = input.into_record_data(data_start);
             Ok(ServerFrame::ReadRecord(ReadRecord {
-                s2_seq_num,
+                seq_num,
                 timestamp_ms,
                 writer_id: WriterId::from_bytes(writer_id),
                 writer_seq_num,
@@ -526,18 +515,13 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             Ok(ServerFrame::ReconnectAdvised { deadline_secs })
         }
         ServerOp::ReadTail => {
-            let (next_s2_seq_num, body) = read_u64(body)?;
+            let (next_seq_num, body) = read_u64(body)?;
             let (timestamp_ms, body) = read_u64(body)?;
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::ReadTail(ReadTail {
-                next_s2_seq_num,
+                next_seq_num,
                 timestamp_ms,
             }))
-        }
-        ServerOp::ReadCursor => {
-            let (seq_num, body) = read_u64(body)?;
-            ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::ReadCursor { seq_num })
         }
         ServerOp::StreamInfo => serde_json::from_slice(body)
             .map(ServerFrame::StreamInfo)
@@ -690,7 +674,7 @@ mod tests {
         ));
 
         ServerFrame::ReadRecord(ReadRecord {
-            s2_seq_num: 0,
+            seq_num: 0,
             timestamp_ms: 0,
             writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
             writer_seq_num: 0,
@@ -702,7 +686,7 @@ mod tests {
         .expect("server max record encodes");
         assert!(matches!(
             ServerFrame::ReadRecord(ReadRecord {
-                s2_seq_num: 0,
+                seq_num: 0,
                 timestamp_ms: 0,
                 writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
                 writer_seq_num: 0,
@@ -778,7 +762,7 @@ mod tests {
 
         let writer_id = WriterId::from_bytes([1; WriterId::BYTE_LEN]);
         let mut server = ServerFrame::ReadRecord(ReadRecord {
-            s2_seq_num: 0,
+            seq_num: 0,
             timestamp_ms: 0,
             writer_id,
             writer_seq_num: 0,

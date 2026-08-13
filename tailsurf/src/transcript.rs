@@ -497,7 +497,7 @@ mod tests {
         data: &[u8],
     ) -> ReadRecord {
         ReadRecord {
-            s2_seq_num: seq,
+            seq_num: seq,
             timestamp_ms: seq,
             writer_id,
             writer_seq_num: seq,

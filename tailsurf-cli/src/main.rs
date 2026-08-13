@@ -228,7 +228,7 @@ struct ReadArgs {
     /// Start this many records before the current tail.
     #[arg(short = 'n', long, conflicts_with_all = ["seq", "since"])]
     last: Option<u64>,
-    /// Start at this S2 sequence number.
+    /// Start at this absolute sequence number.
     #[arg(long, conflicts_with_all = ["last", "since"])]
     seq: Option<u64>,
     /// Start at an RFC 3339 time or this duration ago, such as 15m.
@@ -1474,7 +1474,7 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
         .get_stream_tail(&locator.stream_id, read_link)
         .await
         .context("failed to check stream tail")?;
-    if tail.next_s2_seq_num == 0 {
+    if tail.next_seq_num == 0 {
         return Ok(());
     }
 
@@ -1487,15 +1487,15 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     );
     request.start = Some(match selected_start {
         ReadStart::TailOffset(offset) => {
-            ReadStart::SeqNum(tail.next_s2_seq_num.saturating_sub(offset))
+            ReadStart::SeqNum(tail.next_seq_num.saturating_sub(offset))
         }
         start => start,
     });
-    request.until = Some(tail.next_s2_seq_num - 1);
+    request.until = Some(tail.next_seq_num - 1);
     request.count = args
         .read
         .limit
-        .or_else(|| replay_count_from_tail(&request, tail.next_s2_seq_num));
+        .or_else(|| replay_count_from_tail(&request, tail.next_seq_num));
     if let Some(link) = read_link {
         request = request.with_stream_link(link);
     }
@@ -2209,10 +2209,10 @@ fn selected_read_start(
         .unwrap_or(default)
 }
 
-fn replay_count_from_tail(options: &ReadStreamOptions, next_s2_seq_num: u64) -> Option<u64> {
+fn replay_count_from_tail(options: &ReadStreamOptions, next_seq_num: u64) -> Option<u64> {
     match options.start {
-        Some(ReadStart::SeqNum(seq_num)) => Some(next_s2_seq_num.saturating_sub(seq_num)),
-        None => Some(next_s2_seq_num),
+        Some(ReadStart::SeqNum(seq_num)) => Some(next_seq_num.saturating_sub(seq_num)),
+        None => Some(next_seq_num),
         Some(ReadStart::TimestampMs(_) | ReadStart::TailOffset(_)) => None,
     }
 }

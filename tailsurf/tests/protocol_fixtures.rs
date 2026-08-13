@@ -58,11 +58,11 @@ enum ServerFixture {
     Ack {
         writer_seq_start: String,
         writer_seq_end: String,
-        s2_seq_start: String,
-        s2_seq_end: String,
+        seq_start: String,
+        seq_end: String,
     },
     ReadRecord {
-        s2_seq_num: String,
+        seq_num: String,
         timestamp_ms: String,
         writer_id_hex: String,
         writer_seq_num: String,
@@ -75,11 +75,8 @@ enum ServerFixture {
         deadline_secs: u8,
     },
     ReadTail {
-        next_s2_seq_num: String,
+        next_seq_num: String,
         timestamp_ms: String,
-    },
-    ReadCursor {
-        seq_num: String,
     },
     StreamInfo {
         stream_id: String,
@@ -176,16 +173,16 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
         ServerFixture::Ack {
             writer_seq_start,
             writer_seq_end,
-            s2_seq_start,
-            s2_seq_end,
+            seq_start,
+            seq_end,
         } => ServerFrame::Ack {
             writer_seq_start: parse_u64(&writer_seq_start),
             writer_seq_end: parse_u64(&writer_seq_end),
-            s2_seq_start: parse_u64(&s2_seq_start),
-            s2_seq_end: parse_u64(&s2_seq_end),
+            seq_start: parse_u64(&seq_start),
+            seq_end: parse_u64(&seq_end),
         },
         ServerFixture::ReadRecord {
-            s2_seq_num,
+            seq_num,
             timestamp_ms,
             writer_id_hex,
             writer_seq_num,
@@ -193,7 +190,7 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             format,
             data_hex,
         } => ServerFrame::ReadRecord(ReadRecord {
-            s2_seq_num: parse_u64(&s2_seq_num),
+            seq_num: parse_u64(&seq_num),
             timestamp_ms: parse_u64(&timestamp_ms),
             writer_id: decode_writer_id(&writer_id_hex),
             writer_seq_num: parse_u64(&writer_seq_num),
@@ -206,15 +203,12 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             ServerFrame::ReconnectAdvised { deadline_secs }
         }
         ServerFixture::ReadTail {
-            next_s2_seq_num,
+            next_seq_num,
             timestamp_ms,
         } => ServerFrame::ReadTail(ReadTail {
-            next_s2_seq_num: parse_u64(&next_s2_seq_num),
+            next_seq_num: parse_u64(&next_seq_num),
             timestamp_ms: parse_u64(&timestamp_ms),
         }),
-        ServerFixture::ReadCursor { seq_num } => ServerFrame::ReadCursor {
-            seq_num: parse_u64(&seq_num),
-        },
         ServerFixture::StreamInfo {
             stream_id,
             title,
