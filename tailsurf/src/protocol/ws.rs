@@ -45,6 +45,9 @@ impl ReadStreamOptions {
 
     pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
         let mut pairs = Vec::new();
+        if self.link_secret.is_some() {
+            pairs.push(("auth", "link".to_owned()));
+        }
         match self.start {
             None => {}
             Some(ReadStart::SeqNum(seq_num)) => pairs.push(("seq_num", seq_num.to_string())),

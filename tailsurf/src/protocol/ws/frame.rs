@@ -46,7 +46,6 @@ impl TryFrom<u8> for ClientOp {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerOp {
     Hello = 0x80,
-    AuthRequired = 0x81,
     Ack = 0x82,
     ReadRecord = 0x83,
     Heartbeat = 0x84,
@@ -66,7 +65,6 @@ impl TryFrom<u8> for ServerOp {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             value if value == Self::Hello.byte() => Ok(Self::Hello),
-            value if value == Self::AuthRequired.byte() => Ok(Self::AuthRequired),
             value if value == Self::Ack.byte() => Ok(Self::Ack),
             value if value == Self::ReadRecord.byte() => Ok(Self::ReadRecord),
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
@@ -220,8 +218,6 @@ pub enum ServerFrame {
         /// Selected TSF protocol version.
         version: ProtocolVersion,
     },
-    /// Requests a reader authentication frame before streaming records.
-    AuthRequired,
     /// Confirms a contiguous range of writer records is durable.
     Ack {
         /// First acknowledged writer-local sequence number.
@@ -336,7 +332,6 @@ impl ServerFrame {
                 output.put_u8(ServerOp::Hello.byte());
                 output.put_u16(*version);
             }
-            Self::AuthRequired => output.put_u8(ServerOp::AuthRequired.byte()),
             Self::Ack {
                 writer_seq_start,
                 writer_seq_end,
@@ -460,10 +455,6 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             let (version, body) = read_u16(body)?;
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::Hello { version })
-        }
-        ServerOp::AuthRequired => {
-            ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::AuthRequired)
         }
         ServerOp::Ack => {
             let (writer_seq_start, body) = read_u64(body)?;

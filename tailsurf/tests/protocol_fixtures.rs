@@ -52,7 +52,6 @@ enum ServerFixture {
     Hello {
         version: u16,
     },
-    AuthRequired,
     Ack {
         writer_seq_start: String,
         writer_seq_end: String,
@@ -158,7 +157,6 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
 fn server_frame(fixture: ServerFixture) -> ServerFrame {
     match fixture {
         ServerFixture::Hello { version } => ServerFrame::Hello { version },
-        ServerFixture::AuthRequired => ServerFrame::AuthRequired,
         ServerFixture::Ack {
             writer_seq_start,
             writer_seq_end,

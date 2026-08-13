@@ -470,32 +470,15 @@ impl TsfClient {
             async move {
                 let mut ws = connect_websocket(url, connect_timeout).await?;
 
-                match with_timeout(
-                    operation_timeout,
-                    "reader hello",
-                    next_server_frame(&mut ws),
-                )
-                .await?
-                {
-                    Some(ServerFrame::Hello { version }) => ensure_protocol_version(version)?,
-                    Some(ServerFrame::AuthRequired) => {
-                        let link_secret = link_secret.ok_or(TsfClientError::MissingReadLink)?;
-                        with_timeout(
-                            operation_timeout,
-                            "authenticate reader",
-                            send_client_frame(&mut ws, ClientFrame::AuthRead { link_secret }),
-                        )
-                        .await?;
-                        with_timeout(operation_timeout, "reader hello", expect_hello(&mut ws))
-                            .await?;
-                    }
-                    Some(frame) => {
-                        return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-                            &frame,
-                        )));
-                    }
-                    None => return Err(TsfClientError::WebSocketClosed),
+                if let Some(link_secret) = link_secret {
+                    with_timeout(
+                        operation_timeout,
+                        "authenticate reader",
+                        send_client_frame(&mut ws, ClientFrame::AuthRead { link_secret }),
+                    )
+                    .await?;
                 }
+                with_timeout(operation_timeout, "reader hello", expect_hello(&mut ws)).await?;
 
                 Ok(ReadSocket {
                     ws,
@@ -1723,7 +1706,6 @@ fn ensure_protocol_version(version: u16) -> Result<(), TsfClientError> {
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
     match frame {
         ServerFrame::Hello { .. } => "hello",
-        ServerFrame::AuthRequired => "auth required",
         ServerFrame::Ack { .. } => "ack",
         ServerFrame::ReadRecord(_) => "read record",
         ServerFrame::Heartbeat => "heartbeat",
@@ -1819,9 +1801,6 @@ pub enum TsfClientError {
     /// The producer background task failed or could not be joined.
     #[error("append producer failed: {0}")]
     AppendProducerFailed(String),
-    /// A private read requested authentication but no link was configured.
-    #[error("private stream read requires a read link")]
-    MissingReadLink,
     /// Consecutive read connections ended or requested reconnect without delivering a record.
     #[error(
         "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"

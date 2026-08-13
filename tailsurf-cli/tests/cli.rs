@@ -2343,9 +2343,9 @@ async fn test_read_flow(
     query: HashMap<String, String>,
     mut socket: WebSocket,
 ) {
-    send_server_frame(&mut socket, ServerFrame::AuthRequired)
-        .await
-        .expect("send auth required");
+    if query.get("auth").map(String::as_str) != Some("link") {
+        return;
+    }
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
@@ -3187,9 +3187,9 @@ async fn fake_read_flow(
     query: HashMap<String, String>,
     mut socket: WebSocket,
 ) {
-    send_server_frame(&mut socket, ServerFrame::AuthRequired)
-        .await
-        .expect("send auth required");
+    if query.get("auth").map(String::as_str) != Some("link") {
+        return;
+    }
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };

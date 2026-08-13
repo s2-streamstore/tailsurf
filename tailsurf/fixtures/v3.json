@@ -42,13 +42,6 @@
       "hex": "800003"
     },
     {
-      "name": "authentication required",
-      "frame": {
-        "type": "auth_required"
-      },
-      "hex": "81"
-    },
-    {
       "name": "append acknowledgement",
       "frame": {
         "type": "ack",
