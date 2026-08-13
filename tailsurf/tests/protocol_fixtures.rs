@@ -71,9 +71,6 @@ enum ServerFixture {
         data_hex: String,
     },
     Heartbeat,
-    ReconnectAdvised {
-        deadline_secs: u8,
-    },
     CaughtUp {
         next_seq_num: String,
         timestamp_ms: String,
@@ -199,9 +196,6 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             data: Bytes::from(decode_hex(&data_hex)),
         }),
         ServerFixture::Heartbeat => ServerFrame::Heartbeat,
-        ServerFixture::ReconnectAdvised { deadline_secs } => {
-            ServerFrame::ReconnectAdvised { deadline_secs }
-        }
         ServerFixture::CaughtUp {
             next_seq_num,
             timestamp_ms,

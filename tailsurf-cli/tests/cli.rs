@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     extract::{
         Path, Query, State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -3304,12 +3304,7 @@ async fn fake_read_flow(
         FakeReadMode::Reconnect => {
             if attempt_count == 1 {
                 send_read_record(&mut socket, 0, 0, b"first\n").await;
-                send_server_frame(
-                    &mut socket,
-                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
-                )
-                .await
-                .expect("send reconnect advised");
+                close_retryable_read(&mut socket).await;
             } else {
                 send_read_record(&mut socket, 1, 1, b"second\n").await;
             }
@@ -3325,24 +3320,14 @@ async fn fake_read_flow(
                 )
                 .await
                 .expect("send empty caught up");
-                send_server_frame(
-                    &mut socket,
-                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
-                )
-                .await
-                .expect("send reconnect advised");
+                close_retryable_read(&mut socket).await;
             } else {
                 send_read_record(&mut socket, 5, 0, b"stable\n").await;
             }
         }
         FakeReadMode::ReconnectBeforeFirstDefault => {
             if attempt_count == 1 {
-                send_server_frame(
-                    &mut socket,
-                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
-                )
-                .await
-                .expect("send reconnect advised");
+                close_retryable_read(&mut socket).await;
             } else {
                 send_read_record(&mut socket, 20, 0, b"default\n").await;
             }
@@ -3351,12 +3336,7 @@ async fn fake_read_flow(
             if matches!(state.mode, FakeReadMode::SlowReconnectForever) {
                 sleep(Duration::from_millis(40)).await;
             }
-            send_server_frame(
-                &mut socket,
-                ServerFrame::ReconnectAdvised { deadline_secs: 0 },
-            )
-            .await
-            .expect("send reconnect advised");
+            close_retryable_read(&mut socket).await;
         }
         FakeReadMode::SilentThenRecord => {
             if attempt_count == 1 {
@@ -3424,6 +3404,16 @@ async fn fake_read_flow(
                 .expect("close split replay socket");
         }
     }
+}
+
+async fn close_retryable_read(socket: &mut WebSocket) {
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 1013,
+            reason: "upstream_unavailable".into(),
+        })))
+        .await
+        .expect("close retryable read");
 }
 
 async fn send_read_record(socket: &mut WebSocket, seq_num: u64, writer_seq_num: u64, data: &[u8]) {

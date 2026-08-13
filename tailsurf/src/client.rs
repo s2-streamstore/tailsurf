@@ -1428,10 +1428,6 @@ impl TsfReadSession {
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
                 }
-                Ok(ReadSocketOutcome::ReconnectAdvised) => {
-                    self.require_reconnect()?;
-                    self.reconnect().await?;
-                }
                 Ok(ReadSocketOutcome::Closed) => {
                     self.finished = true;
                     return Ok(None);
@@ -1546,7 +1542,6 @@ impl ReadSocket {
 enum ReadSocketOutcome {
     Record(ReadRecord),
     CaughtUp(ReadCaughtUp),
-    ReconnectAdvised,
     Closed,
 }
 
@@ -1683,7 +1678,6 @@ async fn next_read_socket_frame(
         Some(ServerFrame::ReadRecord(record)) => Ok(Some(ReadSocketOutcome::Record(record))),
         Some(ServerFrame::CaughtUp(caught_up)) => Ok(Some(ReadSocketOutcome::CaughtUp(caught_up))),
         Some(ServerFrame::Heartbeat) => Ok(None),
-        Some(ServerFrame::ReconnectAdvised { .. }) => Ok(Some(ReadSocketOutcome::ReconnectAdvised)),
         Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
             &frame,
         ))),
@@ -1731,7 +1725,6 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Ack { .. } => "ack",
         ServerFrame::ReadRecord(_) => "read record",
         ServerFrame::Heartbeat => "heartbeat",
-        ServerFrame::ReconnectAdvised { .. } => "reconnect advised",
         ServerFrame::CaughtUp(_) => "caught up",
         ServerFrame::StreamInfo(_) => "stream info",
     }

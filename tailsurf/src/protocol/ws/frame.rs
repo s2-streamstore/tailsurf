@@ -49,9 +49,8 @@ enum ServerOp {
     Ack = 0x82,
     ReadRecord = 0x83,
     Heartbeat = 0x84,
-    ReconnectAdvised = 0x85,
-    CaughtUp = 0x86,
-    StreamInfo = 0x87,
+    CaughtUp = 0x85,
+    StreamInfo = 0x86,
 }
 
 impl ServerOp {
@@ -69,7 +68,6 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::Ack.byte() => Ok(Self::Ack),
             value if value == Self::ReadRecord.byte() => Ok(Self::ReadRecord),
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
-            value if value == Self::ReconnectAdvised.byte() => Ok(Self::ReconnectAdvised),
             value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
             value if value == Self::StreamInfo.byte() => Ok(Self::StreamInfo),
             other => Err(FrameCodecError::UnknownOperation(other)),
@@ -235,11 +233,6 @@ pub enum ServerFrame {
     ReadRecord(ReadRecord),
     /// Keeps an otherwise idle unbounded read connection active.
     Heartbeat,
-    /// Requests a resumable reader reconnect before the deadline.
-    ReconnectAdvised {
-        /// Advisory reconnect deadline in seconds.
-        deadline_secs: u8,
-    },
     /// Confirms that every record preceding the captured position was delivered.
     CaughtUp(ReadCaughtUp),
     /// Supplies stream metadata from the read authorization result.
@@ -360,10 +353,6 @@ impl ServerFrame {
                 output.put_slice(&record.data);
             }
             Self::Heartbeat => output.put_u8(ServerOp::Heartbeat.byte()),
-            Self::ReconnectAdvised { deadline_secs } => {
-                output.put_u8(ServerOp::ReconnectAdvised.byte());
-                output.put_u8(*deadline_secs);
-            }
             Self::CaughtUp(caught_up) => {
                 output.put_u8(ServerOp::CaughtUp.byte());
                 output.put_u64(caught_up.next_seq_num);
@@ -504,15 +493,6 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
         ServerOp::Heartbeat => {
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::Heartbeat)
-        }
-        ServerOp::ReconnectAdvised => {
-            let (&deadline_secs, body) =
-                body.split_first().ok_or(FrameCodecError::TruncatedFrame {
-                    op: op_byte,
-                    needed: 1,
-                })?;
-            ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::ReconnectAdvised { deadline_secs })
         }
         ServerOp::CaughtUp => {
             let (next_seq_num, body) = read_u64(body)?;
