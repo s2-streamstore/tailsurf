@@ -91,12 +91,14 @@ Choose a shorter initial lifetime with a human duration:
 
 ```sh
 tsf new --expires 7d
-make test | tsf --title 'Test run' --expires 6h
+make test | tsf new --title 'Test run' --expires 6h
 ```
 
 Streams expire after 10 days by default. Their complete history remains readable until expiry.
 
-`tsf new` prints the title, Stream ID, expiry, and an owner link. The title is optional. Issue more labeled links at creation with `--link 'read=Build reader'`, `--link 'write=Deploy writer'`, `--link 'read-write=Operator'`, or `--link 'owner=Backup owner'`. Links are shown once.
+`tsf new` prints the title, Stream ID, expiry, and initial links. Private streams get a read link and an owner link. Public streams get a public URL and an owner link. The title is optional.
+
+Issue custom labeled links with `--link PERMISSION=LABEL`. Permissions are `read`, `write`, `read-write`, and `owner`. The short forms `r`, `w`, `rw`, and `o` are also accepted. A stream may have up to three initial links, including defaults. Links are shown once.
 
 Stream command output into a new stream:
 
@@ -104,25 +106,23 @@ Stream command output into a new stream:
 make test | tsf
 ```
 
-Bare `tsf` captures piped input in a new stream. With terminal input and no command or capture options, it prints help.
+Bare `tsf` captures piped input in a new stream. With terminal input and no subcommand, it prints help.
 
-Private capture creates an owner link and a read link. The owner link writes the captured data. The read link is the single stdout result. Creation details, the owner link, and durability status go to stderr.
+Creation details and links go to stdout. Durability progress goes to stderr.
 
-Public capture creates only an owner link. It prints the public stream URL to stdout.
-
-Use `--to` to capture into an existing stream. It accepts a write-capable link and creates no links.
+Use `write` to send input to an existing stream. It accepts a write-capable link and creates no links.
 
 Run a command through `tsf` when you want `tsf` to propagate the command exit status:
 
 ```sh
-tsf -- make test
+tsf new -- make test
 ```
 
 By default, `tsf` makes line boundaries transcript record boundaries and marks records as transcript-oriented:
 
 ```sh
 make test | tsf
-make test | tsf --to '{write-link}'
+make test | tsf write '{write-link}'
 ```
 
 One logical line is limited to 16 MiB by default. This is the same default used by `tail` and `replay`. Set `--max-logical-record-bytes` on both the writer and reader only when a larger application-specific limit is required.
@@ -130,7 +130,8 @@ One logical line is limited to 16 MiB by default. This is the same default used 
 Use raw mode when you want to send stdin as byte records instead of line-framed transcript records. Raw mode flushes at the physical record size limit, after a short linger, and at EOF:
 
 ```sh
-cat artifact.bin | tsf --raw
+cat artifact.bin | tsf new --raw
+cat artifact.bin | tsf write '{write-link}' --raw
 ```
 
 On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the producer, and exits with status 130.
@@ -140,11 +141,14 @@ Tail or replay a link or public stream URL:
 ```sh
 tsf tail '{url}'
 tsf tail -n 200 '{url}'
-tsf tail --seq-num 0 --count 500 '{url}'
+tsf tail --seq 0 --limit 500 '{url}'
+tsf tail --since 15m '{url}'
 tsf replay '{url}'
 ```
 
-`tail` follows new records unless `--count` bounds it. `replay` snapshots the current durable tail and exits after printing that range.
+`--last` or `-n` starts relative to the durable tail. `--seq` starts at an S2 sequence number. `--since` accepts a duration or RFC 3339 timestamp. `--limit` bounds the number of records.
+
+`tail` follows new records unless `--limit` bounds it. `replay` snapshots the current durable tail and exits after printing that range.
 
 Both commands preserve payload bytes. They exit successfully when a downstream pipe closes normally.
 
@@ -152,32 +156,36 @@ Inspect stream metadata:
 
 ```sh
 tsf info '{url}'
-tsf info '{url}' --format json
+tsf info '{url}' --json
 ```
 
 Owner links contain `#o=` and can manage the stream:
 
 ```sh
 tsf visibility '{owner-link}' public
-tsf title '{owner-link}' 'Production deploy — west'
-tsf title '{owner-link}' --clear
-tsf renew '{owner-link}' --expires 7d
-tsf link issue '{owner-link}' 'Deploy reader' --permission read --expires 7d
+tsf title set '{owner-link}' 'Production deploy — west'
+tsf title clear '{owner-link}'
+tsf renew '{owner-link}' 7d
+tsf link issue '{owner-link}' 'read=Deploy reader' --expires 7d
 tsf link list '{owner-link}'
-tsf link rename '{owner-link}' '{link_id}' 'CI reader'
-tsf link revoke '{owner-link}' '{link_id}'
+tsf link rename '{owner-link}' '{link_id_or_prefix}' 'CI reader'
+tsf link revoke '{owner-link}' '{link_id_or_prefix}'
 tsf delete '{owner-link}'
 ```
 
-Renewal extends an active stream from the current time. Link permissions are `read`, `write`, `read-write`, and `owner`. Link expiry accepts durations such as `1h` or `7d`, or `never` by default.
+Deletion asks for confirmation on a terminal. Scripts must pass `--yes`.
+
+Renewal extends an active stream from the current time. Link expiry accepts durations such as `1h` or `7d`, or `never` by default.
 
 A stream title contains 1 to 120 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Titles may be duplicated, changed, or cleared. The immutable Stream ID remains the stream identity and URL component.
 
 Every link has a required owner-visible label. Labels contain 1 to 64 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Labels may be renamed and do not need to be unique.
 
-Each link also has an immutable generated Link ID. The CLI uses it for rename and revoke commands. Renaming does not change the secret, permissions, expiry, or established sessions.
+Each link also has an immutable generated Link ID. Rename and revoke accept a full Link ID or an unambiguous prefix of at least four characters. Renaming does not change the secret, permissions, expiry, or established sessions.
 
-Link file options write only the secret value. On Unix, `tsf` creates and tightens these files to mode `0600`.
+Link file options write complete URLs. Any command that accepts a link also accepts `@PATH` to read one complete URL from a file. On Unix, `tsf` creates and tightens link files to mode `0600`.
+
+Commands with structured output accept `--json`.
 
 ## Development
 

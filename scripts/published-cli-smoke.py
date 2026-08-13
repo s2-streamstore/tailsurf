@@ -46,8 +46,8 @@ def main() -> int:
                 tsf_bin,
                 args.api_url,
                 args.web_url,
-                ["--to", created.write_link],
-                "tsf --to",
+                ["write", created.write_link],
+                "tsf write",
                 input_data=message,
             )
             replayed = run_tsf(
@@ -64,7 +64,7 @@ def main() -> int:
                 tsf_bin,
                 args.api_url,
                 args.web_url,
-                ["delete", created.owner_link],
+                ["delete", created.owner_link, "--yes"],
                 "tsf delete cleanup",
                 expect_success=False,
             )
@@ -73,7 +73,7 @@ def main() -> int:
             tsf_bin,
             args.api_url,
             args.web_url,
-            ["delete", created.owner_link],
+            ["delete", created.owner_link, "--yes"],
             "tsf delete",
         )
 
@@ -124,8 +124,7 @@ def create_stream(tsf_bin: str, api_url: str, web_url: str) -> CreatedStream:
         web_url,
         [
             "new",
-            "--format",
-            "json",
+            "--json",
             "--link",
             "owner=Smoke owner",
             "--link",
@@ -133,7 +132,7 @@ def create_stream(tsf_bin: str, api_url: str, web_url: str) -> CreatedStream:
             "--link",
             "read=Smoke reader",
         ],
-        "tsf new --format json",
+        "tsf new --json",
     )
     return parse_created_stream(result.stdout)
 

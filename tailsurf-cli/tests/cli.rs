@@ -71,65 +71,11 @@ fn update_refuses_an_unmanaged_executable() {
 }
 
 #[test]
-fn to_rejects_creation_options() {
-    const WRITE_LINK: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-    let misplaced_public = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["--to", WRITE_LINK, "--public"])
-        .output()
-        .expect("tsf --to link --public");
-    assert!(!misplaced_public.status.success());
-    assert!(
-        String::from_utf8(misplaced_public.stderr)
-            .expect("stderr UTF-8")
-            .contains("--public cannot be used with --to")
-    );
-
-    let misplaced_title = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["--to", WRITE_LINK, "--title", "Deploy log"])
-        .output()
-        .expect("tsf --to link --title");
-    assert!(!misplaced_title.status.success());
-    assert!(
-        String::from_utf8(misplaced_title.stderr)
-            .expect("stderr UTF-8")
-            .contains("--title cannot be used with --to")
-    );
-
-    let misplaced_expiry = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["--to", WRITE_LINK, "--expires", "6h"])
-        .output()
-        .expect("tsf --to link --expires 6h");
-    assert!(!misplaced_expiry.status.success());
-    assert!(
-        String::from_utf8(misplaced_expiry.stderr)
-            .expect("stderr UTF-8")
-            .contains("--expires cannot be used with --to")
-    );
-
-    let misplaced_recovery_key = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args([
-            "--to",
-            WRITE_LINK,
-            "--create-idempotency-key",
-            TEST_STREAM_LINK,
-        ])
-        .output()
-        .expect("tsf --to link --create-idempotency-key");
-    assert!(!misplaced_recovery_key.status.success());
-    assert!(
-        String::from_utf8(misplaced_recovery_key.stderr)
-            .expect("stderr UTF-8")
-            .contains("--create-idempotency-key cannot be used with --to")
-    );
-}
-
-#[test]
 fn renew_rejects_an_overflowing_expiry() {
     const OWNER_LINK: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#o=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     let renewed = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["renew", OWNER_LINK, "--expires", "18446744073709551615s"])
+        .args(["renew", OWNER_LINK, "18446744073709551615s"])
         .output()
         .expect("tsf renew with overflowing expiry");
 
@@ -168,8 +114,7 @@ async fn new_outputs_json_and_link_files() {
             "new",
             "--title",
             "Link file test",
-            "--format",
-            "json",
+            "--json",
             "--link",
             "owner=Owner",
             "--link",
@@ -193,6 +138,11 @@ async fn new_outputs_json_and_link_files() {
     assert_eq!(json["visibility"], "private");
     assert!(json["expires_at"].as_str().is_some());
     assert_eq!(json["links"].as_array().map(Vec::len), Some(3));
+    assert!(
+        json["links"]
+            .as_array()
+            .is_some_and(|links| links.iter().all(|link| link.get("secret").is_none()))
+    );
     for (path, label) in [
         (&owner_file, "Owner"),
         (&read_file, "Reader"),
@@ -200,11 +150,8 @@ async fn new_outputs_json_and_link_files() {
     ] {
         let url = created_link_url(&json, label);
         let locator = StreamLocator::parse(url).expect("matching URL parses");
-        let expected = locator.link.expect("matching URL link");
-        assert_eq!(
-            fs::read_to_string(path).expect("link file"),
-            expected.secret.expose_secret()
-        );
+        locator.link.expect("matching URL link");
+        assert_eq!(fs::read_to_string(path).expect("link file"), url);
     }
     #[cfg(unix)]
     for path in [&owner_file, &read_file, &write_file] {
@@ -219,6 +166,13 @@ async fn new_outputs_json_and_link_files() {
             path.display()
         );
     }
+
+    let owner_file_arg = format!("@{}", owner_file.display());
+    let info = run_tsf(&server, ["info", owner_file_arg.as_str(), "--json"], None).await;
+    assert!(info.status.success(), "stderr={}", info.stderr);
+    let info_json: serde_json::Value =
+        serde_json::from_str(&info.stdout).expect("info JSON from @file link");
+    assert_eq!(info_json["stream_id"], json["stream_id"]);
 
     fs::remove_dir_all(tmp).expect("cleanup");
     server.abort();
@@ -241,8 +195,7 @@ async fn new_prints_recovery_links_before_a_link_file_error() {
         &server,
         [
             "new",
-            "--format",
-            "json",
+            "--json",
             "--owner-link-file",
             unwritable_path.to_str().expect("link path"),
         ],
@@ -273,7 +226,7 @@ async fn new_prints_recovery_links_before_a_link_file_error() {
 async fn new_retries_with_one_canonical_idempotency_key() {
     let server = TestServer::start_with_create_failures(1).await;
 
-    let output = run_tsf(&server, ["new", "--format", "json"], None).await;
+    let output = run_tsf(&server, ["new", "--json"], None).await;
 
     assert!(output.status.success(), "stderr={}", output.stderr);
     let keys = server.create_idempotency_keys();
@@ -317,7 +270,7 @@ async fn create_stream_recovers_a_committed_truncated_response() {
 async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
     let server = TestServer::start_with_create_failures(3).await;
 
-    let failed = run_tsf(&server, ["new", "--format", "json"], None).await;
+    let failed = run_tsf(&server, ["new", "--json"], None).await;
 
     assert!(!failed.status.success());
     let recovery_key = failed
@@ -341,13 +294,7 @@ async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
 
     let recovered = run_tsf(
         &server,
-        [
-            "new",
-            "--format",
-            "json",
-            "--create-idempotency-key",
-            recovery_key,
-        ],
+        ["new", "--json", "--create-idempotency-key", recovery_key],
         None,
     )
     .await;
@@ -381,9 +328,9 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(private.status.success(), "stderr={}", private.stderr);
     assert_eq!(
         normalize_created_stream_output(&private.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
-    assert_created_links_parse(&private.stdout, &[("Owner", "o")]);
+    assert_created_links_parse(&private.stdout, &[("Reader", "r"), ("Owner", "o")]);
 
     let public = run_tsf(&server, ["new", "--public"], None).await;
     assert!(public.status.success(), "stderr={}", public.stderr);
@@ -484,7 +431,7 @@ async fn new_link_files_require_the_exact_requested_permission() {
             "new",
             "--link",
             "read-write=Combined",
-            "--read-link-file",
+            "--write-link-file",
             "unused.link",
         ],
         None,
@@ -495,7 +442,7 @@ async fn new_link_files_require_the_exact_requested_permission() {
     assert!(
         output
             .stderr
-            .contains("--read-link-file requires a link with read permission"),
+            .contains("--write-link-file requires a link with write permission"),
         "stderr={}",
         output.stderr
     );
@@ -508,20 +455,15 @@ async fn new_link_files_require_the_exact_requested_permission() {
 async fn new_and_capture_accept_human_expiry_and_surface_free_limits() {
     let server = TestServer::start().await;
 
-    let finite = run_tsf(
-        &server,
-        ["new", "--expires", "7d", "--format", "json"],
-        None,
-    )
-    .await;
+    let finite = run_tsf(&server, ["new", "--expires", "7d", "--json"], None).await;
     assert!(finite.status.success(), "stderr={}", finite.stderr);
     let finite_json: serde_json::Value =
         serde_json::from_str(&finite.stdout).expect("finite JSON output");
     assert!(finite_json["expires_at"].as_str().is_some());
 
-    let capture = run_tsf(&server, ["--expires", "6h"], Some("retained\n")).await;
+    let capture = run_tsf(&server, ["new", "--expires", "6h"], Some("retained\n")).await;
     assert!(capture.status.success(), "stderr={}", capture.stderr);
-    assert!(capture.stderr.contains("Expires: "));
+    assert!(capture.stdout.contains("Expires: "));
 
     let denied = run_tsf(&server, ["new", "--expires", "864001s"], None).await;
     assert!(!denied.status.success());
@@ -539,19 +481,23 @@ async fn new_and_capture_accept_human_expiry_and_surface_free_limits() {
 #[tokio::test]
 async fn public_capture_prints_a_public_url_on_stdout() {
     let server = TestServer::start().await;
-    let output = run_tsf(&server, ["--public"], Some("public\n")).await;
+    let output = run_tsf(&server, ["new", "--public"], Some("public\n")).await;
 
     assert!(output.status.success(), "stderr={}", output.stderr);
-    assert_eq!(output.stdout.lines().count(), 1);
-    let public_url = Url::parse(output.stdout.trim()).expect("public URL");
+    let public_url = output
+        .stdout
+        .lines()
+        .find_map(|line| extract_link_line(line, "Public"))
+        .map(|url| Url::parse(url).expect("public URL"))
+        .expect("public link");
     assert_eq!(
         public_url.origin().ascii_serialization(),
         "http://localhost:3000"
     );
     assert!(public_url.path().starts_with("/s/"));
     assert!(public_url.fragment().is_none());
-    assert!(output.stderr.contains("Created public stream"));
-    assert!(output.stderr.contains("1 record durable · read "));
+    assert!(output.stdout.contains("Created public stream"));
+    assert!(output.stderr.contains("1 record durable"));
 
     server.abort();
 }
@@ -562,9 +508,12 @@ async fn piped_input_without_a_subcommand_creates_and_writes() {
     let output = run_tsf(&server, [], Some("implicit write\n")).await;
 
     assert!(output.status.success(), "stderr={}", output.stderr);
-    assert_eq!(output.stdout.lines().count(), 1);
-    assert!(output.stderr.contains("Created private stream"));
-    let read_link = output.stdout.trim();
+    assert!(output.stdout.contains("Created private stream"));
+    let read_link = output
+        .stdout
+        .lines()
+        .find_map(|line| extract_link_line(line, "Reader"))
+        .expect("read link");
     StreamLocator::parse(read_link).expect("valid read link");
 
     let replay = run_tsf(&server, ["replay", read_link], None).await;
@@ -579,18 +528,17 @@ async fn capture_then_replay_round_trips_piped_input() {
     let server = TestServer::start().await;
     let output = run_tsf(&server, [], Some("hello from cli integration\n")).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
-    assert_eq!(output.stdout.lines().count(), 1);
     assert_eq!(
-        normalize_created_stream_output(&output.stderr),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n<records> durable · read <url>\n"
+        normalize_created_stream_output(&output.stdout),
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert!(
-        output.stderr.contains("1 record durable · read "),
+        output.stderr.contains("1 record durable"),
         "stderr={}",
         output.stderr
     );
     let owner_link = output
-        .stderr
+        .stdout
         .lines()
         .find_map(|line| extract_link_line(line, "Owner"))
         .expect("owner link");
@@ -601,7 +549,11 @@ async fn capture_then_replay_round_trips_piped_input() {
         .expose_secret()
         .to_owned();
     assert_eq!(server.write_link_secrets(), [owner_secret]);
-    let read_link = output.stdout.trim();
+    let read_link = output
+        .stdout
+        .lines()
+        .find_map(|line| extract_link_line(line, "Reader"))
+        .expect("read link");
     StreamLocator::parse(read_link).expect("valid read link");
 
     let replay = run_tsf(&server, ["replay", read_link], None).await;
@@ -610,7 +562,7 @@ async fn capture_then_replay_round_trips_piped_input() {
 
     let bounded_tail = run_tsf(
         &server,
-        ["tail", "--seq-num", "0", "--count", "1", read_link],
+        ["tail", "--seq", "0", "--limit", "1", read_link],
         None,
     )
     .await;
@@ -629,13 +581,22 @@ async fn capture_command_streams_output_and_propagates_exit_status() {
     let server = TestServer::start().await;
     let output = run_tsf(
         &server,
-        ["--", "sh", "-c", "printf out; printf err >&2; exit 7"],
+        [
+            "new",
+            "--",
+            "sh",
+            "-c",
+            "printf out; printf err >&2; exit 7",
+        ],
         None,
     )
     .await;
     assert_eq!(output.status.code(), Some(7), "stderr={}", output.stderr);
-    assert_eq!(output.stdout.lines().count(), 1);
-    let read_link = output.stdout.trim();
+    let read_link = output
+        .stdout
+        .lines()
+        .find_map(|line| extract_link_line(line, "Reader"))
+        .expect("read link");
 
     let replay = run_tsf(&server, ["replay", read_link], None).await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
@@ -655,7 +616,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     let output = run_tsf(&server, [], Some(input.as_str())).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_link = output
-        .stderr
+        .stdout
         .lines()
         .find_map(|line| extract_link_line(line, "Reader"))
         .expect("read link");
@@ -711,7 +672,7 @@ async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() 
         output.stderr
     );
     let read_link = output
-        .stderr
+        .stdout
         .lines()
         .find_map(|line| extract_link_line(line, "Reader"))
         .expect("read link is printed before writing");
@@ -726,10 +687,10 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let server = TestServer::start().await;
     let input = "x".repeat(MAX_RECORD_BYTES + 10);
 
-    let output = run_tsf(&server, ["--raw"], Some(input.as_str())).await;
+    let output = run_tsf(&server, ["new", "--raw"], Some(input.as_str())).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_link = output
-        .stderr
+        .stdout
         .lines()
         .find_map(|line| extract_link_line(line, "Reader"))
         .expect("read link");
@@ -784,13 +745,20 @@ async fn write_raw_flushes_on_linger() {
 
     let output = run_tsf(
         &server,
-        ["--raw", "--", "sh", "-c", "printf a; sleep 0.1; printf b"],
+        [
+            "new",
+            "--raw",
+            "--",
+            "sh",
+            "-c",
+            "printf a; sleep 0.1; printf b",
+        ],
         None,
     )
     .await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_link = output
-        .stderr
+        .stdout
         .lines()
         .find_map(|line| extract_link_line(line, "Reader"))
         .expect("read link");
@@ -837,13 +805,13 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         .kill_on_drop(true);
     let mut child = command.spawn().expect("spawn tsf capture");
     let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
     let mut stderr_output = String::new();
     let read_link = loop {
         let mut line = String::new();
-        let read = stderr.read_line(&mut line).await.expect("read created URL");
+        let read = stdout.read_line(&mut line).await.expect("read created URL");
         assert!(read > 0, "tsf exited before printing a read link");
-        stderr_output.push_str(&line);
         if let Some(url) = extract_link_line(&line, "Reader") {
             break url.trim_end().to_owned();
         }
@@ -896,7 +864,7 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["--to", write_link.as_str()],
+        ["write", write_link.as_str()],
         Some("retry me\n"),
     )
     .await;
@@ -1086,7 +1054,7 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
 
     let tail_offset_output = run_tsf_until_stdout_contains(
         tail_offset_server.api_url.clone(),
-        ["tail", "-n", "25", "--count", "7", read_link.as_str()],
+        ["tail", "--last", "25", "--limit", "7", read_link.as_str()],
         b"first\n",
         Duration::from_secs(5),
     )
@@ -1111,14 +1079,7 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     let seq_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let seq_output = run_tsf_until_stdout_contains(
         seq_server.api_url.clone(),
-        [
-            "tail",
-            "--seq-num",
-            "42",
-            "--count",
-            "3",
-            read_link.as_str(),
-        ],
+        ["tail", "--seq", "42", "--limit", "3", read_link.as_str()],
         b"first\n",
         Duration::from_secs(5),
     )
@@ -1143,7 +1104,12 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     let timestamp_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let timestamp_output = run_tsf_until_stdout_contains(
         timestamp_server.api_url.clone(),
-        ["tail", "--timestamp", "1781717406000", read_link.as_str()],
+        [
+            "tail",
+            "--since",
+            "2026-06-17T17:30:06Z",
+            read_link.as_str(),
+        ],
         b"first\n",
         Duration::from_secs(5),
     )
@@ -1366,7 +1332,7 @@ async fn zero_count_reads_complete_without_opening_a_socket() {
 
     let tail = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["tail", "--count", "0", read_link.as_str()],
+        ["tail", "--limit", "0", read_link.as_str()],
         None,
     )
     .await;
@@ -1375,7 +1341,7 @@ async fn zero_count_reads_complete_without_opening_a_socket() {
 
     let replay = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["replay", "--count", "0", read_link.as_str()],
+        ["replay", "--limit", "0", read_link.as_str()],
         None,
     )
     .await;
@@ -1395,7 +1361,7 @@ async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["tail", "-n", "10", "--seq-num", "5", read_link.as_str()],
+        ["tail", "--last", "10", "--seq", "5", read_link.as_str()],
         None,
     )
     .await;
@@ -1490,7 +1456,7 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let seq_output = run_tsf_with_api_url(
         seq_server.api_url.clone(),
-        ["replay", "--seq-num", "2", read_link.as_str()],
+        ["replay", "--seq", "2", read_link.as_str()],
         None,
     )
     .await;
@@ -1516,7 +1482,12 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     let timestamp_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let timestamp_output = run_tsf_with_api_url(
         timestamp_server.api_url.clone(),
-        ["replay", "--timestamp", "1781717406000", read_link.as_str()],
+        [
+            "replay",
+            "--since",
+            "2026-06-17T17:30:06Z",
+            read_link.as_str(),
+        ],
         None,
     )
     .await;
@@ -1543,7 +1514,7 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     let count_server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
     let count_output = run_tsf_bytes_with_api_url(
         count_server.api_url.clone(),
-        ["replay", "--count", "1", read_link.as_str()],
+        ["replay", "--limit", "1", read_link.as_str()],
     )
     .await;
 
@@ -1602,15 +1573,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     let server = TestServer::start().await;
     let created = run_tsf(
         &server,
-        [
-            "new",
-            "--title",
-            "Deploy log",
-            "--expires",
-            "1d",
-            "--format",
-            "json",
-        ],
+        ["new", "--title", "Deploy log", "--expires", "1d", "--json"],
         None,
     )
     .await;
@@ -1619,7 +1582,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         serde_json::from_str(&created.stdout).expect("create output");
     let owner_link = created_link_url(&created_json, "Owner");
 
-    let info = run_tsf(&server, ["info", owner_link, "--format", "json"], None).await;
+    let info = run_tsf(&server, ["info", owner_link, "--json"], None).await;
     assert!(info.status.success(), "stderr={}", info.stderr);
     let info_json: serde_json::Value =
         serde_json::from_str(&info.stdout).expect("stream info output");
@@ -1629,12 +1592,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     assert_eq!(info_json["state"], "active");
     assert_eq!(info_json["expires_at"], created_json["expires_at"]);
 
-    let renewed = run_tsf(
-        &server,
-        ["renew", owner_link, "--expires", "2d", "--format", "json"],
-        None,
-    )
-    .await;
+    let renewed = run_tsf(&server, ["renew", owner_link, "2d", "--json"], None).await;
     assert!(renewed.status.success(), "stderr={}", renewed.stderr);
     let renewed_json: serde_json::Value =
         serde_json::from_str(&renewed.stdout).expect("renew output");
@@ -1642,7 +1600,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
 
     let visibility = run_tsf(
         &server,
-        ["visibility", owner_link, "public", "--format", "json"],
+        ["visibility", owner_link, "public", "--json"],
         None,
     )
     .await;
@@ -1653,7 +1611,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
 
     let titled = run_tsf(
         &server,
-        ["title", owner_link, "Deploy log west", "--format", "json"],
+        ["title", "set", owner_link, "Deploy log west", "--json"],
         None,
     )
     .await;
@@ -1662,12 +1620,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         serde_json::from_str(&titled.stdout).expect("title output");
     assert_eq!(titled_json["title"], "Deploy log west");
 
-    let cleared = run_tsf(
-        &server,
-        ["title", owner_link, "--clear", "--format", "json"],
-        None,
-    )
-    .await;
+    let cleared = run_tsf(&server, ["title", "clear", owner_link, "--json"], None).await;
     assert!(cleared.status.success(), "stderr={}", cleared.stderr);
     let cleared_json: serde_json::Value =
         serde_json::from_str(&cleared.stdout).expect("title clear output");
@@ -1675,16 +1628,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
 
     let issued = run_tsf(
         &server,
-        [
-            "link",
-            "issue",
-            owner_link,
-            "Deploy reader",
-            "--permission",
-            "read",
-            "--format",
-            "json",
-        ],
+        ["link", "issue", owner_link, "read=Deploy reader", "--json"],
         None,
     )
     .await;
@@ -1695,18 +1639,14 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     StreamLocator::parse(issued_url).expect("issued URL parses");
     let link_id = issued_json["link_id"].as_str().expect("link id").to_owned();
     assert_eq!(issued_json["label"], "Deploy reader");
+    assert!(issued_json.get("secret").is_none());
 
     server.fail_next_link_list();
-    let listed = run_tsf(
-        &server,
-        ["link", "list", owner_link, "--format", "json"],
-        None,
-    )
-    .await;
+    let listed = run_tsf(&server, ["link", "list", owner_link, "--json"], None).await;
     assert!(listed.status.success(), "stderr={}", listed.stderr);
     let listed_json: serde_json::Value =
         serde_json::from_str(&listed.stdout).expect("link list output");
-    assert_eq!(listed_json["links"].as_array().map(Vec::len), Some(2));
+    assert_eq!(listed_json["links"].as_array().map(Vec::len), Some(3));
     assert_eq!(
         listed_json["links"]
             .as_array()
@@ -1715,20 +1655,28 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         Some(&serde_json::Value::String("active".to_owned()))
     );
 
+    let link_prefix = &link_id[..8];
     let renamed = run_tsf(
         &server,
-        ["link", "rename", owner_link, link_id.as_str(), "CI reader"],
+        [
+            "link",
+            "rename",
+            owner_link,
+            link_prefix,
+            "CI reader",
+            "--json",
+        ],
         None,
     )
     .await;
     assert!(renamed.status.success(), "stderr={}", renamed.stderr);
+    let renamed_json: serde_json::Value =
+        serde_json::from_str(&renamed.stdout).expect("rename output");
+    assert_eq!(renamed_json["link_id"], link_id);
+    assert_eq!(renamed_json["status"], "renamed");
+    assert_eq!(renamed_json["label"], "CI reader");
 
-    let listed = run_tsf(
-        &server,
-        ["link", "list", owner_link, "--format", "json"],
-        None,
-    )
-    .await;
+    let listed = run_tsf(&server, ["link", "list", owner_link, "--json"], None).await;
     let listed_json: serde_json::Value =
         serde_json::from_str(&listed.stdout).expect("renamed link list output");
     assert_eq!(
@@ -1741,19 +1689,17 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
 
     let revoked = run_tsf(
         &server,
-        ["link", "revoke", owner_link, link_id.as_str()],
+        ["link", "revoke", owner_link, link_prefix, "--json"],
         None,
     )
     .await;
     assert!(revoked.status.success(), "stderr={}", revoked.stderr);
-    assert_eq!(revoked.stdout, "");
+    let revoked_json: serde_json::Value =
+        serde_json::from_str(&revoked.stdout).expect("revoke output");
+    assert_eq!(revoked_json["link_id"], link_id);
+    assert_eq!(revoked_json["status"], "revoked");
 
-    let listed = run_tsf(
-        &server,
-        ["link", "list", owner_link, "--format", "json"],
-        None,
-    )
-    .await;
+    let listed = run_tsf(&server, ["link", "list", owner_link, "--json"], None).await;
     let listed_json: serde_json::Value =
         serde_json::from_str(&listed.stdout).expect("link list output");
     assert_eq!(
@@ -1764,9 +1710,12 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         Some(&serde_json::Value::String("revoked".to_owned()))
     );
 
-    let deleted = run_tsf(&server, ["delete", owner_link], None).await;
+    let deleted = run_tsf(&server, ["delete", owner_link, "--yes", "--json"], None).await;
     assert!(deleted.status.success(), "stderr={}", deleted.stderr);
-    assert_eq!(deleted.stdout, "");
+    let deleted_json: serde_json::Value =
+        serde_json::from_str(&deleted.stdout).expect("delete output");
+    assert_eq!(deleted_json["stream_id"], created_json["stream_id"]);
+    assert_eq!(deleted_json["status"], "deleted");
 
     let after_delete = run_tsf(&server, ["visibility", owner_link, "private"], None).await;
     assert!(
@@ -2457,7 +2406,7 @@ fn test_issue_stream_link(
     permissions: LinkPermissions,
 ) -> TestLink {
     let mut next_link = state.next_link.lock().expect("next link lock");
-    let link_id = format!("{:024x}", *next_link)
+    let link_id = format!("{:x}{:023x}", *next_link, *next_link)
         .parse::<LinkId>()
         .expect("link id");
     let secret = LinkSecret::from(format!("{:042}A", *next_link));
