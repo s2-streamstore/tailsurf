@@ -39,8 +39,8 @@ use crate::{
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
-            ListLinksResponse, RenameLinkRequest, StreamInfoResponse, StreamRangeResponse,
-            StreamTailResponse, UpdateStreamRequest,
+            ListLinksResponse, RenameLinkRequest, StreamBootstrapResponse, StreamInfoResponse,
+            StreamRangeResponse, StreamTailResponse, UpdateStreamRequest,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -242,6 +242,22 @@ impl TsfClient {
         self.get_json_with_bearer(
             format!("/streams/{stream_id}/tail"),
             "check stream tail",
+            link_secret,
+        )
+        .await
+    }
+
+    /// Retrieves workspace metadata and bounds with one authorization lookup.
+    ///
+    /// Private streams require a read-capable stream link. Public streams may pass `None`.
+    pub async fn get_stream_bootstrap(
+        &self,
+        stream_id: &StreamId,
+        link_secret: Option<&LinkSecret>,
+    ) -> Result<StreamBootstrapResponse, TsfClientError> {
+        self.get_json_with_bearer(
+            format!("/streams/{stream_id}/bootstrap"),
+            "bootstrap stream",
             link_secret,
         )
         .await

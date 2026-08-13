@@ -267,6 +267,15 @@ pub struct StreamRangeResponse {
     pub read_authorization: Option<String>,
 }
 
+/// Metadata and read bounds needed to open one stream workspace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StreamBootstrapResponse {
+    /// Current stream metadata.
+    pub stream: StreamInfoResponse,
+    /// Current stream bounds and a short-lived read authorization.
+    pub range: StreamRangeResponse,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
