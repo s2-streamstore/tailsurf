@@ -437,7 +437,7 @@ impl FromStr for InitialLinkArg {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let (label, permission) = value
-            .split_once('=')
+            .rsplit_once('=')
             .ok_or_else(|| "link must use LABEL=PERMISSION".to_owned())?;
         Ok(Self(InitialStreamLink {
             label: label
@@ -2146,6 +2146,16 @@ mod tests {
             .expect("parser leaves mixed-mode validation to main");
         assert!(mixed.command.is_some());
         assert!(capture_has_explicit_intent(&mixed.capture));
+    }
+
+    #[test]
+    fn initial_link_labels_may_contain_equals_signs() {
+        let parsed = "CI=prod=read"
+            .parse::<InitialLinkArg>()
+            .expect("valid initial link");
+
+        assert_eq!(parsed.0.label.as_str(), "CI=prod");
+        assert_eq!(parsed.0.permissions, LinkPermissions::read());
     }
 
     #[test]
