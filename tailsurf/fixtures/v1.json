@@ -15,7 +15,7 @@
       "hex": "0100030000000000000050"
     },
     {
-      "name": "open authenticated bounded playback read",
+      "name": "open authenticated paced read",
       "frame": {
         "type": "open_read",
         "start_type": "timestamp_ms",
