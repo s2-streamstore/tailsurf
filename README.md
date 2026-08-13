@@ -96,7 +96,7 @@ make test | tsf --title 'Test run' --expires 6h
 
 Streams expire after 10 days by default. Their complete history remains readable until expiry.
 
-`tsf new` prints the title, Stream ID, expiry, and an owner link. The title is optional. Issue more labeled links at creation with `--link 'Build reader=read'`, `--link 'Deploy writer=write'`, `--link 'Operator=read-write'`, or `--link 'Backup owner=owner'`. Links are shown once.
+`tsf new` prints the title, Stream ID, expiry, and an owner link. The title is optional. Issue more labeled links at creation with `--link 'read=Build reader'`, `--link 'write=Deploy writer'`, `--link 'read-write=Operator'`, or `--link 'owner=Backup owner'`. Links are shown once.
 
 Stream command output into a new stream:
 

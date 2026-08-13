@@ -124,8 +124,8 @@ struct NewArgs {
     /// Allow anonymous reads.
     #[arg(long)]
     public: bool,
-    /// Issue an additional labeled link at creation, as LABEL=PERMISSION. May be repeated.
-    #[arg(long = "link", value_name = "LABEL=PERMISSION")]
+    /// Issue an additional labeled link at creation, as PERMISSION=LABEL. May be repeated.
+    #[arg(long = "link", value_name = "PERMISSION=LABEL")]
     links: Vec<InitialLinkArg>,
     #[arg(
         long,
@@ -145,7 +145,7 @@ struct NewArgs {
     /// Write the exact read-only link secret to this file. Requires a read link.
     #[arg(long = "read-link-file", value_name = "PATH")]
     read_link_file: Option<PathBuf>,
-    /// Write the exact write-only link secret to this file. Requires `--link LABEL=write`.
+    /// Write the exact write-only link secret to this file. Requires `--link write=LABEL`.
     #[arg(long = "write-link-file", value_name = "PATH")]
     write_link_file: Option<PathBuf>,
 }
@@ -436,9 +436,9 @@ impl FromStr for InitialLinkArg {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (label, permission) = value
-            .rsplit_once('=')
-            .ok_or_else(|| "link must use LABEL=PERMISSION".to_owned())?;
+        let (permission, label) = value
+            .split_once('=')
+            .ok_or_else(|| "link must use PERMISSION=LABEL".to_owned())?;
         Ok(Self(InitialStreamLink {
             label: label
                 .parse()
@@ -2150,7 +2150,7 @@ mod tests {
 
     #[test]
     fn initial_link_labels_may_contain_equals_signs() {
-        let parsed = "CI=prod=read"
+        let parsed = "read=CI=prod"
             .parse::<InitialLinkArg>()
             .expect("valid initial link");
 

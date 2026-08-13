@@ -171,11 +171,11 @@ async fn new_outputs_json_and_link_files() {
             "--format",
             "json",
             "--link",
-            "Owner=owner",
+            "owner=Owner",
             "--link",
-            "Reader=read",
+            "read=Reader",
             "--link",
-            "Writer=write",
+            "write=Writer",
             "--owner-link-file",
             owner_file.to_str().expect("owner path"),
             "--read-link-file",
@@ -398,9 +398,9 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
         [
             "new",
             "--link",
-            "Combined=read-write",
+            "read-write=Combined",
             "--link",
-            "Reader=read",
+            "read=Reader",
         ],
         None,
     )
@@ -424,7 +424,7 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
 
     let deduplicated = run_tsf(
         &server,
-        ["new", "--link", "Admin=owner", "--link", "Reader=read"],
+        ["new", "--link", "owner=Admin", "--link", "read=Reader"],
         None,
     )
     .await;
@@ -437,7 +437,7 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
 
     let duplicate_labels = run_tsf(
         &server,
-        ["new", "--link", "Same=read", "--link", "Same=write"],
+        ["new", "--link", "read=Same", "--link", "write=Same"],
         None,
     )
     .await;
@@ -452,11 +452,11 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
         [
             "new",
             "--link",
-            "Reader=read",
+            "read=Reader",
             "--link",
-            "Writer=write",
+            "write=Writer",
             "--link",
-            "Combined=read-write",
+            "read-write=Combined",
         ],
         None,
     )
@@ -483,7 +483,7 @@ async fn new_link_files_require_the_exact_requested_permission() {
         [
             "new",
             "--link",
-            "Combined=read-write",
+            "read-write=Combined",
             "--read-link-file",
             "unused.link",
         ],
