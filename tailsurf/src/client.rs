@@ -39,8 +39,7 @@ use crate::{
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
-            ListLinksResponse, RenameLinkRequest, StreamInfoResponse, StreamTailResponse,
-            UpdateStreamRequest,
+            ListLinksResponse, RenameLinkRequest, StreamInfoResponse, UpdateStreamRequest,
         },
         ws::{
             DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
@@ -48,7 +47,7 @@ use crate::{
             frame::{
                 AppendRecord, ClientFrame, FrameCodecError, MAX_APPEND_BATCH_RECORDS,
                 MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
-                ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+                ReadSnapshotBoundary, ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
             },
         },
     },
@@ -232,22 +231,6 @@ impl TsfClient {
             .await
     }
 
-    /// Retrieves the current durable stream tail, retrying transient failures according to policy.
-    ///
-    /// Private streams require a read-capable stream link. Public streams may pass `None`.
-    pub async fn get_stream_tail(
-        &self,
-        stream_id: &StreamId,
-        link_secret: Option<&LinkSecret>,
-    ) -> Result<StreamTailResponse, TsfClientError> {
-        self.get_json_with_bearer(
-            format!("/streams/{stream_id}/tail"),
-            "check stream tail",
-            link_secret,
-        )
-        .await
-    }
-
     /// Updates owner-controlled stream settings.
     ///
     /// This mutation is attempted once and is not transparently retried.
@@ -410,18 +393,21 @@ impl TsfClient {
     /// Connects a resumable read session at the requested position and bounds.
     pub async fn connect_reader(
         &self,
-        options: ReadStreamOptions,
+        mut options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
         let ConnectedReadSocket {
             socket,
             stream_info,
+            snapshot_boundary,
         } = self.connect_read_socket(options.clone()).await?;
+        apply_snapshot_boundary(&mut options, snapshot_boundary);
         Ok(TsfReadSession::new(
             self.clone(),
             options,
             socket,
             stream_info,
             None,
+            snapshot_boundary,
         ))
     }
 
@@ -450,9 +436,12 @@ impl TsfClient {
                     maximum: MAX_PLAYBACK_RATE_PERMILLE,
                 });
             }
-            if options.until.is_none() {
+            if options.until.is_none() && !options.snapshot {
                 return Err(TsfClientError::PlaybackRequiresUntil);
             }
+        }
+        if options.snapshot && options.until.is_some() {
+            return Err(TsfClientError::SnapshotWithUntil);
         }
         let opening_frame = ClientFrame::OpenRead {
             link_secret: options.link_secret.clone(),
@@ -462,12 +451,14 @@ impl TsfClient {
             count: options.count,
             until: options.until,
             playback_rate_permille: options.playback_rate_permille,
+            snapshot: options.snapshot,
         }
         .encode()?;
         let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
         let read_idle_timeout = self.config.websocket_read_idle_timeout;
+        let snapshot = options.snapshot;
 
         self.retry_transient(|| {
             let url = url.clone();
@@ -477,10 +468,10 @@ impl TsfClient {
                 let mut ws =
                     connect_websocket(url, connect_timeout, operation_timeout, opening_frame)
                         .await?;
-                let stream_info = with_timeout(
+                let handshake = with_timeout(
                     operation_timeout,
                     "reader handshake",
-                    expect_read_handshake(&mut ws),
+                    expect_read_handshake(&mut ws, snapshot),
                 )
                 .await?;
 
@@ -490,7 +481,8 @@ impl TsfClient {
                         read_idle_timeout,
                         pending_records: VecDeque::new(),
                     },
-                    stream_info,
+                    stream_info: handshake.stream_info,
+                    snapshot_boundary: handshake.snapshot_boundary,
                 })
             }
         })
@@ -1394,6 +1386,7 @@ pub struct TsfReadSession {
     stream_info: ReadStreamInfo,
     finished: bool,
     last_caught_up: Option<ReadCaughtUp>,
+    snapshot_boundary: Option<ReadSnapshotBoundary>,
     no_progress_reconnects: usize,
     reconnect_backoff: Duration,
     pending_reconnect_backoff: Duration,
@@ -1407,6 +1400,7 @@ impl TsfReadSession {
         socket: ReadSocket,
         stream_info: ReadStreamInfo,
         last_caught_up: Option<ReadCaughtUp>,
+        snapshot_boundary: Option<ReadSnapshotBoundary>,
     ) -> Self {
         let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
@@ -1416,6 +1410,7 @@ impl TsfReadSession {
             stream_info,
             finished: false,
             last_caught_up,
+            snapshot_boundary,
             no_progress_reconnects: 0,
             reconnect_backoff,
             pending_reconnect_backoff: Duration::ZERO,
@@ -1426,6 +1421,11 @@ impl TsfReadSession {
     /// Returns the latest reconnect-safe position reported after preceding records were delivered.
     pub const fn last_caught_up(&self) -> Option<ReadCaughtUp> {
         self.last_caught_up
+    }
+
+    /// Returns the fixed exclusive end captured for a snapshot read.
+    pub const fn snapshot_boundary(&self) -> Option<ReadSnapshotBoundary> {
+        self.snapshot_boundary
     }
 
     /// Returns metadata supplied by the latest successful read handshake.
@@ -1489,12 +1489,17 @@ impl TsfReadSession {
         let ConnectedReadSocket {
             socket,
             stream_info,
+            snapshot_boundary,
         } = self
             .client
             .connect_read_socket(self.options.clone())
             .await?;
         self.socket = socket;
         self.stream_info = stream_info;
+        apply_snapshot_boundary(&mut self.options, snapshot_boundary);
+        if snapshot_boundary.is_some() {
+            self.snapshot_boundary = snapshot_boundary;
+        }
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
         Ok(())
@@ -1558,6 +1563,22 @@ struct ReadSocket {
 struct ConnectedReadSocket {
     socket: ReadSocket,
     stream_info: ReadStreamInfo,
+    snapshot_boundary: Option<ReadSnapshotBoundary>,
+}
+
+fn apply_snapshot_boundary(
+    options: &mut ReadStreamOptions,
+    boundary: Option<ReadSnapshotBoundary>,
+) {
+    let Some(boundary) = boundary else {
+        return;
+    };
+    options.snapshot = false;
+    if boundary.next_seq_num == 0 {
+        options.count = Some(0);
+    } else {
+        options.until = Some(boundary.next_seq_num - 1);
+    }
 }
 
 impl ReadSocket {
@@ -1742,7 +1763,15 @@ async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
     }
 }
 
-async fn expect_read_handshake(ws: &mut ClientWebSocket) -> Result<ReadStreamInfo, TsfClientError> {
+struct ReadHandshake {
+    stream_info: ReadStreamInfo,
+    snapshot_boundary: Option<ReadSnapshotBoundary>,
+}
+
+async fn expect_read_handshake(
+    ws: &mut ClientWebSocket,
+    snapshot: bool,
+) -> Result<ReadHandshake, TsfClientError> {
     expect_ready(ws).await?;
     let stream_info = match next_server_frame(ws).await? {
         Some(ServerFrame::StreamInfo(stream_info)) => stream_info,
@@ -1753,7 +1782,23 @@ async fn expect_read_handshake(ws: &mut ClientWebSocket) -> Result<ReadStreamInf
         }
         None => return Err(TsfClientError::WebSocketClosed),
     };
-    Ok(stream_info)
+    let snapshot_boundary = if snapshot {
+        match next_server_frame(ws).await? {
+            Some(ServerFrame::SnapshotBoundary(boundary)) => Some(boundary),
+            Some(frame) => {
+                return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+                    &frame,
+                )));
+            }
+            None => return Err(TsfClientError::WebSocketClosed),
+        }
+    } else {
+        None
+    };
+    Ok(ReadHandshake {
+        stream_info,
+        snapshot_boundary,
+    })
 }
 
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
@@ -1764,6 +1809,7 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::CaughtUp(_) => "caught up",
         ServerFrame::StreamInfo(_) => "stream info",
+        ServerFrame::SnapshotBoundary(_) => "snapshot boundary",
     }
 }
 
@@ -1883,6 +1929,9 @@ pub enum TsfClientError {
     /// Timestamp playback needs a stable inclusive ending sequence.
     #[error("playback rate requires an inclusive until sequence")]
     PlaybackRequiresUntil,
+    /// A snapshot request also supplied an explicit ending sequence.
+    #[error("snapshot and until are mutually exclusive")]
+    SnapshotWithUntil,
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
@@ -2015,11 +2064,12 @@ mod tests {
             }
         });
 
-        let handshake = expect_read_handshake(&mut client)
+        let handshake = expect_read_handshake(&mut client, false)
             .await
             .expect("read handshake");
 
-        assert_eq!(handshake, expected_stream_info);
+        assert_eq!(handshake.stream_info, expected_stream_info);
+        assert_eq!(handshake.snapshot_boundary, None);
         sender.await.expect("join handshake sender");
     }
 

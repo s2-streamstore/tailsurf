@@ -27,6 +27,8 @@ pub struct ReadStreamOptions {
     pub until: Option<u64>,
     /// Optional timestamp playback rate in thousandths. `1000` is recorded speed.
     pub playback_rate_permille: Option<u64>,
+    /// Captures a fixed ending position when the socket opens.
+    pub snapshot: bool,
     /// Secret from a read-capable stream link for private streams.
     pub link_secret: Option<LinkSecret>,
 }
@@ -40,6 +42,7 @@ impl ReadStreamOptions {
             count: None,
             until: None,
             playback_rate_permille: None,
+            snapshot: false,
             link_secret: None,
         }
     }

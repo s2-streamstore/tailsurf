@@ -11,7 +11,7 @@ use tailsurf::{
             frame::{
                 AppendRecord, ClientFrame, MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES,
                 MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
-                ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+                ReadSnapshotBoundary, ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
             },
         },
     },
@@ -46,6 +46,8 @@ enum ClientFixture {
         count: Option<String>,
         until: Option<String>,
         playback_rate_permille: Option<String>,
+        #[serde(default)]
+        snapshot: bool,
         link_secret: Option<String>,
     },
     OpenWrite {
@@ -81,6 +83,10 @@ enum ServerFixture {
     },
     Heartbeat,
     CaughtUp {
+        next_seq_num: String,
+        last_timestamp_ms: String,
+    },
+    SnapshotBoundary {
         next_seq_num: String,
         last_timestamp_ms: String,
     },
@@ -154,6 +160,7 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             count,
             until,
             playback_rate_permille,
+            snapshot,
             link_secret,
         } => ClientFrame::OpenRead {
             link_secret: link_secret.map(LinkSecret::from),
@@ -161,6 +168,7 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             count: count.as_deref().map(parse_u64),
             until: until.as_deref().map(parse_u64),
             playback_rate_permille: playback_rate_permille.as_deref().map(parse_u64),
+            snapshot,
         },
         ClientFixture::OpenWrite {
             writer_id_hex,
@@ -228,6 +236,13 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             next_seq_num,
             last_timestamp_ms,
         } => ServerFrame::CaughtUp(ReadCaughtUp {
+            next_seq_num: parse_u64(&next_seq_num),
+            last_timestamp_ms: parse_u64(&last_timestamp_ms),
+        }),
+        ServerFixture::SnapshotBoundary {
+            next_seq_num,
+            last_timestamp_ms,
+        } => ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
             next_seq_num: parse_u64(&next_seq_num),
             last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),

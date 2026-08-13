@@ -237,17 +237,6 @@ where
     Option::<StreamTitle>::deserialize(deserializer)
 }
 
-/// Current durable tail position for a stream.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamTailResponse {
-    /// Stable stream identifier.
-    pub stream_id: StreamId,
-    /// Sequence number assigned to the next durable append.
-    pub next_seq_num: u64,
-    /// Timestamp of the last record, or `None` for an empty stream.
-    pub last_timestamp_ms: Option<u64>,
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;

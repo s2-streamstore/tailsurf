@@ -56,8 +56,12 @@ const OPEN_READ_LINK_SECRET: u8 = 0x01;
 const OPEN_READ_COUNT: u8 = 0x02;
 const OPEN_READ_UNTIL: u8 = 0x04;
 const OPEN_READ_PLAYBACK_RATE: u8 = 0x08;
-const OPEN_READ_FLAGS: u8 =
-    OPEN_READ_LINK_SECRET | OPEN_READ_COUNT | OPEN_READ_UNTIL | OPEN_READ_PLAYBACK_RATE;
+const OPEN_READ_SNAPSHOT: u8 = 0x10;
+const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET
+    | OPEN_READ_COUNT
+    | OPEN_READ_UNTIL
+    | OPEN_READ_PLAYBACK_RATE
+    | OPEN_READ_SNAPSHOT;
 
 const READ_START_SEQ_NUM: u8 = 0x01;
 const READ_START_TIMESTAMP_MS: u8 = 0x02;
@@ -72,6 +76,7 @@ enum ServerOp {
     Heartbeat = 0x83,
     CaughtUp = 0x84,
     StreamInfo = 0x85,
+    SnapshotBoundary = 0x86,
 }
 
 impl ServerOp {
@@ -91,6 +96,7 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
             value if value == Self::StreamInfo.byte() => Ok(Self::StreamInfo),
+            value if value == Self::SnapshotBoundary.byte() => Ok(Self::SnapshotBoundary),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
@@ -216,6 +222,15 @@ pub struct ReadCaughtUp {
     pub last_timestamp_ms: u64,
 }
 
+/// Fixed exclusive ending position captured when a snapshot read opens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadSnapshotBoundary {
+    /// Sequence number assigned to the next appended record.
+    pub next_seq_num: u64,
+    /// Timestamp of the last record, or zero for an empty stream.
+    pub last_timestamp_ms: u64,
+}
+
 /// Stream metadata supplied by an authorized read handshake.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReadStreamInfo {
@@ -246,6 +261,8 @@ pub enum ClientFrame {
         until: Option<u64>,
         /// Timestamp playback rate in thousandths.
         playback_rate_permille: Option<u64>,
+        /// Whether the server captures a fixed ending position.
+        snapshot: bool,
     },
     /// Opens a write connection and establishes authorization and writer identity.
     OpenWrite {
@@ -282,6 +299,8 @@ pub enum ServerFrame {
     CaughtUp(ReadCaughtUp),
     /// Supplies stream metadata from the read authorization result.
     StreamInfo(ReadStreamInfo),
+    /// Supplies the fixed exclusive end for a snapshot read.
+    SnapshotBoundary(ReadSnapshotBoundary),
 }
 
 impl ClientFrame {
@@ -297,8 +316,9 @@ impl ClientFrame {
                 count,
                 until,
                 playback_rate_permille,
+                snapshot,
             } => {
-                validate_open_read(*start, *until, *playback_rate_permille)?;
+                validate_open_read(*start, *until, *playback_rate_permille, *snapshot)?;
                 let secret_len = link_secret
                     .as_ref()
                     .map(|secret| secret.expose_secret().len())
@@ -335,12 +355,14 @@ impl ClientFrame {
                 count,
                 until,
                 playback_rate_permille,
+                snapshot,
             } => {
                 output.put_u8(ClientOp::OpenRead.byte());
                 let flags = link_secret.as_ref().map_or(0, |_| OPEN_READ_LINK_SECRET)
                     | count.map_or(0, |_| OPEN_READ_COUNT)
                     | until.map_or(0, |_| OPEN_READ_UNTIL)
-                    | playback_rate_permille.map_or(0, |_| OPEN_READ_PLAYBACK_RATE);
+                    | playback_rate_permille.map_or(0, |_| OPEN_READ_PLAYBACK_RATE)
+                    | if *snapshot { OPEN_READ_SNAPSHOT } else { 0 };
                 output.put_u8(flags);
                 let (tag, value) = read_start_wire(*start);
                 output.put_u8(tag);
@@ -457,6 +479,11 @@ impl ServerFrame {
                 output.put_u8(ServerOp::StreamInfo.byte());
                 output.put_slice(&payload);
             }
+            Self::SnapshotBoundary(boundary) => {
+                output.put_u8(ServerOp::SnapshotBoundary.byte());
+                output.put_u64(boundary.next_seq_num);
+                output.put_u64(boundary.last_timestamp_ms);
+            }
         }
         Ok(())
     }
@@ -570,6 +597,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         body = tail;
         Some(value)
     };
+    let snapshot = flags & OPEN_READ_SNAPSHOT != 0;
     let link_secret = if flags & OPEN_READ_LINK_SECRET == 0 {
         ensure_empty(op, body)?;
         None
@@ -588,13 +616,14 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         }
         Some(LinkSecret::from(utf8_tail(secret)?))
     };
-    validate_open_read(start, until, playback_rate_permille)?;
+    validate_open_read(start, until, playback_rate_permille, snapshot)?;
     Ok(ClientFrame::OpenRead {
         link_secret,
         start,
         count,
         until,
         playback_rate_permille,
+        snapshot,
     })
 }
 
@@ -602,16 +631,20 @@ fn validate_open_read(
     start: ReadStart,
     until: Option<u64>,
     playback_rate_permille: Option<u64>,
+    snapshot: bool,
 ) -> Result<(), FrameCodecError> {
     let (_, selector) = read_start_wire(start);
     if selector > MAX_READ_SELECTOR_VALUE {
         return Err(FrameCodecError::ReadSelectorOutOfRange(selector));
     }
+    if snapshot && until.is_some() {
+        return Err(FrameCodecError::SnapshotWithUntil);
+    }
     if let Some(rate) = playback_rate_permille {
         if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
             return Err(FrameCodecError::PlaybackRateOutOfRange(rate));
         }
-        if until.is_none() {
+        if until.is_none() && !snapshot {
             return Err(FrameCodecError::PlaybackRequiresUntil);
         }
     }
@@ -707,6 +740,15 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
         ServerOp::StreamInfo => serde_json::from_slice(body)
             .map(ServerFrame::StreamInfo)
             .map_err(FrameCodecError::InvalidStreamInfo),
+        ServerOp::SnapshotBoundary => {
+            let (next_seq_num, body) = read_u64(body)?;
+            let (last_timestamp_ms, body) = read_u64(body)?;
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+                next_seq_num,
+                last_timestamp_ms,
+            }))
+        }
     }
 }
 
@@ -859,8 +901,11 @@ pub enum FrameCodecError {
         "playback rate {0} must be between {MIN_PLAYBACK_RATE_PERMILLE} and {MAX_PLAYBACK_RATE_PERMILLE} permille"
     )]
     PlaybackRateOutOfRange(u64),
+    /// A snapshot request also supplied an explicit ending sequence.
+    #[error("snapshot and until are mutually exclusive")]
+    SnapshotWithUntil,
     /// Timestamp playback did not include a fixed ending sequence.
-    #[error("playback rate requires an inclusive until sequence")]
+    #[error("playback rate requires an inclusive until sequence or snapshot")]
     PlaybackRequiresUntil,
     /// A present read link secret was empty.
     #[error("OpenRead link secret cannot be empty")]
@@ -1134,16 +1179,17 @@ mod tests {
             count: None,
             until: None,
             playback_rate_permille: None,
+            snapshot: false,
         }
         .encode()
         .expect("valid OpenRead");
         assert_eq!(valid.len(), ClientFrame::OPEN_READ_FIXED_LEN);
 
         let mut unknown_flags = valid.to_vec();
-        unknown_flags[1] = 0x10;
+        unknown_flags[1] = 0x20;
         assert!(matches!(
             ClientFrame::decode(&unknown_flags),
-            Err(FrameCodecError::UnknownOpenReadFlags(0x10))
+            Err(FrameCodecError::UnknownOpenReadFlags(0x20))
         ));
 
         let mut unknown_tag = valid.to_vec();
@@ -1197,6 +1243,7 @@ mod tests {
                 count: None,
                 until: None,
                 playback_rate_permille: Some(1_000),
+                snapshot: false,
             }
             .encode(),
             Err(FrameCodecError::PlaybackRequiresUntil)
@@ -1208,6 +1255,7 @@ mod tests {
                 count: None,
                 until: Some(1),
                 playback_rate_permille: Some(MAX_PLAYBACK_RATE_PERMILLE + 1),
+                snapshot: false,
             }
             .encode(),
             Err(FrameCodecError::PlaybackRateOutOfRange(_))

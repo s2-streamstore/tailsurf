@@ -1469,34 +1469,16 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     if args.read.limit == Some(0) {
         return Ok(());
     }
-    let read_link = locator.link_declaring(LinkPermissions::allows_read);
-    let read_client = TsfClient::with_api_base_url(api_url.clone());
-    let tail = read_client
-        .get_stream_tail(&locator.stream_id, read_link)
-        .await
-        .context("failed to check stream tail")?;
-    if tail.next_seq_num == 0 {
-        return Ok(());
-    }
-
     let mut request = ReadStreamOptions::new(locator.stream_id);
-    let selected_start = selected_read_start(
+    request.start = Some(selected_read_start(
         args.read.last,
         args.read.seq,
         args.read.since,
         ReadStart::SeqNum(0),
-    );
-    request.start = Some(match selected_start {
-        ReadStart::TailOffset(offset) => {
-            ReadStart::SeqNum(tail.next_seq_num.saturating_sub(offset))
-        }
-        start => start,
-    });
-    request.until = Some(tail.next_seq_num - 1);
-    request.count = args
-        .read
-        .limit
-        .or_else(|| replay_count_from_tail(&request, tail.next_seq_num));
+    ));
+    request.snapshot = true;
+    request.count = args.read.limit;
+    let read_link = locator.link_declaring(LinkPermissions::allows_read);
     if let Some(link) = read_link {
         request = request.with_stream_link(link);
     }
@@ -2208,14 +2190,6 @@ fn selected_read_start(
         .or_else(|| seq.map(ReadStart::SeqNum))
         .or_else(|| since.map(|since| ReadStart::TimestampMs(since.0)))
         .unwrap_or(default)
-}
-
-fn replay_count_from_tail(options: &ReadStreamOptions, next_seq_num: u64) -> Option<u64> {
-    match options.start {
-        Some(ReadStart::SeqNum(seq_num)) => Some(next_seq_num.saturating_sub(seq_num)),
-        None => Some(next_seq_num),
-        Some(ReadStart::TimestampMs(_) | ReadStart::TailOffset(_)) => None,
-    }
 }
 
 fn exit_interrupted() -> ! {

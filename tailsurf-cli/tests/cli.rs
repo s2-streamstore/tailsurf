@@ -30,14 +30,14 @@ use tailsurf::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, InitialStreamLink, IssueLinkRequest,
             IssueLinkResponse, IssuedStreamLink, ListLinksResponse, RenameLinkRequest,
-            StreamInfoResponse, StreamLinkStatus, StreamLinkSummary, StreamTailResponse,
-            StreamTitleUpdate, UpdateStreamRequest, Visibility,
+            StreamInfoResponse, StreamLinkStatus, StreamLinkSummary, StreamTitleUpdate,
+            UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
                 ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
-                ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+                ReadSnapshotBoundary, ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
             },
         },
     },
@@ -1121,7 +1121,6 @@ async fn empty_caught_up_establishes_the_reconnect_position() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
     assert_eq!(attempts[1].start, ReadStart::SeqNum(5));
-    assert!(server.tail_link_secrets().is_empty());
 
     server.abort();
 }
@@ -1148,7 +1147,6 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(80));
     assert_eq!(attempts[1].start, ReadStart::TailOffset(80));
-    assert!(server.tail_link_secrets().is_empty());
 
     server.abort();
 }
@@ -1429,13 +1427,10 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     );
     let attempts = last_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].start, ReadStart::SeqNum(2));
-    assert_eq!(attempts[0].until, Some(3));
-    assert_eq!(attempts[0].count, Some(2));
-    assert_eq!(
-        last_server.tail_link_secrets(),
-        [Some(TEST_STREAM_LINK.to_owned())]
-    );
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
+    assert_eq!(attempts[0].until, None);
+    assert_eq!(attempts[0].count, None);
+    assert!(attempts[0].snapshot);
     last_server.abort();
 
     let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
@@ -1450,8 +1445,9 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let attempts = seq_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::SeqNum(2));
-    assert_eq!(attempts[0].until, Some(3));
-    assert_eq!(attempts[0].count, Some(2));
+    assert_eq!(attempts[0].until, None);
+    assert_eq!(attempts[0].count, None);
+    assert!(attempts[0].snapshot);
     seq_server.abort();
 
     let timestamp_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
@@ -1475,8 +1471,9 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let attempts = timestamp_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
-    assert_eq!(attempts[0].until, Some(3));
+    assert_eq!(attempts[0].until, None);
     assert_eq!(attempts[0].count, None);
+    assert!(attempts[0].snapshot);
     timestamp_server.abort();
 
     let count_server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
@@ -1494,8 +1491,9 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let attempts = count_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::SeqNum(0));
-    assert_eq!(attempts[0].until, Some(1));
+    assert_eq!(attempts[0].until, None);
     assert_eq!(attempts[0].count, Some(1));
+    assert!(attempts[0].snapshot);
     count_server.abort();
 }
 
@@ -1518,7 +1516,8 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     assert_eq!(output.stderr, Vec::<u8>::new());
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].until, Some(1));
+    assert_eq!(attempts[0].until, None);
+    assert!(attempts[0].snapshot);
 
     server.abort();
 }
@@ -1706,10 +1705,6 @@ impl TestServer {
                 get(test_get_stream)
                     .patch(test_update_stream)
                     .delete(test_delete_stream),
-            )
-            .route(
-                "/api/v1/streams/{stream_id}/tail",
-                get(test_get_stream_tail),
             )
             .route(
                 "/api/v1/streams/{stream_id}/links",
@@ -2048,25 +2043,6 @@ async fn test_delete_stream(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn test_get_stream_tail(
-    State(state): State<Arc<TestApiState>>,
-    Path(stream_id): Path<String>,
-) -> Response {
-    let streams = state.streams.lock().expect("streams lock");
-    let Some(stream) = streams.get(&stream_id) else {
-        return test_error(StatusCode::NOT_FOUND, "not_found", "stream not found");
-    };
-    if stream.deleted {
-        return test_error(StatusCode::CONFLICT, "conflict", "stream is deleted");
-    }
-    Json(StreamTailResponse {
-        stream_id: stream.stream_id,
-        next_seq_num: stream.records.len() as u64,
-        last_timestamp_ms: stream.records.last().map(|_| 1_781_717_406_000),
-    })
-    .into_response()
-}
-
 async fn test_issue_link(
     State(state): State<Arc<TestApiState>>,
     Path(stream_id): Path<String>,
@@ -2308,6 +2284,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         start,
         count,
         until,
+        snapshot,
         ..
     }) = ClientFrame::decode_bytes(opening)
     else {
@@ -2346,6 +2323,17 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
     send_server_frame(&mut socket, ServerFrame::StreamInfo(stream_info))
         .await
         .expect("send stream info");
+    if snapshot {
+        send_server_frame(
+            &mut socket,
+            ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+                next_seq_num: caught_up.next_seq_num,
+                last_timestamp_ms: caught_up.last_timestamp_ms,
+            }),
+        )
+        .await
+        .expect("send snapshot boundary");
+    }
     if !records.is_empty() {
         send_server_frame(
             &mut socket,
@@ -3068,11 +3056,11 @@ struct ReadAttempt {
     count: Option<u64>,
     until: Option<u64>,
     playback_rate_permille: Option<u64>,
+    snapshot: bool,
 }
 
 struct FakeReadState {
     read_attempts: Mutex<Vec<ReadAttempt>>,
-    tail_link_secrets: Mutex<Vec<Option<String>>>,
     mode: FakeReadMode,
 }
 
@@ -3101,12 +3089,10 @@ impl FakeReadServer {
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(FakeReadState {
             read_attempts: Mutex::new(Vec::new()),
-            tail_link_secrets: Mutex::new(Vec::new()),
             mode,
         });
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/read", get(fake_read_socket))
-            .route("/api/v1/streams/{stream_id}/tail", get(fake_read_tail))
             .with_state(state.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.expect("fake server");
@@ -3126,40 +3112,9 @@ impl FakeReadServer {
             .clone()
     }
 
-    fn tail_link_secrets(&self) -> Vec<Option<String>> {
-        self.state
-            .tail_link_secrets
-            .lock()
-            .expect("tail bearer links lock")
-            .clone()
-    }
-
     fn abort(self) {
         self.task.abort();
     }
-}
-
-async fn fake_read_tail(
-    State(state): State<Arc<FakeReadState>>,
-    Path(stream_id): Path<String>,
-    headers: HeaderMap,
-) -> Json<serde_json::Value> {
-    let link_secret = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    state
-        .tail_link_secrets
-        .lock()
-        .expect("tail bearer links lock")
-        .push(link_secret);
-    let next_seq_num = fake_read_next_seq_num(state.mode);
-    Json(serde_json::json!({
-        "stream_id": stream_id,
-        "next_seq_num": next_seq_num,
-        "last_timestamp_ms": 1781717406000_u64
-    }))
 }
 
 const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
@@ -3205,6 +3160,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
         count,
         until,
         playback_rate_permille,
+        snapshot,
     } = ClientFrame::decode_bytes(opening).expect("open read")
     else {
         return;
@@ -3217,6 +3173,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
             count,
             until,
             playback_rate_permille,
+            snapshot,
         });
         attempts.len()
     };
@@ -3229,6 +3186,17 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
     )
     .await
     .expect("send stream info");
+    if snapshot {
+        send_server_frame(
+            &mut socket,
+            ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+                next_seq_num: fake_read_next_seq_num(state.mode),
+                last_timestamp_ms: 1_781_717_406_000,
+            }),
+        )
+        .await
+        .expect("send snapshot boundary");
+    }
     match state.mode {
         FakeReadMode::Reconnect => {
             if attempt_count == 1 {
