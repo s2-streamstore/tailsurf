@@ -410,7 +410,12 @@ impl TsfClient {
         &self,
         options: WriteStreamOptions,
     ) -> Result<TsfAppendSession, TsfClientError> {
-        let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id), &[])?;
+        let query = options
+            .link_authorization
+            .as_ref()
+            .map(|_| vec![("auth", "grant".to_owned())])
+            .unwrap_or_default();
+        let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id), &query)?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
 
