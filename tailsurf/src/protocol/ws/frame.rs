@@ -15,7 +15,7 @@ pub const TSF_WS_PROTOCOL: &str = "tsf.v3";
 /// Maximum data payload in one physical record.
 pub const MAX_RECORD_BYTES: usize = 512 * 1024;
 /// Maximum encoded size of a short-lived read authorization.
-pub const MAX_READ_AUTHORIZATION_BYTES: usize = 2_048;
+pub const MAX_LINK_AUTHORIZATION_BYTES: usize = 2_048;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +24,7 @@ enum ClientOp {
     AuthWrite = 0x02,
     AppendRecord = 0x03,
     AuthReadGrant = 0x04,
+    AuthWriteGrant = 0x05,
 }
 
 impl ClientOp {
@@ -41,6 +42,7 @@ impl TryFrom<u8> for ClientOp {
             value if value == Self::AuthWrite.byte() => Ok(Self::AuthWrite),
             value if value == Self::AppendRecord.byte() => Ok(Self::AppendRecord),
             value if value == Self::AuthReadGrant.byte() => Ok(Self::AuthReadGrant),
+            value if value == Self::AuthWriteGrant.byte() => Ok(Self::AuthWriteGrant),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
@@ -208,6 +210,15 @@ pub enum ClientFrame {
         /// Secret from a write-capable stream link.
         link_secret: LinkSecret,
     },
+    /// Authenticates a write using a recent workspace authorization.
+    AuthWriteGrant {
+        /// Stable identity reused across reconnects.
+        writer_id: WriterId,
+        /// Opaque short-lived link authorization.
+        authorization: String,
+        /// Secret from the same write-capable stream link.
+        link_secret: LinkSecret,
+    },
     /// Submits one physical record for durable append.
     AppendRecord {
         /// Writer-local sequence number reused on retransmission.
@@ -265,11 +276,22 @@ impl ClientFrame {
                 authorization,
                 link_secret,
             } => {
-                validate_read_authorization_len(authorization.len())?;
+                validate_link_authorization_len(authorization.len())?;
                 Ok(1 + 2 + authorization.len() + link_secret.expose_secret().len())
             }
             Self::AuthWrite { link_secret, .. } => {
                 Ok(1 + WriterId::BYTE_LEN + link_secret.expose_secret().len())
+            }
+            Self::AuthWriteGrant {
+                authorization,
+                link_secret,
+                ..
+            } => {
+                validate_link_authorization_len(authorization.len())?;
+                Ok(1 + WriterId::BYTE_LEN
+                    + 2
+                    + authorization.len()
+                    + link_secret.expose_secret().len())
             }
             Self::AppendRecord { data, .. } => {
                 validate_record_len(data.len())?;
@@ -290,7 +312,7 @@ impl ClientFrame {
                 link_secret,
             } => {
                 let authorization_len = u16::try_from(authorization.len())
-                    .expect("validated read authorization length fits u16");
+                    .expect("validated link authorization length fits u16");
                 output.put_u8(ClientOp::AuthReadGrant.byte());
                 output.put_u16(authorization_len);
                 output.put_slice(authorization.as_bytes());
@@ -302,6 +324,19 @@ impl ClientFrame {
             } => {
                 output.put_u8(ClientOp::AuthWrite.byte());
                 output.put_slice(writer_id.as_bytes());
+                output.put_slice(link_secret.expose_secret().as_bytes());
+            }
+            Self::AuthWriteGrant {
+                writer_id,
+                authorization,
+                link_secret,
+            } => {
+                let authorization_len = u16::try_from(authorization.len())
+                    .expect("validated link authorization length fits u16");
+                output.put_u8(ClientOp::AuthWriteGrant.byte());
+                output.put_slice(writer_id.as_bytes());
+                output.put_u16(authorization_len);
+                output.put_slice(authorization.as_bytes());
                 output.put_slice(link_secret.expose_secret().as_bytes());
             }
             Self::AppendRecord {
@@ -452,7 +487,7 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
         ClientOp::AuthReadGrant => {
             let (authorization_len, body) = read_u16(body)?;
             let authorization_len = usize::from(authorization_len);
-            validate_read_authorization_len(authorization_len)?;
+            validate_link_authorization_len(authorization_len)?;
             let Some((authorization, secret_bytes)) = body.split_at_checked(authorization_len)
             else {
                 return Err(FrameCodecError::TruncatedFrame {
@@ -469,6 +504,24 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
             let (writer_id, secret_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
             Ok(ClientFrame::AuthWrite {
                 writer_id: WriterId::from_bytes(writer_id),
+                link_secret: LinkSecret::from(utf8_tail(secret_bytes)?),
+            })
+        }
+        ClientOp::AuthWriteGrant => {
+            let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            let (authorization_len, body) = read_u16(body)?;
+            let authorization_len = usize::from(authorization_len);
+            validate_link_authorization_len(authorization_len)?;
+            let Some((authorization, secret_bytes)) = body.split_at_checked(authorization_len)
+            else {
+                return Err(FrameCodecError::TruncatedFrame {
+                    op: ClientOp::AuthWriteGrant.byte(),
+                    needed: authorization_len.saturating_sub(body.len()),
+                });
+            };
+            Ok(ClientFrame::AuthWriteGrant {
+                writer_id: WriterId::from_bytes(writer_id),
+                authorization: utf8_tail(authorization)?.to_owned(),
                 link_secret: LinkSecret::from(utf8_tail(secret_bytes)?),
             })
         }
@@ -569,11 +622,11 @@ fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
     Ok(())
 }
 
-fn validate_read_authorization_len(len: usize) -> Result<(), FrameCodecError> {
-    if len > MAX_READ_AUTHORIZATION_BYTES {
-        return Err(FrameCodecError::ReadAuthorizationTooLarge {
+fn validate_link_authorization_len(len: usize) -> Result<(), FrameCodecError> {
+    if len > MAX_LINK_AUTHORIZATION_BYTES {
+        return Err(FrameCodecError::LinkAuthorizationTooLarge {
             actual: len,
-            max: MAX_READ_AUTHORIZATION_BYTES,
+            max: MAX_LINK_AUTHORIZATION_BYTES,
         });
     }
     Ok(())
@@ -665,9 +718,9 @@ pub enum FrameCodecError {
         /// Maximum accepted payload length.
         max: usize,
     },
-    /// A read authorization exceeded [`MAX_READ_AUTHORIZATION_BYTES`].
-    #[error("read authorization is {actual} bytes; maximum is {max}")]
-    ReadAuthorizationTooLarge {
+    /// A link authorization exceeded [`MAX_LINK_AUTHORIZATION_BYTES`].
+    #[error("link authorization is {actual} bytes; maximum is {max}")]
+    LinkAuthorizationTooLarge {
         /// Actual encoded authorization length.
         actual: usize,
         /// Maximum accepted encoded authorization length.
@@ -757,31 +810,31 @@ mod tests {
     }
 
     #[test]
-    fn read_authorization_byte_limit_is_enforced_at_the_shared_boundary() {
-        let oversized = "a".repeat(MAX_READ_AUTHORIZATION_BYTES + 1);
+    fn link_authorization_byte_limit_is_enforced_at_the_shared_boundary() {
+        let oversized = "a".repeat(MAX_LINK_AUTHORIZATION_BYTES + 1);
         assert!(matches!(
             ClientFrame::AuthReadGrant {
                 authorization: oversized,
                 link_secret: LinkSecret::from("read-link"),
             }
             .encode(),
-            Err(FrameCodecError::ReadAuthorizationTooLarge {
+            Err(FrameCodecError::LinkAuthorizationTooLarge {
                 actual,
-                max: MAX_READ_AUTHORIZATION_BYTES,
-            }) if actual == MAX_READ_AUTHORIZATION_BYTES + 1
+                max: MAX_LINK_AUTHORIZATION_BYTES,
+            }) if actual == MAX_LINK_AUTHORIZATION_BYTES + 1
         ));
 
-        let authorization_len = u16::try_from(MAX_READ_AUTHORIZATION_BYTES + 1)
+        let authorization_len = u16::try_from(MAX_LINK_AUTHORIZATION_BYTES + 1)
             .expect("test authorization length fits u16");
         let mut encoded = vec![ClientOp::AuthReadGrant.byte()];
         encoded.extend_from_slice(&authorization_len.to_be_bytes());
         encoded.resize(3 + usize::from(authorization_len), b'a');
         assert!(matches!(
             ClientFrame::decode(&encoded),
-            Err(FrameCodecError::ReadAuthorizationTooLarge {
+            Err(FrameCodecError::LinkAuthorizationTooLarge {
                 actual,
-                max: MAX_READ_AUTHORIZATION_BYTES,
-            }) if actual == MAX_READ_AUTHORIZATION_BYTES + 1
+                max: MAX_LINK_AUTHORIZATION_BYTES,
+            }) if actual == MAX_LINK_AUTHORIZATION_BYTES + 1
         ));
     }
 

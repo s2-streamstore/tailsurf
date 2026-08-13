@@ -95,6 +95,8 @@ pub struct WriteStreamOptions {
     pub writer_id: WriterId,
     /// Secret from a write-capable stream link.
     pub link_secret: LinkSecret,
+    /// Optional short-lived authorization from a workspace bootstrap response.
+    pub link_authorization: Option<String>,
 }
 
 impl WriteStreamOptions {
@@ -108,11 +110,18 @@ impl WriteStreamOptions {
             stream_id,
             writer_id,
             link_secret: link_secret.into(),
+            link_authorization: None,
         }
     }
 
     /// Creates write options by cloning a stream link without exposing it.
     pub fn with_stream_link(stream_id: StreamId, writer_id: WriterId, link: &LinkSecret) -> Self {
         Self::new(stream_id, writer_id, link.clone())
+    }
+
+    /// Reuses a recent authorization for the first connection and reconnects.
+    pub fn with_link_authorization(mut self, authorization: impl Into<String>) -> Self {
+        self.link_authorization = Some(authorization.into());
+        self
     }
 }

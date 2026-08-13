@@ -274,6 +274,9 @@ pub struct StreamBootstrapResponse {
     pub stream: StreamInfoResponse,
     /// Current stream bounds and a short-lived read authorization.
     pub range: StreamRangeResponse,
+    /// Short-lived authorization for a write-capable link.
+    #[serde(default)]
+    pub write_authorization: Option<String>,
 }
 
 #[cfg(test)]

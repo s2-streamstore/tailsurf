@@ -425,9 +425,16 @@ impl TsfClient {
                     "authenticate writer",
                     send_client_frame(
                         &mut ws,
-                        ClientFrame::AuthWrite {
-                            writer_id: options.writer_id,
-                            link_secret: options.link_secret,
+                        match options.link_authorization {
+                            Some(authorization) => ClientFrame::AuthWriteGrant {
+                                writer_id: options.writer_id,
+                                authorization,
+                                link_secret: options.link_secret,
+                            },
+                            None => ClientFrame::AuthWrite {
+                                writer_id: options.writer_id,
+                                link_secret: options.link_secret,
+                            },
                         },
                     ),
                 )

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tailsurf::{
     LinkSecret, WriterId,
     protocol::ws::frame::{
-        ClientFrame, MAX_READ_AUTHORIZATION_BYTES, MAX_RECORD_BYTES, PartHeader, ReadRecord,
+        ClientFrame, MAX_LINK_AUTHORIZATION_BYTES, MAX_RECORD_BYTES, PartHeader, ReadRecord,
         ReadTail, RecordFormat, ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
     },
 };
@@ -17,7 +17,7 @@ struct Fixtures {
     version: u16,
     websocket_protocol: String,
     max_record_bytes: usize,
-    max_read_authorization_bytes: usize,
+    max_link_authorization_bytes: usize,
     client_frames: Vec<FrameFixture<ClientFixture>>,
     server_frames: Vec<FrameFixture<ServerFixture>>,
 }
@@ -41,6 +41,11 @@ enum ClientFixture {
     },
     AuthWrite {
         writer_id_hex: String,
+        link_secret: String,
+    },
+    AuthWriteGrant {
+        writer_id_hex: String,
+        authorization: String,
         link_secret: String,
     },
     AppendRecord {
@@ -90,8 +95,8 @@ fn protocol_constants_match_v3_fixtures() {
     assert_eq!(fixtures.websocket_protocol, TSF_WS_PROTOCOL);
     assert_eq!(fixtures.max_record_bytes, MAX_RECORD_BYTES);
     assert_eq!(
-        fixtures.max_read_authorization_bytes,
-        MAX_READ_AUTHORIZATION_BYTES
+        fixtures.max_link_authorization_bytes,
+        MAX_LINK_AUTHORIZATION_BYTES
     );
 }
 
@@ -154,6 +159,15 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             link_secret,
         } => ClientFrame::AuthWrite {
             writer_id: decode_writer_id(&writer_id_hex),
+            link_secret: LinkSecret::from(link_secret),
+        },
+        ClientFixture::AuthWriteGrant {
+            writer_id_hex,
+            authorization,
+            link_secret,
+        } => ClientFrame::AuthWriteGrant {
+            writer_id: decode_writer_id(&writer_id_hex),
+            authorization,
             link_secret: LinkSecret::from(link_secret),
         },
         ClientFixture::AppendRecord {
