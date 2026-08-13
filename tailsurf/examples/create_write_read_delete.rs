@@ -1,11 +1,11 @@
-//! Minimal SDK lifecycle example using a private stream and separate owner, write, and read tokens.
+//! Minimal SDK lifecycle example using a private stream and separate owner, write, and read links.
 
 use std::env;
 
 use tailsurf::{
-    TokenPermissions, TsfClient, WriterId,
+    LinkPermissions, TsfClient, WriterId,
     protocol::{
-        rest::{CreateStreamRequest, Visibility},
+        rest::{CreateStreamRequest, InitialStreamLink, Visibility},
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{PartHeader, RecordFormat},
@@ -24,42 +24,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let created = client
         .create_stream(&CreateStreamRequest {
+            title: Some("SDK lifecycle".parse()?),
             visibility: Visibility::Private,
             expires_in_secs: None,
-            issue_tokens: Some(vec![
-                TokenPermissions::owner(),
-                TokenPermissions::write(),
-                TokenPermissions::read(),
+            issue_links: Some(vec![
+                InitialStreamLink {
+                    label: "Owner".parse()?,
+                    permissions: LinkPermissions::owner(),
+                },
+                InitialStreamLink {
+                    label: "Example writer".parse()?,
+                    permissions: LinkPermissions::write(),
+                },
+                InitialStreamLink {
+                    label: "Example reader".parse()?,
+                    permissions: LinkPermissions::read(),
+                },
             ]),
         })
         .await?;
-    let owner_token = created
-        .tokens
+    let owner_link_secret = created
+        .links
         .iter()
-        .find(|token| token.permissions.allows_owner())
-        .expect("owner token")
-        .token
+        .find(|link| link.permissions.allows_owner())
+        .expect("owner link")
+        .secret
         .clone();
-    let write_token = created
-        .tokens
+    let write_link_secret = created
+        .links
         .iter()
-        .find(|token| token.permissions.allows_write() && !token.permissions.allows_owner())
-        .expect("write token")
-        .token
+        .find(|link| link.permissions.allows_write() && !link.permissions.allows_owner())
+        .expect("write link")
+        .secret
         .clone();
-    let read_token = created
-        .tokens
+    let read_link_secret = created
+        .links
         .iter()
-        .find(|token| token.permissions.allows_read() && !token.permissions.allows_owner())
-        .expect("read token")
-        .token
+        .find(|link| link.permissions.allows_read() && !link.permissions.allows_owner())
+        .expect("read link")
+        .secret
         .clone();
 
     let writer = client
-        .connect_producer(WriteStreamOptions::with_stream_token(
+        .connect_producer(WriteStreamOptions::with_stream_link(
             created.stream_id,
             WriterId::new_random(),
-            &write_token,
+            &write_link_secret,
         ))
         .await?;
     let ticket = writer
@@ -73,7 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _receipt = ticket.await?;
     writer.close().await?;
 
-    let mut read_request = ReadStreamOptions::new(created.stream_id).with_stream_token(&read_token);
+    let mut read_request =
+        ReadStreamOptions::new(created.stream_id).with_stream_link(&read_link_secret);
     read_request.start = Some(ReadStart::SeqNum(0));
     read_request.count = Some(1);
     let mut reader = client.connect_reader(read_request).await?;
@@ -82,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     client
-        .delete_stream(&created.stream_id, &owner_token)
+        .delete_stream(&created.stream_id, &owner_link_secret)
         .await?;
 
     Ok(())

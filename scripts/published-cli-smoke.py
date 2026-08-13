@@ -22,9 +22,9 @@ COMMAND_TIMEOUT_SECS = int(os.environ.get("TSF_PUBLISHED_CLI_COMMAND_TIMEOUT_SEC
 
 @dataclass(frozen=True)
 class CreatedStream:
-    owner_url: str
-    write_url: str
-    read_url: str
+    owner_link: str
+    write_link: str
+    read_link: str
 
 
 def main() -> int:
@@ -46,7 +46,7 @@ def main() -> int:
                 tsf_bin,
                 args.api_url,
                 args.web_url,
-                ["write", created.write_url],
+                ["write", created.write_link],
                 "tsf write",
                 input_data=message,
             )
@@ -54,7 +54,7 @@ def main() -> int:
                 tsf_bin,
                 args.api_url,
                 args.web_url,
-                ["replay", created.read_url],
+                ["replay", created.read_link],
                 "tsf replay",
             )
             if message not in replayed.stdout:
@@ -64,7 +64,7 @@ def main() -> int:
                 tsf_bin,
                 args.api_url,
                 args.web_url,
-                ["delete", created.owner_url],
+                ["delete", created.owner_link, "--yes"],
                 "tsf delete cleanup",
                 expect_success=False,
             )
@@ -73,7 +73,7 @@ def main() -> int:
             tsf_bin,
             args.api_url,
             args.web_url,
-            ["delete", created.owner_url],
+            ["delete", created.owner_link, "--yes"],
             "tsf delete",
         )
 
@@ -122,8 +122,17 @@ def create_stream(tsf_bin: str, api_url: str, web_url: str) -> CreatedStream:
         tsf_bin,
         api_url,
         web_url,
-        ["new", "--format", "json", "--link", "owner", "--link", "write", "--link", "view"],
-        "tsf new --format json",
+        [
+            "new",
+            "--json",
+            "--link",
+            "owner=Smoke owner",
+            "--link",
+            "write=Smoke writer",
+            "--link",
+            "read=Smoke reader",
+        ],
+        "tsf new --json",
     )
     return parse_created_stream(result.stdout)
 
@@ -178,15 +187,20 @@ def parse_created_stream(stdout: bytes) -> CreatedStream:
         raise PublishedCliSmokeError("tsf new did not return valid JSON") from error
     if not isinstance(payload, dict):
         raise PublishedCliSmokeError("tsf new JSON was not an object")
-    urls = payload.get("urls")
-    if not isinstance(urls, dict):
-        raise PublishedCliSmokeError("tsf new JSON did not contain urls")
-    owner_url = urls.get("o")
-    write_url = urls.get("w")
-    read_url = urls.get("r")
-    if not all(isinstance(url, str) and url for url in [owner_url, write_url, read_url]):
-        raise PublishedCliSmokeError("tsf new JSON did not contain owner, write, and read URLs")
-    return CreatedStream(owner_url=owner_url, write_url=write_url, read_url=read_url)
+    links = payload.get("links")
+    if not isinstance(links, list):
+        raise PublishedCliSmokeError("tsf new JSON did not contain links")
+    links_by_permission = {
+        link.get("permissions"): link.get("url")
+        for link in links
+        if isinstance(link, dict)
+    }
+    owner_link = links_by_permission.get("owner")
+    write_link = links_by_permission.get("write")
+    read_link = links_by_permission.get("read")
+    if not all(isinstance(link, str) and link for link in [owner_link, write_link, read_link]):
+        raise PublishedCliSmokeError("tsf new JSON did not contain owner, write, and read links")
+    return CreatedStream(owner_link=owner_link, write_link=write_link, read_link=read_link)
 
 
 def require(value: str | None, name: str) -> None:
@@ -207,10 +221,10 @@ def self_test() -> None:
     if "owner-secret" in redacted or "bearer-secret" in redacted:
         raise PublishedCliSmokeError("redaction self-test failed")
 
-    payload = b'{"urls":{"o":"owner","w":"write","r":"read"}}'
+    payload = b'{"links":[{"permissions":"owner","url":"owner"},{"permissions":"write","url":"write"},{"permissions":"read","url":"read"}]}'
     if parse_created_stream(payload) != CreatedStream("owner", "write", "read"):
         raise PublishedCliSmokeError("stream parsing self-test failed")
-    for malformed in (b"not-json", b'{"urls":{"o":"owner"}}'):
+    for malformed in (b"not-json", b'{"links":[{"permissions":"owner","url":"owner"}]}'):
         try:
             parse_created_stream(malformed)
         except PublishedCliSmokeError:

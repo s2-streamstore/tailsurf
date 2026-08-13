@@ -3,7 +3,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 
-use crate::{BearerToken, WriterId};
+use crate::{LinkSecret, WriterId};
 
 /// Numeric protocol version sent in [`ServerFrame::Hello`].
 pub type ProtocolVersion = u16;
@@ -189,15 +189,15 @@ pub struct ReadTail {
 pub enum ClientFrame {
     /// Authenticates a private read connection.
     AuthRead {
-        /// Account or read-capable stream bearer token.
-        bearer_token: BearerToken,
+        /// Secret from a read-capable stream link.
+        link_secret: LinkSecret,
     },
     /// Authenticates a write connection and establishes writer identity.
     AuthWrite {
         /// Stable identity reused across reconnects.
         writer_id: WriterId,
-        /// Account or write-capable stream bearer token.
-        bearer_token: BearerToken,
+        /// Secret from a write-capable stream link.
+        link_secret: LinkSecret,
     },
     /// Submits one physical record for durable append.
     AppendRecord {
@@ -253,9 +253,9 @@ impl ClientFrame {
     /// Returns the exact wire length of this frame, validating the payload size for records.
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
-            Self::AuthRead { bearer_token } => Ok(1 + bearer_token.expose_secret().len()),
-            Self::AuthWrite { bearer_token, .. } => {
-                Ok(1 + WriterId::BYTE_LEN + bearer_token.expose_secret().len())
+            Self::AuthRead { link_secret } => Ok(1 + link_secret.expose_secret().len()),
+            Self::AuthWrite { link_secret, .. } => {
+                Ok(1 + WriterId::BYTE_LEN + link_secret.expose_secret().len())
             }
             Self::AppendRecord { data, .. } => {
                 validate_record_len(data.len())?;
@@ -267,17 +267,17 @@ impl ClientFrame {
     /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
     fn encode_into(&self, output: &mut BytesMut) {
         match self {
-            Self::AuthRead { bearer_token } => {
+            Self::AuthRead { link_secret } => {
                 output.put_u8(ClientOp::AuthRead.byte());
-                output.put_slice(bearer_token.expose_secret().as_bytes());
+                output.put_slice(link_secret.expose_secret().as_bytes());
             }
             Self::AuthWrite {
                 writer_id,
-                bearer_token,
+                link_secret,
             } => {
                 output.put_u8(ClientOp::AuthWrite.byte());
                 output.put_slice(writer_id.as_bytes());
-                output.put_slice(bearer_token.expose_secret().as_bytes());
+                output.put_slice(link_secret.expose_secret().as_bytes());
             }
             Self::AppendRecord {
                 writer_seq_num,
@@ -423,13 +423,13 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
 
     match ClientOp::try_from(op_byte)? {
         ClientOp::AuthRead => Ok(ClientFrame::AuthRead {
-            bearer_token: BearerToken::from(utf8_tail(body)?),
+            link_secret: LinkSecret::from(utf8_tail(body)?),
         }),
         ClientOp::AuthWrite => {
-            let (writer_id, token_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            let (writer_id, secret_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
             Ok(ClientFrame::AuthWrite {
                 writer_id: WriterId::from_bytes(writer_id),
-                bearer_token: BearerToken::from(utf8_tail(token_bytes)?),
+                link_secret: LinkSecret::from(utf8_tail(secret_bytes)?),
             })
         }
         ClientOp::AppendRecord => {
@@ -608,8 +608,8 @@ pub enum FrameCodecError {
         /// Number of undefined trailing bytes.
         count: usize,
     },
-    /// A bearer-token tail was not valid UTF-8.
-    #[error("token is not valid UTF-8: {0}")]
+    /// A link-secret tail was not valid UTF-8.
+    #[error("link secret is not valid UTF-8: {0}")]
     InvalidUtf8(#[source] std::str::Utf8Error),
     /// A physical record payload exceeded [`MAX_RECORD_BYTES`].
     #[error("record is {actual} bytes; maximum is {max}")]

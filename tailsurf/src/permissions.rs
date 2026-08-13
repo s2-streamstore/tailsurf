@@ -1,17 +1,17 @@
-//! Canonical owner, read, and write permissions carried by stream tokens.
+//! Canonical owner, read, and write permissions carried by stream links.
 
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-/// Valid permissions for a stream token.
+/// Valid permissions for a stream link.
 ///
 /// Owner permission implies read and write and cannot be combined with either bit. String and JSON
 /// representations are canonicalized to `o`, `r`, `w`, or `rw`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TokenPermissions(u8);
+pub struct LinkPermissions(u8);
 
-impl TokenPermissions {
+impl LinkPermissions {
     const OWNER: u8 = 0b001;
     const READ: u8 = 0b010;
     const WRITE: u8 = 0b100;
@@ -71,23 +71,23 @@ impl TokenPermissions {
     }
 }
 
-impl fmt::Display for TokenPermissions {
+impl fmt::Display for LinkPermissions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.allows_owner() {
             f.write_str("o")?;
             return Ok(());
         }
-        if self.0 & TokenPermissions::READ != 0 {
+        if self.0 & LinkPermissions::READ != 0 {
             f.write_str("r")?;
         }
-        if self.0 & TokenPermissions::WRITE != 0 {
+        if self.0 & LinkPermissions::WRITE != 0 {
             f.write_str("w")?;
         }
         Ok(())
     }
 }
 
-impl FromStr for TokenPermissions {
+impl FromStr for LinkPermissions {
     type Err = PermissionsError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
@@ -98,9 +98,9 @@ impl FromStr for TokenPermissions {
         let mut bits = 0;
         for ch in input.chars() {
             let bit = match ch {
-                'o' => TokenPermissions::OWNER,
-                'r' => TokenPermissions::READ,
-                'w' => TokenPermissions::WRITE,
+                'o' => LinkPermissions::OWNER,
+                'r' => LinkPermissions::READ,
+                'w' => LinkPermissions::WRITE,
                 other => return Err(PermissionsError::UnknownPermission(other)),
             };
 
@@ -114,7 +114,7 @@ impl FromStr for TokenPermissions {
     }
 }
 
-impl Serialize for TokenPermissions {
+impl Serialize for LinkPermissions {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -123,7 +123,7 @@ impl Serialize for TokenPermissions {
     }
 }
 
-impl<'de> Deserialize<'de> for TokenPermissions {
+impl<'de> Deserialize<'de> for LinkPermissions {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -133,7 +133,7 @@ impl<'de> Deserialize<'de> for TokenPermissions {
     }
 }
 
-/// Error returned when parsing a stream-token permission string.
+/// Error returned when parsing a stream-link permission string.
 #[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum PermissionsError {
     /// No permission was provided.
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn parses_data_permissions_in_any_order_and_formats_canonically() {
-        let permissions: TokenPermissions = "wr".parse().expect("valid permissions");
+        let permissions: LinkPermissions = "wr".parse().expect("valid permissions");
 
         assert!(!permissions.allows_owner());
         assert!(permissions.allows_read());
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn owner_implies_all_effective_permissions() {
-        let permissions: TokenPermissions = "o".parse().expect("valid permissions");
+        let permissions: LinkPermissions = "o".parse().expect("valid permissions");
 
         assert!(permissions.allows_owner());
         assert!(permissions.allows_read());
@@ -176,32 +176,32 @@ mod tests {
 
     #[test]
     fn rejects_empty_unknown_duplicate_and_redundant_owner_permissions() {
-        assert_eq!("".parse::<TokenPermissions>(), Err(PermissionsError::Empty));
+        assert_eq!("".parse::<LinkPermissions>(), Err(PermissionsError::Empty));
         assert_eq!(
-            "rx".parse::<TokenPermissions>(),
+            "rx".parse::<LinkPermissions>(),
             Err(PermissionsError::UnknownPermission('x'))
         );
         assert_eq!(
-            "rr".parse::<TokenPermissions>(),
+            "rr".parse::<LinkPermissions>(),
             Err(PermissionsError::DuplicatePermission('r'))
         );
         assert_eq!(
-            "or".parse::<TokenPermissions>(),
+            "or".parse::<LinkPermissions>(),
             Err(PermissionsError::OwnerCannotBeCombined)
         );
         assert_eq!(
-            "ow".parse::<TokenPermissions>(),
+            "ow".parse::<LinkPermissions>(),
             Err(PermissionsError::OwnerCannotBeCombined)
         );
         assert_eq!(
-            "orw".parse::<TokenPermissions>(),
+            "orw".parse::<LinkPermissions>(),
             Err(PermissionsError::OwnerCannotBeCombined)
         );
     }
 
     #[test]
     fn serde_uses_canonical_string_form() {
-        let permissions: TokenPermissions =
+        let permissions: LinkPermissions =
             serde_json::from_str("\"wr\"").expect("valid permission JSON");
 
         assert_eq!(permissions.to_string(), "rw");
