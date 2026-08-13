@@ -415,10 +415,10 @@ impl FromStr for PermissionArg {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let permissions = match value.to_ascii_lowercase().as_str() {
-            "read" => LinkPermissions::read(),
-            "write" => LinkPermissions::write(),
-            "read-write" => LinkPermissions::read_write(),
-            "owner" => LinkPermissions::owner(),
+            "read" | "r" => LinkPermissions::read(),
+            "write" | "w" => LinkPermissions::write(),
+            "read-write" | "rw" => LinkPermissions::read_write(),
+            "owner" | "o" => LinkPermissions::owner(),
             other => {
                 return Err(format!(
                     "unknown permission {other:?}; use read, write, read-write, or owner"
@@ -2149,13 +2149,25 @@ mod tests {
     }
 
     #[test]
-    fn initial_link_labels_may_contain_equals_signs() {
+    fn initial_links_accept_equals_in_labels_and_short_permissions() {
         let parsed = "read=CI=prod"
             .parse::<InitialLinkArg>()
             .expect("valid initial link");
 
         assert_eq!(parsed.0.label.as_str(), "CI=prod");
         assert_eq!(parsed.0.permissions, LinkPermissions::read());
+
+        for (value, expected) in [
+            ("r=Reader", LinkPermissions::read()),
+            ("w=Writer", LinkPermissions::write()),
+            ("rw=Operator", LinkPermissions::read_write()),
+            ("o=Owner", LinkPermissions::owner()),
+        ] {
+            let parsed = value
+                .parse::<InitialLinkArg>()
+                .expect("valid short permission");
+            assert_eq!(parsed.0.permissions, expected);
+        }
     }
 
     #[test]
