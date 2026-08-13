@@ -141,6 +141,7 @@ struct NewArgs {
         long,
         env = "TSF_CREATE_IDEMPOTENCY_KEY",
         value_name = "KEY",
+        allow_hyphen_values = true,
         help_heading = "Advanced"
     )]
     create_idempotency_key: Option<CreateStreamIdempotencyKey>,
@@ -2305,6 +2306,28 @@ mod tests {
         assert_eq!(existing.input.program, ["make", "test"]);
 
         assert!(Cli::try_parse_from(["tsf", "--title", "Build log"]).is_err());
+    }
+
+    #[test]
+    fn create_recovery_keys_may_start_with_a_hyphen() {
+        let recovery_key = format!("-{}", "A".repeat(42));
+        let parsed = Cli::try_parse_from([
+            "tsf",
+            "new",
+            "--create-idempotency-key",
+            recovery_key.as_str(),
+        ])
+        .expect("base64url recovery key starting with a hyphen");
+        let Some(Command::New(args)) = parsed.command else {
+            panic!("expected new command");
+        };
+
+        assert_eq!(
+            args.create_idempotency_key
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some(recovery_key.as_str()),
+        );
     }
 
     #[test]
