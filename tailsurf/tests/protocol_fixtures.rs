@@ -6,10 +6,13 @@ use tailsurf::{
     LinkSecret, WriterId,
     protocol::{
         rest::Visibility,
-        ws::frame::{
-            AppendRecord, ClientFrame, MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES,
-            MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
-            ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+        ws::{
+            ReadStart,
+            frame::{
+                AppendRecord, ClientFrame, MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES,
+                MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
+                ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+            },
         },
     },
 };
@@ -37,10 +40,15 @@ struct FrameFixture<T> {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientFixture {
-    AuthRead {
-        link_secret: String,
+    OpenRead {
+        start_type: String,
+        start_value: String,
+        count: Option<String>,
+        until: Option<String>,
+        playback_rate_permille: Option<String>,
+        link_secret: Option<String>,
     },
-    AuthWrite {
+    OpenWrite {
         writer_id_hex: String,
         link_secret: String,
     },
@@ -140,13 +148,24 @@ fn fixtures() -> Fixtures {
 
 fn client_frame(fixture: ClientFixture) -> ClientFrame {
     match fixture {
-        ClientFixture::AuthRead { link_secret } => ClientFrame::AuthRead {
-            link_secret: LinkSecret::from(link_secret),
+        ClientFixture::OpenRead {
+            start_type,
+            start_value,
+            count,
+            until,
+            playback_rate_permille,
+            link_secret,
+        } => ClientFrame::OpenRead {
+            link_secret: link_secret.map(LinkSecret::from),
+            start: read_start(&start_type, parse_u64(&start_value)),
+            count: count.as_deref().map(parse_u64),
+            until: until.as_deref().map(parse_u64),
+            playback_rate_permille: playback_rate_permille.as_deref().map(parse_u64),
         },
-        ClientFixture::AuthWrite {
+        ClientFixture::OpenWrite {
             writer_id_hex,
             link_secret,
-        } => ClientFrame::AuthWrite {
+        } => ClientFrame::OpenWrite {
             writer_id: decode_writer_id(&writer_id_hex),
             link_secret: LinkSecret::from(link_secret),
         },
@@ -161,6 +180,15 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             format: parse_format(format),
             data: Bytes::from(decode_hex(&data_hex)),
         }]),
+    }
+}
+
+fn read_start(kind: &str, value: u64) -> ReadStart {
+    match kind {
+        "seq_num" => ReadStart::SeqNum(value),
+        "timestamp_ms" => ReadStart::TimestampMs(value),
+        "tail_offset" => ReadStart::TailOffset(value),
+        other => panic!("unknown fixture read start {other}"),
     }
 }
 

@@ -7,18 +7,26 @@ use crate::{LinkSecret, StreamId, WriterId};
 
 /// Largest read selector accepted by the current TypeScript data adapter.
 pub const MAX_READ_SELECTOR_VALUE: u64 = 9_007_199_254_740_991;
+/// Tail-relative start used when a reader does not select a position.
+pub const DEFAULT_READ_TAIL_OFFSET: u64 = 80;
+/// Slowest accepted timestamp playback rate.
+pub const MIN_PLAYBACK_RATE_PERMILLE: u64 = 100;
+/// Fastest accepted timestamp playback rate.
+pub const MAX_PLAYBACK_RATE_PERMILLE: u64 = 100_000;
 
 /// Position, bounds, and credentials for one read WebSocket.
 #[derive(Clone, Debug)]
 pub struct ReadStreamOptions {
     /// Stream to read.
     pub stream_id: StreamId,
-    /// Optional initial read position. No value uses the service default tail offset.
+    /// Optional initial read position. No value sends a tail offset of 80.
     pub start: Option<ReadStart>,
     /// Optional maximum number of physical records to deliver.
     pub count: Option<u64>,
     /// Optional inclusive ending sequence number.
     pub until: Option<u64>,
+    /// Optional timestamp playback rate in thousandths. `1000` is recorded speed.
+    pub playback_rate_permille: Option<u64>,
     /// Secret from a read-capable stream link for private streams.
     pub link_secret: Option<LinkSecret>,
 }
@@ -31,6 +39,7 @@ impl ReadStreamOptions {
             start: None,
             count: None,
             until: None,
+            playback_rate_permille: None,
             link_secret: None,
         }
     }
@@ -44,30 +53,6 @@ impl ReadStreamOptions {
     /// Sets a cloned stream link without exposing its secret value.
     pub fn with_stream_link(self, link: &LinkSecret) -> Self {
         self.with_link_secret(link.clone())
-    }
-
-    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
-        let mut pairs = Vec::new();
-        if self.link_secret.is_some() {
-            pairs.push(("auth", "link".to_owned()));
-        }
-        match self.start {
-            None => {}
-            Some(ReadStart::SeqNum(seq_num)) => pairs.push(("seq_num", seq_num.to_string())),
-            Some(ReadStart::TimestampMs(timestamp)) => {
-                pairs.push(("timestamp", timestamp.to_string()));
-            }
-            Some(ReadStart::TailOffset(tail_offset)) => {
-                pairs.push(("tail_offset", tail_offset.to_string()));
-            }
-        }
-        if let Some(count) = self.count {
-            pairs.push(("count", count.to_string()));
-        }
-        if let Some(until) = self.until {
-            pairs.push(("until", until.to_string()));
-        }
-        pairs
     }
 }
 

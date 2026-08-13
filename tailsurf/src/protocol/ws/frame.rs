@@ -4,7 +4,16 @@ use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
-use crate::{LinkSecret, StreamId, StreamTitle, WriterId, protocol::rest::Visibility};
+use crate::{
+    LinkSecret, StreamId, StreamTitle, WriterId,
+    protocol::{
+        rest::Visibility,
+        ws::{
+            MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE, MIN_PLAYBACK_RATE_PERMILLE,
+            ReadStart,
+        },
+    },
+};
 /// WebSocket subprotocol offered and selected for TSF v1 connections.
 pub const TSF_WS_PROTOCOL: &str = "tsf.v1";
 /// Maximum data payload in one physical record.
@@ -19,8 +28,8 @@ pub const MAX_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientOp {
-    AuthRead = 0x01,
-    AuthWrite = 0x02,
+    OpenRead = 0x01,
+    OpenWrite = 0x02,
     AppendBatch = 0x03,
 }
 
@@ -35,13 +44,24 @@ impl TryFrom<u8> for ClientOp {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            value if value == Self::AuthRead.byte() => Ok(Self::AuthRead),
-            value if value == Self::AuthWrite.byte() => Ok(Self::AuthWrite),
+            value if value == Self::OpenRead.byte() => Ok(Self::OpenRead),
+            value if value == Self::OpenWrite.byte() => Ok(Self::OpenWrite),
             value if value == Self::AppendBatch.byte() => Ok(Self::AppendBatch),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
 }
+
+const OPEN_READ_LINK_SECRET: u8 = 0x01;
+const OPEN_READ_COUNT: u8 = 0x02;
+const OPEN_READ_UNTIL: u8 = 0x04;
+const OPEN_READ_PLAYBACK_RATE: u8 = 0x08;
+const OPEN_READ_FLAGS: u8 =
+    OPEN_READ_LINK_SECRET | OPEN_READ_COUNT | OPEN_READ_UNTIL | OPEN_READ_PLAYBACK_RATE;
+
+const READ_START_SEQ_NUM: u8 = 0x01;
+const READ_START_TIMESTAMP_MS: u8 = 0x02;
+const READ_START_TAIL_OFFSET: u8 = 0x03;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,13 +234,21 @@ pub struct ReadStreamInfo {
 /// Frame sent from a reader or writer to the service.
 #[derive(Clone, Debug)]
 pub enum ClientFrame {
-    /// Authenticates a private read connection.
-    AuthRead {
-        /// Secret from a read-capable stream link.
-        link_secret: LinkSecret,
+    /// Opens a read connection with its complete request and optional authentication.
+    OpenRead {
+        /// Secret from a read-capable stream link for a private stream.
+        link_secret: Option<LinkSecret>,
+        /// Initial absolute, timestamp, or tail-relative read position.
+        start: ReadStart,
+        /// Maximum number of physical records to deliver.
+        count: Option<u64>,
+        /// Inclusive ending sequence number.
+        until: Option<u64>,
+        /// Timestamp playback rate in thousandths.
+        playback_rate_permille: Option<u64>,
     },
-    /// Authenticates a write connection and establishes writer identity.
-    AuthWrite {
+    /// Opens a write connection and establishes authorization and writer identity.
+    OpenWrite {
         /// Stable identity reused across reconnects.
         writer_id: WriterId,
         /// Secret from a write-capable stream link.
@@ -258,12 +286,36 @@ pub enum ServerFrame {
 
 impl ClientFrame {
     const APPEND_BODY_HEADER_LEN: usize = 8 + 4 + 1;
+    const OPEN_READ_FIXED_LEN: usize = 1 + 1 + 1 + 8;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
-            Self::AuthRead { link_secret } => Ok(1 + link_secret.expose_secret().len()),
-            Self::AuthWrite { link_secret, .. } => {
+            Self::OpenRead {
+                link_secret,
+                start,
+                count,
+                until,
+                playback_rate_permille,
+            } => {
+                validate_open_read(*start, *until, *playback_rate_permille)?;
+                let secret_len = link_secret
+                    .as_ref()
+                    .map(|secret| secret.expose_secret().len())
+                    .unwrap_or_default();
+                if link_secret.is_some() && secret_len == 0 {
+                    return Err(FrameCodecError::EmptyLinkSecret);
+                }
+                if secret_len > u16::MAX as usize {
+                    return Err(FrameCodecError::LinkSecretTooLarge(secret_len));
+                }
+                Ok(Self::OPEN_READ_FIXED_LEN
+                    + count.map_or(0, |_| 8)
+                    + until.map_or(0, |_| 8)
+                    + playback_rate_permille.map_or(0, |_| 8)
+                    + link_secret.as_ref().map_or(0, |_| 2 + secret_len))
+            }
+            Self::OpenWrite { link_secret, .. } => {
                 Ok(1 + WriterId::BYTE_LEN + link_secret.expose_secret().len())
             }
             Self::AppendBatch(records) => batch_encoded_len(
@@ -277,15 +329,41 @@ impl ClientFrame {
     /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
     fn encode_into(&self, output: &mut BytesMut) {
         match self {
-            Self::AuthRead { link_secret } => {
-                output.put_u8(ClientOp::AuthRead.byte());
-                output.put_slice(link_secret.expose_secret().as_bytes());
+            Self::OpenRead {
+                link_secret,
+                start,
+                count,
+                until,
+                playback_rate_permille,
+            } => {
+                output.put_u8(ClientOp::OpenRead.byte());
+                let flags = link_secret.as_ref().map_or(0, |_| OPEN_READ_LINK_SECRET)
+                    | count.map_or(0, |_| OPEN_READ_COUNT)
+                    | until.map_or(0, |_| OPEN_READ_UNTIL)
+                    | playback_rate_permille.map_or(0, |_| OPEN_READ_PLAYBACK_RATE);
+                output.put_u8(flags);
+                let (tag, value) = read_start_wire(*start);
+                output.put_u8(tag);
+                output.put_u64(value);
+                if let Some(value) = count {
+                    output.put_u64(*value);
+                }
+                if let Some(value) = until {
+                    output.put_u64(*value);
+                }
+                if let Some(value) = playback_rate_permille {
+                    output.put_u64(*value);
+                }
+                if let Some(secret) = link_secret {
+                    output.put_u16(secret.expose_secret().len() as u16);
+                    output.put_slice(secret.expose_secret().as_bytes());
+                }
             }
-            Self::AuthWrite {
+            Self::OpenWrite {
                 writer_id,
                 link_secret,
             } => {
-                output.put_u8(ClientOp::AuthWrite.byte());
+                output.put_u8(ClientOp::OpenWrite.byte());
                 output.put_slice(writer_id.as_bytes());
                 output.put_slice(link_secret.expose_secret().as_bytes());
             }
@@ -425,12 +503,10 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
     };
 
     match ClientOp::try_from(op_byte)? {
-        ClientOp::AuthRead => Ok(ClientFrame::AuthRead {
-            link_secret: LinkSecret::from(utf8_tail(body)?),
-        }),
-        ClientOp::AuthWrite => {
+        ClientOp::OpenRead => decode_open_read(op_byte, body),
+        ClientOp::OpenWrite => {
             let (writer_id, secret_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
-            Ok(ClientFrame::AuthWrite {
+            Ok(ClientFrame::OpenWrite {
                 writer_id: WriterId::from_bytes(writer_id),
                 link_secret: LinkSecret::from(utf8_tail(secret_bytes)?),
             })
@@ -457,6 +533,110 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
             Ok(ClientFrame::AppendBatch(records))
         }
     }
+}
+
+fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError> {
+    let (&flags, body) = body
+        .split_first()
+        .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
+    if flags & !OPEN_READ_FLAGS != 0 {
+        return Err(FrameCodecError::UnknownOpenReadFlags(
+            flags & !OPEN_READ_FLAGS,
+        ));
+    }
+    let (&start_tag, body) = body
+        .split_first()
+        .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
+    let (start_value, mut body) = read_u64(body)?;
+    let start = read_start_from_wire(start_tag, start_value)?;
+    let count = if flags & OPEN_READ_COUNT == 0 {
+        None
+    } else {
+        let (value, tail) = read_u64(body)?;
+        body = tail;
+        Some(value)
+    };
+    let until = if flags & OPEN_READ_UNTIL == 0 {
+        None
+    } else {
+        let (value, tail) = read_u64(body)?;
+        body = tail;
+        Some(value)
+    };
+    let playback_rate_permille = if flags & OPEN_READ_PLAYBACK_RATE == 0 {
+        None
+    } else {
+        let (value, tail) = read_u64(body)?;
+        body = tail;
+        Some(value)
+    };
+    let link_secret = if flags & OPEN_READ_LINK_SECRET == 0 {
+        ensure_empty(op, body)?;
+        None
+    } else {
+        let (length, tail) = read_u16(body)?;
+        let length = usize::from(length);
+        let Some((secret, trailing)) = tail.split_at_checked(length) else {
+            return Err(FrameCodecError::TruncatedFrame {
+                op,
+                needed: length.saturating_sub(tail.len()),
+            });
+        };
+        ensure_empty(op, trailing)?;
+        if secret.is_empty() {
+            return Err(FrameCodecError::EmptyLinkSecret);
+        }
+        Some(LinkSecret::from(utf8_tail(secret)?))
+    };
+    validate_open_read(start, until, playback_rate_permille)?;
+    Ok(ClientFrame::OpenRead {
+        link_secret,
+        start,
+        count,
+        until,
+        playback_rate_permille,
+    })
+}
+
+fn validate_open_read(
+    start: ReadStart,
+    until: Option<u64>,
+    playback_rate_permille: Option<u64>,
+) -> Result<(), FrameCodecError> {
+    let (_, selector) = read_start_wire(start);
+    if selector > MAX_READ_SELECTOR_VALUE {
+        return Err(FrameCodecError::ReadSelectorOutOfRange(selector));
+    }
+    if let Some(rate) = playback_rate_permille {
+        if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
+            return Err(FrameCodecError::PlaybackRateOutOfRange(rate));
+        }
+        if until.is_none() {
+            return Err(FrameCodecError::PlaybackRequiresUntil);
+        }
+    }
+    Ok(())
+}
+
+const fn read_start_wire(start: ReadStart) -> (u8, u64) {
+    match start {
+        ReadStart::SeqNum(value) => (READ_START_SEQ_NUM, value),
+        ReadStart::TimestampMs(value) => (READ_START_TIMESTAMP_MS, value),
+        ReadStart::TailOffset(value) => (READ_START_TAIL_OFFSET, value),
+    }
+}
+
+fn read_start_from_wire(tag: u8, value: u64) -> Result<ReadStart, FrameCodecError> {
+    let start = match tag {
+        READ_START_SEQ_NUM => ReadStart::SeqNum(value),
+        READ_START_TIMESTAMP_MS => ReadStart::TimestampMs(value),
+        READ_START_TAIL_OFFSET => ReadStart::TailOffset(value),
+        other => return Err(FrameCodecError::UnknownReadStartTag(other)),
+    };
+    if value > MAX_READ_SELECTOR_VALUE {
+        return Err(FrameCodecError::ReadSelectorOutOfRange(value));
+    }
+    Ok(start)
 }
 
 fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodecError> {
@@ -624,6 +804,11 @@ fn read_u32(input: &[u8]) -> Result<(u32, &[u8]), FrameCodecError> {
     Ok((u32::from_be_bytes(bytes), tail))
 }
 
+fn read_u16(input: &[u8]) -> Result<(u16, &[u8]), FrameCodecError> {
+    let (bytes, tail) = take::<2>(input)?;
+    Ok((u16::from_be_bytes(bytes), tail))
+}
+
 fn read_u64(input: &[u8]) -> Result<(u64, &[u8]), FrameCodecError> {
     let (bytes, tail) = take::<8>(input)?;
     Ok((u64::from_be_bytes(bytes), tail))
@@ -660,6 +845,29 @@ pub enum FrameCodecError {
     /// The operation byte is not defined by TSF v1.
     #[error("unknown operation id 0x{0:02x}")]
     UnknownOperation(u8),
+    /// An `OpenRead` flag bit is not defined by TSF v1.
+    #[error("OpenRead has unknown flags 0x{0:02x}")]
+    UnknownOpenReadFlags(u8),
+    /// An `OpenRead` selector tag is not defined by TSF v1.
+    #[error("OpenRead has unknown start tag 0x{0:02x}")]
+    UnknownReadStartTag(u8),
+    /// A selector exceeds the exact integer range of the current data adapter.
+    #[error("read selector {0} exceeds {MAX_READ_SELECTOR_VALUE}")]
+    ReadSelectorOutOfRange(u64),
+    /// Timestamp playback was outside the accepted rate range.
+    #[error(
+        "playback rate {0} must be between {MIN_PLAYBACK_RATE_PERMILLE} and {MAX_PLAYBACK_RATE_PERMILLE} permille"
+    )]
+    PlaybackRateOutOfRange(u64),
+    /// Timestamp playback did not include a fixed ending sequence.
+    #[error("playback rate requires an inclusive until sequence")]
+    PlaybackRequiresUntil,
+    /// A present read link secret was empty.
+    #[error("OpenRead link secret cannot be empty")]
+    EmptyLinkSecret,
+    /// A read link secret cannot fit in its length prefix.
+    #[error("OpenRead link secret is {0} bytes; maximum is 65535")]
+    LinkSecretTooLarge(usize),
     /// A record used an undefined presentation format byte.
     #[error("unknown record format 0x{0:02x}")]
     UnknownRecordFormat(u8),
@@ -892,13 +1100,117 @@ mod tests {
 
     #[test]
     fn frame_decoders_reject_invalid_utf8_and_trailing_bytes() {
+        let invalid_utf8 = [
+            ClientOp::OpenRead.byte(),
+            OPEN_READ_LINK_SECRET,
+            READ_START_SEQ_NUM,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0xff,
+        ];
         assert!(matches!(
-            ClientFrame::decode(&[ClientOp::AuthRead.byte(), 0xff]),
+            ClientFrame::decode(&invalid_utf8),
             Err(FrameCodecError::InvalidUtf8(_))
         ));
         assert!(matches!(
             ServerFrame::decode(&[ServerOp::Ready.byte(), 0]),
             Err(FrameCodecError::TrailingBytes { op, count: 1 }) if op == ServerOp::Ready.byte()
+        ));
+    }
+
+    #[test]
+    fn open_read_strictly_validates_tags_flags_fields_and_bounds() {
+        let valid = ClientFrame::OpenRead {
+            link_secret: None,
+            start: ReadStart::TailOffset(80),
+            count: None,
+            until: None,
+            playback_rate_permille: None,
+        }
+        .encode()
+        .expect("valid OpenRead");
+        assert_eq!(valid.len(), ClientFrame::OPEN_READ_FIXED_LEN);
+
+        let mut unknown_flags = valid.to_vec();
+        unknown_flags[1] = 0x10;
+        assert!(matches!(
+            ClientFrame::decode(&unknown_flags),
+            Err(FrameCodecError::UnknownOpenReadFlags(0x10))
+        ));
+
+        let mut unknown_tag = valid.to_vec();
+        unknown_tag[2] = 0xff;
+        assert!(matches!(
+            ClientFrame::decode(&unknown_tag),
+            Err(FrameCodecError::UnknownReadStartTag(0xff))
+        ));
+
+        let mut oversized_selector = valid.to_vec();
+        oversized_selector[3..11].copy_from_slice(&(MAX_READ_SELECTOR_VALUE + 1).to_be_bytes());
+        assert!(matches!(
+            ClientFrame::decode(&oversized_selector),
+            Err(FrameCodecError::ReadSelectorOutOfRange(value))
+                if value == MAX_READ_SELECTOR_VALUE + 1
+        ));
+
+        let empty_secret = [
+            ClientOp::OpenRead.byte(),
+            OPEN_READ_LINK_SECRET,
+            READ_START_SEQ_NUM,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert!(matches!(
+            ClientFrame::decode(&empty_secret),
+            Err(FrameCodecError::EmptyLinkSecret)
+        ));
+        assert!(matches!(
+            ClientFrame::decode(&valid[..valid.len() - 1]),
+            Err(FrameCodecError::TruncatedFrame { .. })
+        ));
+        let mut trailing = valid.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            ClientFrame::decode(&trailing),
+            Err(FrameCodecError::TrailingBytes { count: 1, .. })
+        ));
+        assert!(matches!(
+            ClientFrame::OpenRead {
+                link_secret: None,
+                start: ReadStart::SeqNum(0),
+                count: None,
+                until: None,
+                playback_rate_permille: Some(1_000),
+            }
+            .encode(),
+            Err(FrameCodecError::PlaybackRequiresUntil)
+        ));
+        assert!(matches!(
+            ClientFrame::OpenRead {
+                link_secret: None,
+                start: ReadStart::SeqNum(0),
+                count: None,
+                until: Some(1),
+                playback_rate_permille: Some(MAX_PLAYBACK_RATE_PERMILLE + 1),
+            }
+            .encode(),
+            Err(FrameCodecError::PlaybackRateOutOfRange(_))
         ));
     }
 

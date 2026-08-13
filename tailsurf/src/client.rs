@@ -43,7 +43,8 @@ use crate::{
             UpdateStreamRequest,
         },
         ws::{
-            MAX_READ_SELECTOR_VALUE, ReadStart, ReadStreamOptions, WriteStreamOptions,
+            DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
+            MIN_PLAYBACK_RATE_PERMILLE, ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
                 AppendRecord, ClientFrame, FrameCodecError, MAX_APPEND_BATCH_RECORDS,
                 MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
@@ -378,28 +379,23 @@ impl TsfClient {
         &self,
         options: WriteStreamOptions,
     ) -> Result<TsfAppendSession, TsfClientError> {
-        let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id), &[])?;
+        let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
+        let opening_frame = ClientFrame::OpenWrite {
+            writer_id: options.writer_id,
+            link_secret: options.link_secret.clone(),
+        }
+        .encode()?;
 
         self.retry_transient(|| {
             let url = url.clone();
-            let options = options.clone();
+            let opening_frame = opening_frame.clone();
 
             async move {
-                let mut ws = connect_websocket(url, connect_timeout).await?;
-                with_timeout(
-                    operation_timeout,
-                    "authenticate writer",
-                    send_client_frame(
-                        &mut ws,
-                        ClientFrame::AuthWrite {
-                            writer_id: options.writer_id,
-                            link_secret: options.link_secret,
-                        },
-                    ),
-                )
-                .await?;
+                let mut ws =
+                    connect_websocket(url, connect_timeout, operation_timeout, opening_frame)
+                        .await?;
                 with_timeout(operation_timeout, "writer ready", expect_ready(&mut ws)).await?;
 
                 Ok(TsfAppendSession {
@@ -446,27 +442,41 @@ impl TsfClient {
                 });
             }
         }
-        let query = options.query_pairs();
-        let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id), &query)?;
+        if let Some(rate) = options.playback_rate_permille {
+            if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
+                return Err(TsfClientError::InvalidPlaybackRate {
+                    value: rate,
+                    minimum: MIN_PLAYBACK_RATE_PERMILLE,
+                    maximum: MAX_PLAYBACK_RATE_PERMILLE,
+                });
+            }
+            if options.until.is_none() {
+                return Err(TsfClientError::PlaybackRequiresUntil);
+            }
+        }
+        let opening_frame = ClientFrame::OpenRead {
+            link_secret: options.link_secret.clone(),
+            start: options
+                .start
+                .unwrap_or(ReadStart::TailOffset(DEFAULT_READ_TAIL_OFFSET)),
+            count: options.count,
+            until: options.until,
+            playback_rate_permille: options.playback_rate_permille,
+        }
+        .encode()?;
+        let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
         let read_idle_timeout = self.config.websocket_read_idle_timeout;
 
         self.retry_transient(|| {
             let url = url.clone();
-            let link_secret = options.link_secret.clone();
+            let opening_frame = opening_frame.clone();
 
             async move {
-                let mut ws = connect_websocket(url, connect_timeout).await?;
-
-                if let Some(link_secret) = link_secret {
-                    with_timeout(
-                        operation_timeout,
-                        "authenticate reader",
-                        send_client_frame(&mut ws, ClientFrame::AuthRead { link_secret }),
-                    )
-                    .await?;
-                }
+                let mut ws =
+                    connect_websocket(url, connect_timeout, operation_timeout, opening_frame)
+                        .await?;
                 let stream_info = with_timeout(
                     operation_timeout,
                     "reader handshake",
@@ -507,11 +517,7 @@ impl TsfClient {
         }
     }
 
-    fn websocket_url(
-        &self,
-        path: &str,
-        query: &[(&'static str, String)],
-    ) -> Result<Url, TsfClientError> {
+    fn websocket_url(&self, path: &str) -> Result<Url, TsfClientError> {
         let mut url = self.rest_url(path);
         let scheme = match url.scheme() {
             "http" => "ws",
@@ -520,12 +526,6 @@ impl TsfClient {
         };
         url.set_scheme(scheme)
             .map_err(|_| TsfClientError::InvalidWebSocketScheme(url.scheme().to_owned()))?;
-
-        if !query.is_empty() {
-            url.query_pairs_mut()
-                .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
-        }
-
         Ok(url)
     }
 
@@ -1595,6 +1595,8 @@ enum ReadSocketOutcome {
 async fn connect_websocket(
     url: Url,
     connect_timeout: Duration,
+    operation_timeout: Duration,
+    opening_frame: Bytes,
 ) -> Result<ClientWebSocket, TsfClientError> {
     // TSF v1 sends each batch in one message, so Nagle could hold a small append back for an ACK.
     const DISABLE_NAGLE: bool = true;
@@ -1605,7 +1607,7 @@ async fn connect_websocket(
         HeaderValue::from_static(TSF_WS_PROTOCOL),
     );
 
-    let (ws, response) = timeout(
+    let (mut ws, response) = timeout(
         connect_timeout,
         connect_async_with_config(request, None, DISABLE_NAGLE),
     )
@@ -1625,6 +1627,12 @@ async fn connect_websocket(
             selected_protocol,
         ));
     }
+
+    timeout(operation_timeout, ws.send(Message::Binary(opening_frame)))
+        .await
+        .map_err(|_| TsfClientError::Timeout {
+            operation: "send opening frame",
+        })??;
 
     Ok(ws)
 }
@@ -1683,14 +1691,6 @@ struct ApiErrorResponse {
 struct ApiErrorBody {
     code: String,
     message: String,
-}
-
-async fn send_client_frame(
-    ws: &mut ClientWebSocket,
-    frame: ClientFrame,
-) -> Result<(), TsfClientError> {
-    ws.send(Message::Binary(frame.encode()?)).await?;
-    Ok(())
 }
 
 async fn next_server_frame(
@@ -1870,6 +1870,19 @@ pub enum TsfClientError {
         /// Largest supported selector value.
         maximum: u64,
     },
+    /// A timestamp playback rate is outside the protocol range.
+    #[error("playback rate {value} must be between {minimum} and {maximum} permille")]
+    InvalidPlaybackRate {
+        /// Requested playback rate.
+        value: u64,
+        /// Slowest accepted playback rate.
+        minimum: u64,
+        /// Fastest accepted playback rate.
+        maximum: u64,
+    },
+    /// Timestamp playback needs a stable inclusive ending sequence.
+    #[error("playback rate requires an inclusive until sequence")]
+    PlaybackRequiresUntil,
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
@@ -2164,19 +2177,16 @@ mod tests {
     }
 
     #[test]
-    fn builds_versioned_websocket_urls_with_read_query() {
+    fn builds_path_only_versioned_websocket_urls() {
         let client =
             TsfClient::with_api_base_url(Url::parse("https://example.com").expect("API origin"));
 
         assert_eq!(
             client
-                .websocket_url(
-                    "/streams/0123456789abcdefghjkmnpqrstvwxyz/read",
-                    &[("seq_num", "42".to_owned()), ("count", "3".to_owned())],
-                )
+                .websocket_url("/streams/0123456789abcdefghjkmnpqrstvwxyz/read")
                 .expect("WebSocket URL")
                 .as_str(),
-            "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read?seq_num=42&count=3"
+            "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read"
         );
     }
 

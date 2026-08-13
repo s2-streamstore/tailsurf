@@ -13,7 +13,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
@@ -1030,30 +1030,14 @@ async fn tail_reconnect_resumes_after_last_sequence() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[1].link_secret, TEST_STREAM_LINK);
-    assert_eq!(
-        attempts[0].query.get("auth").map(String::as_str),
-        Some("link")
-    );
-    assert_eq!(
-        attempts[1].query.get("auth").map(String::as_str),
-        Some("link")
-    );
-    assert_eq!(attempts[0].query.get("seq_num"), None);
-    assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        attempts[1].query.get("seq_num").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(attempts[1].query.get("tail_offset"), None);
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(0));
+    assert_eq!(attempts[1].start, ReadStart::SeqNum(1));
 
     server.abort();
 }
 
 #[tokio::test]
-async fn tail_selector_flags_are_resolved_as_read_query() {
+async fn tail_selector_flags_are_sent_in_open_read() {
     let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1072,16 +1056,8 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     assert_eq!(tail_offset_output.stderr, "");
     let attempts = tail_offset_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].query.get("seq_num"), None);
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("7")
-    );
-    assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
-        Some("25")
-    );
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(25));
+    assert_eq!(attempts[0].count, Some(7));
     tail_offset_server.abort();
 
     let seq_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
@@ -1097,16 +1073,8 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     assert_eq!(seq_output.stderr, "");
     let attempts = seq_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("42")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(42));
+    assert_eq!(attempts[0].count, Some(3));
     seq_server.abort();
 
     let timestamp_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
@@ -1127,12 +1095,7 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     assert_eq!(timestamp_output.stderr, "");
     let attempts = timestamp_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("timestamp").map(String::as_str),
-        Some("1781717406000")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
     timestamp_server.abort();
 }
 
@@ -1156,16 +1119,8 @@ async fn empty_caught_up_establishes_the_reconnect_position() {
     assert_eq!(output.stderr, "");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert_eq!(
-        attempts[0].query.get("tail_offset").map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(attempts[0].query.get("seq_num"), None);
-    assert_eq!(
-        attempts[1].query.get("seq_num").map(String::as_str),
-        Some("5")
-    );
-    assert_eq!(attempts[1].query.get("tail_offset"), None);
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
+    assert_eq!(attempts[1].start, ReadStart::SeqNum(5));
     assert!(server.tail_link_secrets().is_empty());
 
     server.abort();
@@ -1191,10 +1146,8 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     assert_eq!(record.data.as_ref(), b"default\n");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].query.get("seq_num"), None);
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(attempts[1].query.get("seq_num"), None);
-    assert_eq!(attempts[1].query.get("tail_offset"), None);
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(80));
+    assert_eq!(attempts[1].start, ReadStart::TailOffset(80));
     assert!(server.tail_link_secrets().is_empty());
 
     server.abort();
@@ -1455,7 +1408,7 @@ async fn replay_rejects_logical_records_above_configured_limit() {
 }
 
 #[tokio::test]
-async fn replay_selector_flags_are_sent_as_bounded_read_query() {
+async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1476,19 +1429,9 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     );
     let attempts = last_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("2")
-    );
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(2));
+    assert_eq!(attempts[0].until, Some(3));
+    assert_eq!(attempts[0].count, Some(2));
     assert_eq!(
         last_server.tail_link_secrets(),
         [Some(TEST_STREAM_LINK.to_owned())]
@@ -1506,19 +1449,9 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     assert!(seq_output.status.success(), "stderr={}", seq_output.stderr);
     let attempts = seq_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(2));
+    assert_eq!(attempts[0].until, Some(3));
+    assert_eq!(attempts[0].count, Some(2));
     seq_server.abort();
 
     let timestamp_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
@@ -1541,16 +1474,9 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     );
     let attempts = timestamp_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("timestamp").map(String::as_str),
-        Some("1781717406000")
-    );
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(attempts[0].query.get("count"), None);
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
+    assert_eq!(attempts[0].until, Some(3));
+    assert_eq!(attempts[0].count, None);
     timestamp_server.abort();
 
     let count_server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
@@ -1567,19 +1493,9 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     );
     let attempts = count_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(0));
+    assert_eq!(attempts[0].until, Some(1));
+    assert_eq!(attempts[0].count, Some(1));
     count_server.abort();
 }
 
@@ -1602,10 +1518,7 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     assert_eq!(output.stderr, Vec::<u8>::new());
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("1")
-    );
+    assert_eq!(attempts[0].until, Some(1));
 
     server.abort();
 }
@@ -2297,7 +2210,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let Ok(ClientFrame::AuthWrite {
+    let Ok(ClientFrame::OpenWrite {
         writer_id,
         link_secret,
     }) = ClientFrame::decode_bytes(auth)
@@ -2380,26 +2293,24 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
 async fn test_read_socket(
     State(state): State<Arc<TestApiState>>,
     Path(stream_id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     ws.protocols([TSF_WS_PROTOCOL])
-        .on_upgrade(move |socket| test_read_flow(state, stream_id, query, socket))
+        .on_upgrade(move |socket| test_read_flow(state, stream_id, socket))
 }
 
-async fn test_read_flow(
-    state: Arc<TestApiState>,
-    stream_id: String,
-    query: HashMap<String, String>,
-    mut socket: WebSocket,
-) {
-    if query.get("auth").map(String::as_str) != Some("link") {
-        return;
-    }
-    let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
+async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket: WebSocket) {
+    let Some(Ok(Message::Binary(opening))) = socket.recv().await else {
         return;
     };
-    let Ok(ClientFrame::AuthRead { link_secret }) = ClientFrame::decode_bytes(auth) else {
+    let Ok(ClientFrame::OpenRead {
+        link_secret: Some(link_secret),
+        start,
+        count,
+        until,
+        ..
+    }) = ClientFrame::decode_bytes(opening)
+    else {
         return;
     };
     let (stream_info, caught_up, records) = {
@@ -2426,7 +2337,7 @@ async fn test_read_flow(
         (
             test_read_stream_info(stream),
             caught_up,
-            test_select_records(stream, &query),
+            test_select_records(stream, start, count, until),
         )
     };
     send_server_frame(&mut socket, ServerFrame::Ready)
@@ -2549,31 +2460,29 @@ fn test_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-fn test_select_records(stream: &TestStream, query: &HashMap<String, String>) -> Vec<TestRecord> {
+fn test_select_records(
+    stream: &TestStream,
+    start: ReadStart,
+    count: Option<u64>,
+    until: Option<u64>,
+) -> Vec<TestRecord> {
     let mut records = stream.records.clone();
-    if let Some(seq_num) = query
-        .get("seq_num")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        records.retain(|record| record.seq_num >= seq_num);
-    } else if let Some(tail_offset) = query
-        .get("tail_offset")
-        .and_then(|value| value.parse::<usize>().ok())
-    {
-        let start = records.len().saturating_sub(tail_offset);
-        records = records[start..].to_vec();
+    match start {
+        ReadStart::SeqNum(seq_num) => records.retain(|record| record.seq_num >= seq_num),
+        ReadStart::TimestampMs(timestamp_ms) => {
+            records.retain(|record| record.timestamp_ms >= timestamp_ms);
+        }
+        ReadStart::TailOffset(tail_offset) => {
+            let tail_offset = usize::try_from(tail_offset).unwrap_or(usize::MAX);
+            let start = records.len().saturating_sub(tail_offset);
+            records = records[start..].to_vec();
+        }
     }
-    if let Some(until) = query
-        .get("until")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
+    if let Some(until) = until {
         records.retain(|record| record.seq_num <= until);
     }
-    if let Some(count) = query
-        .get("count")
-        .and_then(|value| value.parse::<usize>().ok())
-    {
-        records.truncate(count);
+    if let Some(count) = count {
+        records.truncate(usize::try_from(count).unwrap_or(usize::MAX));
     }
     records
 }
@@ -2935,7 +2844,7 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let Ok(ClientFrame::AuthWrite { writer_id, .. }) = ClientFrame::decode_bytes(auth) else {
+    let Ok(ClientFrame::OpenWrite { writer_id, .. }) = ClientFrame::decode_bytes(auth) else {
         return;
     };
     let connection_index = {
@@ -3096,7 +3005,7 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let ClientFrame::AuthWrite {
+    let ClientFrame::OpenWrite {
         writer_id,
         link_secret,
     } = ClientFrame::decode_bytes(auth).expect("auth write")
@@ -3155,7 +3064,10 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadAttempt {
     link_secret: String,
-    query: HashMap<String, String>,
+    start: ReadStart,
+    count: Option<u64>,
+    until: Option<u64>,
+    playback_rate_permille: Option<u64>,
 }
 
 struct FakeReadState {
@@ -3277,26 +3189,23 @@ fn fake_stream_info(stream_id: &str) -> ReadStreamInfo {
 async fn fake_read_socket(
     State(state): State<Arc<FakeReadState>>,
     Path(stream_id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     ws.protocols([TSF_WS_PROTOCOL])
-        .on_upgrade(move |socket| fake_read_flow(state, stream_id, query, socket))
+        .on_upgrade(move |socket| fake_read_flow(state, stream_id, socket))
 }
 
-async fn fake_read_flow(
-    state: Arc<FakeReadState>,
-    stream_id: String,
-    query: HashMap<String, String>,
-    mut socket: WebSocket,
-) {
-    if query.get("auth").map(String::as_str) != Some("link") {
-        return;
-    }
-    let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
+async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket: WebSocket) {
+    let Some(Ok(Message::Binary(opening))) = socket.recv().await else {
         return;
     };
-    let ClientFrame::AuthRead { link_secret } = ClientFrame::decode_bytes(auth).expect("auth read")
+    let ClientFrame::OpenRead {
+        link_secret: Some(link_secret),
+        start,
+        count,
+        until,
+        playback_rate_permille,
+    } = ClientFrame::decode_bytes(opening).expect("open read")
     else {
         return;
     };
@@ -3304,7 +3213,10 @@ async fn fake_read_flow(
         let mut attempts = state.read_attempts.lock().expect("read attempts lock");
         attempts.push(ReadAttempt {
             link_secret: link_secret.expose_secret().to_owned(),
-            query,
+            start,
+            count,
+            until,
+            playback_rate_permille,
         });
         attempts.len()
     };
