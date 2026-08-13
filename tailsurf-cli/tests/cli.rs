@@ -56,7 +56,6 @@ use url::Url;
 const FREE_EXPIRY_LIMIT_MESSAGE: &str = "Free streams can expire at most 10 days from now.";
 const TEST_STREAM_LINK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const UNKNOWN_STREAM_LINK: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
-const ROTATED_LINK_AUTHORIZATION: &str = "rotated-link-authorization";
 
 #[test]
 fn update_refuses_an_unmanaged_executable() {
@@ -856,7 +855,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
 }
 
 #[tokio::test]
-async fn write_reconnect_reuses_writer_identity_sequence_and_rotated_grant() {
+async fn write_reconnect_reuses_writer_identity_sequence_and_link_secret() {
     let server = FakeWriteServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -874,11 +873,6 @@ async fn write_reconnect_reuses_writer_identity_sequence_and_rotated_grant() {
     let attempts = server.append_attempts();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].writer_id, attempts[1].writer_id);
-    assert_eq!(attempts[0].link_authorization, None);
-    assert_eq!(
-        attempts[1].link_authorization.as_deref(),
-        Some(ROTATED_LINK_AUTHORIZATION)
-    );
     assert_eq!(attempts[0].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[1].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[0].writer_seq_num, 0);
@@ -1016,7 +1010,7 @@ async fn producer_reconnect_resends_every_unacknowledged_record_in_order() {
 
 #[tokio::test]
 async fn tail_reconnect_resumes_after_last_s2_sequence() {
-    let server = FakeReadServer::start(FakeReadMode::RotatedGrantReconnect).await;
+    let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1036,18 +1030,13 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[1].link_secret, TEST_STREAM_LINK);
-    assert_eq!(attempts[0].link_authorization, None);
-    assert_eq!(
-        attempts[1].link_authorization.as_deref(),
-        Some(ROTATED_LINK_AUTHORIZATION)
-    );
     assert_eq!(
         attempts[0].query.get("auth").map(String::as_str),
         Some("link")
     );
     assert_eq!(
         attempts[1].query.get("auth").map(String::as_str),
-        Some("grant")
+        Some("link")
     );
     assert_eq!(
         attempts[0].query.get("seq_num").map(String::as_str),
@@ -2127,7 +2116,6 @@ async fn test_get_stream_tail(
         stream_id: stream.stream_id,
         next_s2_seq_num: stream.records.len() as u64,
         last_timestamp_ms: stream.records.last().map(|_| 1_781_717_406_000),
-        read_authorization: None,
     })
     .into_response()
 }
@@ -2974,7 +2962,6 @@ async fn send_server_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AppendAttempt {
     writer_id: WriterId,
-    link_authorization: Option<String>,
     link_secret: String,
     writer_seq_num: u64,
     part: PartHeader,
@@ -3036,30 +3023,16 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let (writer_id, link_authorization, link_secret) =
-        match ClientFrame::decode_bytes(auth).expect("auth write") {
-            ClientFrame::AuthWrite {
-                writer_id,
-                link_secret,
-            } => (writer_id, None, link_secret),
-            ClientFrame::AuthWriteGrant {
-                writer_id,
-                authorization,
-                link_secret,
-            } => (writer_id, Some(authorization), link_secret),
-            _ => return,
-        };
+    let ClientFrame::AuthWrite {
+        writer_id,
+        link_secret,
+    } = ClientFrame::decode_bytes(auth).expect("auth write")
+    else {
+        return;
+    };
     send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
-    if link_authorization.is_none() {
-        send_server_frame(
-            &mut socket,
-            ServerFrame::Authorization(ROTATED_LINK_AUTHORIZATION.to_owned()),
-        )
-        .await
-        .expect("send rotated authorization");
-    }
 
     let Some(Ok(Message::Binary(append))) = socket.recv().await else {
         return;
@@ -3077,7 +3050,6 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
         let mut attempts = state.append_attempts.lock().expect("append attempts lock");
         attempts.push(AppendAttempt {
             writer_id,
-            link_authorization,
             link_secret: link_secret.expose_secret().to_owned(),
             writer_seq_num,
             part,
@@ -3110,7 +3082,6 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadAttempt {
-    link_authorization: Option<String>,
     link_secret: String,
     query: HashMap<String, String>,
 }
@@ -3124,7 +3095,6 @@ struct FakeReadState {
 #[derive(Clone, Copy)]
 enum FakeReadMode {
     Reconnect,
-    RotatedGrantReconnect,
     ReconnectBeforeFirstRecord,
     ReconnectBeforeFirstDefault,
     ReconnectForever,
@@ -3201,7 +3171,7 @@ async fn fake_read_tail(
         .expect("tail bearer links lock")
         .push(link_secret);
     let next_s2_seq_num = match state.mode {
-        FakeReadMode::Reconnect | FakeReadMode::RotatedGrantReconnect => 0,
+        FakeReadMode::Reconnect => 0,
         FakeReadMode::ReconnectBeforeFirstRecord => 7,
         FakeReadMode::ReconnectBeforeFirstDefault => 100,
         FakeReadMode::ReconnectForever
@@ -3232,28 +3202,19 @@ async fn fake_read_flow(
     query: HashMap<String, String>,
     mut socket: WebSocket,
 ) {
-    if !matches!(
-        query.get("auth").map(String::as_str),
-        Some("link" | "grant")
-    ) {
+    if query.get("auth").map(String::as_str) != Some("link") {
         return;
     }
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let (link_authorization, link_secret) =
-        match ClientFrame::decode_bytes(auth).expect("auth read") {
-            ClientFrame::AuthRead { link_secret } => (None, link_secret),
-            ClientFrame::AuthReadGrant {
-                authorization,
-                link_secret,
-            } => (Some(authorization), link_secret),
-            _ => return,
-        };
+    let ClientFrame::AuthRead { link_secret } = ClientFrame::decode_bytes(auth).expect("auth read")
+    else {
+        return;
+    };
     let attempt_count = {
         let mut attempts = state.read_attempts.lock().expect("read attempts lock");
         attempts.push(ReadAttempt {
-            link_authorization: link_authorization.clone(),
             link_secret: link_secret.expose_secret().to_owned(),
             query,
         });
@@ -3262,14 +3223,6 @@ async fn fake_read_flow(
     send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
-    if matches!(state.mode, FakeReadMode::RotatedGrantReconnect) && attempt_count == 1 {
-        send_server_frame(
-            &mut socket,
-            ServerFrame::Authorization(ROTATED_LINK_AUTHORIZATION.to_owned()),
-        )
-        .await
-        .expect("send rotated authorization");
-    }
     send_server_frame(
         &mut socket,
         ServerFrame::ReadTail(ReadTail {
@@ -3281,7 +3234,7 @@ async fn fake_read_flow(
     .expect("send read tail");
 
     match state.mode {
-        FakeReadMode::Reconnect | FakeReadMode::RotatedGrantReconnect => {
+        FakeReadMode::Reconnect => {
             if attempt_count == 1 {
                 send_read_record(&mut socket, 0, 0, b"first\n").await;
                 send_server_frame(

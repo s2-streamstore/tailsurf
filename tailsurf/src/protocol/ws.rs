@@ -5,7 +5,7 @@ pub mod frame;
 
 use crate::{LinkSecret, StreamId, WriterId};
 
-/// Position, bounds, and authorization for one read WebSocket.
+/// Position, bounds, and credentials for one read WebSocket.
 #[derive(Clone, Debug)]
 pub struct ReadStreamOptions {
     /// Stream to read.
@@ -43,17 +43,10 @@ impl ReadStreamOptions {
         self.with_link_secret(link.clone())
     }
 
-    pub(crate) fn query_pairs(&self, has_read_authorization: bool) -> Vec<(&'static str, String)> {
+    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
         let mut pairs = Vec::new();
         if self.link_secret.is_some() {
-            pairs.push((
-                "auth",
-                if has_read_authorization {
-                    "grant".to_owned()
-                } else {
-                    "link".to_owned()
-                },
-            ));
+            pairs.push(("auth", "link".to_owned()));
         }
         match self.start {
             None => {}
@@ -86,7 +79,7 @@ pub enum ReadStart {
     TailOffset(u64),
 }
 
-/// Stream, writer identity, and authorization for one write WebSocket.
+/// Stream, writer identity, and credentials for one write WebSocket.
 #[derive(Clone, Debug)]
 pub struct WriteStreamOptions {
     /// Stream to append to.
@@ -95,8 +88,6 @@ pub struct WriteStreamOptions {
     pub writer_id: WriterId,
     /// Secret from a write-capable stream link.
     pub link_secret: LinkSecret,
-    /// Optional short-lived authorization from a workspace bootstrap response.
-    pub link_authorization: Option<String>,
 }
 
 impl WriteStreamOptions {
@@ -110,18 +101,11 @@ impl WriteStreamOptions {
             stream_id,
             writer_id,
             link_secret: link_secret.into(),
-            link_authorization: None,
         }
     }
 
     /// Creates write options by cloning a stream link without exposing it.
     pub fn with_stream_link(stream_id: StreamId, writer_id: WriterId, link: &LinkSecret) -> Self {
         Self::new(stream_id, writer_id, link.clone())
-    }
-
-    /// Reuses a recent authorization for the first connection and reconnects.
-    pub fn with_link_authorization(mut self, authorization: impl Into<String>) -> Self {
-        self.link_authorization = Some(authorization.into());
-        self
     }
 }
