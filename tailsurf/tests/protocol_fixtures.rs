@@ -5,10 +5,10 @@ use serde::Deserialize;
 use tailsurf::{
     LinkSecret, WriterId,
     protocol::{
-        rest::{StreamInfoResponse, Visibility},
+        rest::Visibility,
         ws::frame::{
-            ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord, RecordFormat,
-            ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
+            AppendRecord, ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
+            ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
         },
     },
 };
@@ -17,7 +17,6 @@ const FIXTURES_JSON: &str = include_str!("../fixtures/v3.json");
 
 #[derive(Deserialize)]
 struct Fixtures {
-    version: u16,
     websocket_protocol: String,
     max_record_bytes: usize,
     client_frames: Vec<FrameFixture<ClientFixture>>,
@@ -41,7 +40,7 @@ enum ClientFixture {
         writer_id_hex: String,
         link_secret: String,
     },
-    AppendRecord {
+    AppendBatch {
         writer_seq_num: String,
         part_raw: String,
         format: u8,
@@ -52,16 +51,14 @@ enum ClientFixture {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerFixture {
-    Hello {
-        version: u16,
-    },
+    Ready,
     Ack {
         writer_seq_start: String,
         writer_seq_end: String,
         seq_start: String,
         seq_end: String,
     },
-    ReadRecord {
+    ReadBatch {
         seq_num: String,
         timestamp_ms: String,
         writer_id_hex: String,
@@ -73,17 +70,14 @@ enum ServerFixture {
     Heartbeat,
     CaughtUp {
         next_seq_num: String,
-        timestamp_ms: String,
+        last_timestamp_ms: String,
     },
     StreamInfo {
         stream_id: String,
         title: Option<String>,
-        basin: String,
         visibility: Visibility,
-        state: String,
         created_at: String,
         expires_at: String,
-        active_link_count: usize,
     },
 }
 
@@ -91,7 +85,6 @@ enum ServerFixture {
 fn protocol_constants_match_v3_fixtures() {
     let fixtures = fixtures();
 
-    assert_eq!(fixtures.version, TSF_V3);
     assert_eq!(fixtures.websocket_protocol, TSF_WS_PROTOCOL);
     assert_eq!(fixtures.max_record_bytes, MAX_RECORD_BYTES);
 }
@@ -150,23 +143,23 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             writer_id: decode_writer_id(&writer_id_hex),
             link_secret: LinkSecret::from(link_secret),
         },
-        ClientFixture::AppendRecord {
+        ClientFixture::AppendBatch {
             writer_seq_num,
             part_raw,
             format,
             data_hex,
-        } => ClientFrame::AppendRecord {
+        } => ClientFrame::AppendBatch(vec![AppendRecord {
             writer_seq_num: parse_u64(&writer_seq_num),
             part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
             format: parse_format(format),
             data: Bytes::from(decode_hex(&data_hex)),
-        },
+        }]),
     }
 }
 
 fn server_frame(fixture: ServerFixture) -> ServerFrame {
     match fixture {
-        ServerFixture::Hello { version } => ServerFrame::Hello { version },
+        ServerFixture::Ready => ServerFrame::Ready,
         ServerFixture::Ack {
             writer_seq_start,
             writer_seq_end,
@@ -178,7 +171,7 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             seq_start: parse_u64(&seq_start),
             seq_end: parse_u64(&seq_end),
         },
-        ServerFixture::ReadRecord {
+        ServerFixture::ReadBatch {
             seq_num,
             timestamp_ms,
             writer_id_hex,
@@ -186,7 +179,7 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             part_raw,
             format,
             data_hex,
-        } => ServerFrame::ReadRecord(ReadRecord {
+        } => ServerFrame::ReadBatch(vec![ReadRecord {
             seq_num: parse_u64(&seq_num),
             timestamp_ms: parse_u64(&timestamp_ms),
             writer_id: decode_writer_id(&writer_id_hex),
@@ -194,33 +187,27 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
             format: parse_format(format),
             data: Bytes::from(decode_hex(&data_hex)),
-        }),
+        }]),
         ServerFixture::Heartbeat => ServerFrame::Heartbeat,
         ServerFixture::CaughtUp {
             next_seq_num,
-            timestamp_ms,
+            last_timestamp_ms,
         } => ServerFrame::CaughtUp(ReadCaughtUp {
             next_seq_num: parse_u64(&next_seq_num),
-            timestamp_ms: parse_u64(&timestamp_ms),
+            last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
         ServerFixture::StreamInfo {
             stream_id,
             title,
-            basin,
             visibility,
-            state,
             created_at,
             expires_at,
-            active_link_count,
-        } => ServerFrame::StreamInfo(StreamInfoResponse {
+        } => ServerFrame::StreamInfo(ReadStreamInfo {
             stream_id: stream_id.parse().expect("fixture stream ID"),
             title: title.map(|title| title.parse().expect("fixture stream title")),
-            basin,
             visibility,
-            state,
             created_at,
             expires_at,
-            active_link_count,
         }),
     }
 }

@@ -36,8 +36,8 @@ use tailsurf::{
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord, RecordFormat,
-                ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
+                ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
+                ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
             },
         },
     },
@@ -2324,44 +2324,52 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
             return;
         }
     }
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
+        .expect("send ready");
 
     while let Some(Ok(Message::Binary(append))) = socket.recv().await {
-        let Ok(ClientFrame::AppendRecord {
-            writer_seq_num,
-            part,
-            format,
-            data,
-        }) = ClientFrame::decode_bytes(append)
-        else {
+        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
             return;
         };
-        let seq_num = {
+        let (writer_seq_start, writer_seq_end, seq_start, seq_end) = {
             let mut streams = state.streams.lock().expect("streams lock");
             let Some(stream) = streams.get_mut(&stream_id) else {
                 return;
             };
-            let seq_num = stream.records.len() as u64;
-            stream.records.push(TestRecord {
-                seq_num,
-                timestamp_ms: 1_781_717_406_000 + seq_num,
-                writer_id,
-                writer_seq_num,
-                part,
-                format,
-                data,
-            });
-            seq_num
+            let seq_start = stream.records.len() as u64;
+            let Some(writer_seq_start) = records.first().map(|record| record.writer_seq_num) else {
+                return;
+            };
+            let Some(writer_seq_end) = records.last().map(|record| record.writer_seq_num) else {
+                return;
+            };
+            for record in records {
+                let seq_num = stream.records.len() as u64;
+                stream.records.push(TestRecord {
+                    seq_num,
+                    timestamp_ms: 1_781_717_406_000 + seq_num,
+                    writer_id,
+                    writer_seq_num: record.writer_seq_num,
+                    part: record.part,
+                    format: record.format,
+                    data: record.data,
+                });
+            }
+            (
+                writer_seq_start,
+                writer_seq_end,
+                seq_start,
+                stream.records.len() as u64 - 1,
+            )
         };
         send_server_frame(
             &mut socket,
             ServerFrame::Ack {
-                writer_seq_start: writer_seq_num,
-                writer_seq_end: writer_seq_num,
-                seq_start: seq_num,
-                seq_end: seq_num,
+                writer_seq_start,
+                writer_seq_end,
+                seq_start,
+                seq_end,
             },
         )
         .await
@@ -2410,38 +2418,43 @@ async fn test_read_flow(
         }
         let caught_up = ReadCaughtUp {
             next_seq_num: stream.records.len() as u64,
-            timestamp_ms: stream
+            last_timestamp_ms: stream
                 .records
                 .last()
                 .map_or(0, |record| record.timestamp_ms),
         };
         (
-            test_get_stream_response(stream),
+            test_read_stream_info(stream),
             caught_up,
             test_select_records(stream, &query),
         )
     };
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
+        .expect("send ready");
     send_server_frame(&mut socket, ServerFrame::StreamInfo(stream_info))
         .await
         .expect("send stream info");
-    for record in records {
+    if !records.is_empty() {
         send_server_frame(
             &mut socket,
-            ServerFrame::ReadRecord(ReadRecord {
-                seq_num: record.seq_num,
-                timestamp_ms: record.timestamp_ms,
-                writer_id: record.writer_id,
-                writer_seq_num: record.writer_seq_num,
-                part: record.part,
-                format: record.format,
-                data: record.data,
-            }),
+            ServerFrame::ReadBatch(
+                records
+                    .into_iter()
+                    .map(|record| ReadRecord {
+                        seq_num: record.seq_num,
+                        timestamp_ms: record.timestamp_ms,
+                        writer_id: record.writer_id,
+                        writer_seq_num: record.writer_seq_num,
+                        part: record.part,
+                        format: record.format,
+                        data: record.data,
+                    })
+                    .collect(),
+            ),
         )
         .await
-        .expect("send record");
+        .expect("send records");
     }
     send_server_frame(&mut socket, ServerFrame::CaughtUp(caught_up))
         .await
@@ -2489,6 +2502,16 @@ fn test_get_stream_response(stream: &TestStream) -> StreamInfoResponse {
         created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at: stream.expires_at.clone(),
         active_link_count: stream.links.iter().filter(|link| link.active).count(),
+    }
+}
+
+fn test_read_stream_info(stream: &TestStream) -> ReadStreamInfo {
+    ReadStreamInfo {
+        stream_id: stream.stream_id,
+        title: stream.title.clone(),
+        visibility: stream.visibility,
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
+        expires_at: stream.expires_at.clone(),
     }
 }
 
@@ -2921,34 +2944,34 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
         *connections += 1;
         connection_index
     };
-    if send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    if send_server_frame(&mut socket, ServerFrame::Ready)
         .await
         .is_err()
     {
         return;
     }
 
-    for _ in 0..state.expected_before_ack {
+    let mut received = 0;
+    while received < state.expected_before_ack {
         let Some(Ok(Message::Binary(append))) = socket.recv().await else {
             return;
         };
-        let Ok(ClientFrame::AppendRecord {
-            writer_seq_num,
-            data,
-            ..
-        }) = ClientFrame::decode_bytes(append)
-        else {
+        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
             return;
         };
+        if records.is_empty() || records.len() > state.expected_before_ack - received {
+            return;
+        }
+        received += records.len();
         state
             .attempts
             .lock()
             .expect("attempts lock")
-            .push(HoldingWriteAttempt {
+            .extend(records.into_iter().map(|record| HoldingWriteAttempt {
                 writer_id,
-                writer_seq_num,
-                data,
-            });
+                writer_seq_num: record.writer_seq_num,
+                data: record.data,
+            }));
     }
 
     if state.disconnect_first_batch && connection_index == 0 {
@@ -2964,27 +2987,25 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
     }
 
     while let Some(Ok(Message::Binary(append))) = socket.recv().await {
-        let Ok(ClientFrame::AppendRecord {
-            writer_seq_num,
-            data,
-            ..
-        }) = ClientFrame::decode_bytes(append)
-        else {
+        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
+            return;
+        };
+        let Some(start) = records.first().map(|record| record.writer_seq_num) else {
+            return;
+        };
+        let Some(end) = records.last().map(|record| record.writer_seq_num) else {
             return;
         };
         state
             .attempts
             .lock()
             .expect("attempts lock")
-            .push(HoldingWriteAttempt {
+            .extend(records.into_iter().map(|record| HoldingWriteAttempt {
                 writer_id,
-                writer_seq_num,
-                data,
-            });
-        if send_test_ack(&mut socket, writer_seq_num, writer_seq_num)
-            .await
-            .is_err()
-        {
+                writer_seq_num: record.writer_seq_num,
+                data: record.data,
+            }));
+        if send_test_ack(&mut socket, start, end).await.is_err() {
             return;
         }
     }
@@ -3082,31 +3103,30 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     else {
         return;
     };
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
+        .expect("send ready");
 
     let Some(Ok(Message::Binary(append))) = socket.recv().await else {
         return;
     };
-    let ClientFrame::AppendRecord {
-        writer_seq_num,
-        part,
-        format,
-        data,
-    } = ClientFrame::decode_bytes(append).expect("append")
+    let ClientFrame::AppendBatch(mut records) = ClientFrame::decode_bytes(append).expect("append")
     else {
         return;
     };
+    if records.len() != 1 {
+        return;
+    }
+    let record = records.remove(0);
     let attempt_count = {
         let mut attempts = state.append_attempts.lock().expect("append attempts lock");
         attempts.push(AppendAttempt {
             writer_id,
             link_secret: link_secret.expose_secret().to_owned(),
-            writer_seq_num,
-            part,
-            format,
-            data,
+            writer_seq_num: record.writer_seq_num,
+            part: record.part,
+            format: record.format,
+            data: record.data,
         });
         attempts.len()
     };
@@ -3122,8 +3142,8 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     send_server_frame(
         &mut socket,
         ServerFrame::Ack {
-            writer_seq_start: writer_seq_num,
-            writer_seq_end: writer_seq_num,
+            writer_seq_start: record.writer_seq_num,
+            writer_seq_end: record.writer_seq_num,
             seq_start: 0,
             seq_end: 0,
         },
@@ -3244,16 +3264,13 @@ const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
     }
 }
 
-fn fake_stream_info(stream_id: &str) -> StreamInfoResponse {
-    StreamInfoResponse {
+fn fake_stream_info(stream_id: &str) -> ReadStreamInfo {
+    ReadStreamInfo {
         stream_id: stream_id.parse().expect("fake stream ID"),
         title: None,
-        basin: "test-basin".to_owned(),
         visibility: Visibility::Private,
-        state: "active".to_owned(),
         created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at: "2026-08-23T00:00:00Z".to_owned(),
-        active_link_count: 1,
     }
 }
 
@@ -3291,9 +3308,9 @@ async fn fake_read_flow(
         });
         attempts.len()
     };
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
+        .expect("send ready");
     send_server_frame(
         &mut socket,
         ServerFrame::StreamInfo(fake_stream_info(&stream_id)),
@@ -3315,7 +3332,7 @@ async fn fake_read_flow(
                     &mut socket,
                     ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 5,
-                        timestamp_ms: 1_781_717_406_010,
+                        last_timestamp_ms: 1_781_717_406_010,
                     }),
                 )
                 .await
@@ -3438,7 +3455,7 @@ async fn send_read_record_with_format(
 ) {
     send_server_frame(
         socket,
-        ServerFrame::ReadRecord(ReadRecord {
+        ServerFrame::ReadBatch(vec![ReadRecord {
             seq_num,
             timestamp_ms: 1_781_717_406_000 + seq_num,
             writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
@@ -3446,7 +3463,7 @@ async fn send_read_record_with_format(
             part,
             format,
             data: Bytes::copy_from_slice(data),
-        }),
+        }]),
     )
     .await
     .expect("send read record");

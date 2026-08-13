@@ -1,26 +1,25 @@
-//! Exact binary codec for one-frame-per-message `tsf.v3` WebSocket traffic.
+//! Exact binary codec for `tsf.v3` WebSocket traffic.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 
-use crate::{LinkSecret, WriterId, protocol::rest::StreamInfoResponse};
-
-/// Numeric protocol version sent in [`ServerFrame::Hello`].
-pub type ProtocolVersion = u16;
-
-/// Protocol version implemented by this crate.
-pub const TSF_V3: ProtocolVersion = 3;
+use crate::{LinkSecret, StreamId, StreamTitle, WriterId, protocol::rest::Visibility};
 /// WebSocket subprotocol offered and selected for TSF v3 connections.
 pub const TSF_WS_PROTOCOL: &str = "tsf.v3";
 /// Maximum data payload in one physical record.
 pub const MAX_RECORD_BYTES: usize = 512 * 1024;
+/// Maximum physical records carried by one batch frame.
+pub const MAX_BATCH_RECORDS: usize = 128;
+/// Maximum aggregate record payload carried by one batch frame.
+pub const MAX_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientOp {
     AuthRead = 0x01,
     AuthWrite = 0x02,
-    AppendRecord = 0x03,
+    AppendBatch = 0x03,
 }
 
 impl ClientOp {
@@ -36,7 +35,7 @@ impl TryFrom<u8> for ClientOp {
         match value {
             value if value == Self::AuthRead.byte() => Ok(Self::AuthRead),
             value if value == Self::AuthWrite.byte() => Ok(Self::AuthWrite),
-            value if value == Self::AppendRecord.byte() => Ok(Self::AppendRecord),
+            value if value == Self::AppendBatch.byte() => Ok(Self::AppendBatch),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
@@ -45,12 +44,12 @@ impl TryFrom<u8> for ClientOp {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerOp {
-    Hello = 0x80,
-    Ack = 0x82,
-    ReadRecord = 0x83,
-    Heartbeat = 0x84,
-    CaughtUp = 0x85,
-    StreamInfo = 0x86,
+    Ready = 0x80,
+    Ack = 0x81,
+    ReadBatch = 0x82,
+    Heartbeat = 0x83,
+    CaughtUp = 0x84,
+    StreamInfo = 0x85,
 }
 
 impl ServerOp {
@@ -64,9 +63,9 @@ impl TryFrom<u8> for ServerOp {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            value if value == Self::Hello.byte() => Ok(Self::Hello),
+            value if value == Self::Ready.byte() => Ok(Self::Ready),
             value if value == Self::Ack.byte() => Ok(Self::Ack),
-            value if value == Self::ReadRecord.byte() => Ok(Self::ReadRecord),
+            value if value == Self::ReadBatch.byte() => Ok(Self::ReadBatch),
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
             value if value == Self::StreamInfo.byte() => Ok(Self::StreamInfo),
@@ -173,13 +172,41 @@ pub struct ReadRecord {
     pub data: Bytes,
 }
 
+/// One physical record submitted by a writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendRecord {
+    /// Writer-local sequence number reused on retransmission.
+    pub writer_seq_num: u64,
+    /// Logical split-part metadata.
+    pub part: PartHeader,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record payload bytes.
+    pub data: Bytes,
+}
+
 /// Reconnect-safe position emitted after all preceding records have been delivered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadCaughtUp {
     /// Sequence number assigned to the next appended record.
     pub next_seq_num: u64,
     /// Timestamp of the last record, or zero for an empty stream.
-    pub timestamp_ms: u64,
+    pub last_timestamp_ms: u64,
+}
+
+/// Stream metadata supplied by an authorized read handshake.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReadStreamInfo {
+    /// Stable stream identifier.
+    pub stream_id: StreamId,
+    /// Human-facing title when one has been set.
+    pub title: Option<StreamTitle>,
+    /// Current visibility.
+    pub visibility: Visibility,
+    /// Absolute RFC 3339 stream creation timestamp.
+    pub created_at: String,
+    /// Absolute RFC 3339 stream expiration timestamp.
+    pub expires_at: String,
 }
 
 /// Frame sent from a reader or writer to the service.
@@ -197,27 +224,15 @@ pub enum ClientFrame {
         /// Secret from a write-capable stream link.
         link_secret: LinkSecret,
     },
-    /// Submits one physical record for durable append.
-    AppendRecord {
-        /// Writer-local sequence number reused on retransmission.
-        writer_seq_num: u64,
-        /// Logical split-part metadata.
-        part: PartHeader,
-        /// Presentation hint for the payload.
-        format: RecordFormat,
-        /// Exact record payload bytes.
-        data: Bytes,
-    },
+    /// Submits a bounded batch of physical records for durable append.
+    AppendBatch(Vec<AppendRecord>),
 }
 
 /// Frame sent from the service to a reader or writer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServerFrame {
-    /// Confirms successful authorization and selected protocol version.
-    Hello {
-        /// Selected TSF protocol version.
-        version: ProtocolVersion,
-    },
+    /// Confirms successful authorization and socket readiness.
+    Ready,
     /// Confirms a contiguous range of writer records is durable.
     Ack {
         /// First acknowledged writer-local sequence number.
@@ -229,19 +244,18 @@ pub enum ServerFrame {
         /// Durable sequence number assigned to the last acknowledged record, inclusive.
         seq_end: u64,
     },
-    /// Delivers one physical stream record.
-    ReadRecord(ReadRecord),
+    /// Delivers a bounded batch of physical stream records.
+    ReadBatch(Vec<ReadRecord>),
     /// Keeps an otherwise idle unbounded read connection active.
     Heartbeat,
     /// Confirms that every record preceding the captured position was delivered.
     CaughtUp(ReadCaughtUp),
     /// Supplies stream metadata from the read authorization result.
-    StreamInfo(StreamInfoResponse),
+    StreamInfo(ReadStreamInfo),
 }
 
 impl ClientFrame {
-    /// Encoded size of every [`ClientFrame::AppendRecord`] field before the payload.
-    const APPEND_HEADER_LEN: usize = 1 + 8 + 4 + 1;
+    const APPEND_BODY_HEADER_LEN: usize = 8 + 4 + 1;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
@@ -250,10 +264,10 @@ impl ClientFrame {
             Self::AuthWrite { link_secret, .. } => {
                 Ok(1 + WriterId::BYTE_LEN + link_secret.expose_secret().len())
             }
-            Self::AppendRecord { data, .. } => {
-                validate_record_len(data.len())?;
-                Ok(Self::APPEND_HEADER_LEN + data.len())
-            }
+            Self::AppendBatch(records) => batch_encoded_len(
+                records.iter().map(|record| &record.data),
+                Self::APPEND_BODY_HEADER_LEN,
+            ),
         }
     }
 
@@ -272,17 +286,15 @@ impl ClientFrame {
                 output.put_slice(writer_id.as_bytes());
                 output.put_slice(link_secret.expose_secret().as_bytes());
             }
-            Self::AppendRecord {
-                writer_seq_num,
-                part,
-                format,
-                data,
-            } => {
-                output.put_u8(ClientOp::AppendRecord.byte());
-                output.put_u64(*writer_seq_num);
-                output.put_u32(part.raw());
-                output.put_u8(format.byte());
-                output.put_slice(data);
+            Self::AppendBatch(records) => {
+                output.put_u8(ClientOp::AppendBatch.byte());
+                for record in records {
+                    output.put_u32((Self::APPEND_BODY_HEADER_LEN + record.data.len()) as u32);
+                    output.put_u64(record.writer_seq_num);
+                    output.put_u32(record.part.raw());
+                    output.put_u8(record.format.byte());
+                    output.put_slice(&record.data);
+                }
             }
         }
     }
@@ -306,18 +318,17 @@ impl ClientFrame {
 }
 
 impl ServerFrame {
-    /// Encoded size of every [`ServerFrame::ReadRecord`] field before the payload.
-    const READ_RECORD_HEADER_LEN: usize = 1 + 8 + 8 + WriterId::BYTE_LEN + 8 + 4 + 1;
+    const READ_BODY_HEADER_LEN: usize = 8 + 8 + WriterId::BYTE_LEN + 8 + 4 + 1;
     /// Largest encoded size among the fixed-width frames, set by [`ServerFrame::Ack`].
     const MAX_FIXED_FRAME_LEN: usize = 1 + 4 * 8;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
-            Self::ReadRecord(record) => {
-                validate_record_len(record.data.len())?;
-                Ok(Self::READ_RECORD_HEADER_LEN + record.data.len())
-            }
+            Self::ReadBatch(records) => batch_encoded_len(
+                records.iter().map(|record| &record.data),
+                Self::READ_BODY_HEADER_LEN,
+            ),
             Self::StreamInfo(_) => Ok(1),
             _ => Ok(Self::MAX_FIXED_FRAME_LEN),
         }
@@ -326,10 +337,7 @@ impl ServerFrame {
     /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
     fn encode_into(&self, output: &mut BytesMut) -> Result<(), FrameCodecError> {
         match self {
-            Self::Hello { version } => {
-                output.put_u8(ServerOp::Hello.byte());
-                output.put_u16(*version);
-            }
+            Self::Ready => output.put_u8(ServerOp::Ready.byte()),
             Self::Ack {
                 writer_seq_start,
                 writer_seq_end,
@@ -342,21 +350,24 @@ impl ServerFrame {
                 output.put_u64(*seq_start);
                 output.put_u64(*seq_end);
             }
-            Self::ReadRecord(record) => {
-                output.put_u8(ServerOp::ReadRecord.byte());
-                output.put_u64(record.seq_num);
-                output.put_u64(record.timestamp_ms);
-                output.put_slice(record.writer_id.as_bytes());
-                output.put_u64(record.writer_seq_num);
-                output.put_u32(record.part.raw());
-                output.put_u8(record.format.byte());
-                output.put_slice(&record.data);
+            Self::ReadBatch(records) => {
+                output.put_u8(ServerOp::ReadBatch.byte());
+                for record in records {
+                    output.put_u32((Self::READ_BODY_HEADER_LEN + record.data.len()) as u32);
+                    output.put_u64(record.seq_num);
+                    output.put_u64(record.timestamp_ms);
+                    output.put_slice(record.writer_id.as_bytes());
+                    output.put_u64(record.writer_seq_num);
+                    output.put_u32(record.part.raw());
+                    output.put_u8(record.format.byte());
+                    output.put_slice(&record.data);
+                }
             }
             Self::Heartbeat => output.put_u8(ServerOp::Heartbeat.byte()),
             Self::CaughtUp(caught_up) => {
                 output.put_u8(ServerOp::CaughtUp.byte());
                 output.put_u64(caught_up.next_seq_num);
-                output.put_u64(caught_up.timestamp_ms);
+                output.put_u64(caught_up.last_timestamp_ms);
             }
             Self::StreamInfo(stream) => {
                 let payload =
@@ -387,32 +398,24 @@ impl ServerFrame {
 }
 
 trait FrameInput {
-    fn as_bytes(&self) -> &[u8];
-    fn into_record_data(self, start: usize) -> Bytes;
+    fn into_bytes(self) -> Bytes;
 }
 
 impl FrameInput for &[u8] {
-    fn as_bytes(&self) -> &[u8] {
-        self
-    }
-
-    fn into_record_data(self, start: usize) -> Bytes {
-        Bytes::copy_from_slice(&self[start..])
+    fn into_bytes(self) -> Bytes {
+        Bytes::copy_from_slice(self)
     }
 }
 
 impl FrameInput for Bytes {
-    fn as_bytes(&self) -> &[u8] {
+    fn into_bytes(self) -> Bytes {
         self
-    }
-
-    fn into_record_data(self, start: usize) -> Bytes {
-        self.slice(start..)
     }
 }
 
 fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodecError> {
-    let bytes = input.as_bytes();
+    let input = input.into_bytes();
+    let bytes = input.as_ref();
     let Some((&op_byte, body)) = bytes.split_first() else {
         return Err(FrameCodecError::EmptyFrame);
     };
@@ -428,34 +431,41 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
                 link_secret: LinkSecret::from(utf8_tail(secret_bytes)?),
             })
         }
-        ClientOp::AppendRecord => {
-            let (writer_seq_num, body) = read_u64(body)?;
-            let (part_raw, body) = read_u32(body)?;
-            let (format, data) = read_record_format(body)?;
-            validate_record_len(data.len())?;
-            let data_start = bytes.len() - data.len();
-            let data = input.into_record_data(data_start);
-            Ok(ClientFrame::AppendRecord {
-                writer_seq_num,
-                part: PartHeader::from_raw(part_raw),
-                format,
-                data,
-            })
+        ClientOp::AppendBatch => {
+            let mut records = Vec::new();
+            let mut payload_bytes = 0;
+            for (start, end) in record_body_ranges(bytes)? {
+                let record_body = &bytes[start..end];
+                let (writer_seq_num, body) = read_u64(record_body)?;
+                let (part_raw, body) = read_u32(body)?;
+                let (format, data) = read_record_format(body)?;
+                validate_record_len(data.len())?;
+                payload_bytes += data.len();
+                let data_start = end - data.len();
+                records.push(AppendRecord {
+                    writer_seq_num,
+                    part: PartHeader::from_raw(part_raw),
+                    format,
+                    data: input.slice(data_start..end),
+                });
+            }
+            validate_batch(records.len(), payload_bytes)?;
+            Ok(ClientFrame::AppendBatch(records))
         }
     }
 }
 
 fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodecError> {
-    let bytes = input.as_bytes();
+    let input = input.into_bytes();
+    let bytes = input.as_ref();
     let Some((&op_byte, body)) = bytes.split_first() else {
         return Err(FrameCodecError::EmptyFrame);
     };
 
     match ServerOp::try_from(op_byte)? {
-        ServerOp::Hello => {
-            let (version, body) = read_u16(body)?;
+        ServerOp::Ready => {
             ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::Hello { version })
+            Ok(ServerFrame::Ready)
         }
         ServerOp::Ack => {
             let (writer_seq_start, body) = read_u64(body)?;
@@ -470,25 +480,32 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
                 seq_end,
             })
         }
-        ServerOp::ReadRecord => {
-            let (seq_num, body) = read_u64(body)?;
-            let (timestamp_ms, body) = read_u64(body)?;
-            let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
-            let (writer_seq_num, body) = read_u64(body)?;
-            let (part_raw, body) = read_u32(body)?;
-            let (format, data) = read_record_format(body)?;
-            validate_record_len(data.len())?;
-            let data_start = bytes.len() - data.len();
-            let data = input.into_record_data(data_start);
-            Ok(ServerFrame::ReadRecord(ReadRecord {
-                seq_num,
-                timestamp_ms,
-                writer_id: WriterId::from_bytes(writer_id),
-                writer_seq_num,
-                part: PartHeader::from_raw(part_raw),
-                format,
-                data,
-            }))
+        ServerOp::ReadBatch => {
+            let mut records = Vec::new();
+            let mut payload_bytes = 0;
+            for (start, end) in record_body_ranges(bytes)? {
+                let record_body = &bytes[start..end];
+                let (seq_num, body) = read_u64(record_body)?;
+                let (timestamp_ms, body) = read_u64(body)?;
+                let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
+                let (writer_seq_num, body) = read_u64(body)?;
+                let (part_raw, body) = read_u32(body)?;
+                let (format, data) = read_record_format(body)?;
+                validate_record_len(data.len())?;
+                payload_bytes += data.len();
+                let data_start = end - data.len();
+                records.push(ReadRecord {
+                    seq_num,
+                    timestamp_ms,
+                    writer_id: WriterId::from_bytes(writer_id),
+                    writer_seq_num,
+                    part: PartHeader::from_raw(part_raw),
+                    format,
+                    data: input.slice(data_start..end),
+                });
+            }
+            validate_batch(records.len(), payload_bytes)?;
+            Ok(ServerFrame::ReadBatch(records))
         }
         ServerOp::Heartbeat => {
             ensure_empty(op_byte, body)?;
@@ -496,11 +513,11 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
         }
         ServerOp::CaughtUp => {
             let (next_seq_num, body) = read_u64(body)?;
-            let (timestamp_ms, body) = read_u64(body)?;
+            let (last_timestamp_ms, body) = read_u64(body)?;
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::CaughtUp(ReadCaughtUp {
                 next_seq_num,
-                timestamp_ms,
+                last_timestamp_ms,
             }))
         }
         ServerOp::StreamInfo => serde_json::from_slice(body)
@@ -519,6 +536,67 @@ fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
     Ok(())
 }
 
+fn batch_encoded_len<'a>(
+    records: impl ExactSizeIterator<Item = &'a Bytes>,
+    record_header_len: usize,
+) -> Result<usize, FrameCodecError> {
+    let record_count = records.len();
+    let mut payload_bytes = 0;
+    for data in records {
+        validate_record_len(data.len())?;
+        payload_bytes += data.len();
+    }
+    validate_batch(record_count, payload_bytes)?;
+    Ok(1 + record_count * (4 + record_header_len) + payload_bytes)
+}
+
+fn validate_batch(record_count: usize, payload_bytes: usize) -> Result<(), FrameCodecError> {
+    if record_count == 0 || record_count > MAX_BATCH_RECORDS {
+        return Err(FrameCodecError::InvalidBatchRecordCount {
+            actual: record_count,
+            max: MAX_BATCH_RECORDS,
+        });
+    }
+    if payload_bytes > MAX_BATCH_PAYLOAD_BYTES {
+        return Err(FrameCodecError::BatchPayloadTooLarge {
+            actual: payload_bytes,
+            max: MAX_BATCH_PAYLOAD_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn record_body_ranges(input: &[u8]) -> Result<Vec<(usize, usize)>, FrameCodecError> {
+    let mut ranges = Vec::new();
+    let mut offset = 1;
+    while offset < input.len() {
+        if ranges.len() == MAX_BATCH_RECORDS {
+            return Err(FrameCodecError::InvalidBatchRecordCount {
+                actual: MAX_BATCH_RECORDS + 1,
+                max: MAX_BATCH_RECORDS,
+            });
+        }
+        let (length, _) = read_u32(&input[offset..])?;
+        offset += 4;
+        let length = length as usize;
+        let Some(end) = offset.checked_add(length).filter(|end| *end <= input.len()) else {
+            return Err(FrameCodecError::InvalidRecordLength);
+        };
+        if length == 0 {
+            return Err(FrameCodecError::InvalidRecordLength);
+        }
+        ranges.push((offset, end));
+        offset = end;
+    }
+    if ranges.is_empty() {
+        return Err(FrameCodecError::InvalidBatchRecordCount {
+            actual: 0,
+            max: MAX_BATCH_RECORDS,
+        });
+    }
+    Ok(ranges)
+}
+
 fn take<const N: usize>(input: &[u8]) -> Result<([u8; N], &[u8]), FrameCodecError> {
     let Some((head, tail)) = input.split_at_checked(N) else {
         return Err(FrameCodecError::TruncatedFrame { op: 0, needed: N });
@@ -527,11 +605,6 @@ fn take<const N: usize>(input: &[u8]) -> Result<([u8; N], &[u8]), FrameCodecErro
     let mut bytes = [0_u8; N];
     bytes.copy_from_slice(head);
     Ok((bytes, tail))
-}
-
-fn read_u16(input: &[u8]) -> Result<(u16, &[u8]), FrameCodecError> {
-    let (bytes, tail) = take::<2>(input)?;
-    Ok((u16::from_be_bytes(bytes), tail))
 }
 
 fn read_u32(input: &[u8]) -> Result<(u32, &[u8]), FrameCodecError> {
@@ -578,6 +651,25 @@ pub enum FrameCodecError {
     /// A record used an undefined presentation format byte.
     #[error("unknown record format 0x{0:02x}")]
     UnknownRecordFormat(u8),
+    /// A batch record length was zero or extended beyond the message.
+    #[error("batch record length is invalid")]
+    InvalidRecordLength,
+    /// A batch had no records or exceeded [`MAX_BATCH_RECORDS`].
+    #[error("batch has {actual} records; expected 1 to {max}")]
+    InvalidBatchRecordCount {
+        /// Actual record count.
+        actual: usize,
+        /// Maximum accepted record count.
+        max: usize,
+    },
+    /// Aggregate record payload exceeded [`MAX_BATCH_PAYLOAD_BYTES`].
+    #[error("batch payload is {actual} bytes; maximum is {max}")]
+    BatchPayloadTooLarge {
+        /// Actual aggregate payload length.
+        actual: usize,
+        /// Maximum accepted aggregate payload length.
+        max: usize,
+    },
     /// A fixed-width frame ended before all required bytes were present.
     #[error("frame 0x{op:02x} is truncated; needed {needed} more bytes")]
     TruncatedFrame {
@@ -631,21 +723,21 @@ mod tests {
         let max_data = Bytes::from(vec![0; MAX_RECORD_BYTES]);
         let oversized_data = Bytes::from(vec![0; MAX_RECORD_BYTES + 1]);
 
-        ClientFrame::AppendRecord {
+        ClientFrame::AppendBatch(vec![AppendRecord {
             writer_seq_num: 0,
             part: PartHeader::unsplit(),
             format: RecordFormat::Bytes,
             data: max_data.clone(),
-        }
+        }])
         .encode()
         .expect("client max record encodes");
         assert!(matches!(
-            ClientFrame::AppendRecord {
+            ClientFrame::AppendBatch(vec![AppendRecord {
                 writer_seq_num: 0,
                 part: PartHeader::unsplit(),
                 format: RecordFormat::Bytes,
                 data: oversized_data.clone(),
-            }
+            }])
             .encode(),
             Err(FrameCodecError::RecordTooLarge {
                 actual,
@@ -653,7 +745,7 @@ mod tests {
             }) if actual == MAX_RECORD_BYTES + 1
         ));
 
-        ServerFrame::ReadRecord(ReadRecord {
+        ServerFrame::ReadBatch(vec![ReadRecord {
             seq_num: 0,
             timestamp_ms: 0,
             writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
@@ -661,11 +753,11 @@ mod tests {
             part: PartHeader::unsplit(),
             format: RecordFormat::Bytes,
             data: max_data,
-        })
+        }])
         .encode()
         .expect("server max record encodes");
         assert!(matches!(
-            ServerFrame::ReadRecord(ReadRecord {
+            ServerFrame::ReadBatch(vec![ReadRecord {
                 seq_num: 0,
                 timestamp_ms: 0,
                 writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
@@ -673,7 +765,7 @@ mod tests {
                 part: PartHeader::unsplit(),
                 format: RecordFormat::Bytes,
                 data: oversized_data,
-            })
+            }])
             .encode(),
             Err(FrameCodecError::RecordTooLarge {
                 actual,
@@ -722,7 +814,7 @@ mod tests {
             Err(FrameCodecError::UnknownOperation(0x7f))
         ));
         assert!(matches!(
-            ClientFrame::decode(&[ClientOp::AppendRecord.byte(), 0]),
+            ClientFrame::decode(&[ClientOp::AppendBatch.byte(), 0]),
             Err(FrameCodecError::TruncatedFrame { .. })
         ));
         assert!(matches!(
@@ -732,16 +824,35 @@ mod tests {
     }
 
     #[test]
+    fn stream_info_ignores_unknown_json_fields() {
+        let mut encoded = BytesMut::from(&[ServerOp::StreamInfo.byte()][..]);
+        encoded.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z","future_field":{"enabled":true}}"#);
+
+        assert_eq!(
+            ServerFrame::decode(&encoded).expect("decode stream info"),
+            ServerFrame::StreamInfo(ReadStreamInfo {
+                stream_id: "00000000000000000000000000000000"
+                    .parse()
+                    .expect("stream ID"),
+                title: None,
+                visibility: Visibility::Private,
+                created_at: "2026-08-13T00:00:00Z".to_owned(),
+                expires_at: "2026-08-23T00:00:00Z".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn frame_decoders_reject_unknown_record_formats() {
         let mut client = encoded_append_data_with_len(0).to_vec();
-        client[1 + size_of::<u64>() + size_of::<u32>()] = 0x7f;
+        client[1 + size_of::<u32>() + size_of::<u64>() + size_of::<u32>()] = 0x7f;
         assert!(matches!(
             ClientFrame::decode(&client),
             Err(FrameCodecError::UnknownRecordFormat(0x7f))
         ));
 
         let writer_id = WriterId::from_bytes([1; WriterId::BYTE_LEN]);
-        let mut server = ServerFrame::ReadRecord(ReadRecord {
+        let mut server = ServerFrame::ReadBatch(vec![ReadRecord {
             seq_num: 0,
             timestamp_ms: 0,
             writer_id,
@@ -749,11 +860,12 @@ mod tests {
             part: PartHeader::unsplit(),
             format: RecordFormat::Bytes,
             data: Bytes::new(),
-        })
+        }])
         .encode()
         .expect("server record")
         .to_vec();
         let format_offset = 1
+            + size_of::<u32>()
             + size_of::<u64>()
             + size_of::<u64>()
             + WriterId::BYTE_LEN
@@ -773,14 +885,49 @@ mod tests {
             Err(FrameCodecError::InvalidUtf8(_))
         ));
         assert!(matches!(
-            ServerFrame::decode(&[ServerOp::Hello.byte(), 0, TSF_V3 as u8, 0]),
-            Err(FrameCodecError::TrailingBytes { op, count: 1 }) if op == ServerOp::Hello.byte()
+            ServerFrame::decode(&[ServerOp::Ready.byte(), 0]),
+            Err(FrameCodecError::TrailingBytes { op, count: 1 }) if op == ServerOp::Ready.byte()
+        ));
+    }
+
+    #[test]
+    fn multi_record_batches_round_trip_and_enforce_bounds() {
+        let append = ClientFrame::AppendBatch(
+            (0..2)
+                .map(|writer_seq_num| AppendRecord {
+                    writer_seq_num,
+                    part: PartHeader::unsplit(),
+                    format: RecordFormat::Bytes,
+                    data: Bytes::from(vec![writer_seq_num as u8]),
+                })
+                .collect(),
+        );
+        let encoded = append.encode().expect("encode append batch");
+        let ClientFrame::AppendBatch(decoded) = ClientFrame::decode_bytes(encoded).expect("decode")
+        else {
+            panic!("expected append batch");
+        };
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1].writer_seq_num, 1);
+
+        assert!(matches!(
+            ClientFrame::AppendBatch(Vec::new()).encode(),
+            Err(FrameCodecError::InvalidBatchRecordCount { actual: 0, .. })
+        ));
+        assert!(matches!(
+            ClientFrame::decode(&[ClientOp::AppendBatch.byte()]),
+            Err(FrameCodecError::InvalidBatchRecordCount { actual: 0, .. })
+        ));
+        assert!(matches!(
+            ClientFrame::decode(&[ClientOp::AppendBatch.byte(), 0, 0, 0, 0]),
+            Err(FrameCodecError::InvalidRecordLength)
         ));
     }
 
     fn encoded_append_data_with_len(data_len: usize) -> Bytes {
         let mut frame = BytesMut::new();
-        frame.extend_from_slice(&[ClientOp::AppendRecord.byte()]);
+        frame.extend_from_slice(&[ClientOp::AppendBatch.byte()]);
+        frame.extend_from_slice(&((13 + data_len) as u32).to_be_bytes());
         frame.extend_from_slice(&0_u64.to_be_bytes());
         frame.extend_from_slice(&PartHeader::unsplit().raw().to_be_bytes());
         frame.extend_from_slice(&[RecordFormat::Bytes.byte()]);

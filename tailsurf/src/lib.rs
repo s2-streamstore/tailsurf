@@ -33,6 +33,6 @@ pub use link_label::{LinkLabel, LinkLabelError, MAX_LINK_LABEL_CODE_POINTS};
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     rest::StreamInfoResponse,
-    ws::frame::{ReadCaughtUp, ReadRecord},
+    ws::frame::{AppendRecord, ReadCaughtUp, ReadRecord, ReadStreamInfo},
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

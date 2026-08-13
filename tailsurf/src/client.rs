@@ -43,10 +43,11 @@ use crate::{
             UpdateStreamRequest,
         },
         ws::{
-            ReadStart, ReadStreamOptions, WriteStreamOptions,
+            MAX_READ_SELECTOR_VALUE, ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                ClientFrame, FrameCodecError, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp,
-                ReadRecord, RecordFormat, ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
+                AppendRecord, ClientFrame, FrameCodecError, MAX_BATCH_PAYLOAD_BYTES,
+                MAX_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
+                ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
             },
         },
     },
@@ -399,7 +400,7 @@ impl TsfClient {
                     ),
                 )
                 .await?;
-                with_timeout(operation_timeout, "writer hello", expect_hello(&mut ws)).await?;
+                with_timeout(operation_timeout, "writer ready", expect_ready(&mut ws)).await?;
 
                 Ok(TsfAppendSession {
                     ws,
@@ -432,6 +433,19 @@ impl TsfClient {
         &self,
         options: ReadStreamOptions,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
+        if let Some(start) = options.start {
+            let value = match start {
+                ReadStart::SeqNum(value)
+                | ReadStart::TimestampMs(value)
+                | ReadStart::TailOffset(value) => value,
+            };
+            if value > MAX_READ_SELECTOR_VALUE {
+                return Err(TsfClientError::InvalidReadSelector {
+                    value,
+                    maximum: MAX_READ_SELECTOR_VALUE,
+                });
+            }
+        }
         let query = options.query_pairs();
         let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id), &query)?;
         let connect_timeout = self.config.websocket_connect_timeout;
@@ -464,6 +478,7 @@ impl TsfClient {
                     socket: ReadSocket {
                         ws,
                         read_idle_timeout,
+                        pending_records: VecDeque::new(),
                     },
                     stream_info,
                 })
@@ -1020,31 +1035,37 @@ impl IntoRecordData for &str {
 }
 
 impl TsfAppendSession {
-    /// Sends one physical append frame under the operation timeout.
+    /// Sends one physical record under the operation timeout.
     pub async fn send(&mut self, record: WriteRecord) -> Result<(), TsfClientError> {
         let operation_timeout = self.operation_timeout;
 
         with_timeout(operation_timeout, "send append frame", async move {
-            self.buffer(&record).await?;
+            self.buffer_batch(std::iter::once(&record)).await?;
             self.flush().await
         })
         .await
     }
 
-    /// Encodes one record into the socket's write buffer, leaving the flush to the caller.
-    async fn buffer(&mut self, record: &WriteRecord) -> Result<(), TsfClientError> {
-        let frame = ClientFrame::AppendRecord {
-            writer_seq_num: record.writer_seq_num,
-            part: record.part,
-            format: record.format,
-            data: record.data.clone(),
-        }
-        .encode()?;
+    /// Encodes one batch into the socket's write buffer, leaving the flush to the caller.
+    async fn buffer_batch<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a WriteRecord>,
+    ) -> Result<(), TsfClientError> {
+        let records = records
+            .into_iter()
+            .map(|record| AppendRecord {
+                writer_seq_num: record.writer_seq_num,
+                part: record.part,
+                format: record.format,
+                data: record.data.clone(),
+            })
+            .collect();
+        let frame = ClientFrame::AppendBatch(records).encode()?;
         self.ws.feed(Message::Binary(frame)).await?;
         Ok(())
     }
 
-    /// Writes every buffered append frame to the transport in one flush.
+    /// Writes every buffered append batch to the transport in one flush.
     async fn flush(&mut self) -> Result<(), TsfClientError> {
         self.ws.flush().await?;
         Ok(())
@@ -1242,8 +1263,24 @@ async fn send_retained(
     let operation_timeout = session.operation_timeout;
 
     with_timeout(operation_timeout, "send append frames", async move {
-        for pending in pending.iter().skip(from) {
-            session.buffer(&pending.record).await?;
+        let mut records = pending.iter().skip(from).peekable();
+        while records.peek().is_some() {
+            let mut batch = Vec::with_capacity(MAX_BATCH_RECORDS);
+            let mut payload_bytes = 0;
+            while batch.len() < MAX_BATCH_RECORDS {
+                let Some(next) = records.peek() else {
+                    break;
+                };
+                if !batch.is_empty()
+                    && next.record.data.len() > MAX_BATCH_PAYLOAD_BYTES - payload_bytes
+                {
+                    break;
+                }
+                let next = records.next().expect("peeked record");
+                payload_bytes += next.record.data.len();
+                batch.push(&next.record);
+            }
+            session.buffer_batch(batch).await?;
         }
         session.flush().await
     })
@@ -1354,7 +1391,7 @@ pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
     socket: ReadSocket,
-    stream_info: StreamInfoResponse,
+    stream_info: ReadStreamInfo,
     finished: bool,
     last_caught_up: Option<ReadCaughtUp>,
     no_progress_reconnects: usize,
@@ -1368,7 +1405,7 @@ impl TsfReadSession {
         client: TsfClient,
         options: ReadStreamOptions,
         socket: ReadSocket,
-        stream_info: StreamInfoResponse,
+        stream_info: ReadStreamInfo,
         last_caught_up: Option<ReadCaughtUp>,
     ) -> Self {
         let reconnect_backoff = client.config.retry_policy.initial_backoff;
@@ -1392,7 +1429,7 @@ impl TsfReadSession {
     }
 
     /// Returns metadata supplied by the latest successful read handshake.
-    pub const fn stream_info(&self) -> &StreamInfoResponse {
+    pub const fn stream_info(&self) -> &ReadStreamInfo {
         &self.stream_info
     }
 
@@ -1423,6 +1460,9 @@ impl TsfReadSession {
                 Ok(ReadSocketOutcome::Record(record)) => {
                     self.record_delivered(record.seq_num);
                     return Ok(Some(record));
+                }
+                Ok(ReadSocketOutcome::Records(_)) => {
+                    unreachable!("batches are drained by ReadSocket")
                 }
                 Ok(ReadSocketOutcome::CaughtUp(caught_up)) => {
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
@@ -1512,16 +1552,20 @@ fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
 struct ReadSocket {
     ws: ClientWebSocket,
     read_idle_timeout: Option<Duration>,
+    pending_records: VecDeque<ReadRecord>,
 }
 
 struct ConnectedReadSocket {
     socket: ReadSocket,
-    stream_info: StreamInfoResponse,
+    stream_info: ReadStreamInfo,
 }
 
 impl ReadSocket {
     async fn next_outcome(&mut self) -> Result<ReadSocketOutcome, TsfClientError> {
         loop {
+            if let Some(record) = self.pending_records.pop_front() {
+                return Ok(ReadSocketOutcome::Record(record));
+            }
             let outcome = if let Some(read_idle_timeout) = self.read_idle_timeout {
                 with_timeout(
                     read_idle_timeout,
@@ -1532,7 +1576,9 @@ impl ReadSocket {
             } else {
                 next_read_socket_frame(&mut self.ws).await?
             };
-            if let Some(outcome) = outcome {
+            if let Some(ReadSocketOutcome::Records(records)) = outcome {
+                self.pending_records.extend(records);
+            } else if let Some(outcome) = outcome {
                 return Ok(outcome);
             }
         }
@@ -1541,6 +1587,7 @@ impl ReadSocket {
 
 enum ReadSocketOutcome {
     Record(ReadRecord),
+    Records(Vec<ReadRecord>),
     CaughtUp(ReadCaughtUp),
     Closed,
 }
@@ -1549,7 +1596,7 @@ async fn connect_websocket(
     url: Url,
     connect_timeout: Duration,
 ) -> Result<ClientWebSocket, TsfClientError> {
-    // TSF v3 sends one frame per message, so Nagle would hold a small append back for an ACK.
+    // TSF v3 sends each batch in one message, so Nagle could hold a small append back for an ACK.
     const DISABLE_NAGLE: bool = true;
 
     let mut request = url.as_str().into_client_request()?;
@@ -1675,7 +1722,7 @@ async fn next_read_socket_frame(
     ws: &mut ClientWebSocket,
 ) -> Result<Option<ReadSocketOutcome>, TsfClientError> {
     match next_server_frame(ws).await? {
-        Some(ServerFrame::ReadRecord(record)) => Ok(Some(ReadSocketOutcome::Record(record))),
+        Some(ServerFrame::ReadBatch(records)) => Ok(Some(ReadSocketOutcome::Records(records))),
         Some(ServerFrame::CaughtUp(caught_up)) => Ok(Some(ReadSocketOutcome::CaughtUp(caught_up))),
         Some(ServerFrame::Heartbeat) => Ok(None),
         Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
@@ -1685,9 +1732,9 @@ async fn next_read_socket_frame(
     }
 }
 
-async fn expect_hello(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
+async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
     match next_server_frame(ws).await? {
-        Some(ServerFrame::Hello { version }) => ensure_protocol_version(version),
+        Some(ServerFrame::Ready) => Ok(()),
         Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
             &frame,
         ))),
@@ -1695,10 +1742,8 @@ async fn expect_hello(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
     }
 }
 
-async fn expect_read_handshake(
-    ws: &mut ClientWebSocket,
-) -> Result<StreamInfoResponse, TsfClientError> {
-    expect_hello(ws).await?;
+async fn expect_read_handshake(ws: &mut ClientWebSocket) -> Result<ReadStreamInfo, TsfClientError> {
+    expect_ready(ws).await?;
     let stream_info = match next_server_frame(ws).await? {
         Some(ServerFrame::StreamInfo(stream_info)) => stream_info,
         Some(frame) => {
@@ -1711,19 +1756,11 @@ async fn expect_read_handshake(
     Ok(stream_info)
 }
 
-fn ensure_protocol_version(version: u16) -> Result<(), TsfClientError> {
-    if version == TSF_V3 {
-        Ok(())
-    } else {
-        Err(TsfClientError::UnsupportedProtocolVersion(version))
-    }
-}
-
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
     match frame {
-        ServerFrame::Hello { .. } => "hello",
+        ServerFrame::Ready => "ready",
         ServerFrame::Ack { .. } => "ack",
-        ServerFrame::ReadRecord(_) => "read record",
+        ServerFrame::ReadBatch(_) => "read batch",
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::CaughtUp(_) => "caught up",
         ServerFrame::StreamInfo(_) => "stream info",
@@ -1825,12 +1862,17 @@ pub enum TsfClientError {
         /// Configured maximum consecutive connection attempts, including the initial connection.
         max_connection_attempts: usize,
     },
+    /// A selector exceeds the range supported by the active data adapter.
+    #[error("read selector {value} exceeds the supported maximum {maximum}")]
+    InvalidReadSelector {
+        /// Requested selector value.
+        value: u64,
+        /// Largest supported selector value.
+        maximum: u64,
+    },
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
-    /// The server selected a TSF protocol version unsupported by this client.
-    #[error("server sent unsupported protocol version {0}")]
-    UnsupportedProtocolVersion(u16),
     /// The server sent a text WebSocket message instead of one binary TSF frame.
     #[error("server sent an unexpected text WebSocket message")]
     UnexpectedTextMessage,
@@ -1939,24 +1981,18 @@ mod tests {
     #[tokio::test]
     async fn read_handshake_returns_metadata() {
         let (mut client, mut server) = connected_websockets().await;
-        let stream_info = StreamInfoResponse {
+        let stream_info = ReadStreamInfo {
             stream_id: "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
             title: None,
-            basin: "test-basin".to_owned(),
             visibility: crate::protocol::rest::Visibility::Private,
-            state: "active".to_owned(),
             created_at: "2026-08-13T00:00:00Z".to_owned(),
             expires_at: "2026-08-23T00:00:00Z".to_owned(),
-            active_link_count: 1,
         };
         let expected_stream_info = stream_info.clone();
         let sender = tokio::spawn(async move {
-            for frame in [
-                ServerFrame::Hello { version: TSF_V3 },
-                ServerFrame::StreamInfo(stream_info),
-            ] {
+            for frame in [ServerFrame::Ready, ServerFrame::StreamInfo(stream_info)] {
                 server
                     .send(Message::Binary(
                         frame.encode().expect("encode handshake frame"),
@@ -1991,7 +2027,7 @@ mod tests {
                 .send(Message::Binary(
                     ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 42,
-                        timestamp_ms: 1_786_377_600_000,
+                        last_timestamp_ms: 1_786_377_600_000,
                     })
                     .encode()
                     .expect("encode caught up"),
@@ -2002,6 +2038,7 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_millis(100)),
+            pending_records: VecDeque::new(),
         };
 
         let outcome = socket.next_outcome().await.expect("caught-up outcome");
@@ -2010,7 +2047,7 @@ mod tests {
             outcome,
             ReadSocketOutcome::CaughtUp(ReadCaughtUp {
                 next_seq_num: 42,
-                timestamp_ms: 1_786_377_600_000,
+                last_timestamp_ms: 1_786_377_600_000,
             })
         ));
         sender.await.expect("join heartbeat sender");
@@ -2033,6 +2070,7 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_secs(1)),
+            pending_records: VecDeque::new(),
         };
 
         let result = with_timeout(
@@ -2061,6 +2099,7 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_millis(50)),
+            pending_records: VecDeque::new(),
         };
 
         let result = socket.next_outcome().await;
@@ -2139,6 +2178,26 @@ mod tests {
                 .as_str(),
             "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read?seq_num=42&count=3"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_read_selectors_outside_the_adapter_range() {
+        let client =
+            TsfClient::with_api_base_url(Url::parse("http://localhost").expect("API origin"));
+        let mut options = ReadStreamOptions::new(
+            "0123456789abcdefghjkmnpqrstvwxyz"
+                .parse()
+                .expect("stream ID"),
+        );
+        options.start = Some(ReadStart::TailOffset(MAX_READ_SELECTOR_VALUE + 1));
+
+        assert!(matches!(
+            client.connect_reader(options).await,
+            Err(TsfClientError::InvalidReadSelector {
+                value,
+                maximum: MAX_READ_SELECTOR_VALUE,
+            }) if value == MAX_READ_SELECTOR_VALUE + 1
+        ));
     }
 
     #[test]

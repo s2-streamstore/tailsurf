@@ -5,6 +5,9 @@ pub mod frame;
 
 use crate::{LinkSecret, StreamId, WriterId};
 
+/// Largest read selector accepted by the current TypeScript data adapter.
+pub const MAX_READ_SELECTOR_VALUE: u64 = 9_007_199_254_740_991;
+
 /// Position, bounds, and credentials for one read WebSocket.
 #[derive(Clone, Debug)]
 pub struct ReadStreamOptions {
