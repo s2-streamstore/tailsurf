@@ -2044,6 +2044,7 @@ fn print_stream_info(stream: &StreamInfoResponse, json: bool) -> eyre::Result<()
         );
         println!("Visibility: {}", visibility_label(stream.visibility));
         println!("State: {}", stream.state);
+        println!("Created: {}", stream.created_at);
         println!("Expires: {}", stream.expires_at);
         println!("Active links: {}", stream.active_link_count);
     } else {

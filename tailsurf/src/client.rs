@@ -40,7 +40,7 @@ use crate::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
             ListLinksResponse, RenameLinkRequest, StreamBootstrapResponse, StreamInfoResponse,
-            StreamRangeResponse, StreamTailResponse, UpdateStreamRequest,
+            StreamTailResponse, UpdateStreamRequest,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -246,7 +246,7 @@ impl TsfClient {
         .await
     }
 
-    /// Retrieves workspace metadata and bounds with one authorization lookup.
+    /// Retrieves workspace metadata and its durable tail with one authorization lookup.
     ///
     /// Private streams require a read-capable stream link. Public streams may pass `None`.
     pub async fn get_stream_bootstrap(
@@ -257,22 +257,6 @@ impl TsfClient {
         self.get_json_with_bearer(
             format!("/streams/{stream_id}/bootstrap"),
             "bootstrap stream",
-            link_secret,
-        )
-        .await
-    }
-
-    /// Retrieves stream bounds, retrying transient failures according to policy.
-    ///
-    /// Private streams require a read-capable stream link. Public streams may pass `None`.
-    pub async fn get_stream_range(
-        &self,
-        stream_id: &StreamId,
-        link_secret: Option<&LinkSecret>,
-    ) -> Result<StreamRangeResponse, TsfClientError> {
-        self.get_json_with_bearer(
-            format!("/streams/{stream_id}/range"),
-            "check stream range",
             link_secret,
         )
         .await

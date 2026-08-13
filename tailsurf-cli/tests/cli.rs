@@ -2485,6 +2485,7 @@ fn test_get_stream_response(stream: &TestStream) -> StreamInfoResponse {
         basin: "test-basin".to_owned(),
         visibility: stream.visibility,
         state: if stream.deleted { "deleted" } else { "active" }.to_owned(),
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at: stream.expires_at.clone(),
         active_link_count: stream.links.iter().filter(|link| link.active).count(),
     }
