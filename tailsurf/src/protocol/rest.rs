@@ -244,6 +244,9 @@ pub struct StreamTailResponse {
     pub next_s2_seq_num: u64,
     /// Timestamp of the last record, or `None` for an empty stream.
     pub last_timestamp_ms: Option<u64>,
+    /// Short-lived authorization for the next private read connection.
+    #[serde(default)]
+    pub read_authorization: Option<String>,
 }
 
 /// Timestamp and sequence bounds for a stream.
@@ -259,6 +262,9 @@ pub struct StreamRangeResponse {
     pub next_s2_seq_num: u64,
     /// Timestamp of the last record, or `None` when empty.
     pub last_timestamp_ms: Option<u64>,
+    /// Short-lived authorization for the next private read connection.
+    #[serde(default)]
+    pub read_authorization: Option<String>,
 }
 
 #[cfg(test)]

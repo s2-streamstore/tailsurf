@@ -43,10 +43,17 @@ impl ReadStreamOptions {
         self.with_link_secret(link.clone())
     }
 
-    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
+    pub(crate) fn query_pairs(&self, has_read_authorization: bool) -> Vec<(&'static str, String)> {
         let mut pairs = Vec::new();
         if self.link_secret.is_some() {
-            pairs.push(("auth", "link".to_owned()));
+            pairs.push((
+                "auth",
+                if has_read_authorization {
+                    "grant".to_owned()
+                } else {
+                    "link".to_owned()
+                },
+            ));
         }
         match self.start {
             None => {}

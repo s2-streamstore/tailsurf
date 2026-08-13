@@ -441,6 +441,7 @@ impl TsfClient {
             Some(ReadStart::TailOffset(offset)) => Some(offset),
             Some(ReadStart::SeqNum(_) | ReadStart::TimestampMs(_)) => None,
         };
+        let mut read_authorization = None;
         if let Some(offset) = tail_offset {
             let tail = self
                 .get_stream_tail(&options.stream_id, options.link_secret.as_ref())
@@ -448,16 +449,21 @@ impl TsfClient {
             options.start = Some(ReadStart::SeqNum(
                 tail.next_s2_seq_num.saturating_sub(offset),
             ));
+            read_authorization = tail.read_authorization;
         }
-        let socket = self.connect_read_socket(options.clone()).await?;
+        let socket = self
+            .connect_read_socket(options.clone(), read_authorization)
+            .await?;
         Ok(TsfReadSession::new(self.clone(), options, socket))
     }
 
     async fn connect_read_socket(
         &self,
         options: ReadStreamOptions,
+        read_authorization: Option<String>,
     ) -> Result<ReadSocket, TsfClientError> {
-        let query = options.query_pairs();
+        let read_authorization = read_authorization.filter(|_| options.link_secret.is_some());
+        let query = options.query_pairs(read_authorization.is_some());
         let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id), &query)?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
@@ -466,15 +472,24 @@ impl TsfClient {
         self.retry_transient(|| {
             let url = url.clone();
             let link_secret = options.link_secret.clone();
+            let read_authorization = read_authorization.clone();
 
             async move {
                 let mut ws = connect_websocket(url, connect_timeout).await?;
 
                 if let Some(link_secret) = link_secret {
+                    let auth_frame = if let Some(authorization) = read_authorization {
+                        ClientFrame::AuthReadGrant {
+                            authorization,
+                            link_secret,
+                        }
+                    } else {
+                        ClientFrame::AuthRead { link_secret }
+                    };
                     with_timeout(
                         operation_timeout,
                         "authenticate reader",
-                        send_client_frame(&mut ws, ClientFrame::AuthRead { link_secret }),
+                        send_client_frame(&mut ws, auth_frame),
                     )
                     .await?;
                 }
@@ -1455,7 +1470,7 @@ impl TsfReadSession {
         }
         let socket = self
             .client
-            .connect_read_socket(self.options.clone())
+            .connect_read_socket(self.options.clone(), None)
             .await?;
         self.socket = socket;
         self.pending_reconnect_backoff = Duration::ZERO;

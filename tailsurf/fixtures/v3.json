@@ -2,6 +2,7 @@
   "version": 3,
   "websocket_protocol": "tsf.v3",
   "max_record_bytes": 524288,
+  "max_read_authorization_bytes": 2048,
   "client_frames": [
     {
       "name": "auth read",
@@ -10,6 +11,15 @@
         "link_secret": "read-link"
       },
       "hex": "01726561642d6c696e6b"
+    },
+    {
+      "name": "auth read grant",
+      "frame": {
+        "type": "auth_read_grant",
+        "authorization": "grant",
+        "link_secret": "read-link"
+      },
+      "hex": "0400056772616e74726561642d6c696e6b"
     },
     {
       "name": "auth write",

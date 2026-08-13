@@ -2108,6 +2108,7 @@ async fn test_get_stream_tail(
         stream_id: stream.stream_id,
         next_s2_seq_num: stream.records.len() as u64,
         last_timestamp_ms: stream.records.last().map(|_| 1_781_717_406_000),
+        read_authorization: None,
     })
     .into_response()
 }
