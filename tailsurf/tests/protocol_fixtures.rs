@@ -7,7 +7,7 @@ use tailsurf::{
     protocol::{
         rest::{StreamInfoResponse, Visibility},
         ws::frame::{
-            ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat,
+            ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord, RecordFormat,
             ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
         },
     },
@@ -74,7 +74,7 @@ enum ServerFixture {
     ReconnectAdvised {
         deadline_secs: u8,
     },
-    ReadTail {
+    CaughtUp {
         next_seq_num: String,
         timestamp_ms: String,
     },
@@ -202,10 +202,10 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
         ServerFixture::ReconnectAdvised { deadline_secs } => {
             ServerFrame::ReconnectAdvised { deadline_secs }
         }
-        ServerFixture::ReadTail {
+        ServerFixture::CaughtUp {
             next_seq_num,
             timestamp_ms,
-        } => ServerFrame::ReadTail(ReadTail {
+        } => ServerFrame::CaughtUp(ReadCaughtUp {
             next_seq_num: parse_u64(&next_seq_num),
             timestamp_ms: parse_u64(&timestamp_ms),
         }),

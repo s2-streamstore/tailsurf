@@ -50,7 +50,7 @@ enum ServerOp {
     ReadRecord = 0x83,
     Heartbeat = 0x84,
     ReconnectAdvised = 0x85,
-    ReadTail = 0x86,
+    CaughtUp = 0x86,
     StreamInfo = 0x87,
 }
 
@@ -70,7 +70,7 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::ReadRecord.byte() => Ok(Self::ReadRecord),
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::ReconnectAdvised.byte() => Ok(Self::ReconnectAdvised),
-            value if value == Self::ReadTail.byte() => Ok(Self::ReadTail),
+            value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
             value if value == Self::StreamInfo.byte() => Ok(Self::StreamInfo),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
@@ -175,9 +175,9 @@ pub struct ReadRecord {
     pub data: Bytes,
 }
 
-/// Tail position observed by a read session after it catches up.
+/// Reconnect-safe position emitted after all preceding records have been delivered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadTail {
+pub struct ReadCaughtUp {
     /// Sequence number assigned to the next appended record.
     pub next_seq_num: u64,
     /// Timestamp of the last record, or zero for an empty stream.
@@ -240,8 +240,8 @@ pub enum ServerFrame {
         /// Advisory reconnect deadline in seconds.
         deadline_secs: u8,
     },
-    /// Reports the latest tail observed by the underlying read session.
-    ReadTail(ReadTail),
+    /// Confirms that every record preceding the captured position was delivered.
+    CaughtUp(ReadCaughtUp),
     /// Supplies stream metadata from the read authorization result.
     StreamInfo(StreamInfoResponse),
 }
@@ -364,10 +364,10 @@ impl ServerFrame {
                 output.put_u8(ServerOp::ReconnectAdvised.byte());
                 output.put_u8(*deadline_secs);
             }
-            Self::ReadTail(tail) => {
-                output.put_u8(ServerOp::ReadTail.byte());
-                output.put_u64(tail.next_seq_num);
-                output.put_u64(tail.timestamp_ms);
+            Self::CaughtUp(caught_up) => {
+                output.put_u8(ServerOp::CaughtUp.byte());
+                output.put_u64(caught_up.next_seq_num);
+                output.put_u64(caught_up.timestamp_ms);
             }
             Self::StreamInfo(stream) => {
                 let payload =
@@ -514,11 +514,11 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::ReconnectAdvised { deadline_secs })
         }
-        ServerOp::ReadTail => {
+        ServerOp::CaughtUp => {
             let (next_seq_num, body) = read_u64(body)?;
             let (timestamp_ms, body) = read_u64(body)?;
             ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::ReadTail(ReadTail {
+            Ok(ServerFrame::CaughtUp(ReadCaughtUp {
                 next_seq_num,
                 timestamp_ms,
             }))

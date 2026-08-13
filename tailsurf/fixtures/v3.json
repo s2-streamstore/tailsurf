@@ -82,9 +82,9 @@
       "hex": "8505"
     },
     {
-      "name": "observed read tail",
+      "name": "caught up",
       "frame": {
-        "type": "read_tail",
+        "type": "caught_up",
         "next_seq_num": "102",
         "timestamp_ms": "1786000000456"
       },

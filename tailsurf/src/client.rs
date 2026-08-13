@@ -45,8 +45,8 @@ use crate::{
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                ClientFrame, FrameCodecError, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail,
-                RecordFormat, ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
+                ClientFrame, FrameCodecError, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp,
+                ReadRecord, RecordFormat, ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
             },
         },
     },
@@ -1356,7 +1356,7 @@ pub struct TsfReadSession {
     socket: ReadSocket,
     stream_info: StreamInfoResponse,
     finished: bool,
-    last_observed_tail: Option<ReadTail>,
+    last_caught_up: Option<ReadCaughtUp>,
     no_progress_reconnects: usize,
     reconnect_backoff: Duration,
     pending_reconnect_backoff: Duration,
@@ -1369,7 +1369,7 @@ impl TsfReadSession {
         options: ReadStreamOptions,
         socket: ReadSocket,
         stream_info: StreamInfoResponse,
-        last_observed_tail: Option<ReadTail>,
+        last_caught_up: Option<ReadCaughtUp>,
     ) -> Self {
         let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
@@ -1378,7 +1378,7 @@ impl TsfReadSession {
             socket,
             stream_info,
             finished: false,
-            last_observed_tail,
+            last_caught_up,
             no_progress_reconnects: 0,
             reconnect_backoff,
             pending_reconnect_backoff: Duration::ZERO,
@@ -1386,9 +1386,9 @@ impl TsfReadSession {
         }
     }
 
-    /// Returns the latest tail reported by the active read session.
-    pub const fn last_observed_tail(&self) -> Option<ReadTail> {
-        self.last_observed_tail
+    /// Returns the latest reconnect-safe position reported after preceding records were delivered.
+    pub const fn last_caught_up(&self) -> Option<ReadCaughtUp> {
+        self.last_caught_up
     }
 
     /// Returns metadata supplied by the latest successful read handshake.
@@ -1424,9 +1424,9 @@ impl TsfReadSession {
                     self.record_delivered(record.seq_num);
                     return Ok(Some(record));
                 }
-                Ok(ReadSocketOutcome::Tail(tail)) => {
-                    self.options.start = Some(ReadStart::SeqNum(tail.next_seq_num));
-                    self.last_observed_tail = Some(tail);
+                Ok(ReadSocketOutcome::CaughtUp(caught_up)) => {
+                    self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
+                    self.last_caught_up = Some(caught_up);
                 }
                 Ok(ReadSocketOutcome::ReconnectAdvised) => {
                     self.require_reconnect()?;
@@ -1545,7 +1545,7 @@ impl ReadSocket {
 
 enum ReadSocketOutcome {
     Record(ReadRecord),
-    Tail(ReadTail),
+    CaughtUp(ReadCaughtUp),
     ReconnectAdvised,
     Closed,
 }
@@ -1681,7 +1681,7 @@ async fn next_read_socket_frame(
 ) -> Result<Option<ReadSocketOutcome>, TsfClientError> {
     match next_server_frame(ws).await? {
         Some(ServerFrame::ReadRecord(record)) => Ok(Some(ReadSocketOutcome::Record(record))),
-        Some(ServerFrame::ReadTail(tail)) => Ok(Some(ReadSocketOutcome::Tail(tail))),
+        Some(ServerFrame::CaughtUp(caught_up)) => Ok(Some(ReadSocketOutcome::CaughtUp(caught_up))),
         Some(ServerFrame::Heartbeat) => Ok(None),
         Some(ServerFrame::ReconnectAdvised { .. }) => Ok(Some(ReadSocketOutcome::ReconnectAdvised)),
         Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
@@ -1732,7 +1732,7 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::ReadRecord(_) => "read record",
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::ReconnectAdvised { .. } => "reconnect advised",
-        ServerFrame::ReadTail(_) => "read tail",
+        ServerFrame::CaughtUp(_) => "caught up",
         ServerFrame::StreamInfo(_) => "stream info",
     }
 }
@@ -1996,26 +1996,26 @@ mod tests {
             }
             server
                 .send(Message::Binary(
-                    ServerFrame::ReadTail(ReadTail {
+                    ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 42,
                         timestamp_ms: 1_786_377_600_000,
                     })
                     .encode()
-                    .expect("encode read tail"),
+                    .expect("encode caught up"),
                 ))
                 .await
-                .expect("send read tail");
+                .expect("send caught up");
         });
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_millis(100)),
         };
 
-        let outcome = socket.next_outcome().await.expect("read tail outcome");
+        let outcome = socket.next_outcome().await.expect("caught-up outcome");
 
         assert!(matches!(
             outcome,
-            ReadSocketOutcome::Tail(ReadTail {
+            ReadSocketOutcome::CaughtUp(ReadCaughtUp {
                 next_seq_num: 42,
                 timestamp_ms: 1_786_377_600_000,
             })

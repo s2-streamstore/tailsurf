@@ -36,7 +36,7 @@ use tailsurf::{
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat,
+                ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord, RecordFormat,
                 ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
             },
         },
@@ -1137,8 +1137,8 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
 }
 
 #[tokio::test]
-async fn empty_tail_establishes_the_reconnect_position() {
-    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+async fn empty_caught_up_establishes_the_reconnect_position() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectAfterEmptyCaughtUp).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1269,7 +1269,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
 
 #[tokio::test]
 async fn reader_resumes_pending_reconnect_after_caller_timeout() {
-    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+    let server = FakeReadServer::start(FakeReadMode::ReconnectAfterEmptyCaughtUp).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -2394,7 +2394,7 @@ async fn test_read_flow(
     let Ok(ClientFrame::AuthRead { link_secret }) = ClientFrame::decode_bytes(auth) else {
         return;
     };
-    let (stream_info, tail, records) = {
+    let (stream_info, caught_up, records) = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
             return;
@@ -2408,7 +2408,7 @@ async fn test_read_flow(
         {
             return;
         }
-        let tail = ReadTail {
+        let caught_up = ReadCaughtUp {
             next_seq_num: stream.records.len() as u64,
             timestamp_ms: stream
                 .records
@@ -2417,7 +2417,7 @@ async fn test_read_flow(
         };
         (
             test_get_stream_response(stream),
-            tail,
+            caught_up,
             test_select_records(stream, &query),
         )
     };
@@ -2443,9 +2443,9 @@ async fn test_read_flow(
         .await
         .expect("send record");
     }
-    send_server_frame(&mut socket, ServerFrame::ReadTail(tail))
+    send_server_frame(&mut socket, ServerFrame::CaughtUp(caught_up))
         .await
-        .expect("send read tail");
+        .expect("send caught up");
     socket
         .send(Message::Close(None))
         .await
@@ -3147,7 +3147,7 @@ struct FakeReadState {
 #[derive(Clone, Copy)]
 enum FakeReadMode {
     Reconnect,
-    ReconnectBeforeFirstRecord,
+    ReconnectAfterEmptyCaughtUp,
     ReconnectBeforeFirstDefault,
     ReconnectForever,
     SlowReconnectForever,
@@ -3233,7 +3233,7 @@ async fn fake_read_tail(
 const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
     match mode {
         FakeReadMode::Reconnect => 0,
-        FakeReadMode::ReconnectBeforeFirstRecord => 7,
+        FakeReadMode::ReconnectAfterEmptyCaughtUp => 7,
         FakeReadMode::ReconnectBeforeFirstDefault => 100,
         FakeReadMode::ReconnectForever
         | FakeReadMode::SlowReconnectForever
@@ -3314,17 +3314,17 @@ async fn fake_read_flow(
                 send_read_record(&mut socket, 1, 1, b"second\n").await;
             }
         }
-        FakeReadMode::ReconnectBeforeFirstRecord => {
+        FakeReadMode::ReconnectAfterEmptyCaughtUp => {
             if attempt_count == 1 {
                 send_server_frame(
                     &mut socket,
-                    ServerFrame::ReadTail(ReadTail {
+                    ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 5,
                         timestamp_ms: 1_781_717_406_010,
                     }),
                 )
                 .await
-                .expect("send empty read tail");
+                .expect("send empty caught up");
                 send_server_frame(
                     &mut socket,
                     ServerFrame::ReconnectAdvised { deadline_secs: 0 },

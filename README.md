@@ -67,7 +67,7 @@ Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession`
 
 SDK readers and producers retry bounded transient WebSocket interruptions while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes fail immediately.
 
-Every read handshake returns stream metadata. Records carry absolute sequence numbers. An empty read reports its next sequence through `ReadTail`. `TsfReadSession::stream_info()` and `last_observed_tail()` expose the latest values without a REST request.
+Every read handshake returns stream metadata. Records carry absolute sequence numbers. `CaughtUp` confirms that every preceding record through its position was delivered. `TsfReadSession::stream_info()` and `last_caught_up()` expose the latest values without a REST request.
 
 REST authorization is stream-scoped. Read methods accept an optional link secret because public streams need none. Management methods require an owner link secret on each call. The client never retains a link secret as implicit authorization for later REST requests.
 
