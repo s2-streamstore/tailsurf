@@ -1,6 +1,6 @@
-//! WebSocket connection options for TSF v3 readers and writers.
+//! WebSocket connection options for TSF v1 readers and writers.
 
-/// Binary TSF v3 frames and their codec.
+/// Binary TSF v1 frames and their codec.
 pub mod frame;
 
 use crate::{LinkSecret, StreamId, WriterId};

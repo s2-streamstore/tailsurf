@@ -1,12 +1,12 @@
-//! Exact binary codec for `tsf.v3` WebSocket traffic.
+//! Exact binary codec for `tsf.v1` WebSocket traffic.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 use crate::{LinkSecret, StreamId, StreamTitle, WriterId, protocol::rest::Visibility};
-/// WebSocket subprotocol offered and selected for TSF v3 connections.
-pub const TSF_WS_PROTOCOL: &str = "tsf.v3";
+/// WebSocket subprotocol offered and selected for TSF v1 connections.
+pub const TSF_WS_PROTOCOL: &str = "tsf.v1";
 /// Maximum data payload in one physical record.
 pub const MAX_RECORD_BYTES: usize = 512 * 1024;
 /// Maximum physical records carried by one append batch.
@@ -651,13 +651,13 @@ fn ensure_empty(op: u8, body: &[u8]) -> Result<(), FrameCodecError> {
     }
 }
 
-/// Error returned when encoding or decoding a TSF v3 binary frame.
+/// Error returned when encoding or decoding a TSF v1 binary frame.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameCodecError {
     /// A message did not contain an operation byte.
     #[error("frame cannot be empty")]
     EmptyFrame,
-    /// The operation byte is not defined by TSF v3.
+    /// The operation byte is not defined by TSF v1.
     #[error("unknown operation id 0x{0:02x}")]
     UnknownOperation(u8),
     /// A record used an undefined presentation format byte.

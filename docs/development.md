@@ -5,7 +5,7 @@ This repository is a Rust workspace with two crates:
 - `tailsurf`: SDK and common crate with API types, stream URL parsing, permissions, IDs, and binary frame encoding.
 - `tailsurf-cli`: CLI shell for stream workflows and URL validation. Its binary is named `tsf`.
 
-Language-neutral TSF v3 frame vectors live in `tailsurf/fixtures/v3.json`. They are packaged with the SDK and exercised by both the Rust and TypeScript implementations.
+Language-neutral TSF v1 frame vectors live in `tailsurf/fixtures/v1.json`. They are packaged with the SDK and exercised by both the Rust and TypeScript implementations.
 
 ## Local installation
 

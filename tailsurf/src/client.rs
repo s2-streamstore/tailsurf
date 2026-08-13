@@ -139,7 +139,7 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Cloneable TSF control-plane and v3 data-plane client.
+/// Cloneable TSF control-plane and v1 data-plane client.
 ///
 /// Anonymous stream creation is retried with one idempotency key. Other mutating REST operations
 /// are not retried because a timeout may occur after the service applies the mutation. Metadata
@@ -1596,7 +1596,7 @@ async fn connect_websocket(
     url: Url,
     connect_timeout: Duration,
 ) -> Result<ClientWebSocket, TsfClientError> {
-    // TSF v3 sends each batch in one message, so Nagle could hold a small append back for an ACK.
+    // TSF v1 sends each batch in one message, so Nagle could hold a small append back for an ACK.
     const DISABLE_NAGLE: bool = true;
 
     let mut request = url.as_str().into_client_request()?;
@@ -1801,7 +1801,7 @@ pub enum TsfClientError {
     /// The server returned a non-text WebSocket protocol header.
     #[error("server selected invalid WebSocket protocol header")]
     InvalidWebSocketProtocolHeader,
-    /// The server did not select `tsf.v3` during upgrade.
+    /// The server did not select `tsf.v1` during upgrade.
     #[error("server selected unsupported WebSocket protocol {0:?}")]
     UnexpectedWebSocketProtocol(Option<String>),
     /// The server closed without a non-normal close reason.

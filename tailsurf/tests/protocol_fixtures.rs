@@ -1,4 +1,4 @@
-//! Cross-language TSF v3 frame conformance tests driven by packaged JSON fixtures.
+//! Cross-language TSF v1 frame conformance tests driven by packaged JSON fixtures.
 
 use bytes::Bytes;
 use serde::Deserialize;
@@ -14,7 +14,7 @@ use tailsurf::{
     },
 };
 
-const FIXTURES_JSON: &str = include_str!("../fixtures/v3.json");
+const FIXTURES_JSON: &str = include_str!("../fixtures/v1.json");
 
 #[derive(Deserialize)]
 struct Fixtures {
@@ -86,7 +86,7 @@ enum ServerFixture {
 }
 
 #[test]
-fn protocol_constants_match_v3_fixtures() {
+fn protocol_constants_match_v1_fixtures() {
     let fixtures = fixtures();
 
     assert_eq!(fixtures.websocket_protocol, TSF_WS_PROTOCOL);
@@ -97,7 +97,7 @@ fn protocol_constants_match_v3_fixtures() {
 }
 
 #[test]
-fn client_frames_match_v3_fixtures() {
+fn client_frames_match_v1_fixtures() {
     let fixtures = fixtures();
 
     for fixture in fixtures.client_frames {
@@ -117,7 +117,7 @@ fn client_frames_match_v3_fixtures() {
 }
 
 #[test]
-fn server_frames_match_v3_fixtures() {
+fn server_frames_match_v1_fixtures() {
     let fixtures = fixtures();
 
     for fixture in fixtures.server_frames {
@@ -135,7 +135,7 @@ fn server_frames_match_v3_fixtures() {
 }
 
 fn fixtures() -> Fixtures {
-    serde_json::from_str(FIXTURES_JSON).expect("v3 protocol fixtures are valid JSON")
+    serde_json::from_str(FIXTURES_JSON).expect("v1 protocol fixtures are valid JSON")
 }
 
 fn client_frame(fixture: ClientFixture) -> ClientFrame {

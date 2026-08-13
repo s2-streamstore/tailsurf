@@ -1,4 +1,4 @@
-//! Async Rust SDK and shared TSF v3 protocol types for [tail.surf](https://tail.surf).
+//! Async Rust SDK and shared TSF v1 protocol types for [tail.surf](https://tail.surf).
 //!
 //! Use [`TsfClient`] for control-plane requests, [`TsfProducer`] for durable reconnecting writes,
 //! and [`TsfReadSession`] for resumable reads. Stream links and transcript reconstruction are
@@ -12,7 +12,7 @@ pub mod ids;
 pub mod link_label;
 /// Stream-link permission parsing and validation.
 pub mod permissions;
-/// TSF REST models and v3 binary WebSocket protocol types.
+/// TSF REST models and v1 binary WebSocket protocol types.
 pub mod protocol;
 /// User-provided stream titles.
 pub mod stream_title;

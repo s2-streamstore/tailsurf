@@ -1,5 +1,5 @@
 {
-  "websocket_protocol": "tsf.v3",
+  "websocket_protocol": "tsf.v1",
   "max_record_bytes": 524288,
   "max_append_batch_records": 128,
   "max_read_batch_records": 1000,
