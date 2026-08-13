@@ -1479,12 +1479,18 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     }
 
     let mut request = ReadStreamOptions::new(locator.stream_id);
-    request.start = Some(selected_read_start(
+    let selected_start = selected_read_start(
         args.read.last,
         args.read.seq,
         args.read.since,
         ReadStart::SeqNum(0),
-    ));
+    );
+    request.start = Some(match selected_start {
+        ReadStart::TailOffset(offset) => {
+            ReadStart::SeqNum(tail.next_s2_seq_num.saturating_sub(offset))
+        }
+        start => start,
+    });
     request.until = Some(tail.next_s2_seq_num - 1);
     request.count = args
         .read

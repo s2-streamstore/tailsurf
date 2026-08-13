@@ -55,7 +55,6 @@ use crate::{
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const API_PREFIX: &str = "/api/v1";
-const DEFAULT_READ_TAIL_OFFSET: u64 = 80;
 
 /// Timeouts, retry behavior, and API origin for [`TsfClient`].
 #[derive(Clone, Debug)]
@@ -445,34 +444,26 @@ impl TsfClient {
 
     /// Connects a resumable read session at the requested position and bounds.
     ///
-    /// An explicit tail offset, or the service-default offset of 80 records, is resolved to an
-    /// absolute S2 sequence number before the first socket is opened. Reconnects therefore resume
-    /// from the same position even if the stream advances before a record arrives.
+    /// The read socket establishes an absolute S2 sequence number for a tail-relative start before
+    /// this method returns. Reconnects therefore resume from the same position even if the stream
+    /// advances before a record arrives.
     pub async fn connect_reader(
         &self,
         mut options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
-        let tail_offset = match options.start {
-            None => Some(DEFAULT_READ_TAIL_OFFSET),
-            Some(ReadStart::TailOffset(offset)) => Some(offset),
-            Some(ReadStart::SeqNum(_) | ReadStart::TimestampMs(_)) => None,
-        };
-        if let Some(offset) = tail_offset {
-            let tail = self
-                .get_stream_tail(&options.stream_id, options.link_secret.as_ref())
-                .await?;
-            options.start = Some(ReadStart::SeqNum(
-                tail.next_s2_seq_num.saturating_sub(offset),
-            ));
+        let connected = self.connect_read_socket(options.clone()).await?;
+        if let Some(cursor) = connected.cursor {
+            options.start = Some(ReadStart::SeqNum(cursor));
         }
-        let socket = self.connect_read_socket(options.clone()).await?;
-        Ok(TsfReadSession::new(self.clone(), options, socket))
+        Ok(TsfReadSession::new(self.clone(), options, connected.socket))
     }
 
     async fn connect_read_socket(
         &self,
         options: ReadStreamOptions,
-    ) -> Result<ReadSocket, TsfClientError> {
+    ) -> Result<ConnectedReadSocket, TsfClientError> {
+        let establishes_cursor = options.count != Some(0)
+            && matches!(options.start, None | Some(ReadStart::TailOffset(_)));
         let query = options.query_pairs();
         let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id), &query)?;
         let connect_timeout = self.config.websocket_connect_timeout;
@@ -494,11 +485,19 @@ impl TsfClient {
                     )
                     .await?;
                 }
-                with_timeout(operation_timeout, "reader hello", expect_hello(&mut ws)).await?;
+                let cursor = with_timeout(
+                    operation_timeout,
+                    "reader handshake",
+                    expect_read_handshake(&mut ws, establishes_cursor),
+                )
+                .await?;
 
-                Ok(ReadSocket {
-                    ws,
-                    read_idle_timeout,
+                Ok(ConnectedReadSocket {
+                    socket: ReadSocket {
+                        ws,
+                        read_idle_timeout,
+                    },
+                    cursor,
                 })
             }
         })
@@ -1469,11 +1468,14 @@ impl TsfReadSession {
         if !self.pending_reconnect_backoff.is_zero() {
             sleep(self.pending_reconnect_backoff).await;
         }
-        let socket = self
+        let connected = self
             .client
             .connect_read_socket(self.options.clone())
             .await?;
-        self.socket = socket;
+        if let Some(cursor) = connected.cursor {
+            self.options.start = Some(ReadStart::SeqNum(cursor));
+        }
+        self.socket = connected.socket;
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
         Ok(())
@@ -1531,6 +1533,11 @@ fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
 struct ReadSocket {
     ws: ClientWebSocket,
     read_idle_timeout: Option<Duration>,
+}
+
+struct ConnectedReadSocket {
+    socket: ReadSocket,
+    cursor: Option<u64>,
 }
 
 impl ReadSocket {
@@ -1711,6 +1718,23 @@ async fn expect_hello(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
     }
 }
 
+async fn expect_read_handshake(
+    ws: &mut ClientWebSocket,
+    establishes_cursor: bool,
+) -> Result<Option<u64>, TsfClientError> {
+    expect_hello(ws).await?;
+    if !establishes_cursor {
+        return Ok(None);
+    }
+    match next_server_frame(ws).await? {
+        Some(ServerFrame::ReadCursor { seq_num }) => Ok(Some(seq_num)),
+        Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+            &frame,
+        ))),
+        None => Err(TsfClientError::WebSocketClosed),
+    }
+}
+
 fn ensure_protocol_version(version: u16) -> Result<(), TsfClientError> {
     if version == TSF_V3 {
         Ok(())
@@ -1727,6 +1751,7 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::ReconnectAdvised { .. } => "reconnect advised",
         ServerFrame::ReadTail(_) => "read tail",
+        ServerFrame::ReadCursor { .. } => "read cursor",
     }
 }
 

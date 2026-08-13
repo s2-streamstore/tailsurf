@@ -89,6 +89,14 @@
         "timestamp_ms": "1786000000456"
       },
       "hex": "8600000000000000660000019fd5e545c8"
+    },
+    {
+      "name": "absolute read cursor",
+      "frame": {
+        "type": "read_cursor",
+        "seq_num": "100"
+      },
+      "hex": "870000000000000064"
     }
   ]
 }

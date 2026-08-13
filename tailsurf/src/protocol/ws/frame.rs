@@ -51,6 +51,7 @@ enum ServerOp {
     Heartbeat = 0x84,
     ReconnectAdvised = 0x85,
     ReadTail = 0x86,
+    ReadCursor = 0x87,
 }
 
 impl ServerOp {
@@ -70,6 +71,7 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::ReconnectAdvised.byte() => Ok(Self::ReconnectAdvised),
             value if value == Self::ReadTail.byte() => Ok(Self::ReadTail),
+            value if value == Self::ReadCursor.byte() => Ok(Self::ReadCursor),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
@@ -240,6 +242,11 @@ pub enum ServerFrame {
     },
     /// Reports the latest tail observed by the underlying read session.
     ReadTail(ReadTail),
+    /// Establishes the absolute sequence number for a tail-relative read.
+    ReadCursor {
+        /// First S2 sequence number the server will read.
+        seq_num: u64,
+    },
 }
 
 impl ClientFrame {
@@ -363,6 +370,10 @@ impl ServerFrame {
                 output.put_u8(ServerOp::ReadTail.byte());
                 output.put_u64(tail.next_s2_seq_num);
                 output.put_u64(tail.timestamp_ms);
+            }
+            Self::ReadCursor { seq_num } => {
+                output.put_u8(ServerOp::ReadCursor.byte());
+                output.put_u64(*seq_num);
             }
         }
     }
@@ -510,6 +521,11 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
                 next_s2_seq_num,
                 timestamp_ms,
             }))
+        }
+        ServerOp::ReadCursor => {
+            let (seq_num, body) = read_u64(body)?;
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::ReadCursor { seq_num })
         }
     }
 }

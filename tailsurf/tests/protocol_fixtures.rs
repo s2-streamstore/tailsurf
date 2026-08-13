@@ -75,6 +75,9 @@ enum ServerFixture {
         next_s2_seq_num: String,
         timestamp_ms: String,
     },
+    ReadCursor {
+        seq_num: String,
+    },
 }
 
 #[test]
@@ -196,6 +199,9 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             next_s2_seq_num: parse_u64(&next_s2_seq_num),
             timestamp_ms: parse_u64(&timestamp_ms),
         }),
+        ServerFixture::ReadCursor { seq_num } => ServerFrame::ReadCursor {
+            seq_num: parse_u64(&seq_num),
+        },
     }
 }
 

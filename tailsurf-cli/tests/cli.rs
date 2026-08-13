@@ -1038,11 +1038,11 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
         attempts[1].query.get("auth").map(String::as_str),
         Some("link")
     );
+    assert_eq!(attempts[0].query.get("seq_num"), None);
     assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
+        attempts[0].query.get("tail_offset").map(String::as_str),
         Some("0")
     );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
     assert_eq!(
         attempts[1].query.get("seq_num").map(String::as_str),
         Some("1")
@@ -1072,15 +1072,15 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     assert_eq!(tail_offset_output.stderr, "");
     let attempts = tail_offset_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("0")
-    );
+    assert_eq!(attempts[0].query.get("seq_num"), None);
     assert_eq!(
         attempts[0].query.get("count").map(String::as_str),
         Some("7")
     );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
+    assert_eq!(
+        attempts[0].query.get("tail_offset").map(String::as_str),
+        Some("25")
+    );
     assert_eq!(attempts[0].query.get("timestamp"), None);
     tail_offset_server.abort();
 
@@ -1156,14 +1156,17 @@ async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position()
     assert_eq!(output.stderr, "");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert!(attempts.iter().all(|attempt| {
-        attempt.query.get("seq_num").map(String::as_str) == Some("5")
-            && !attempt.query.contains_key("tail_offset")
-    }));
     assert_eq!(
-        server.tail_link_secrets(),
-        [Some(TEST_STREAM_LINK.to_owned())]
+        attempts[0].query.get("tail_offset").map(String::as_str),
+        Some("2")
     );
+    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(
+        attempts[1].query.get("seq_num").map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(attempts[1].query.get("tail_offset"), None);
+    assert!(server.tail_link_secrets().is_empty());
 
     server.abort();
 }
@@ -1188,14 +1191,14 @@ async fn default_read_start_reconnect_before_first_record_keeps_tail_minus_eight
     assert_eq!(record.data.as_ref(), b"default\n");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert!(attempts.iter().all(|attempt| {
-        attempt.query.get("seq_num").map(String::as_str) == Some("20")
-            && !attempt.query.contains_key("tail_offset")
-    }));
+    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].query.get("tail_offset"), None);
     assert_eq!(
-        server.tail_link_secrets(),
-        [Some(TEST_STREAM_LINK.to_owned())]
+        attempts[1].query.get("seq_num").map(String::as_str),
+        Some("20")
     );
+    assert_eq!(attempts[1].query.get("tail_offset"), None);
+    assert!(server.tail_link_secrets().is_empty());
 
     server.abort();
 }
@@ -1460,6 +1463,40 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
         .parse::<StreamId>()
         .expect("stream id");
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+
+    let last_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
+    let last_output = run_tsf_with_api_url(
+        last_server.api_url.clone(),
+        ["replay", "--last", "2", read_link.as_str()],
+        None,
+    )
+    .await;
+
+    assert!(
+        last_output.status.success(),
+        "stderr={}",
+        last_output.stderr
+    );
+    let attempts = last_server.read_attempts();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].query.get("seq_num").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(attempts[0].query.get("tail_offset"), None);
+    assert_eq!(
+        attempts[0].query.get("until").map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        attempts[0].query.get("count").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        last_server.tail_link_secrets(),
+        [Some(TEST_STREAM_LINK.to_owned())]
+    );
+    last_server.abort();
 
     let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let seq_output = run_tsf_with_api_url(
@@ -2360,7 +2397,7 @@ async fn test_read_flow(
     let Ok(ClientFrame::AuthRead { link_secret }) = ClientFrame::decode_bytes(auth) else {
         return;
     };
-    let records = {
+    let (cursor, records) = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
             return;
@@ -2374,11 +2411,24 @@ async fn test_read_flow(
         {
             return;
         }
-        test_select_records(stream, &query)
+        let cursor = if query.contains_key("seq_num") || query.contains_key("timestamp") {
+            None
+        } else {
+            let tail_offset = query
+                .get("tail_offset")
+                .map_or(80, |value| value.parse().expect("tail offset"));
+            Some((stream.records.len() as u64).saturating_sub(tail_offset))
+        };
+        (cursor, test_select_records(stream, &query))
     };
     send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
+    if let Some(seq_num) = cursor {
+        send_server_frame(&mut socket, ServerFrame::ReadCursor { seq_num })
+            .await
+            .expect("send read cursor");
+    }
     for record in records {
         send_server_frame(
             &mut socket,
@@ -3170,7 +3220,16 @@ async fn fake_read_tail(
         .lock()
         .expect("tail bearer links lock")
         .push(link_secret);
-    let next_s2_seq_num = match state.mode {
+    let next_s2_seq_num = fake_read_next_seq_num(state.mode);
+    Json(serde_json::json!({
+        "stream_id": stream_id,
+        "next_s2_seq_num": next_s2_seq_num,
+        "last_timestamp_ms": 1781717406000_u64
+    }))
+}
+
+const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
+    match mode {
         FakeReadMode::Reconnect => 0,
         FakeReadMode::ReconnectBeforeFirstRecord => 7,
         FakeReadMode::ReconnectBeforeFirstDefault => 100,
@@ -3180,12 +3239,7 @@ async fn fake_read_tail(
         FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
-    };
-    Json(serde_json::json!({
-        "stream_id": stream_id,
-        "next_s2_seq_num": next_s2_seq_num,
-        "last_timestamp_ms": 1781717406000_u64
-    }))
+    }
 }
 
 async fn fake_read_socket(
@@ -3212,6 +3266,14 @@ async fn fake_read_flow(
     else {
         return;
     };
+    let cursor = if query.contains_key("seq_num") || query.contains_key("timestamp") {
+        None
+    } else {
+        let tail_offset = query
+            .get("tail_offset")
+            .map_or(80, |value| value.parse().expect("tail offset"));
+        Some(fake_read_next_seq_num(state.mode).saturating_sub(tail_offset))
+    };
     let attempt_count = {
         let mut attempts = state.read_attempts.lock().expect("read attempts lock");
         attempts.push(ReadAttempt {
@@ -3223,6 +3285,11 @@ async fn fake_read_flow(
     send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
         .await
         .expect("send hello");
+    if let Some(seq_num) = cursor {
+        send_server_frame(&mut socket, ServerFrame::ReadCursor { seq_num })
+            .await
+            .expect("send read cursor");
+    }
     send_server_frame(
         &mut socket,
         ServerFrame::ReadTail(ReadTail {
