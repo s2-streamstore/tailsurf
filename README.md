@@ -77,7 +77,7 @@ The permission in a link fragment selects the intended client mode. The server r
 
 The default producer window is capped at the service's hard writer-queue contract: 128 records and 5 MiB of payload. Applications may configure smaller windows.
 
-The producer packs retained records into protocol batches of at most 128 records and 1 MiB. Read sessions drain batched records one at a time and advance their reconnect cursor only after delivery.
+The producer packs retained records into protocol batches of at most 128 records and 1 MiB. Read batches carry up to 1,000 records or 1 MiB. Read sessions drain them one record at a time and advance their reconnect cursor only after delivery.
 
 ## CLI quickstart
 

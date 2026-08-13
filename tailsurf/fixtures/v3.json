@@ -1,6 +1,9 @@
 {
   "websocket_protocol": "tsf.v3",
   "max_record_bytes": 524288,
+  "max_append_batch_records": 128,
+  "max_read_batch_records": 1000,
+  "max_batch_payload_bytes": 1048576,
   "client_frames": [
     {
       "name": "auth read",

@@ -7,7 +7,8 @@ use tailsurf::{
     protocol::{
         rest::Visibility,
         ws::frame::{
-            AppendRecord, ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
+            AppendRecord, ClientFrame, MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES,
+            MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
             ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
         },
     },
@@ -19,6 +20,9 @@ const FIXTURES_JSON: &str = include_str!("../fixtures/v3.json");
 struct Fixtures {
     websocket_protocol: String,
     max_record_bytes: usize,
+    max_append_batch_records: usize,
+    max_read_batch_records: usize,
+    max_batch_payload_bytes: usize,
     client_frames: Vec<FrameFixture<ClientFixture>>,
     server_frames: Vec<FrameFixture<ServerFixture>>,
 }
@@ -87,6 +91,9 @@ fn protocol_constants_match_v3_fixtures() {
 
     assert_eq!(fixtures.websocket_protocol, TSF_WS_PROTOCOL);
     assert_eq!(fixtures.max_record_bytes, MAX_RECORD_BYTES);
+    assert_eq!(fixtures.max_append_batch_records, MAX_APPEND_BATCH_RECORDS);
+    assert_eq!(fixtures.max_read_batch_records, MAX_READ_BATCH_RECORDS);
+    assert_eq!(fixtures.max_batch_payload_bytes, MAX_BATCH_PAYLOAD_BYTES);
 }
 
 #[test]

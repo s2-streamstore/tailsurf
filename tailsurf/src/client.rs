@@ -45,8 +45,8 @@ use crate::{
         ws::{
             MAX_READ_SELECTOR_VALUE, ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                AppendRecord, ClientFrame, FrameCodecError, MAX_BATCH_PAYLOAD_BYTES,
-                MAX_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
+                AppendRecord, ClientFrame, FrameCodecError, MAX_APPEND_BATCH_RECORDS,
+                MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
                 ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
             },
         },
@@ -1265,9 +1265,9 @@ async fn send_retained(
     with_timeout(operation_timeout, "send append frames", async move {
         let mut records = pending.iter().skip(from).peekable();
         while records.peek().is_some() {
-            let mut batch = Vec::with_capacity(MAX_BATCH_RECORDS);
+            let mut batch = Vec::with_capacity(MAX_APPEND_BATCH_RECORDS);
             let mut payload_bytes = 0;
-            while batch.len() < MAX_BATCH_RECORDS {
+            while batch.len() < MAX_APPEND_BATCH_RECORDS {
                 let Some(next) = records.peek() else {
                     break;
                 };
