@@ -425,6 +425,7 @@ impl TsfClient {
 
             async move {
                 let mut ws = connect_websocket(url, connect_timeout).await?;
+                let link_authorization = options.link_authorization.clone();
                 with_timeout(
                     operation_timeout,
                     "authenticate writer",
@@ -449,6 +450,7 @@ impl TsfClient {
                 Ok(TsfAppendSession {
                     ws,
                     operation_timeout,
+                    link_authorization,
                 })
             }
         })
@@ -480,9 +482,14 @@ impl TsfClient {
             read_authorization = tail.read_authorization;
         }
         let socket = self
-            .connect_read_socket(options.clone(), read_authorization)
+            .connect_read_socket(options.clone(), read_authorization.clone())
             .await?;
-        Ok(TsfReadSession::new(self.clone(), options, socket))
+        Ok(TsfReadSession::new(
+            self.clone(),
+            options,
+            socket,
+            read_authorization,
+        ))
     }
 
     async fn connect_read_socket(
@@ -710,6 +717,7 @@ pub struct InvalidCreateStreamIdempotencyKey;
 pub struct TsfAppendSession {
     ws: ClientWebSocket,
     operation_timeout: Duration,
+    link_authorization: Option<String>,
 }
 
 /// Maximum payload bytes a producer may retain before acknowledgement.
@@ -1114,31 +1122,44 @@ impl TsfAppendSession {
     ///
     /// Returns `None` when the service closes the socket normally before another ack.
     pub async fn next_ack(&mut self) -> Result<Option<AppendAck>, TsfClientError> {
-        match with_timeout(
-            self.operation_timeout,
-            "append acknowledgement",
-            next_server_frame(&mut self.ws),
-        )
-        .await?
-        {
-            Some(ServerFrame::Ack {
-                writer_seq_start,
-                writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
-            }) => AppendAck {
-                writer_seq_start,
-                writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
+        loop {
+            match with_timeout(
+                self.operation_timeout,
+                "append acknowledgement",
+                next_server_frame(&mut self.ws),
+            )
+            .await?
+            {
+                Some(ServerFrame::Ack {
+                    writer_seq_start,
+                    writer_seq_end,
+                    s2_seq_start,
+                    s2_seq_end,
+                }) => {
+                    return AppendAck {
+                        writer_seq_start,
+                        writer_seq_end,
+                        s2_seq_start,
+                        s2_seq_end,
+                    }
+                    .validate()
+                    .map(Some);
+                }
+                Some(ServerFrame::Authorization(authorization)) => {
+                    self.link_authorization = Some(authorization);
+                }
+                Some(frame) => {
+                    return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+                        &frame,
+                    )));
+                }
+                None => return Ok(None),
             }
-            .validate()
-            .map(Some),
-            Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-                &frame,
-            ))),
-            None => Ok(None),
         }
+    }
+
+    fn take_link_authorization(&mut self) -> Option<String> {
+        self.link_authorization.take()
     }
 }
 
@@ -1163,7 +1184,7 @@ struct PendingAppend {
 
 async fn run_producer(
     client: TsfClient,
-    options: WriteStreamOptions,
+    mut options: WriteStreamOptions,
     mut session: TsfAppendSession,
     mut cmd_rx: mpsc::Receiver<ProducerCommand>,
     config: TsfProducerConfig,
@@ -1204,6 +1225,9 @@ async fn run_producer(
             }
 
             ack = session.next_ack(), if !pending.is_empty() => {
+                if let Some(authorization) = session.take_link_authorization() {
+                    options.link_authorization = Some(authorization);
+                }
                 match ack {
                     Ok(Some(ack)) => {
                         if let Err(error) = dispatch_ack(ack, &mut pending) {
@@ -1414,6 +1438,7 @@ pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
     socket: ReadSocket,
+    read_authorization: Option<String>,
     finished: bool,
     last_observed_tail: Option<ReadTail>,
     no_progress_reconnects: usize,
@@ -1423,12 +1448,18 @@ pub struct TsfReadSession {
 }
 
 impl TsfReadSession {
-    fn new(client: TsfClient, options: ReadStreamOptions, socket: ReadSocket) -> Self {
+    fn new(
+        client: TsfClient,
+        options: ReadStreamOptions,
+        socket: ReadSocket,
+        read_authorization: Option<String>,
+    ) -> Self {
         let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
             client,
             options,
             socket,
+            read_authorization,
             finished: false,
             last_observed_tail: None,
             no_progress_reconnects: 0,
@@ -1474,6 +1505,9 @@ impl TsfReadSession {
                 Ok(ReadSocketOutcome::Tail(tail)) => {
                     self.last_observed_tail = Some(tail);
                 }
+                Ok(ReadSocketOutcome::Authorization(authorization)) => {
+                    self.read_authorization = Some(authorization);
+                }
                 Ok(ReadSocketOutcome::ReconnectAdvised) => {
                     self.require_reconnect()?;
                     self.reconnect().await?;
@@ -1498,7 +1532,7 @@ impl TsfReadSession {
         }
         let socket = self
             .client
-            .connect_read_socket(self.options.clone(), None)
+            .connect_read_socket(self.options.clone(), self.read_authorization.clone())
             .await?;
         self.socket = socket;
         self.pending_reconnect_backoff = Duration::ZERO;
@@ -1583,6 +1617,7 @@ impl ReadSocket {
 enum ReadSocketOutcome {
     Record(ReadRecord),
     Tail(ReadTail),
+    Authorization(String),
     ReconnectAdvised,
     Closed,
 }
@@ -1719,6 +1754,9 @@ async fn next_read_socket_frame(
     match next_server_frame(ws).await? {
         Some(ServerFrame::ReadRecord(record)) => Ok(Some(ReadSocketOutcome::Record(record))),
         Some(ServerFrame::ReadTail(tail)) => Ok(Some(ReadSocketOutcome::Tail(tail))),
+        Some(ServerFrame::Authorization(authorization)) => {
+            Ok(Some(ReadSocketOutcome::Authorization(authorization)))
+        }
         Some(ServerFrame::Heartbeat) => Ok(None),
         Some(ServerFrame::ReconnectAdvised { .. }) => Ok(Some(ReadSocketOutcome::ReconnectAdvised)),
         Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
@@ -1754,6 +1792,7 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::ReconnectAdvised { .. } => "reconnect advised",
         ServerFrame::ReadTail(_) => "read tail",
+        ServerFrame::Authorization(_) => "authorization",
     }
 }
 

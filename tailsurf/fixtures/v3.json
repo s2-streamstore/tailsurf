@@ -13,6 +13,15 @@
       "hex": "01726561642d6c696e6b"
     },
     {
+      "name": "auth write",
+      "frame": {
+        "type": "auth_write",
+        "writer_id_hex": "000102030405060708090a0b0c0d0e0f",
+        "link_secret": "write-link"
+      },
+      "hex": "02000102030405060708090a0b0c0d0e0f77726974652d6c696e6b"
+    },
+    {
       "name": "auth read grant",
       "frame": {
         "type": "auth_read_grant",
@@ -30,15 +39,6 @@
         "link_secret": "write-link"
       },
       "hex": "05000102030405060708090a0b0c0d0e0f00056772616e7477726974652d6c696e6b"
-    },
-    {
-      "name": "auth write",
-      "frame": {
-        "type": "auth_write",
-        "writer_id_hex": "000102030405060708090a0b0c0d0e0f",
-        "link_secret": "write-link"
-      },
-      "hex": "02000102030405060708090a0b0c0d0e0f77726974652d6c696e6b"
     },
     {
       "name": "append transcript record",
@@ -109,6 +109,14 @@
         "timestamp_ms": "1786000000456"
       },
       "hex": "8600000000000000660000019fd5e545c8"
+    },
+    {
+      "name": "refreshed authorization",
+      "frame": {
+        "type": "authorization",
+        "authorization": "grant"
+      },
+      "hex": "8700056772616e74"
     }
   ]
 }

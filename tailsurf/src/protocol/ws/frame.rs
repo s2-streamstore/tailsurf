@@ -57,6 +57,7 @@ enum ServerOp {
     Heartbeat = 0x84,
     ReconnectAdvised = 0x85,
     ReadTail = 0x86,
+    Authorization = 0x87,
 }
 
 impl ServerOp {
@@ -76,6 +77,7 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::ReconnectAdvised.byte() => Ok(Self::ReconnectAdvised),
             value if value == Self::ReadTail.byte() => Ok(Self::ReadTail),
+            value if value == Self::Authorization.byte() => Ok(Self::Authorization),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
@@ -262,6 +264,8 @@ pub enum ServerFrame {
     },
     /// Reports the latest tail observed by the underlying read session.
     ReadTail(ReadTail),
+    /// Refreshes the short-lived authorization used by a reconnect.
+    Authorization(String),
 }
 
 impl ClientFrame {
@@ -385,6 +389,10 @@ impl ServerFrame {
                 validate_record_len(record.data.len())?;
                 Ok(Self::READ_RECORD_HEADER_LEN + record.data.len())
             }
+            Self::Authorization(authorization) => {
+                validate_link_authorization_len(authorization.len())?;
+                Ok(1 + 2 + authorization.len())
+            }
             _ => Ok(Self::MAX_FIXED_FRAME_LEN),
         }
     }
@@ -427,6 +435,11 @@ impl ServerFrame {
                 output.put_u8(ServerOp::ReadTail.byte());
                 output.put_u64(tail.next_s2_seq_num);
                 output.put_u64(tail.timestamp_ms);
+            }
+            Self::Authorization(authorization) => {
+                output.put_u8(ServerOp::Authorization.byte());
+                output.put_u16(authorization.len() as u16);
+                output.put_slice(authorization.as_bytes());
             }
         }
     }
@@ -608,6 +621,21 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
                 next_s2_seq_num,
                 timestamp_ms,
             }))
+        }
+        ServerOp::Authorization => {
+            let (authorization_len, body) = read_u16(body)?;
+            let authorization_len = usize::from(authorization_len);
+            validate_link_authorization_len(authorization_len)?;
+            let Some((authorization, trailing)) = body.split_at_checked(authorization_len) else {
+                return Err(FrameCodecError::TruncatedFrame {
+                    op: op_byte,
+                    needed: authorization_len.saturating_sub(body.len()),
+                });
+            };
+            ensure_empty(op_byte, trailing)?;
+            Ok(ServerFrame::Authorization(
+                utf8_tail(authorization)?.to_owned(),
+            ))
         }
     }
 }
