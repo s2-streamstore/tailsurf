@@ -93,11 +93,7 @@ impl TsfClientConfig {
         validate_api_origin(&api_origin)?;
         Ok(Self {
             api_origin,
-            rest_request_timeout: Duration::from_secs(10),
-            websocket_connect_timeout: Duration::from_secs(10),
-            websocket_operation_timeout: Duration::from_secs(30),
-            websocket_read_idle_timeout: Some(Duration::from_secs(60)),
-            retry_policy: RetryPolicy::default(),
+            ..Self::default()
         })
     }
 }
@@ -687,13 +683,10 @@ impl TsfClient {
     ) -> Result<Option<SseConnection>, TsfClientError> {
         let mut url = self.rest_url(&format!("/streams/{}/records", options.stream_id));
         append_sse_query(&mut url, options);
-        let mut request = self.http.get(url).header("Accept", "text/event-stream");
-        if let Some(secret) = options.link_secret.as_ref() {
-            if !is_canonical_base64url_32(secret.expose_secret()) {
-                return Err(TsfClientError::InvalidLinkSecret);
-            }
-            request = request.bearer_auth(secret.expose_secret());
-        }
+        let mut request = self.apply_rest_auth(
+            self.http.get(url).header("Accept", "text/event-stream"),
+            options.link_secret.as_ref(),
+        )?;
         if let Some(last_event_id) = last_event_id {
             request = request.header("Last-Event-ID", last_event_id);
         }
@@ -3241,13 +3234,12 @@ impl TsfClientError {
     }
 
     fn is_retryable(&self) -> bool {
+        if self.is_resumable_read_interruption() {
+            return true;
+        }
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
             Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
-            Self::Timeout { .. } => true,
-            Self::WebSocket(error) => is_retryable_websocket_error(error),
-            Self::WebSocketClosed => true,
-            Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),
             _ => false,
         }
     }
