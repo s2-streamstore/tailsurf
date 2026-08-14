@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::{Rng, RngExt};
 use reqwest::StatusCode;
 use secrecy::ExposeSecret;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
@@ -39,12 +39,12 @@ use crate::{
     ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::{
         rest::{
-            AppendJsonRecord, AppendRange, AppendRecordsRequest, CreateLinkInput,
+            ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest, CreateLinkInput,
             CreateStreamRequest, CreateStreamResponse, ListLinksResponse, MAX_SSE_EVENT_BYTES,
             MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS,
             MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
-            MAX_STATELESS_APPEND_RECORDS, RecordData, RestRecordPart, SseCaughtUpEvent,
-            SseReadBatchEvent, SseReadRecord, SseSnapshotBoundaryEvent, StreamLinkCredential,
+            MAX_STATELESS_APPEND_RECORDS, RecordData, RestRecordPart, SseCaughtUpData,
+            SseReadBatchData, SseReadRecord, SseSnapshotBoundaryData, StreamLinkCredential,
             StreamMetadata, UpdateStreamRequest,
         },
         ws::{
@@ -678,7 +678,7 @@ impl TsfClient {
                     ));
                 }
                 let (event_id, cursor) = sse_resume_cursor(&event)?;
-                let boundary: SseSnapshotBoundaryEvent = serde_json::from_str(&event.data)
+                let boundary: SseSnapshotBoundaryData = serde_json::from_str(&event.data)
                     .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
                 let boundary = SnapshotBoundary {
                     end_seq_num: boundary.end_seq_num,
@@ -1795,7 +1795,7 @@ impl TsfSseReadSession {
             };
             match event.event.as_str() {
                 "read_batch" => {
-                    let batch: SseReadBatchEvent = serde_json::from_str(&event.data)
+                    let batch: SseReadBatchData = serde_json::from_str(&event.data)
                         .map_err(|_| TsfClientError::InvalidSse("invalid read_batch event"))?;
                     validate_sse_read_batch_count(batch.records.len())?;
                     let records = batch
@@ -1822,7 +1822,7 @@ impl TsfSseReadSession {
                     self.reconnect_attempts = 0;
                 }
                 "caught_up" => {
-                    let value: SseCaughtUpEvent = serde_json::from_str(&event.data)
+                    let value: SseCaughtUpData = serde_json::from_str(&event.data)
                         .map_err(|_| TsfClientError::InvalidSse("invalid caught_up event"))?;
                     let caught_up = CaughtUpPosition {
                         next_seq_num: value.next_seq_num,
@@ -2688,18 +2688,37 @@ async fn json_response<T: DeserializeOwned>(
 
 async fn http_status_error(response: reqwest::Response, operation: &'static str) -> TsfClientError {
     let status = response.status();
-    let request_id = response
+    let header_request_id = response
         .headers()
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let retry_after = response
+    let header_retry_after = response
         .headers()
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_retry_after);
     let raw = response.text().await.unwrap_or_default();
     let parsed = serde_json::from_str::<ApiErrorResponse>(&raw).ok();
+    let request_id = header_request_id.or_else(|| {
+        parsed
+            .as_ref()
+            .map(|response| response.error.request_id.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    let retry_after = header_retry_after.or_else(|| {
+        parsed
+            .as_ref()
+            .and_then(|response| response.error.retry_after_ms)
+            .map(Duration::from_millis)
+    });
+    let actual_next_seq_num = parsed
+        .as_ref()
+        .and_then(|response| response.error.actual_next_seq_num);
     let api_code = parsed
         .as_ref()
         .map(|response| response.error.code.clone())
@@ -2712,6 +2731,7 @@ async fn http_status_error(response: reqwest::Response, operation: &'static str)
         api_code,
         request_id,
         retry_after,
+        actual_next_seq_num,
     }
 }
 
@@ -2720,9 +2740,9 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 }
 
 fn api_error_message(body: &str) -> Option<String> {
-    let response = serde_json::from_str::<ApiErrorResponse>(body).ok()?;
-    let code = response.error.code.trim();
-    let message = response.error.message.trim();
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = response["error"]["code"].as_str()?.trim();
+    let message = response["error"]["message"].as_str()?.trim();
 
     match (code.is_empty(), message.is_empty()) {
         (true, true) => None,
@@ -2730,17 +2750,6 @@ fn api_error_message(body: &str) -> Option<String> {
         (false, true) => Some(code.to_owned()),
         (false, false) => Some(format!("{code}: {message}")),
     }
-}
-
-#[derive(Deserialize)]
-struct ApiErrorResponse {
-    error: ApiErrorBody,
-}
-
-#[derive(Deserialize)]
-struct ApiErrorBody {
-    code: String,
-    message: String,
 }
 
 async fn next_server_frame(
@@ -2880,6 +2889,8 @@ pub enum TsfClientError {
         request_id: Option<String>,
         /// Server-requested retry delay.
         retry_after: Option<Duration>,
+        /// Actual stream next sequence for a failed sequence precondition.
+        actual_next_seq_num: Option<u64>,
     },
     /// Stateless append input violates the local protocol contract.
     #[error("invalid stateless append: {0}")]
@@ -3040,6 +3051,17 @@ impl TsfClientError {
             _ => None,
         }
     }
+
+    /// Returns the actual stream next sequence attached to a failed sequence precondition.
+    pub fn actual_next_seq_num(&self) -> Option<u64> {
+        match self {
+            Self::HttpStatus {
+                actual_next_seq_num,
+                ..
+            } => *actual_next_seq_num,
+            _ => None,
+        }
+    }
     /// Returns whether retrying a failed create with the same idempotency key and request is safe
     /// and may succeed.
     pub fn is_recoverable_create_failure(&self) -> bool {
@@ -3111,6 +3133,26 @@ mod tests {
     use tokio_tungstenite::connect_async;
 
     use super::*;
+
+    #[test]
+    fn parses_structured_http_error_details() {
+        let body = r#"{"error":{"code":"sequence_mismatch","message":"position changed","request_id":"request-42","retry_after_ms":125,"actual_next_seq_num":"42","future_field":true}}"#;
+        let parsed: ApiErrorResponse = serde_json::from_str(body).expect("structured API error");
+
+        assert_eq!(
+            api_error_message(body).as_deref(),
+            Some("sequence_mismatch: position changed")
+        );
+        assert_eq!(parsed.error.request_id, "request-42");
+        assert_eq!(parsed.error.retry_after_ms, Some(125));
+        assert_eq!(parsed.error.actual_next_seq_num, Some(42));
+        for invalid in ["", "00", "01", "-1", "18446744073709551616"] {
+            let body = format!(
+                r#"{{"error":{{"code":"sequence_mismatch","message":"position changed","request_id":"request-42","actual_next_seq_num":"{invalid}"}}}}"#,
+            );
+            assert!(serde_json::from_str::<ApiErrorResponse>(&body).is_err());
+        }
+    }
 
     async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

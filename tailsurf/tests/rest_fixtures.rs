@@ -2,10 +2,10 @@
 
 use serde_json::Value;
 use tailsurf::protocol::rest::{
-    AppendRange, AppendRecordsRequest, CreateStreamRequest, MAX_SSE_EVENT_BYTES,
+    ApiErrorResponse, AppendRange, AppendRecordsRequest, CreateStreamRequest, MAX_SSE_EVENT_BYTES,
     MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS, MAX_SSE_UNTERMINATED_EVENT_BYTES,
     MAX_STATELESS_APPEND_JSON_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
-    MAX_STATELESS_APPEND_RECORDS, SseCaughtUpEvent, SseReadBatchEvent, SseSnapshotBoundaryEvent,
+    MAX_STATELESS_APPEND_RECORDS, SseCaughtUpData, SseReadBatchData, SseSnapshotBoundaryData,
     StreamMetadata,
 };
 
@@ -53,7 +53,10 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
         (acknowledgement.start_seq_num, acknowledgement.end_seq_num),
         (7, 9)
     );
-    let records: SseReadBatchEvent = fixture(&fixtures, "sse_read_batch");
+    let error: ApiErrorResponse = fixture(&fixtures, "error_response");
+    assert_eq!(error.error.code, "sequence_mismatch");
+    assert_eq!(error.error.actual_next_seq_num, Some(9));
+    let records: SseReadBatchData = fixture(&fixtures, "sse_read_batch");
     assert_eq!(records.records.len(), 1);
     assert_eq!(
         fixtures["sse_resume_cursor"].as_str(),
@@ -63,12 +66,12 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
         fixtures["sse_snapshot_cursor"].as_str(),
         Some("v1,0,0,2,1786579200000")
     );
-    let snapshot: SseSnapshotBoundaryEvent = fixture(&fixtures, "sse_snapshot_boundary");
+    let snapshot: SseSnapshotBoundaryData = fixture(&fixtures, "sse_snapshot_boundary");
     assert_eq!(
         (snapshot.end_seq_num, snapshot.last_timestamp_ms),
         (2, 1_786_579_200_000)
     );
-    let caught_up: SseCaughtUpEvent = fixture(&fixtures, "sse_caught_up");
+    let caught_up: SseCaughtUpData = fixture(&fixtures, "sse_caught_up");
     assert_eq!(caught_up.next_seq_num, 8);
 }
 

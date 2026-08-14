@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::{
     LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
     ids::{encode_base64url_32, is_canonical_base64url_32},
-    protocol::ws::frame::RecordFormat,
+    protocol::ws::{MAX_READ_SELECTOR_VALUE, frame::RecordFormat},
 };
 
 /// Maximum records in one stateless atomic append.
@@ -280,6 +280,55 @@ pub struct AppendRange {
     pub end_seq_num: u64,
 }
 
+/// Stable error response returned by the REST API.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct ApiErrorResponse {
+    /// Structured error detail.
+    pub error: ApiError,
+}
+
+/// Stable error detail returned by the REST API.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct ApiError {
+    /// Stable lowercase snake-case error code.
+    pub code: String,
+    /// Human-readable diagnostic message.
+    pub message: String,
+    /// Request identifier used for support and tracing.
+    pub request_id: String,
+    /// Retry delay in milliseconds when supplied.
+    pub retry_after_ms: Option<u64>,
+    /// Actual stream next sequence for a failed sequence precondition.
+    #[serde(default, with = "optional_safe_decimal_u64")]
+    pub actual_next_seq_num: Option<u64>,
+}
+
+mod optional_safe_decimal_u64 {
+    use serde::{Deserialize, Deserializer};
+
+    use super::MAX_READ_SELECTOR_VALUE;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value
+            .map(|value| {
+                if value != "0" && value.starts_with('0') {
+                    return Err(serde::de::Error::custom("non-canonical decimal u64"));
+                }
+                let value: u64 = value.parse().map_err(serde::de::Error::custom)?;
+                if value > MAX_READ_SELECTOR_VALUE {
+                    return Err(serde::de::Error::custom(
+                        "sequence exceeds the data adapter range",
+                    ));
+                }
+                Ok(value)
+            })
+            .transpose()
+    }
+}
+
 /// One record in a batched SSE `read_batch` event.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct SseReadRecord {
@@ -304,14 +353,14 @@ pub struct SseReadRecord {
 
 /// Payload of a batched SSE `read_batch` event.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct SseReadBatchEvent {
+pub struct SseReadBatchData {
     /// Ordered records in this event.
     pub records: Vec<SseReadRecord>,
 }
 
 /// Payload of an SSE `caught_up` event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
-pub struct SseCaughtUpEvent {
+pub struct SseCaughtUpData {
     /// Next safe reconnect sequence.
     #[serde(with = "decimal_u64")]
     pub next_seq_num: u64,
@@ -322,7 +371,7 @@ pub struct SseCaughtUpEvent {
 
 /// Payload of an SSE `snapshot_boundary` event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
-pub struct SseSnapshotBoundaryEvent {
+pub struct SseSnapshotBoundaryData {
     /// Exclusive end of the fixed snapshot.
     #[serde(with = "decimal_u64")]
     pub end_seq_num: u64,
