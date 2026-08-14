@@ -1055,9 +1055,8 @@ async fn stream_lines_to_writer(
             break false;
         }
 
-        line_appender
-            .push_bytes(&mut session, read_buffer.split().freeze())
-            .await?;
+        line_appender.push_bytes(&mut session, &read_buffer).await?;
+        read_buffer.clear();
     };
 
     line_appender.finish(&mut session).await?;
@@ -1146,7 +1145,7 @@ async fn stream_child_command_output(
             WriteBuffering::Lines => {
                 let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
                 while let Some(chunk) = chunk_rx.recv().await {
-                    line_appender.push_bytes(session, chunk?).await?;
+                    line_appender.push_bytes(session, &chunk?).await?;
                 }
                 line_appender.finish(session).await?;
             }
@@ -1189,9 +1188,9 @@ async fn read_child_pipe<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffer = BytesMut::with_capacity(MAX_RECORD_BYTES);
+    let mut buffer = BytesMut::with_capacity(STDIN_READ_BYTES);
     loop {
-        buffer.reserve(MAX_RECORD_BYTES);
+        buffer.reserve(STDIN_READ_BYTES);
         let byte_count = pipe
             .read_buf(&mut buffer)
             .await
@@ -1199,7 +1198,12 @@ where
         if byte_count == 0 {
             return Ok(());
         }
-        if chunk_tx.send(Ok(buffer.split().freeze())).await.is_err() {
+        // split_to keeps spare capacity local; a full split would give the whole allocation away.
+        if chunk_tx
+            .send(Ok(buffer.split_to(byte_count).freeze()))
+            .await
+            .is_err()
+        {
             return Ok(());
         }
     }
@@ -1306,10 +1310,10 @@ impl LineRecordAppender {
     async fn push_bytes(
         &mut self,
         session: &mut WriterSession<'_>,
-        mut bytes: Bytes,
+        mut bytes: &[u8],
     ) -> eyre::Result<()> {
         while !bytes.is_empty() {
-            let newline = memchr(b'\n', &bytes);
+            let newline = memchr(b'\n', bytes);
             let take = newline.map_or(bytes.len(), |index| index + 1);
             let logical_record_bytes = self
                 .logical_record_bytes
@@ -1323,7 +1327,7 @@ impl LineRecordAppender {
             }
             self.logical_record_bytes = logical_record_bytes;
             self.buffer(&bytes[..take]);
-            bytes.advance(take);
+            bytes = &bytes[take..];
             if newline.is_some() {
                 self.send_line(session).await?;
             }
@@ -1354,13 +1358,13 @@ impl LineRecordAppender {
         if !self.pending.is_empty() {
             self.pending_parts.push(self.pending.split().freeze());
         }
-        let parts = std::mem::take(&mut self.pending_parts);
-        self.logical_record_bytes = 0;
-        let last_part = parts
+        let last_part = self
+            .pending_parts
             .len()
             .checked_sub(1)
             .context("logical line is empty")?;
-        for (index, part) in parts.into_iter().enumerate() {
+        self.logical_record_bytes = 0;
+        for (index, part) in self.pending_parts.drain(..).enumerate() {
             let part_index = u32::try_from(index).context("line split part index overflowed")?;
             session
                 .append_line_part(part_index, index == last_part, part)
