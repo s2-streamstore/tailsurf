@@ -472,6 +472,29 @@ impl FromStr for SinceArg {
     }
 }
 
+fn parse_duration_arg(value: &str, what: &str) -> Result<Duration, String> {
+    let duration = humantime::parse_duration(value)
+        .map_err(|error| format!("invalid {what} duration: {error}"))?;
+    if duration.is_zero() {
+        return Err(format!("{what} must be at least one second"));
+    }
+    Ok(duration)
+}
+
+fn rfc3339_from_now(duration: Duration, what: &str) -> eyre::Result<String> {
+    let expires_at = SystemTime::now()
+        .checked_add(duration)
+        .ok_or_else(|| eyre!("{what} is too large"))?;
+    // humantime only formats years 0000..=9999 and its Display-to-String panics outside that.
+    let unix_secs = expires_at
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| eyre!("{what} is too large"))?;
+    if unix_secs.as_secs() > 253_402_300_799 {
+        return Err(eyre!("{what} is too large"));
+    }
+    Ok(humantime::format_rfc3339_seconds(expires_at).to_string())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StreamExpiryArg(Duration);
 
@@ -479,11 +502,7 @@ impl FromStr for StreamExpiryArg {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let duration = humantime::parse_duration(value)
-            .map_err(|error| format!("invalid stream expiry duration: {error}"))?;
-        if duration.is_zero() {
-            return Err("stream expiry must be at least one second".to_owned());
-        }
+        let duration = parse_duration_arg(value, "stream expiry")?;
         if duration.subsec_nanos() != 0 {
             return Err("stream expiry must be a whole number of seconds".to_owned());
         }
@@ -497,10 +516,7 @@ impl StreamExpiryArg {
     }
 
     fn rfc3339(self) -> eyre::Result<String> {
-        let expires_at = SystemTime::now()
-            .checked_add(self.0)
-            .ok_or_else(|| eyre!("stream expiry is too large"))?;
-        Ok(humantime::format_rfc3339_seconds(expires_at).to_string())
+        rfc3339_from_now(self.0, "stream expiry")
     }
 }
 
@@ -552,13 +568,10 @@ enum ExpiresArg {
 }
 
 impl ExpiresArg {
-    fn rfc3339(self) -> Option<String> {
+    fn rfc3339(self) -> eyre::Result<Option<String>> {
         match self {
-            Self::Never => None,
-            Self::In(duration) => Some(
-                humantime::format_rfc3339_seconds(std::time::SystemTime::now() + duration)
-                    .to_string(),
-            ),
+            Self::Never => Ok(None),
+            Self::In(duration) => rfc3339_from_now(duration, "link expiry").map(Some),
         }
     }
 }
@@ -570,12 +583,7 @@ impl FromStr for ExpiresArg {
         if value.eq_ignore_ascii_case("never") {
             return Ok(Self::Never);
         }
-        let duration = humantime::parse_duration(value)
-            .map_err(|error| format!("invalid expiry duration: {error}"))?;
-        if duration.is_zero() {
-            return Err("expiry must be at least one second".to_owned());
-        }
-        Ok(Self::In(duration))
+        parse_duration_arg(value, "expiry").map(Self::In)
     }
 }
 
@@ -1629,6 +1637,7 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
         permissions,
         secret,
     } = args.link.0;
+    let expires_at = args.expires.rfc3339()?;
     let credential = client
         .create_link(
             &locator.stream_id,
@@ -1636,7 +1645,7 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
                 link_id,
                 secret,
                 permissions,
-                expires_at: args.expires.rfc3339(),
+                expires_at,
             },
             &owner_link_secret,
         )
@@ -2323,5 +2332,23 @@ mod tests {
         let small = serde_json::json!({ "a": 1 });
         let error = write_json(BrokenPipeWriter, &small).expect_err("broken pipe");
         assert!(is_broken_pipe(&error));
+    }
+
+    #[test]
+    fn expiry_beyond_rfc3339_range_errors_instead_of_panicking() {
+        let huge = Duration::from_secs(u64::MAX / 4);
+        assert!(rfc3339_from_now(huge, "link expiry").is_err());
+
+        // One second before the last representable instant still formats.
+        let to_end = Duration::from_secs(
+            253_402_300_799
+                - SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("post-epoch")
+                    .as_secs()
+                - 1,
+        );
+        let formatted = rfc3339_from_now(to_end, "link expiry").expect("in-range expiry");
+        assert!(formatted.starts_with("9999-12-31T23:59:5"));
     }
 }
