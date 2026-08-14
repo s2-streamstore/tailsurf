@@ -583,7 +583,8 @@ impl TsfClient {
     /// Connects a resumable SSE reader.
     ///
     /// Private credentials stay in the bearer header. Reconnects reuse the original URL and send
-    /// the latest versioned event cursor in `Last-Event-ID`.
+    /// the latest versioned event cursor in `Last-Event-ID`. The REST request timeout bounds each
+    /// opening handshake but not the established event body.
     pub async fn connect_sse_reader(
         &self,
         mut options: ReadStreamOptions,
@@ -622,76 +623,90 @@ impl TsfClient {
         options: &ReadStreamOptions,
         last_event_id: Option<&str>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
+        let handshake_timeout = self.config.rest_request_timeout;
         self.retry_transient(|| async {
-            let mut url = self.rest_url(&format!("/streams/{}/records", options.stream_id));
-            append_sse_query(&mut url, options);
-            let mut request = self.http.get(url).header("Accept", "text/event-stream");
-            if let Some(secret) = options.link_secret.as_ref() {
-                if !is_canonical_base64url_32(secret.expose_secret()) {
-                    return Err(TsfClientError::InvalidLinkSecret);
-                }
-                request = request.bearer_auth(secret.expose_secret());
+            with_timeout(
+                handshake_timeout,
+                "SSE handshake",
+                self.open_sse_connection_once(options, last_event_id),
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn open_sse_connection_once(
+        &self,
+        options: &ReadStreamOptions,
+        last_event_id: Option<&str>,
+    ) -> Result<Option<SseConnection>, TsfClientError> {
+        let mut url = self.rest_url(&format!("/streams/{}/records", options.stream_id));
+        append_sse_query(&mut url, options);
+        let mut request = self.http.get(url).header("Accept", "text/event-stream");
+        if let Some(secret) = options.link_secret.as_ref() {
+            if !is_canonical_base64url_32(secret.expose_secret()) {
+                return Err(TsfClientError::InvalidLinkSecret);
             }
-            if let Some(last_event_id) = last_event_id {
-                request = request.header("Last-Event-ID", last_event_id);
-            }
-            let response = request.send().await?;
-            if response.status() == StatusCode::NO_CONTENT {
-                return Ok(None);
-            }
-            if !response.status().is_success() {
-                return Err(http_status_error(response, "read SSE").await);
-            }
-            let mut connection = SseConnection {
-                body: Box::pin(response.bytes_stream()),
-                parser: SseParser::default(),
-                stream_metadata: None,
-                snapshot_boundary: None,
-                resume_event_id: None,
-            };
+            request = request.bearer_auth(secret.expose_secret());
+        }
+        if let Some(last_event_id) = last_event_id {
+            request = request.header("Last-Event-ID", last_event_id);
+        }
+        let response = request.send().await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(http_status_error(response, "read SSE").await);
+        }
+        let mut connection = SseConnection {
+            body: Box::pin(response.bytes_stream()),
+            parser: SseParser::default(),
+            stream_metadata: None,
+            snapshot_boundary: None,
+            resume_event_id: None,
+        };
+        let event = next_sse_event(&mut connection.body, &mut connection.parser)
+            .await?
+            .ok_or(TsfClientError::InvalidSse(
+                "response ended before stream_metadata",
+            ))?;
+        if event.event != "stream_metadata" {
+            return Err(TsfClientError::InvalidSse(
+                "first event is not stream_metadata",
+            ));
+        }
+        connection.stream_metadata = Some(
+            serde_json::from_str(&event.data)
+                .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?,
+        );
+        if event.id.is_some() {
+            connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
+        }
+        if options.snapshot {
             let event = next_sse_event(&mut connection.body, &mut connection.parser)
                 .await?
                 .ok_or(TsfClientError::InvalidSse(
-                    "response ended before stream_metadata",
+                    "response ended before snapshot_boundary",
                 ))?;
-            if event.event != "stream_metadata" {
+            if event.event != "snapshot_boundary" {
                 return Err(TsfClientError::InvalidSse(
-                    "first event is not stream_metadata",
+                    "snapshot_boundary must follow stream_metadata",
                 ));
             }
-            connection.stream_metadata = Some(
-                serde_json::from_str(&event.data)
-                    .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?,
-            );
-            if event.id.is_some() {
-                connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
-            }
-            if options.snapshot {
-                let event = next_sse_event(&mut connection.body, &mut connection.parser)
-                    .await?
-                    .ok_or(TsfClientError::InvalidSse(
-                        "response ended before snapshot_boundary",
-                    ))?;
-                if event.event != "snapshot_boundary" {
-                    return Err(TsfClientError::InvalidSse(
-                        "snapshot_boundary must follow stream_metadata",
-                    ));
-                }
-                let (event_id, cursor) = sse_resume_cursor(&event)?;
-                let boundary: SseSnapshotBoundaryData = serde_json::from_str(&event.data)
-                    .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
-                let boundary = SnapshotBoundary {
-                    end_seq_num: boundary.end_seq_num,
-                    last_timestamp_ms: boundary.last_timestamp_ms,
-                };
-                let previous = last_event_id.map(parse_sse_resume_cursor).transpose()?;
-                validate_sse_snapshot_cursor(boundary, cursor, previous)?;
-                connection.resume_event_id = Some(event_id.to_owned());
-                connection.snapshot_boundary = Some(boundary);
-            }
-            Ok(Some(connection))
-        })
-        .await
+            let (event_id, cursor) = sse_resume_cursor(&event)?;
+            let boundary: SseSnapshotBoundaryData = serde_json::from_str(&event.data)
+                .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
+            let boundary = SnapshotBoundary {
+                end_seq_num: boundary.end_seq_num,
+                last_timestamp_ms: boundary.last_timestamp_ms,
+            };
+            let previous = last_event_id.map(parse_sse_resume_cursor).transpose()?;
+            validate_sse_snapshot_cursor(boundary, cursor, previous)?;
+            connection.resume_event_id = Some(event_id.to_owned());
+            connection.snapshot_boundary = Some(boundary);
+        }
+        Ok(Some(connection))
     }
 
     async fn connect_read_socket(
@@ -3133,6 +3148,7 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::connect_async;
 
     use super::*;
@@ -3155,6 +3171,50 @@ mod tests {
             );
             assert!(serde_json::from_str::<ApiErrorResponse>(&body).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn sse_handshake_uses_the_rest_request_timeout() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind SSE listener");
+        let address = listener.local_addr().expect("SSE listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept SSE request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.expect("read SSE request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write SSE headers");
+            sleep(Duration::from_secs(1)).await;
+        });
+        let mut config =
+            TsfClientConfig::new(Url::parse(&format!("http://{address}")).expect("SSE API origin"))
+                .expect("valid client config");
+        config.rest_request_timeout = Duration::from_millis(20);
+        config.retry_policy = RetryPolicy::none();
+        let client = TsfClient::with_config(config).expect("SSE client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+
+        let started_at = std::time::Instant::now();
+        let result = client
+            .connect_sse_reader(ReadStreamOptions::new(stream_id))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::Timeout {
+                operation: "SSE handshake"
+            })
+        ));
+        assert!(started_at.elapsed() < Duration::from_millis(200));
+        server.abort();
+        let _ = server.await;
     }
 
     async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
