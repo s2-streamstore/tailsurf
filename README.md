@@ -77,7 +77,7 @@ Streams expire after 10 days by default. Their complete history remains readable
 
 `tsf new` prints the title, Stream ID, expiry, and initial links. Private streams get a read link and an owner link. Public streams get a public URL and an owner link. The title is optional.
 
-Issue custom labeled links with `--link PERMISSION=LABEL`. Permissions are `read`, `write`, `read-write`, and `owner`. The short forms `r`, `w`, `rw`, and `o` are also accepted. A stream may have up to three initial links, including defaults. Links are shown once.
+Issue custom links with `--link LINK_ID=PERMISSION`. Link IDs are short semantic names such as `deploy-bot`. Permissions are `read`, `write`, `read-write`, and `owner`. The short forms `r`, `w`, `rw`, and `o` are also accepted. A stream may have up to three initial links, including defaults. Links are shown once.
 
 Stream command output into a new stream:
 
@@ -148,10 +148,9 @@ tsf visibility '{owner-link}' public
 tsf title set '{owner-link}' 'Production deploy — west'
 tsf title clear '{owner-link}'
 tsf renew '{owner-link}' 7d
-tsf link issue '{owner-link}' 'read=Deploy reader' --expires 7d
+tsf link issue '{owner-link}' 'deploy-reader=read' --expires 7d
 tsf link list '{owner-link}'
-tsf link rename '{owner-link}' '{link_id_or_prefix}' 'CI reader'
-tsf link revoke '{owner-link}' '{link_id_or_prefix}'
+tsf link revoke '{owner-link}' 'deploy-reader'
 tsf delete '{owner-link}'
 ```
 
@@ -161,9 +160,7 @@ Renewal extends an active stream from the current time. Link expiry accepts dura
 
 A stream title contains 1 to 120 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Titles may be duplicated, changed, or cleared. The immutable Stream ID remains the stream identity and URL component.
 
-Every link has a required owner-visible label. Labels contain 1 to 64 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Labels may be renamed and do not need to be unique.
-
-Each link also has an immutable generated Link ID. Rename and revoke accept a full Link ID or an unambiguous prefix of at least four characters. Renaming does not change the secret, permissions, expiry, or established sessions.
+Every link has a client-chosen immutable Link ID. Link IDs contain 1 to 64 lowercase ASCII letters, digits, or hyphens. They cannot start or end with a hyphen. Link IDs are unique within a stream.
 
 Link file options write complete URLs. Any command that accepts a link also accepts `@PATH` to read one complete URL from a file. On Unix, `tsf` creates and tightens link files to mode `0600`.
 

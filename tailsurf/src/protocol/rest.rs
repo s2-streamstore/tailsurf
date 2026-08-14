@@ -3,9 +3,7 @@
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{
-    LinkId, LinkLabel, LinkPermissions, LinkSecret, StreamId, StreamTitle, ids::encode_base64url_32,
-};
+use crate::{LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle, ids::encode_base64url_32};
 
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -41,7 +39,7 @@ impl Default for CreateStreamRequest {
             visibility: Visibility::Private,
             expires_in_secs: None,
             issue_links: vec![InitialStreamLink::new(
-                "Owner".parse().expect("default owner label is valid"),
+                "owner".parse().expect("default owner Link ID is valid"),
                 LinkPermissions::owner(),
             )],
         }
@@ -51,8 +49,8 @@ impl Default for CreateStreamRequest {
 /// One link requested atomically with stream creation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitialStreamLink {
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
+    /// Client-chosen immutable Link ID.
+    pub link_id: LinkId,
     /// Permissions carried by the link.
     pub permissions: LinkPermissions,
     /// Client-generated secret retained with this prepared request.
@@ -62,9 +60,9 @@ pub struct InitialStreamLink {
 
 impl InitialStreamLink {
     /// Creates one initial link with an independent random secret.
-    pub fn new(label: LinkLabel, permissions: LinkPermissions) -> Self {
+    pub fn new(link_id: LinkId, permissions: LinkPermissions) -> Self {
         Self {
-            label,
+            link_id,
             permissions,
             secret: random_link_secret(),
         }
@@ -76,8 +74,6 @@ impl InitialStreamLink {
 pub struct IssuedStreamLink {
     /// Stable non-secret link identifier used for revocation.
     pub link_id: LinkId,
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
     /// Effective permissions carried by the link.
     pub permissions: LinkPermissions,
     /// Secret link value, returned only when issued.
@@ -104,16 +100,14 @@ pub struct CreateStreamResponse {
 }
 
 /// Options for issuing a stream link.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct IssueLinkRequest {
     /// Client-generated stable link identifier carried in the request path.
-    #[serde(skip_serializing, default = "LinkId::generate")]
+    #[serde(skip_serializing)]
     pub link_id: LinkId,
     /// Client-generated secret. The same request can be retried safely.
     #[serde(serialize_with = "crate::ids::serialize_link_secret")]
     pub secret: LinkSecret,
-    /// Owner-visible label for the new link.
-    pub label: LinkLabel,
     /// Permissions carried by the new link.
     pub permissions: LinkPermissions,
     /// Optional RFC 3339 expiration timestamp.
@@ -123,11 +117,10 @@ pub struct IssueLinkRequest {
 
 impl IssueLinkRequest {
     /// Creates retry-safe link issuance material.
-    pub fn new(label: LinkLabel, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
+    pub fn new(link_id: LinkId, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
         Self {
-            link_id: LinkId::generate(),
+            link_id,
             secret: random_link_secret(),
-            label,
             permissions,
             expires_at,
         }
@@ -145,20 +138,11 @@ fn random_link_secret() -> LinkSecret {
 pub struct IssueLinkResponse {
     /// Stable non-secret link identifier used for revocation.
     pub link_id: LinkId,
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
     /// Effective permissions carried by the link.
     pub permissions: LinkPermissions,
     /// Secret link value, returned only when issued.
     #[serde(serialize_with = "crate::ids::serialize_link_secret")]
     pub secret: LinkSecret,
-}
-
-/// A request to rename one stream link.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RenameLinkRequest {
-    /// New owner-visible label.
-    pub label: LinkLabel,
 }
 
 /// Effective lifecycle state for a stream link.
@@ -178,8 +162,6 @@ pub enum StreamLinkStatus {
 pub struct StreamLinkSummary {
     /// Stable non-secret link identifier used for revocation.
     pub link_id: LinkId,
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
     /// Effective permissions carried by the link.
     pub permissions: LinkPermissions,
     /// Current effective lifecycle state.
@@ -449,7 +431,7 @@ mod tests {
         let value = serde_json::to_value(request).expect("serialize create request");
 
         assert_eq!(value["visibility"], "private");
-        assert_eq!(value["issue_links"][0]["label"], "Owner");
+        assert_eq!(value["issue_links"][0]["link_id"], "owner");
         assert_eq!(value["issue_links"][0]["permissions"], "o");
         assert!(value["issue_links"][0]["secret"].is_string());
     }
@@ -473,22 +455,14 @@ mod tests {
     #[test]
     fn serializes_link_mutations_and_omits_absent_stream_update() {
         let link = IssueLinkRequest::new(
-            "Reader".parse().expect("label"),
+            "reader".parse().expect("Link ID"),
             LinkPermissions::read(),
             None,
         );
         let link = serde_json::to_value(link).expect("serialize link request");
-        assert_eq!(link["label"], "Reader");
         assert_eq!(link["permissions"], "r");
         assert!(link.get("link_id").is_none());
         assert!(link["secret"].is_string());
-        assert_eq!(
-            serde_json::to_value(RenameLinkRequest {
-                label: "Deploy bot".parse().expect("label"),
-            })
-            .expect("serialize link rename request"),
-            json!({ "label": "Deploy bot" })
-        );
         assert_eq!(
             serde_json::to_value(UpdateStreamRequest::default()).expect("serialize update request"),
             json!({})

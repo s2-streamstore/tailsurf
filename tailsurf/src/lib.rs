@@ -8,8 +8,6 @@
 pub mod client;
 /// Stream and link IDs, link secrets, and writer identities.
 pub mod ids;
-/// User-provided stream link labels.
-pub mod link_label;
 /// Stream-link permission parsing and validation.
 pub mod permissions;
 /// TSF REST models and v1 binary WebSocket protocol types.
@@ -28,8 +26,7 @@ pub use client::{
     TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession, TsfSseReadSession, WritePermit,
     WriteRecord, default_api_base_url,
 };
-pub use ids::{LinkId, LinkSecret, StreamId, WriterId};
-pub use link_label::{LinkLabel, LinkLabelError, MAX_LINK_LABEL_CODE_POINTS};
+pub use ids::{LinkId, LinkIdError, LinkSecret, MAX_LINK_ID_LEN, StreamId, WriterId};
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     rest::StreamInfoResponse,

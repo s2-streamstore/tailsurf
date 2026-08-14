@@ -2,7 +2,7 @@
 //! streams.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fmt,
     fs::{self, OpenOptions},
     io::{ErrorKind, IsTerminal},
@@ -19,13 +19,13 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
-    AppendTicket, LinkId, LinkLabel, LinkPermissions, LinkSecret, StreamId, StreamTitle, TsfClient,
+    AppendTicket, LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle, TsfClient,
     TsfProducer, TsfReadSession, TsfSseReadSession, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, InitialStreamLink, IssueLinkRequest,
-            IssueLinkResponse, RenameLinkRequest, StreamInfoResponse, StreamLinkStatus,
-            StreamTitleUpdate, UpdateStreamRequest, Visibility,
+            IssueLinkResponse, StreamInfoResponse, StreamLinkStatus, StreamTitleUpdate,
+            UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -126,8 +126,8 @@ struct NewArgs {
     /// Allow anonymous reads.
     #[arg(long)]
     public: bool,
-    /// Issue an additional labeled link at creation, as PERMISSION=LABEL. May be repeated.
-    #[arg(long = "link", value_name = "PERMISSION=LABEL")]
+    /// Issue an additional link at creation, as LINK_ID=PERMISSION. May be repeated.
+    #[arg(long = "link", value_name = "LINK_ID=PERMISSION")]
     links: Vec<InitialLinkArg>,
     #[arg(
         long,
@@ -144,7 +144,7 @@ struct NewArgs {
     /// Write the complete read-only link to this file.
     #[arg(long = "read-link-file", value_name = "PATH")]
     read_link_file: Option<PathBuf>,
-    /// Write the complete write-only link to this file. Requires `--link write=LABEL`.
+    /// Write the complete write-only link to this file. Requires a write link.
     #[arg(long = "write-link-file", value_name = "PATH")]
     write_link_file: Option<PathBuf>,
     #[command(flatten)]
@@ -348,8 +348,6 @@ enum LinkCommand {
     Issue(IssueLinkArgs),
     /// Revoke a link by its ID.
     Revoke(RevokeLinkArgs),
-    /// Rename a link by its ID.
-    Rename(RenameLinkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -367,8 +365,8 @@ struct IssueLinkArgs {
     /// Owner link or @path containing one.
     #[arg(value_name = "OWNER_LINK")]
     owner_link: LinkInput,
-    /// Permission and owner-visible label, as PERMISSION=LABEL.
-    #[arg(value_name = "PERMISSION=LABEL")]
+    /// Immutable Link ID and permission, as LINK_ID=PERMISSION.
+    #[arg(value_name = "LINK_ID=PERMISSION")]
     link: InitialLinkArg,
     /// Expiry such as 1h, 7d, or never.
     #[arg(long, value_name = "EXPIRY", default_value = "never")]
@@ -386,25 +384,9 @@ struct RevokeLinkArgs {
     /// Owner link or @path containing one.
     #[arg(value_name = "OWNER_LINK")]
     owner_link: LinkInput,
-    /// Full Link ID or an unambiguous prefix from `tsf link list`.
-    #[arg(value_name = "LINK_ID_OR_PREFIX")]
-    link_id: String,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct RenameLinkArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
-    /// Full Link ID or an unambiguous prefix from `tsf link list`.
-    #[arg(value_name = "LINK_ID_OR_PREFIX")]
-    link_id: String,
-    /// New owner-visible label.
-    #[arg(value_name = "LABEL")]
-    label: LinkLabel,
+    /// Link ID to revoke.
+    #[arg(value_name = "LINK_ID")]
+    link_id: LinkId,
     /// Print one JSON object instead of human-readable output.
     #[arg(long)]
     json: bool,
@@ -548,13 +530,13 @@ impl FromStr for InitialLinkArg {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (permission, label) = value
+        let (link_id, permission) = value
             .split_once('=')
-            .ok_or_else(|| "link must use PERMISSION=LABEL".to_owned())?;
+            .ok_or_else(|| "link must use LINK_ID=PERMISSION".to_owned())?;
         Ok(Self(InitialStreamLink::new(
-            label
+            link_id
                 .parse()
-                .map_err(|error| format!("invalid link label: {error}"))?,
+                .map_err(|error| format!("invalid Link ID: {error}"))?,
             permission.parse::<PermissionArg>()?.0,
         )))
     }
@@ -841,19 +823,26 @@ fn new_stream_links(
         .iter()
         .any(|link| link.permissions.allows_owner())
     {
-        issue_links.insert(0, initial_link("Owner", LinkPermissions::owner())?);
+        issue_links.insert(0, initial_link("owner", LinkPermissions::owner())?);
     }
     if matches!(visibility, Visibility::Private)
         && !issue_links
             .iter()
             .any(|link| link.permissions == LinkPermissions::read())
     {
-        issue_links.push(initial_link("Reader", LinkPermissions::read())?);
+        issue_links.push(initial_link("reader", LinkPermissions::read())?);
     }
     if issue_links.len() > MAX_INITIAL_LINKS {
         bail!(
             "at most {MAX_INITIAL_LINKS} initial links may be issued, including the default owner and private reader links"
         );
+    }
+    let mut link_ids = HashSet::with_capacity(issue_links.len());
+    if issue_links
+        .iter()
+        .any(|link| !link_ids.insert(link.link_id.as_str()))
+    {
+        bail!("initial Link IDs must be unique");
     }
     if args.read_link_file.is_some()
         && !issue_links
@@ -1577,7 +1566,6 @@ async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Resul
         LinkCommand::List(args) => list_links(api_url, args).await,
         LinkCommand::Issue(args) => issue_link(api_url, web_url, args).await,
         LinkCommand::Revoke(args) => revoke_link(api_url, args).await,
-        LinkCommand::Rename(args) => rename_link(api_url, args).await,
     }
 }
 
@@ -1593,12 +1581,11 @@ async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
     } else {
         for link in response.links {
             println!(
-                "{:<24}  {:<10}  {:<7}  expires {:<24}  id {}{}",
-                link.label,
+                "{:<24}  {:<10}  {:<7}  expires {}{}",
+                link.link_id,
                 permission_label(link.permissions),
                 link_status_label(link.status),
                 link.expires_at.as_deref().unwrap_or("never"),
-                link.link_id,
                 if link.is_current { "  (current)" } else { "" }
             );
         }
@@ -1618,7 +1605,7 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
     let (client, locator, owner_link_secret) =
         owner_client_from_link(api_url, args.owner_link.as_str())?;
     let InitialStreamLink {
-        label,
+        link_id,
         permissions,
         secret,
     } = args.link.0;
@@ -1626,9 +1613,8 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
         .issue_link(
             &locator.stream_id,
             &IssueLinkRequest {
-                link_id: LinkId::generate(),
+                link_id,
                 secret,
-                label,
                 permissions,
                 expires_at: args.expires.rfc3339(),
             },
@@ -1650,45 +1636,14 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
     Ok(())
 }
 
-async fn rename_link(api_url: Url, args: RenameLinkArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
-    let link_id = resolve_link_id(
-        &client,
-        &locator.stream_id,
-        &owner_link_secret,
-        &args.link_id,
-    )
-    .await?;
-    client
-        .rename_link(
-            &locator.stream_id,
-            &link_id,
-            &RenameLinkRequest {
-                label: args.label.clone(),
-            },
-            &owner_link_secret,
-        )
-        .await
-        .context("failed to rename link")?;
-    print_link_mutation(&link_id, "renamed", Some(args.label.as_str()), args.json)
-}
-
 async fn revoke_link(api_url: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
         owner_client_from_link(api_url, args.owner_link.as_str())?;
-    let link_id = resolve_link_id(
-        &client,
-        &locator.stream_id,
-        &owner_link_secret,
-        &args.link_id,
-    )
-    .await?;
     client
-        .revoke_link(&locator.stream_id, &link_id, &owner_link_secret)
+        .revoke_link(&locator.stream_id, &args.link_id, &owner_link_secret)
         .await
         .context("failed to revoke link")?;
-    print_link_mutation(&link_id, "revoked", None, args.json)
+    print_link_revoked(&args.link_id, args.json)
 }
 
 async fn read_transcript(
@@ -1904,61 +1859,15 @@ fn confirm_delete(stream_id: &StreamId, yes: bool) -> eyre::Result<bool> {
     ))
 }
 
-async fn resolve_link_id(
-    client: &TsfClient,
-    stream_id: &StreamId,
-    owner_link_secret: &LinkSecret,
-    selector: &str,
-) -> eyre::Result<LinkId> {
-    if let Ok(link_id) = selector.parse::<LinkId>() {
-        return Ok(link_id);
-    }
-    let prefix = selector.to_ascii_lowercase();
-    if prefix.len() < 4 {
-        bail!("Link ID prefixes must contain at least 4 characters");
-    }
-    const LINK_ID_ALPHABET: &str = "0123456789abcdefghjkmnpqrstvwxyz";
-    if !prefix
-        .chars()
-        .all(|character| LINK_ID_ALPHABET.contains(character))
-    {
-        bail!("invalid Link ID or prefix {selector:?}");
-    }
-    let response = client
-        .list_links(stream_id, owner_link_secret)
-        .await
-        .context("failed to resolve Link ID prefix")?;
-    let mut matches = response
-        .links
-        .into_iter()
-        .filter(|link| link.link_id.to_string().starts_with(&prefix))
-        .map(|link| link.link_id);
-    let Some(link_id) = matches.next() else {
-        bail!("no link matches ID prefix {selector:?}");
-    };
-    if matches.next().is_some() {
-        bail!("Link ID prefix {selector:?} is ambiguous");
-    }
-    Ok(link_id)
-}
-
-fn print_link_mutation(
-    link_id: &LinkId,
-    status: &'static str,
-    label: Option<&str>,
-    json: bool,
-) -> eyre::Result<()> {
+fn print_link_revoked(link_id: &LinkId, json: bool) -> eyre::Result<()> {
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&LinkMutationOutput {
                 link_id: link_id.to_string(),
-                status,
-                label,
+                status: "revoked",
             })?
         );
-    } else if let Some(label) = label {
-        println!("Renamed link {link_id} to {label}");
     } else {
         println!("Revoked link {link_id}");
     }
@@ -1989,7 +1898,7 @@ fn print_created_stream(
             .iter()
             .map(|issued| {
                 Ok((
-                    issued.label.as_str(),
+                    issued.link_id.as_str(),
                     permission_label(issued.permissions),
                     stream_link(
                         web_url,
@@ -2042,7 +1951,6 @@ fn print_created_stream(
                 .map(|issued| {
                     Ok(CreatedLinkOutput {
                         link_id: issued.link_id.to_string(),
-                        label: issued.label.as_str().to_owned(),
                         permissions: permission_label(issued.permissions),
                         url: stream_link(
                             web_url,
@@ -2085,7 +1993,7 @@ fn print_issued_link(url: &Url, issued: &IssueLinkResponse, json: bool) -> eyre:
     if !json {
         println!(
             "Issued {} ({})",
-            issued.label,
+            issued.link_id,
             permission_label(issued.permissions)
         );
         println!("  Link     {url}");
@@ -2094,7 +2002,6 @@ fn print_issued_link(url: &Url, issued: &IssueLinkResponse, json: bool) -> eyre:
     } else {
         let output = IssuedLinkOutput {
             link_id: issued.link_id.to_string(),
-            label: issued.label.as_str().to_owned(),
             permissions: permission_label(issued.permissions),
             url: url.to_string(),
         };
@@ -2137,7 +2044,7 @@ fn write_link_file(
     web_url: &Url,
     created: &CreateStreamResponse,
     permissions: LinkPermissions,
-    label: &str,
+    kind: &str,
 ) -> eyre::Result<()> {
     let Some(path) = path else {
         return Ok(());
@@ -2146,10 +2053,10 @@ fn write_link_file(
         .links
         .iter()
         .find(|link| link.permissions == permissions)
-        .with_context(|| format!("created stream did not include a {label} link"))?;
+        .with_context(|| format!("created stream did not include a {kind} link"))?;
     let url = stream_link(web_url, &created.stream_id, link.permissions, &link.secret)?;
     write_private_file(path, url.as_str())
-        .with_context(|| format!("failed to write {label} link file {}", path.display()))?;
+        .with_context(|| format!("failed to write {kind} link file {}", path.display()))?;
     Ok(())
 }
 
@@ -2173,11 +2080,11 @@ fn write_private_file(path: &Path, value: &str) -> std::io::Result<()> {
     std::io::Write::write_all(&mut file, value.as_bytes())
 }
 
-fn initial_link(label: &str, permissions: LinkPermissions) -> eyre::Result<InitialStreamLink> {
+fn initial_link(link_id: &str, permissions: LinkPermissions) -> eyre::Result<InitialStreamLink> {
     Ok(InitialStreamLink::new(
-        label
+        link_id
             .parse()
-            .map_err(|error| eyre!("invalid link label: {error}"))?,
+            .map_err(|error| eyre!("invalid Link ID: {error}"))?,
         permissions,
     ))
 }
@@ -2269,7 +2176,6 @@ struct CreatedStreamOutput {
 #[derive(Serialize)]
 struct CreatedLinkOutput {
     link_id: String,
-    label: String,
     permissions: &'static str,
     url: String,
 }
@@ -2277,7 +2183,6 @@ struct CreatedLinkOutput {
 #[derive(Serialize)]
 struct IssuedLinkOutput {
     link_id: String,
-    label: String,
     permissions: &'static str,
     url: String,
 }
@@ -2289,11 +2194,9 @@ struct DeleteOutput {
 }
 
 #[derive(Serialize)]
-struct LinkMutationOutput<'a> {
+struct LinkMutationOutput {
     link_id: String,
     status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    label: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -2328,19 +2231,19 @@ mod tests {
     }
 
     #[test]
-    fn initial_links_accept_equals_in_labels_and_short_permissions() {
-        let parsed = "read=CI=prod"
+    fn initial_links_accept_semantic_ids_and_short_permissions() {
+        let parsed = "deploy-bot=read"
             .parse::<InitialLinkArg>()
             .expect("valid initial link");
 
-        assert_eq!(parsed.0.label.as_str(), "CI=prod");
+        assert_eq!(parsed.0.link_id.as_str(), "deploy-bot");
         assert_eq!(parsed.0.permissions, LinkPermissions::read());
 
         for (value, expected) in [
-            ("r=Reader", LinkPermissions::read()),
-            ("w=Writer", LinkPermissions::write()),
-            ("rw=Operator", LinkPermissions::read_write()),
-            ("o=Owner", LinkPermissions::owner()),
+            ("reader=r", LinkPermissions::read()),
+            ("writer=w", LinkPermissions::write()),
+            ("operator=rw", LinkPermissions::read_write()),
+            ("owner=o", LinkPermissions::owner()),
         ] {
             let parsed = value
                 .parse::<InitialLinkArg>()

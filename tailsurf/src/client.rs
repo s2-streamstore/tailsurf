@@ -41,8 +41,8 @@ use crate::{
         rest::{
             AppendJsonRecord, AppendRecordData, AppendRecordsRequest, AppendRecordsResponse,
             CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
-            ListLinksResponse, RenameLinkRequest, RestRecordPart, SseCaughtUpEvent, SseReadRecord,
-            SseRecordsEvent, StreamInfoResponse, UpdateStreamRequest,
+            ListLinksResponse, RestRecordPart, SseCaughtUpEvent, SseReadRecord, SseRecordsEvent,
+            StreamInfoResponse, UpdateStreamRequest,
         },
         ws::{
             DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
@@ -283,7 +283,7 @@ impl TsfClient {
         request: &IssueLinkRequest,
         owner_link_secret: &LinkSecret,
     ) -> Result<IssueLinkResponse, TsfClientError> {
-        let link_id = request.link_id;
+        let link_id = request.link_id.clone();
         self.retry_transient(|| {
             self.send_json_with_bearer(
                 self.http
@@ -328,26 +328,6 @@ impl TsfClient {
             links,
             next_cursor: None,
         })
-    }
-
-    /// Renames a stream link without changing its identity, secret, permissions, or expiry.
-    pub async fn rename_link(
-        &self,
-        stream_id: &StreamId,
-        link_id: &LinkId,
-        request: &RenameLinkRequest,
-        owner_link_secret: &LinkSecret,
-    ) -> Result<(), TsfClientError> {
-        self.retry_transient(|| {
-            self.send_empty(
-                self.http
-                    .patch(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}")))
-                    .json(request),
-                "rename link",
-                Some(owner_link_secret),
-            )
-        })
-        .await
     }
 
     /// Revokes a stream link by its non-secret identifier.

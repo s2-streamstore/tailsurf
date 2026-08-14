@@ -3,13 +3,76 @@
 use base64::{Engine as _, alphabet, engine};
 use rand::Rng;
 use secrecy::ExposeSecret;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::{fmt, str::FromStr};
 
 /// Stable 160-bit identifier for a stream.
 pub type StreamId = ubid::Ubid160;
 
-/// Stable 120-bit identifier for an issued stream link.
-pub type LinkId = ubid::Ubid120;
+/// Maximum length of a stream-scoped Link ID.
+pub const MAX_LINK_ID_LEN: usize = 64;
+
+/// Client-chosen immutable identifier for an issued stream link.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LinkId(String);
+
+impl LinkId {
+    /// Returns the canonical Link ID text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LinkId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LinkId {
+    type Err = LinkIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = value.as_bytes();
+        let is_segment = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        if bytes.is_empty()
+            || bytes.len() > MAX_LINK_ID_LEN
+            || !is_segment(bytes[0])
+            || !is_segment(bytes[bytes.len() - 1])
+            || !bytes.iter().all(|byte| is_segment(*byte) || *byte == b'-')
+        {
+            return Err(LinkIdError);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl Serialize for LinkId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LinkId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Error returned for a non-canonical Link ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "link ID must be 1 to 64 lowercase letters, digits, or hyphens, without a leading or trailing hyphen"
+)]
+pub struct LinkIdError;
 
 /// Secret value carried by a stream link.
 pub type LinkSecret = secrecy::SecretString;
@@ -117,5 +180,23 @@ mod tests {
             let link: String = chars.iter().collect();
             assert!(!is_canonical_base64url_32(&link), "link={link}");
         }
+    }
+
+    #[test]
+    fn link_ids_accept_semantic_slugs() {
+        for value in ["owner", "deploy-bot", "a", "a1-b2"] {
+            assert_eq!(
+                value.parse::<LinkId>().expect("valid Link ID").as_str(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn link_ids_reject_non_canonical_values() {
+        for value in ["", "Owner", "-owner", "owner-", "deploy_bot", "deploy bot"] {
+            assert!(value.parse::<LinkId>().is_err(), "accepted {value:?}");
+        }
+        assert!("a".repeat(MAX_LINK_ID_LEN + 1).parse::<LinkId>().is_err());
     }
 }

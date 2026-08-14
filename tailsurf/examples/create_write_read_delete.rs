@@ -28,9 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             visibility: Visibility::Private,
             expires_in_secs: None,
             issue_links: vec![
-                InitialStreamLink::new("Owner".parse()?, LinkPermissions::owner()),
-                InitialStreamLink::new("Example writer".parse()?, LinkPermissions::write()),
-                InitialStreamLink::new("Example reader".parse()?, LinkPermissions::read()),
+                InitialStreamLink::new("owner".parse()?, LinkPermissions::owner()),
+                InitialStreamLink::new("example-writer".parse()?, LinkPermissions::write()),
+                InitialStreamLink::new("example-reader".parse()?, LinkPermissions::read()),
             ],
         })
         .await?;

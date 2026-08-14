@@ -23,15 +23,14 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    CreateStreamIdempotencyKey, LinkId, LinkLabel, LinkPermissions, LinkSecret, RetryPolicy,
-    StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfProducerConfig,
-    WriteRecord, WriterId,
+    CreateStreamIdempotencyKey, LinkId, LinkPermissions, LinkSecret, RetryPolicy, StreamId,
+    StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfProducerConfig, WriteRecord,
+    WriterId,
     protocol::{
         rest::{
-            CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
-            IssuedStreamLink, ListLinksResponse, RenameLinkRequest, StreamInfoResponse,
-            StreamLinkStatus, StreamLinkSummary, StreamTitleUpdate, UpdateStreamRequest,
-            Visibility,
+            CreateStreamRequest, CreateStreamResponse, IssueLinkResponse, IssuedStreamLink,
+            ListLinksResponse, StreamInfoResponse, StreamLinkStatus, StreamLinkSummary,
+            StreamTitleUpdate, UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -116,11 +115,11 @@ async fn new_outputs_json_and_link_files() {
             "Link file test",
             "--json",
             "--link",
-            "owner=Owner",
+            "owner=owner",
             "--link",
-            "read=Reader",
+            "reader=read",
             "--link",
-            "write=Writer",
+            "writer=write",
             "--owner-link-file",
             owner_file.to_str().expect("owner path"),
             "--read-link-file",
@@ -144,9 +143,9 @@ async fn new_outputs_json_and_link_files() {
             .is_some_and(|links| links.iter().all(|link| link.get("secret").is_none()))
     );
     for (path, label) in [
-        (&owner_file, "Owner"),
-        (&read_file, "Reader"),
-        (&write_file, "Writer"),
+        (&owner_file, "owner"),
+        (&read_file, "reader"),
+        (&write_file, "writer"),
     ] {
         let url = created_link_url(&json, label);
         let locator = StreamLocator::parse(url).expect("matching URL parses");
@@ -205,7 +204,7 @@ async fn new_prints_created_links_before_a_link_file_error() {
 
     assert!(!output.status.success());
     let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("creation JSON");
-    let owner_link = created_link_url(&json, "Owner");
+    let owner_link = created_link_url(&json, "owner");
     let locator = StreamLocator::parse(owner_link).expect("owner link parses");
     assert!(
         locator
@@ -294,26 +293,26 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(private.status.success(), "stderr={}", private.stderr);
     assert_eq!(
         normalize_created_stream_output(&private.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
-    assert_created_links_parse(&private.stdout, &[("Reader", "r"), ("Owner", "o")]);
+    assert_created_links_parse(&private.stdout, &[("reader", "r"), ("owner", "o")]);
 
     let public = run_tsf(&server, ["new", "--public"], None).await;
     assert!(public.status.success(), "stderr={}", public.stderr);
     assert_eq!(
         normalize_created_stream_output(&public.stdout),
-        "Created public stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Public read <url> (public)\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created public stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Public read <url> (public)\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
-    assert_created_links_parse(&public.stdout, &[("Owner", "o")]);
+    assert_created_links_parse(&public.stdout, &[("owner", "o")]);
 
     let explicit = run_tsf(
         &server,
         [
             "new",
             "--link",
-            "read-write=Combined",
+            "combined=read-write",
             "--link",
-            "read=Reader",
+            "reader=read",
         ],
         None,
     )
@@ -321,23 +320,23 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Combined read-write <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  combined read-write <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert_created_links_parse(
         &explicit.stdout,
-        &[("Owner", "o"), ("Combined", "rw"), ("Reader", "r")],
+        &[("owner", "o"), ("combined", "rw"), ("reader", "r")],
     );
 
     server.abort();
 }
 
 #[tokio::test]
-async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
+async fn new_uses_an_explicit_owner_rejects_duplicate_ids_and_limits_links() {
     let server = TestServer::start().await;
 
     let deduplicated = run_tsf(
         &server,
-        ["new", "--link", "owner=Admin", "--link", "read=Reader"],
+        ["new", "--link", "admin=owner", "--link", "reader=read"],
         None,
     )
     .await;
@@ -346,18 +345,19 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
         "stderr={}",
         deduplicated.stderr
     );
-    assert_created_links_parse(&deduplicated.stdout, &[("Admin", "o"), ("Reader", "r")]);
+    assert_created_links_parse(&deduplicated.stdout, &[("admin", "o"), ("reader", "r")]);
 
-    let duplicate_labels = run_tsf(
+    let duplicate_ids = run_tsf(
         &server,
-        ["new", "--link", "read=Same", "--link", "write=Same"],
+        ["new", "--link", "same=read", "--link", "same=write"],
         None,
     )
     .await;
+    assert!(!duplicate_ids.status.success());
     assert!(
-        duplicate_labels.status.success(),
-        "stderr={}",
-        duplicate_labels.stderr
+        duplicate_ids
+            .stderr
+            .contains("initial Link IDs must be unique")
     );
 
     let too_many = run_tsf(
@@ -365,11 +365,11 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
         [
             "new",
             "--link",
-            "read=Reader",
+            "reader=read",
             "--link",
-            "write=Writer",
+            "writer=write",
             "--link",
-            "read-write=Combined",
+            "combined=read-write",
         ],
         None,
     )
@@ -382,7 +382,7 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
         "stderr={}",
         too_many.stderr
     );
-    assert_eq!(server.create_idempotency_keys().len(), 2);
+    assert_eq!(server.create_idempotency_keys().len(), 1);
 
     server.abort();
 }
@@ -396,7 +396,7 @@ async fn new_link_files_require_the_exact_requested_permission() {
         [
             "new",
             "--link",
-            "read-write=Combined",
+            "combined=read-write",
             "--write-link-file",
             "unused.link",
         ],
@@ -478,7 +478,7 @@ async fn piped_input_without_a_subcommand_creates_and_writes() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     StreamLocator::parse(read_link).expect("valid read link");
 
@@ -496,7 +496,7 @@ async fn capture_then_replay_round_trips_piped_input() {
     assert!(output.status.success(), "stderr={}", output.stderr);
     assert_eq!(
         normalize_created_stream_output(&output.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert!(
         output.stderr.contains("1 record durable"),
@@ -506,7 +506,7 @@ async fn capture_then_replay_round_trips_piped_input() {
     let owner_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Owner"))
+        .find_map(|line| extract_link_line(line, "owner"))
         .expect("owner link");
     let owner_secret = StreamLocator::parse(owner_link)
         .expect("valid owner link")
@@ -518,7 +518,7 @@ async fn capture_then_replay_round_trips_piped_input() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     StreamLocator::parse(read_link).expect("valid read link");
 
@@ -561,7 +561,7 @@ async fn capture_command_streams_output_and_propagates_exit_status() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
 
     let replay = run_tsf(&server, ["replay", read_link], None).await;
@@ -584,7 +584,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     let read_link = locator
@@ -640,7 +640,7 @@ async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() 
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link is printed before writing");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     assert_eq!(server.record_count(&locator.stream_id), 0);
@@ -658,7 +658,7 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     let read_link = locator
@@ -726,7 +726,7 @@ async fn write_raw_flushes_on_linger() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     let read_link = locator
@@ -778,7 +778,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         let mut line = String::new();
         let read = stdout.read_line(&mut line).await.expect("read created URL");
         assert!(read > 0, "tsf exited before printing a read link");
-        if let Some(url) = extract_link_line(&line, "Reader") {
+        if let Some(url) = extract_link_line(&line, "reader") {
             break url.trim_end().to_owned();
         }
     };
@@ -1371,7 +1371,7 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
     let owner_link = public
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Owner"))
+        .find_map(|line| extract_link_line(line, "owner"))
         .expect("owner link");
     let bad_owner_link = owner_link
         .split_once("#o=")
@@ -1561,7 +1561,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     assert!(created.status.success(), "stderr={}", created.stderr);
     let created_json: serde_json::Value =
         serde_json::from_str(&created.stdout).expect("create output");
-    let owner_link = created_link_url(&created_json, "Owner");
+    let owner_link = created_link_url(&created_json, "owner");
 
     let info = run_tsf(&server, ["info", owner_link, "--json"], None).await;
     assert!(info.status.success(), "stderr={}", info.stderr);
@@ -1609,7 +1609,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
 
     let issued = run_tsf(
         &server,
-        ["link", "issue", owner_link, "read=Deploy reader", "--json"],
+        ["link", "issue", owner_link, "deploy-reader=read", "--json"],
         None,
     )
     .await;
@@ -1619,7 +1619,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     let issued_url = issued_json["url"].as_str().expect("issued URL");
     StreamLocator::parse(issued_url).expect("issued URL parses");
     let link_id = issued_json["link_id"].as_str().expect("link id").to_owned();
-    assert_eq!(issued_json["label"], "Deploy reader");
+    assert_eq!(issued_json["link_id"], "deploy-reader");
     assert!(issued_json.get("secret").is_none());
 
     server.fail_next_link_list();
@@ -1636,41 +1636,9 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         Some(&serde_json::Value::String("active".to_owned()))
     );
 
-    let link_prefix = &link_id[..8];
-    let renamed = run_tsf(
-        &server,
-        [
-            "link",
-            "rename",
-            owner_link,
-            link_prefix,
-            "CI reader",
-            "--json",
-        ],
-        None,
-    )
-    .await;
-    assert!(renamed.status.success(), "stderr={}", renamed.stderr);
-    let renamed_json: serde_json::Value =
-        serde_json::from_str(&renamed.stdout).expect("rename output");
-    assert_eq!(renamed_json["link_id"], link_id);
-    assert_eq!(renamed_json["status"], "renamed");
-    assert_eq!(renamed_json["label"], "CI reader");
-
-    let listed = run_tsf(&server, ["link", "list", owner_link, "--json"], None).await;
-    let listed_json: serde_json::Value =
-        serde_json::from_str(&listed.stdout).expect("renamed link list output");
-    assert_eq!(
-        listed_json["links"]
-            .as_array()
-            .and_then(|links| links.iter().find(|link| link["link_id"] == link_id))
-            .map(|link| &link["label"]),
-        Some(&serde_json::Value::String("CI reader".to_owned()))
-    );
-
     let revoked = run_tsf(
         &server,
-        ["link", "revoke", owner_link, link_prefix, "--json"],
+        ["link", "revoke", owner_link, link_id.as_str(), "--json"],
         None,
     )
     .await;
@@ -1736,9 +1704,7 @@ impl TestServer {
             .route("/api/v1/streams/{stream_id}/links", get(test_list_links))
             .route(
                 "/api/v1/streams/{stream_id}/links/{link_id}",
-                axum::routing::put(test_issue_link)
-                    .patch(test_rename_link)
-                    .delete(test_revoke_link),
+                axum::routing::put(test_issue_link).delete(test_revoke_link),
             )
             .route("/api/v1/streams/{stream_id}/write", get(test_write_socket))
             .route("/api/v1/streams/{stream_id}/read", get(test_read_socket))
@@ -1835,7 +1801,6 @@ impl TestServer {
 #[derive(Default)]
 struct TestApiState {
     next_stream: Mutex<u64>,
-    next_link: Mutex<u64>,
     create_failures_remaining: Mutex<usize>,
     create_invalid_json_remaining: Mutex<usize>,
     create_responses: Mutex<HashMap<String, CreateStreamResponse>>,
@@ -1859,10 +1824,15 @@ struct TestStream {
 #[derive(Clone)]
 struct TestLink {
     link_id: LinkId,
-    label: LinkLabel,
     permissions: LinkPermissions,
     secret: LinkSecret,
     active: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct TestIssueLinkRequest {
+    secret: String,
+    permissions: LinkPermissions,
 }
 
 #[derive(Clone)]
@@ -1946,13 +1916,12 @@ async fn test_create_stream(
     let requested_links = request.issue_links;
     let links = requested_links
         .into_iter()
-        .map(|link| test_store_stream_link(&state, None, link.secret, link.label, link.permissions))
+        .map(|link| test_store_stream_link(link.link_id, link.secret, link.permissions))
         .collect::<Vec<_>>();
     let response_links = links
         .iter()
         .map(|link| IssuedStreamLink {
-            link_id: link.link_id,
-            label: link.label.clone(),
+            link_id: link.link_id.clone(),
             permissions: link.permissions,
             secret: link.secret.clone(),
         })
@@ -2072,7 +2041,7 @@ async fn test_issue_link(
     State(state): State<Arc<TestApiState>>,
     Path((stream_id, link_id)): Path<(String, LinkId)>,
     headers: HeaderMap,
-    Json(request): Json<IssueLinkRequest>,
+    Json(request): Json<TestIssueLinkRequest>,
 ) -> Response {
     let mut streams = state.streams.lock().expect("streams lock");
     let Some(stream) = streams.get_mut(&stream_id) else {
@@ -2084,16 +2053,9 @@ async fn test_issue_link(
     if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
-    let link = test_store_stream_link(
-        &state,
-        Some(link_id),
-        request.secret,
-        request.label,
-        request.permissions,
-    );
+    let link = test_store_stream_link(link_id, request.secret.into(), request.permissions);
     let response = IssueLinkResponse {
-        link_id: link.link_id,
-        label: link.label.clone(),
+        link_id: link.link_id.clone(),
         permissions: link.permissions,
         secret: link.secret.clone(),
     };
@@ -2140,8 +2102,7 @@ async fn test_list_links(
             .links
             .iter()
             .map(|link| StreamLinkSummary {
-                link_id: link.link_id,
-                label: link.label.clone(),
+                link_id: link.link_id.clone(),
                 permissions: link.permissions,
                 status: if link.active {
                     StreamLinkStatus::Active
@@ -2179,29 +2140,6 @@ async fn test_revoke_link(
             link.active = false;
         }
     }
-    StatusCode::NO_CONTENT.into_response()
-}
-
-async fn test_rename_link(
-    State(state): State<Arc<TestApiState>>,
-    Path((stream_id, link_id)): Path<(String, LinkId)>,
-    headers: HeaderMap,
-    Json(request): Json<RenameLinkRequest>,
-) -> Response {
-    let mut streams = state.streams.lock().expect("streams lock");
-    let Some(stream) = streams.get_mut(&stream_id) else {
-        return test_error(StatusCode::NOT_FOUND, "not_found", "stream not found");
-    };
-    if stream.deleted {
-        return test_error(StatusCode::CONFLICT, "conflict", "stream is deleted");
-    }
-    if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
-        return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
-    }
-    let Some(link) = stream.links.iter_mut().find(|link| link.link_id == link_id) else {
-        return test_error(StatusCode::NOT_FOUND, "not_found", "link not found");
-    };
-    link.label = request.label;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2397,22 +2335,12 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
 }
 
 fn test_store_stream_link(
-    state: &TestApiState,
-    link_id: Option<LinkId>,
+    link_id: LinkId,
     secret: LinkSecret,
-    label: LinkLabel,
     permissions: LinkPermissions,
 ) -> TestLink {
-    let mut next_link = state.next_link.lock().expect("next link lock");
-    let link_id = link_id.unwrap_or_else(|| {
-        format!("{:x}{:023x}", *next_link, *next_link)
-            .parse::<LinkId>()
-            .expect("link id")
-    });
-    *next_link += 1;
     TestLink {
         link_id,
-        label,
         permissions,
         secret,
         active: true,
@@ -2698,19 +2626,19 @@ fn normalize_created_stream_output(output: &str) -> String {
         + "\n"
 }
 
-fn extract_link_line<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+fn extract_link_line<'a>(line: &'a str, link_id: &str) -> Option<&'a str> {
     let mut links = line.split_whitespace();
-    if links.next()? != label {
+    if links.next()? != link_id {
         return None;
     }
     let _permission = links.next()?;
     links.next().filter(|url| url.starts_with("http"))
 }
 
-fn created_link_url<'a>(json: &'a serde_json::Value, label: &str) -> &'a str {
+fn created_link_url<'a>(json: &'a serde_json::Value, link_id: &str) -> &'a str {
     json["links"]
         .as_array()
-        .and_then(|links| links.iter().find(|link| link["label"] == label))
+        .and_then(|links| links.iter().find(|link| link["link_id"] == link_id))
         .and_then(|link| link["url"].as_str())
         .expect("created link URL")
 }
