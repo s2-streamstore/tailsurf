@@ -3,8 +3,9 @@
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::ids::encode_base64url_32;
-use crate::{LinkId, LinkLabel, LinkPermissions, LinkSecret, StreamId, StreamTitle};
+use crate::{
+    LinkId, LinkLabel, LinkPermissions, LinkSecret, StreamId, StreamTitle, ids::encode_base64url_32,
+};
 
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
