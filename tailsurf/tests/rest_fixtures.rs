@@ -20,6 +20,10 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     assert_eq!((acknowledgement.seq_start, acknowledgement.seq_end), (7, 8));
     let records: SseRecordsEvent = fixture(&fixtures, "sse_records");
     assert_eq!(records.records.len(), 1);
+    assert_eq!(
+        fixtures["sse_resume_cursor"].as_str(),
+        Some("tsf1.AQAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAg")
+    );
     let caught_up: SseCaughtUpEvent = fixture(&fixtures, "sse_caught_up");
     assert_eq!(caught_up.next_seq_num, 8);
 }

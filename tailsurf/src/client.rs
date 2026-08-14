@@ -518,20 +518,27 @@ impl TsfClient {
 
     /// Connects a resumable SSE reader.
     ///
-    /// Private credentials stay in the bearer header. Reconnects use the last safe absolute
-    /// sequence cursor reported by records or `caught_up`.
+    /// Private credentials stay in the bearer header. Reconnects reuse the original URL and send
+    /// the latest opaque event cursor in `Last-Event-ID`.
     pub async fn connect_sse_reader(
         &self,
         mut options: ReadStreamOptions,
     ) -> Result<TsfSseReadSession, TsfClientError> {
         validate_read_options(&options)?;
-        let connection = self.open_sse_connection(&options).await?;
+        let request_options = options.clone();
+        let connection = self
+            .open_sse_connection(&request_options, None)
+            .await?
+            .ok_or(TsfClientError::InvalidSse(
+                "initial read completed without stream_info",
+            ))?;
         if let Some(boundary) = connection.snapshot_boundary {
             apply_snapshot_boundary(&mut options, Some(boundary));
         }
         Ok(TsfSseReadSession {
             client: self.clone(),
             options,
+            request_options,
             body: connection.body,
             buffer: connection.buffer,
             queued_events: connection.queued_events,
@@ -540,13 +547,16 @@ impl TsfClient {
             last_caught_up: None,
             snapshot_boundary: connection.snapshot_boundary,
             reconnect_attempts: 0,
+            last_event_id: None,
+            finished: false,
         })
     }
 
     async fn open_sse_connection(
         &self,
         options: &ReadStreamOptions,
-    ) -> Result<SseConnection, TsfClientError> {
+        last_event_id: Option<&str>,
+    ) -> Result<Option<SseConnection>, TsfClientError> {
         self.retry_transient(|| async {
             let mut url = self.rest_url(&format!("/streams/{}/records", options.stream_id));
             append_sse_query(&mut url, options);
@@ -554,10 +564,13 @@ impl TsfClient {
             if let Some(secret) = options.link_secret.as_ref() {
                 request = request.bearer_auth(secret.expose_secret());
             }
-            if let Some(ReadStart::SeqNum(seq_num)) = options.start {
-                request = request.header("Last-Event-ID", seq_num.to_string());
+            if let Some(last_event_id) = last_event_id {
+                request = request.header("Last-Event-ID", last_event_id);
             }
             let response = request.send().await?;
+            if response.status() == StatusCode::NO_CONTENT {
+                return Ok(None);
+            }
             if !response.status().is_success() {
                 return Err(http_status_error(response, "read SSE").await);
             }
@@ -585,7 +598,7 @@ impl TsfClient {
                 serde_json::from_str(&event.data)
                     .map_err(|_| TsfClientError::InvalidSse("invalid stream_info event"))?,
             );
-            Ok(connection)
+            Ok(Some(connection))
         })
         .await
     }
@@ -1563,6 +1576,7 @@ type SseBody = Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Er
 struct ParsedSseEvent {
     event: String,
     data: String,
+    id: Option<String>,
 }
 
 struct SseConnection {
@@ -1577,6 +1591,7 @@ struct SseConnection {
 pub struct TsfSseReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
+    request_options: ReadStreamOptions,
     body: SseBody,
     buffer: Vec<u8>,
     queued_events: VecDeque<ParsedSseEvent>,
@@ -1585,6 +1600,8 @@ pub struct TsfSseReadSession {
     last_caught_up: Option<ReadCaughtUp>,
     snapshot_boundary: Option<ReadSnapshotBoundary>,
     reconnect_attempts: usize,
+    last_event_id: Option<String>,
+    finished: bool,
 }
 
 impl TsfSseReadSession {
@@ -1606,6 +1623,9 @@ impl TsfSseReadSession {
     /// Returns the next record, reconnecting from the last safe absolute cursor when needed.
     pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
         loop {
+            if self.finished {
+                return Ok(None);
+            }
             if let Some(record) = self.queued_records.pop_front() {
                 self.options.start = record.seq_num.checked_add(1).map(ReadStart::SeqNum);
                 if let Some(count) = self.options.count.as_mut() {
@@ -1639,7 +1659,19 @@ impl TsfSseReadSession {
                     sleep(delay).await;
                 }
                 self.reconnect_attempts += 1;
-                let connection = self.client.open_sse_connection(&self.options).await?;
+                let Some(connection) = self
+                    .client
+                    .open_sse_connection(&self.request_options, self.last_event_id.as_deref())
+                    .await?
+                else {
+                    self.finished = true;
+                    return Ok(None);
+                };
+                if connection.snapshot_boundary != self.snapshot_boundary {
+                    return Err(TsfClientError::InvalidSse(
+                        "snapshot boundary changed during resume",
+                    ));
+                }
                 self.body = connection.body;
                 self.buffer = connection.buffer;
                 self.queued_events = connection.queued_events;
@@ -1650,9 +1682,13 @@ impl TsfSseReadSession {
                 "records" => {
                     let batch: SseRecordsEvent = serde_json::from_str(&event.data)
                         .map_err(|_| TsfClientError::InvalidSse("invalid records event"))?;
-                    for record in batch.records {
-                        self.queued_records.push_back(sse_read_record(record)?);
-                    }
+                    let records = batch
+                        .records
+                        .into_iter()
+                        .map(sse_read_record)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.last_event_id = Some(sse_resume_event_id(&event)?.to_owned());
+                    self.queued_records.extend(records);
                     self.reconnect_attempts = 0;
                 }
                 "caught_up" => {
@@ -1662,6 +1698,7 @@ impl TsfSseReadSession {
                         next_seq_num: value.next_seq_num,
                         last_timestamp_ms: value.last_timestamp_ms.unwrap_or(0),
                     };
+                    self.last_event_id = Some(sse_resume_event_id(&event)?.to_owned());
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
                     self.reconnect_attempts = 0;
@@ -2001,16 +2038,17 @@ fn validate_read_options(options: &ReadStreamOptions) -> Result<(), TsfClientErr
 
 fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
     let mut query = url.query_pairs_mut();
-    if !matches!(options.start, Some(ReadStart::SeqNum(_))) {
-        match options.start {
-            Some(ReadStart::TimestampMs(value)) => {
-                query.append_pair("timestamp_ms", &value.to_string());
-            }
-            Some(ReadStart::TailOffset(value)) => {
-                query.append_pair("tail_offset", &value.to_string());
-            }
-            _ => {}
+    match options.start {
+        Some(ReadStart::SeqNum(value)) => {
+            query.append_pair("seq_num", &value.to_string());
         }
+        Some(ReadStart::TimestampMs(value)) => {
+            query.append_pair("timestamp_ms", &value.to_string());
+        }
+        Some(ReadStart::TailOffset(value)) => {
+            query.append_pair("tail_offset", &value.to_string());
+        }
+        None => {}
     }
     if let Some(value) = options.count {
         query.append_pair("count", &value.to_string());
@@ -2096,6 +2134,7 @@ fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientErro
     let text =
         std::str::from_utf8(block).map_err(|_| TsfClientError::InvalidSse("event is not UTF-8"))?;
     let mut event = "message".to_owned();
+    let mut id = None;
     let mut data = Vec::new();
     for line in text.lines() {
         if line.is_empty() || line.starts_with(':') {
@@ -2106,6 +2145,7 @@ fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientErro
         });
         match name {
             "event" => event = value.to_owned(),
+            "id" => id = Some(value.to_owned()),
             "data" => data.push(value),
             _ => {}
         }
@@ -2116,8 +2156,31 @@ fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientErro
         Ok(Some(ParsedSseEvent {
             event,
             data: data.join("\n"),
+            id,
         }))
     }
+}
+
+fn sse_resume_event_id(event: &ParsedSseEvent) -> Result<&str, TsfClientError> {
+    let encoded = event
+        .id
+        .as_deref()
+        .and_then(|value| value.strip_prefix("tsf1."));
+    let Some(encoded) = encoded else {
+        return Err(TsfClientError::InvalidSse(
+            "records and caught_up events require a valid resume cursor",
+        ));
+    };
+    if !matches!(encoded.len(), 23 | 34)
+        || !encoded
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+    {
+        return Err(TsfClientError::InvalidSse(
+            "records and caught_up events require a valid resume cursor",
+        ));
+    }
+    Ok(event.id.as_deref().expect("validated event ID"))
 }
 
 fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
@@ -2784,6 +2847,51 @@ mod tests {
                 .as_str(),
             "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read"
         );
+    }
+
+    #[test]
+    fn sse_query_keeps_the_original_absolute_selector_and_limit() {
+        let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+            .parse()
+            .expect("stream ID");
+        let mut options = ReadStreamOptions::new(stream_id);
+        options.start = Some(ReadStart::SeqNum(42));
+        options.count = Some(7);
+        options.snapshot = true;
+        let mut url = Url::parse("https://tail.surf/api/v1/streams/id/records").expect("SSE URL");
+
+        append_sse_query(&mut url, &options);
+
+        assert_eq!(url.query(), Some("seq_num=42&count=7&snapshot=true"));
+    }
+
+    #[test]
+    fn sse_parser_retains_only_strict_versioned_resume_ids() {
+        let cursor = "tsf1.AAAAAAAAAAAEAAAAAAAAAAA";
+        let block = format!(
+            "id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"4\",\"last_timestamp_ms\":null}}"
+        );
+        let event = parse_sse_block(block.as_bytes())
+            .expect("parse SSE event")
+            .expect("data event");
+
+        assert_eq!(sse_resume_event_id(&event).expect("resume cursor"), cursor);
+
+        for invalid in [
+            "tsf2.AAAAAAAAAAAAAAAAAAAAAAA",
+            "tsf1.short",
+            "tsf1.AAAAAAAAAAAAAAAAAAAAAA!",
+        ] {
+            let event = ParsedSseEvent {
+                event: "caught_up".to_owned(),
+                data: "{}".to_owned(),
+                id: Some(invalid.to_owned()),
+            };
+            assert!(matches!(
+                sse_resume_event_id(&event),
+                Err(TsfClientError::InvalidSse(_))
+            ));
+        }
     }
 
     #[tokio::test]

@@ -4,5 +4,6 @@
   "append_request": { "writer_id": "AAECAwQFBgcICQoLDA0ODw", "first_writer_seq_num": "41", "records": [{ "type": "text", "text": "hello\n", "part": { "index": 0, "is_final": true } }, { "type": "bytes", "base64": "AP8", "format": "bytes" }], "match_seq_num": "7" },
   "append_response": { "seq_start": "7", "seq_end": "8", "future_field": true },
   "sse_records": { "records": [{ "seq_num": "7", "timestamp_ms": "1786579200000", "writer_id": "AAECAwQFBgcICQoLDA0ODw", "writer_seq_num": "41", "part": { "index": 0, "is_final": true }, "data": { "type": "text", "text": "hello\n" } }], "future_field": true },
+  "sse_resume_cursor": "tsf1.AQAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAg",
   "sse_caught_up": { "next_seq_num": "8", "last_timestamp_ms": "1786579200000", "future_field": true }
 }
