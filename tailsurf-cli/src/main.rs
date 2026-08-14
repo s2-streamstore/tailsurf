@@ -156,6 +156,9 @@ struct WriteArgs {
     /// Write-capable link or @path containing one.
     #[arg(value_name = "WRITE_LINK")]
     link: LinkInput,
+    /// Require the stream to begin this writer session at this sequence.
+    #[arg(long, value_name = "SEQ_NUM", help_heading = "Advanced")]
+    expected_next_seq_num: Option<u64>,
     #[command(flatten)]
     input: InputArgs,
 }
@@ -798,7 +801,14 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
         .context("created stream did not include an owner link")?
         .secret
         .clone();
-    write_input(api_url, created.stream_id, owner_link_secret, args.input).await
+    write_input(
+        api_url,
+        created.stream_id,
+        owner_link_secret,
+        Some(0),
+        args.input,
+    )
+    .await
 }
 
 async fn write_stream(api_url: Url, args: WriteArgs) -> eyre::Result<()> {
@@ -807,7 +817,14 @@ async fn write_stream(api_url: Url, args: WriteArgs) -> eyre::Result<()> {
         .link_declaring(LinkPermissions::allows_write)
         .context("link does not declare write permission")?
         .clone();
-    write_input(api_url, locator.stream_id, link, args.input).await
+    write_input(
+        api_url,
+        locator.stream_id,
+        link,
+        args.expected_next_seq_num,
+        args.input,
+    )
+    .await
 }
 
 fn new_stream_links(
@@ -862,6 +879,7 @@ async fn write_input(
     api_url: Url,
     stream_id: StreamId,
     link: LinkSecret,
+    expected_next_seq_num: Option<u64>,
     input: InputArgs,
 ) -> eyre::Result<()> {
     let buffering = if input.raw {
@@ -874,6 +892,7 @@ async fn write_input(
             api_url,
             stream_id,
             link,
+            expected_next_seq_num,
             buffering,
             input.max_logical_record_bytes,
         )
@@ -883,6 +902,7 @@ async fn write_input(
             api_url,
             stream_id,
             link,
+            expected_next_seq_num,
             buffering,
             input.max_logical_record_bytes,
             input.program,
@@ -921,13 +941,16 @@ async fn stream_stdin_to_writer(
     api_url: Url,
     stream_id: StreamId,
     link: LinkSecret,
+    expected_next_seq_num: Option<u64>,
     buffering: WriteBuffering,
     max_logical_record_bytes: usize,
 ) -> eyre::Result<()> {
     let client = TsfClient::with_api_origin(api_url)?;
     let mut state = WriterState::new_random();
+    let mut options = WriteStreamOptions::new(stream_id, state.writer_id, link);
+    options.expected_next_seq_num = expected_next_seq_num;
     let writer = client
-        .connect_writer(WriteStreamOptions::new(stream_id, state.writer_id, link))
+        .connect_writer(options)
         .await
         .context("failed to connect writer")?;
 
@@ -1039,14 +1062,17 @@ async fn stream_command_to_writer(
     api_url: Url,
     stream_id: StreamId,
     link: LinkSecret,
+    expected_next_seq_num: Option<u64>,
     buffering: WriteBuffering,
     max_logical_record_bytes: usize,
     command: Vec<String>,
 ) -> eyre::Result<()> {
     let client = TsfClient::with_api_origin(api_url)?;
     let mut state = WriterState::new_random();
+    let mut options = WriteStreamOptions::new(stream_id, state.writer_id, link);
+    options.expected_next_seq_num = expected_next_seq_num;
     let writer = client
-        .connect_writer(WriteStreamOptions::new(stream_id, state.writer_id, link))
+        .connect_writer(options)
         .await
         .context("failed to connect writer")?;
     let outcome = {

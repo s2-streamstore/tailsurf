@@ -832,7 +832,12 @@ async fn write_reconnect_reuses_writer_identity_sequence_and_link_secret() {
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["write", write_link.as_str()],
+        [
+            "write",
+            write_link.as_str(),
+            "--expected-next-seq-num",
+            "12",
+        ],
         Some("retry me\n"),
     )
     .await;
@@ -843,6 +848,8 @@ async fn write_reconnect_reuses_writer_identity_sequence_and_link_secret() {
     assert_eq!(attempts[0].writer_id, attempts[1].writer_id);
     assert_eq!(attempts[0].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[1].link_secret, TEST_STREAM_LINK);
+    assert_eq!(attempts[0].expected_next_seq_num, Some(12));
+    assert_eq!(attempts[1].expected_next_seq_num, None);
     assert_eq!(attempts[0].writer_seq_num, 0);
     assert_eq!(attempts[1].writer_seq_num, 0);
     assert_eq!(attempts[0].data.as_ref(), b"retry me\n");
@@ -2170,6 +2177,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
     let Ok(ClientFrame::OpenWrite {
         writer_id,
         link_secret,
+        ..
     }) = ClientFrame::decode_bytes(auth)
     else {
         return;
@@ -2902,6 +2910,7 @@ async fn send_server_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result
 struct AppendAttempt {
     writer_id: WriterId,
     link_secret: String,
+    expected_next_seq_num: Option<u64>,
     writer_seq_num: u64,
     part: PartHeader,
     format: RecordFormat,
@@ -2965,6 +2974,7 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     let ClientFrame::OpenWrite {
         writer_id,
         link_secret,
+        expected_next_seq_num,
     } = ClientFrame::decode_bytes(auth).expect("auth write")
     else {
         return;
@@ -2989,6 +2999,7 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
         attempts.push(AppendAttempt {
             writer_id,
             link_secret: link_secret.expose_secret().to_owned(),
+            expected_next_seq_num,
             writer_seq_num: record.writer_seq_num,
             part: record.part,
             format: record.format,

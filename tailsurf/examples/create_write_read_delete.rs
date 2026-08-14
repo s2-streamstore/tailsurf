@@ -57,11 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
 
     let writer = client
-        .connect_writer(WriteStreamOptions::new(
-            created.stream_id,
-            WriterId::new_random(),
-            write_link_secret,
-        ))
+        .connect_writer(
+            WriteStreamOptions::new(created.stream_id, WriterId::new_random(), write_link_secret)
+                .with_expected_next_seq_num(0),
+        )
         .await?;
     let ticket = writer
         .submit(tailsurf::WriteRecord::new(
