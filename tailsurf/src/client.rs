@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    fmt::Display,
     future::Future,
     pin::Pin,
     str::FromStr,
@@ -277,8 +278,12 @@ impl TsfClient {
         stream_id: &StreamId,
         link_secret: Option<&LinkSecret>,
     ) -> Result<StreamMetadata, TsfClientError> {
-        self.get_json_with_bearer(format!("/streams/{stream_id}"), "get stream", link_secret)
-            .await
+        self.get_json_with_bearer(
+            format_args!("/streams/{stream_id}"),
+            "get stream",
+            link_secret,
+        )
+        .await
     }
 
     /// Updates owner-controlled stream settings.
@@ -293,7 +298,7 @@ impl TsfClient {
         self.retry_transient(|| {
             self.send_json_with_bearer(
                 self.http
-                    .patch(self.rest_url(&format!("/streams/{stream_id}")))
+                    .patch(self.rest_url(format_args!("/streams/{stream_id}")))
                     .json(request),
                 "update stream",
                 Some(owner_link_secret),
@@ -313,7 +318,7 @@ impl TsfClient {
         self.retry_transient(|| {
             self.send_empty(
                 self.http
-                    .delete(self.rest_url(&format!("/streams/{stream_id}"))),
+                    .delete(self.rest_url(format_args!("/streams/{stream_id}"))),
                 "delete stream",
                 Some(owner_link_secret),
             )
@@ -337,7 +342,7 @@ impl TsfClient {
         self.retry_transient(|| {
             self.send_json_with_bearer(
                 self.http
-                    .put(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}")))
+                    .put(self.rest_url(format_args!("/streams/{stream_id}/links/{link_id}")))
                     .json(request),
                 "create link",
                 Some(owner_link_secret),
@@ -366,7 +371,7 @@ impl TsfClient {
                 "cursor must not be empty",
             ));
         }
-        let mut url = self.rest_url(&format!("/streams/{stream_id}/links"));
+        let mut url = self.rest_url(format_args!("/streams/{stream_id}/links"));
         {
             let mut query = url.query_pairs_mut();
             if let Some(limit) = options.limit {
@@ -453,7 +458,7 @@ impl TsfClient {
         self.retry_transient(|| {
             self.send_empty(
                 self.http
-                    .delete(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}"))),
+                    .delete(self.rest_url(format_args!("/streams/{stream_id}/links/{link_id}"))),
                 "revoke link",
                 Some(owner_link_secret),
             )
@@ -535,7 +540,7 @@ impl TsfClient {
             .retry_transient(|| {
                 self.send_json_with_bearer(
                     self.http
-                        .post(self.rest_url(&format!("/streams/{stream_id}/records")))
+                        .post(self.rest_url(format_args!("/streams/{stream_id}/records")))
                         .json(&request),
                     "append records",
                     Some(write_link_secret),
@@ -560,7 +565,7 @@ impl TsfClient {
         mut options: WriteStreamOptions,
         config: TsfWriterConfig,
     ) -> Result<TsfWriter, TsfClientError> {
-        let session = self.connect_write_session(options.clone()).await?;
+        let session = self.open_write_session(&options).await?;
         options.expected_next_seq_num = None;
         TsfWriter::new(self.clone(), options, session, config)
     }
@@ -572,15 +577,22 @@ impl TsfClient {
         &self,
         options: WriteStreamOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        self.retry_transient(|| self.connect_write_session_once(options.clone()))
+        self.open_write_session(&options).await
+    }
+
+    async fn open_write_session(
+        &self,
+        options: &WriteStreamOptions,
+    ) -> Result<TsfWriteSession, TsfClientError> {
+        self.retry_transient(|| self.connect_write_session_once(options))
             .await
     }
 
     async fn connect_write_session_once(
         &self,
-        options: WriteStreamOptions,
+        options: &WriteStreamOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id))?;
+        let url = self.websocket_url(format_args!("/streams/{}/write", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
         let opening_frame = ClientFrame::OpenWrite {
@@ -609,7 +621,7 @@ impl TsfClient {
             socket,
             stream_metadata,
             snapshot_boundary,
-        } = self.connect_read_socket(options.clone()).await?;
+        } = self.connect_read_socket(&options).await?;
         apply_snapshot_boundary(&mut options, snapshot_boundary);
         Ok(TsfReadSession::new(
             self.clone(),
@@ -681,7 +693,7 @@ impl TsfClient {
         options: &ReadStreamOptions,
         last_event_id: Option<&str>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
-        let mut url = self.rest_url(&format!("/streams/{}/records", options.stream_id));
+        let mut url = self.rest_url(format_args!("/streams/{}/records", options.stream_id));
         append_sse_query(&mut url, options);
         let mut request = self.apply_rest_auth(
             self.http.get(url).header("Accept", "text/event-stream"),
@@ -749,7 +761,7 @@ impl TsfClient {
 
     async fn connect_read_socket(
         &self,
-        options: ReadStreamOptions,
+        options: &ReadStreamOptions,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
         if let Some(start) = options.start {
             let value = match start {
@@ -790,7 +802,7 @@ impl TsfClient {
             snapshot: options.snapshot,
         }
         .encode()?;
-        let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id))?;
+        let url = self.websocket_url(format_args!("/streams/{}/read", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
         let read_idle_timeout = self.config.websocket_read_idle_timeout;
@@ -825,7 +837,7 @@ impl TsfClient {
         .await
     }
 
-    fn rest_url(&self, path: &str) -> Url {
+    fn rest_url(&self, path: impl Display) -> Url {
         let mut url = self.config.api_origin.clone();
         url.set_path(&format!("{API_PREFIX}{path}"));
         url.set_query(None);
@@ -848,7 +860,7 @@ impl TsfClient {
         }
     }
 
-    fn websocket_url(&self, path: &str) -> Result<Url, TsfClientError> {
+    fn websocket_url(&self, path: impl Display) -> Result<Url, TsfClientError> {
         let mut url = self.rest_url(path);
         let scheme = match url.scheme() {
             "http" => "ws",
@@ -862,11 +874,11 @@ impl TsfClient {
 
     async fn get_json_with_bearer<T: DeserializeOwned>(
         &self,
-        path: String,
+        path: impl Display,
         operation: &'static str,
         link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
-        let url = self.rest_url(&path);
+        let url = self.rest_url(path);
         self.retry_transient(|| {
             self.send_json_with_bearer(self.http.get(url.clone()), operation, link_secret)
         })
@@ -1632,7 +1644,7 @@ async fn recover_pending_appends(
             sleep(delay).await;
         }
         *reconnect_attempts += 1;
-        match client.connect_write_session_once(options.clone()).await {
+        match client.connect_write_session_once(options).await {
             Ok(mut connected) => match send_retained(&mut connected, pending, 0).await {
                 Ok(()) => {
                     *session = connected;
@@ -2012,10 +2024,7 @@ impl TsfReadSession {
             socket,
             stream_metadata,
             snapshot_boundary,
-        } = self
-            .client
-            .connect_read_socket(self.options.clone())
-            .await?;
+        } = self.client.connect_read_socket(&self.options).await?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
         apply_snapshot_boundary(&mut self.options, snapshot_boundary);
@@ -2199,13 +2208,16 @@ async fn connect_websocket(
     let selected_protocol = response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
-        .map(|value| value.to_str().map(str::to_owned))
-        .transpose()
-        .map_err(|_| TsfClientError::InvalidWebSocketProtocolHeader)?;
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| TsfClientError::InvalidWebSocketProtocolHeader)
+        })
+        .transpose()?;
 
-    if selected_protocol.as_deref() != Some(TSF_WEBSOCKET_PROTOCOL) {
+    if selected_protocol != Some(TSF_WEBSOCKET_PROTOCOL) {
         return Err(TsfClientError::UnexpectedWebSocketProtocol(
-            selected_protocol,
+            selected_protocol.map(str::to_owned),
         ));
     }
 

@@ -5,7 +5,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt,
     fs::{self, OpenOptions},
-    io::{ErrorKind, IsTerminal},
+    io::{ErrorKind, IsTerminal, Write as _},
     path::{Path, PathBuf},
     process::{ExitCode, ExitStatus, Stdio},
     str::FromStr,
@@ -472,6 +472,29 @@ impl FromStr for SinceArg {
     }
 }
 
+fn parse_duration_arg(value: &str, what: &str) -> Result<Duration, String> {
+    let duration = humantime::parse_duration(value)
+        .map_err(|error| format!("invalid {what} duration: {error}"))?;
+    if duration.is_zero() {
+        return Err(format!("{what} must be at least one second"));
+    }
+    Ok(duration)
+}
+
+fn rfc3339_from_now(duration: Duration, what: &str) -> eyre::Result<String> {
+    let expires_at = SystemTime::now()
+        .checked_add(duration)
+        .ok_or_else(|| eyre!("{what} is too large"))?;
+    // humantime only formats years 0000..=9999 and its Display-to-String panics outside that.
+    let unix_secs = expires_at
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| eyre!("{what} is too large"))?;
+    if unix_secs.as_secs() > 253_402_300_799 {
+        return Err(eyre!("{what} is too large"));
+    }
+    Ok(humantime::format_rfc3339_seconds(expires_at).to_string())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StreamExpiryArg(Duration);
 
@@ -479,11 +502,7 @@ impl FromStr for StreamExpiryArg {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let duration = humantime::parse_duration(value)
-            .map_err(|error| format!("invalid stream expiry duration: {error}"))?;
-        if duration.is_zero() {
-            return Err("stream expiry must be at least one second".to_owned());
-        }
+        let duration = parse_duration_arg(value, "stream expiry")?;
         if duration.subsec_nanos() != 0 {
             return Err("stream expiry must be a whole number of seconds".to_owned());
         }
@@ -497,10 +516,7 @@ impl StreamExpiryArg {
     }
 
     fn rfc3339(self) -> eyre::Result<String> {
-        let expires_at = SystemTime::now()
-            .checked_add(self.0)
-            .ok_or_else(|| eyre!("stream expiry is too large"))?;
-        Ok(humantime::format_rfc3339_seconds(expires_at).to_string())
+        rfc3339_from_now(self.0, "stream expiry")
     }
 }
 
@@ -552,13 +568,10 @@ enum ExpiresArg {
 }
 
 impl ExpiresArg {
-    fn rfc3339(self) -> Option<String> {
+    fn rfc3339(self) -> eyre::Result<Option<String>> {
         match self {
-            Self::Never => None,
-            Self::In(duration) => Some(
-                humantime::format_rfc3339_seconds(std::time::SystemTime::now() + duration)
-                    .to_string(),
-            ),
+            Self::Never => Ok(None),
+            Self::In(duration) => rfc3339_from_now(duration, "link expiry").map(Some),
         }
     }
 }
@@ -570,12 +583,7 @@ impl FromStr for ExpiresArg {
         if value.eq_ignore_ascii_case("never") {
             return Ok(Self::Never);
         }
-        let duration = humantime::parse_duration(value)
-            .map_err(|error| format!("invalid expiry duration: {error}"))?;
-        if duration.is_zero() {
-            return Err("expiry must be at least one second".to_owned());
-        }
-        Ok(Self::In(duration))
+        parse_duration_arg(value, "expiry").map(Self::In)
     }
 }
 
@@ -1047,9 +1055,8 @@ async fn stream_lines_to_writer(
             break false;
         }
 
-        line_appender
-            .push_bytes(&mut session, read_buffer.split().freeze())
-            .await?;
+        line_appender.push_bytes(&mut session, &read_buffer).await?;
+        read_buffer.clear();
     };
 
     line_appender.finish(&mut session).await?;
@@ -1138,7 +1145,7 @@ async fn stream_child_command_output(
             WriteBuffering::Lines => {
                 let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
                 while let Some(chunk) = chunk_rx.recv().await {
-                    line_appender.push_bytes(session, chunk?).await?;
+                    line_appender.push_bytes(session, &chunk?).await?;
                 }
                 line_appender.finish(session).await?;
             }
@@ -1181,9 +1188,9 @@ async fn read_child_pipe<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffer = BytesMut::with_capacity(MAX_RECORD_BYTES);
+    let mut buffer = BytesMut::with_capacity(STDIN_READ_BYTES);
     loop {
-        buffer.reserve(MAX_RECORD_BYTES);
+        buffer.reserve(STDIN_READ_BYTES);
         let byte_count = pipe
             .read_buf(&mut buffer)
             .await
@@ -1191,7 +1198,12 @@ where
         if byte_count == 0 {
             return Ok(());
         }
-        if chunk_tx.send(Ok(buffer.split().freeze())).await.is_err() {
+        // split_to keeps spare capacity local; a full split would give the whole allocation away.
+        if chunk_tx
+            .send(Ok(buffer.split_to(byte_count).freeze()))
+            .await
+            .is_err()
+        {
             return Ok(());
         }
     }
@@ -1298,10 +1310,10 @@ impl LineRecordAppender {
     async fn push_bytes(
         &mut self,
         session: &mut WriterSession<'_>,
-        mut bytes: Bytes,
+        mut bytes: &[u8],
     ) -> eyre::Result<()> {
         while !bytes.is_empty() {
-            let newline = memchr(b'\n', &bytes);
+            let newline = memchr(b'\n', bytes);
             let take = newline.map_or(bytes.len(), |index| index + 1);
             let logical_record_bytes = self
                 .logical_record_bytes
@@ -1315,7 +1327,7 @@ impl LineRecordAppender {
             }
             self.logical_record_bytes = logical_record_bytes;
             self.buffer(&bytes[..take]);
-            bytes.advance(take);
+            bytes = &bytes[take..];
             if newline.is_some() {
                 self.send_line(session).await?;
             }
@@ -1346,13 +1358,13 @@ impl LineRecordAppender {
         if !self.pending.is_empty() {
             self.pending_parts.push(self.pending.split().freeze());
         }
-        let parts = std::mem::take(&mut self.pending_parts);
-        self.logical_record_bytes = 0;
-        let last_part = parts
+        let last_part = self
+            .pending_parts
             .len()
             .checked_sub(1)
             .context("logical line is empty")?;
-        for (index, part) in parts.into_iter().enumerate() {
+        self.logical_record_bytes = 0;
+        for (index, part) in self.pending_parts.drain(..).enumerate() {
             let part_index = u32::try_from(index).context("line split part index overflowed")?;
             session
                 .append_line_part(part_index, index == last_part, part)
@@ -1426,19 +1438,28 @@ impl WriterSession<'_> {
     }
 }
 
+fn read_options(
+    locator: &StreamLocator,
+    read: &ReadArgs,
+    default_start: ReadStart,
+) -> ReadStreamOptions {
+    let mut options = ReadStreamOptions::new(locator.stream_id);
+    options.start = Some(selected_read_start(
+        read.last,
+        read.seq,
+        read.since,
+        default_start,
+    ));
+    options.limit = read.limit;
+    if let Some(link) = locator.link_declaring(LinkPermissions::allows_read) {
+        options = options.with_link_secret(link.clone());
+    }
+    options
+}
+
 async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
-    let mut request = ReadStreamOptions::new(locator.stream_id);
-    request.start = Some(selected_read_start(
-        args.read.last,
-        args.read.seq,
-        args.read.since,
-        ReadStart::TailOffset(0),
-    ));
-    request.limit = args.read.limit;
-    if let Some(link) = locator.link_declaring(LinkPermissions::allows_read) {
-        request = request.with_link_secret(link.clone());
-    }
+    let request = read_options(&locator, &args.read, ReadStart::TailOffset(0));
 
     read_transcript(
         api_url,
@@ -1454,19 +1475,8 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     if args.read.limit == Some(0) {
         return Ok(());
     }
-    let mut request = ReadStreamOptions::new(locator.stream_id);
-    request.start = Some(selected_read_start(
-        args.read.last,
-        args.read.seq,
-        args.read.since,
-        ReadStart::SeqNum(0),
-    ));
+    let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
     request.snapshot = true;
-    request.limit = args.read.limit;
-    let read_link = locator.link_declaring(LinkPermissions::allows_read);
-    if let Some(link) = read_link {
-        request = request.with_link_secret(link.clone());
-    }
 
     read_transcript(
         api_url,
@@ -1502,36 +1512,45 @@ async fn delete_stream(api_url: Url, args: DeleteArgs) -> eyre::Result<()> {
         .await
         .context("failed to delete stream")?;
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&DeleteOutput {
-                stream_id: locator.stream_id.to_string(),
-                status: "deleted",
-            })?
-        );
+        print_json(&DeleteOutput {
+            stream_id: locator.stream_id.to_string(),
+            status: "deleted",
+        })?;
     } else {
         println!("Deleted stream {}", locator.stream_id);
     }
     Ok(())
 }
 
-async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<()> {
+async fn update_and_print(
+    api_url: Url,
+    owner_link: &LinkInput,
+    request: &UpdateStreamRequest,
+    json: bool,
+    context: &'static str,
+) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
+        owner_client_from_link(api_url, owner_link.as_str())?;
     let stream = client
-        .update_stream(
-            &locator.stream_id,
-            &UpdateStreamRequest {
-                title: StreamTitleUpdate::Unchanged,
-                visibility: Some(args.visibility.into()),
-                expires_at: None,
-            },
-            &owner_link_secret,
-        )
+        .update_stream(&locator.stream_id, request, &owner_link_secret)
         .await
-        .context("failed to update stream visibility")?;
-    print_stream_metadata(&stream, args.json)?;
-    Ok(())
+        .context(context)?;
+    print_stream_metadata(&stream, json)
+}
+
+async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<()> {
+    update_and_print(
+        api_url,
+        &args.owner_link,
+        &UpdateStreamRequest {
+            title: StreamTitleUpdate::Unchanged,
+            visibility: Some(args.visibility.into()),
+            expires_at: None,
+        },
+        args.json,
+        "failed to update stream visibility",
+    )
+    .await
 }
 
 async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
@@ -1543,41 +1562,33 @@ async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
         ),
         TitleCommand::Clear(args) => (args.owner_link, StreamTitleUpdate::Clear, args.json),
     };
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, owner_link.as_str())?;
-    let stream = client
-        .update_stream(
-            &locator.stream_id,
-            &UpdateStreamRequest {
-                title,
-                visibility: None,
-                expires_at: None,
-            },
-            &owner_link_secret,
-        )
-        .await
-        .context("failed to update stream title")?;
-    print_stream_metadata(&stream, json)?;
-    Ok(())
+    update_and_print(
+        api_url,
+        &owner_link,
+        &UpdateStreamRequest {
+            title,
+            visibility: None,
+            expires_at: None,
+        },
+        json,
+        "failed to update stream title",
+    )
+    .await
 }
 
 async fn renew_stream(api_url: Url, args: RenewArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
-    let stream = client
-        .update_stream(
-            &locator.stream_id,
-            &UpdateStreamRequest {
-                title: StreamTitleUpdate::Unchanged,
-                visibility: None,
-                expires_at: Some(args.expires.rfc3339()?),
-            },
-            &owner_link_secret,
-        )
-        .await
-        .context("failed to renew stream")?;
-    print_stream_metadata(&stream, args.json)?;
-    Ok(())
+    update_and_print(
+        api_url,
+        &args.owner_link,
+        &UpdateStreamRequest {
+            title: StreamTitleUpdate::Unchanged,
+            visibility: None,
+            expires_at: Some(args.expires.rfc3339()?),
+        },
+        args.json,
+        "failed to renew stream",
+    )
+    .await
 }
 
 async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Result<()> {
@@ -1596,7 +1607,7 @@ async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
         .await
         .context("failed to list links")?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&inventory)?);
+        print_json(&inventory)?;
     } else {
         for link in &inventory.links {
             println!(
@@ -1632,6 +1643,7 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
         permissions,
         secret,
     } = args.link.0;
+    let expires_at = args.expires.rfc3339()?;
     let credential = client
         .create_link(
             &locator.stream_id,
@@ -1639,7 +1651,7 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
                 link_id,
                 secret,
                 permissions,
-                expires_at: args.expires.rfc3339(),
+                expires_at,
             },
             &owner_link_secret,
         )
@@ -1843,16 +1855,27 @@ fn confirm_delete(stream_id: &StreamId, yes: bool) -> eyre::Result<bool> {
 
 fn print_link_revoked(link_id: &LinkId, json: bool) -> eyre::Result<()> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&LinkMutationOutput {
-                link_id: link_id.to_string(),
-                status: "revoked",
-            })?
-        );
+        print_json(&LinkMutationOutput {
+            link_id: link_id.to_string(),
+            status: "revoked",
+        })?;
     } else {
         println!("Revoked link {link_id}");
     }
+    Ok(())
+}
+
+fn print_json(value: &impl Serialize) -> eyre::Result<()> {
+    write_json(std::io::stdout().lock(), value)
+}
+
+fn write_json(writer: impl std::io::Write, value: &impl Serialize) -> eyre::Result<()> {
+    let mut writer = std::io::BufWriter::new(writer);
+    // serde_json::Error hides the io::Error from chain walking; unwrap it so broken-pipe
+    // classification and error reports see the real cause.
+    serde_json::to_writer_pretty(&mut writer, value).map_err(std::io::Error::from)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -1947,7 +1970,7 @@ fn print_created_stream(
             public_url: matches!(created.visibility, Visibility::Public)
                 .then(|| bare_stream_url(web_url, &created.stream_id).to_string()),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
     }
     Ok(())
 }
@@ -1966,7 +1989,7 @@ fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()
         println!("Created: {}", stream.created_at);
         println!("Expires: {}", stream.expires_at);
     } else {
-        println!("{}", serde_json::to_string_pretty(stream)?);
+        print_json(stream)?;
     }
     Ok(())
 }
@@ -1991,7 +2014,7 @@ fn print_created_link(
             permissions: permission_label(credential.permissions),
             url: url.to_string(),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
     }
     Ok(())
 }
@@ -2099,12 +2122,13 @@ fn bare_stream_url(base_url: &Url, stream_id: &StreamId) -> Url {
 }
 
 fn permission_label(permissions: LinkPermissions) -> &'static str {
-    match permissions.to_string().as_str() {
+    match permissions.as_str() {
         "o" => "owner",
         "r" => "read",
         "w" => "write",
         "rw" => "read-write",
-        _ => "link",
+        // as_str is total over the four validated bit patterns; no other value is representable.
+        _ => unreachable!(),
     }
 }
 
@@ -2284,5 +2308,53 @@ mod tests {
         let connection_reset: eyre::Report =
             std::io::Error::new(ErrorKind::ConnectionReset, "reset consumer").into();
         assert!(!is_broken_pipe(&connection_reset));
+    }
+
+    #[test]
+    fn json_output_surfaces_io_errors_for_broken_pipe_classification() {
+        struct BrokenPipeWriter;
+        impl std::io::Write for BrokenPipeWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "closed consumer",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "closed consumer",
+                ))
+            }
+        }
+
+        // Larger than the BufWriter capacity: fails inside serde_json, exercising the
+        // io::Error unwrap; without it the chain ends at serde_json::Error.
+        let large = serde_json::json!({ "data": "x".repeat(16 * 1024) });
+        let error = write_json(BrokenPipeWriter, &large).expect_err("broken pipe");
+        assert!(is_broken_pipe(&error));
+
+        // Smaller than the buffer: fails at the final flush instead.
+        let small = serde_json::json!({ "a": 1 });
+        let error = write_json(BrokenPipeWriter, &small).expect_err("broken pipe");
+        assert!(is_broken_pipe(&error));
+    }
+
+    #[test]
+    fn expiry_beyond_rfc3339_range_errors_instead_of_panicking() {
+        let huge = Duration::from_secs(u64::MAX / 4);
+        assert!(rfc3339_from_now(huge, "link expiry").is_err());
+
+        // One second before the last representable instant still formats.
+        let to_end = Duration::from_secs(
+            253_402_300_799
+                - SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("post-epoch")
+                    .as_secs()
+                - 1,
+        );
+        let formatted = rfc3339_from_now(to_end, "link expiry").expect("in-range expiry");
+        assert!(formatted.starts_with("9999-12-31T23:59:5"));
     }
 }
