@@ -1,7 +1,7 @@
-//! Bounded REST and WebSocket clients for the TSF service.
+//! Bounded REST, SSE, and WebSocket clients for the TSF service.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     future::Future,
     pin::Pin,
     str::FromStr,
@@ -10,12 +10,13 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use reqwest::StatusCode;
 use secrecy::ExposeSecret;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
@@ -34,19 +35,26 @@ use tokio_tungstenite::{
 use url::Url;
 
 use crate::{
-    LinkId, LinkSecret, StreamId,
+    ClientWriterId, LinkId, LinkSecret, StreamId, WriterId,
     ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::{
         rest::{
-            CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
-            ListLinksResponse, RenameLinkRequest, StreamInfoResponse, StreamRangeResponse,
-            StreamTailResponse, UpdateStreamRequest,
+            ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest, CreateLinkInput,
+            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, MAX_LINK_PAGE_ITEMS,
+            MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
+            MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS,
+            MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
+            MAX_STATELESS_APPEND_RECORDS, RecordData, RestRecordPart, SseCaughtUpData,
+            SseReadBatchData, SseReadRecord, SseSnapshotBoundaryData, StreamLinkCredential,
+            StreamMetadata, UpdateStreamRequest,
         },
         ws::{
-            ReadStart, ReadStreamOptions, WriteStreamOptions,
+            DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
+            MIN_PLAYBACK_RATE_PERMILLE, ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                ClientFrame, FrameCodecError, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail,
-                RecordFormat, ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
+                AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
+                MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader,
+                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -55,14 +63,17 @@ use crate::{
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const API_PREFIX: &str = "/api/v1";
-const DEFAULT_READ_TAIL_OFFSET: u64 = 80;
+const MAX_CLIENT_DELAY: Duration = Duration::from_millis(2_147_483_647);
 
 /// Timeouts, retry behavior, and API origin for [`TsfClient`].
+///
+/// Configured durations cannot exceed 2,147,483,647 milliseconds. Required timeouts must be
+/// greater than zero.
 #[derive(Clone, Debug)]
 pub struct TsfClientConfig {
     /// Service origin without the `/api/v1` namespace.
-    pub api_base_url: Url,
-    /// Per-request timeout for REST operations.
+    pub api_origin: Url,
+    /// Per-request timeout for REST operations and SSE opening handshakes.
     pub rest_request_timeout: Duration,
     /// Timeout for establishing and upgrading a WebSocket.
     pub websocket_connect_timeout: Duration,
@@ -72,15 +83,25 @@ pub struct TsfClientConfig {
     /// `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
     /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and
-    /// consecutive read reconnects without a delivered record.
+    /// consecutive read connection failures.
     pub retry_policy: RetryPolicy,
 }
 
 impl TsfClientConfig {
     /// Creates a configuration with bounded defaults for the supplied API origin.
-    pub fn new(api_base_url: Url) -> Self {
+    pub fn new(api_origin: Url) -> Result<Self, TsfClientError> {
+        validate_api_origin(&api_origin)?;
+        Ok(Self {
+            api_origin,
+            ..Self::default()
+        })
+    }
+}
+
+impl Default for TsfClientConfig {
+    fn default() -> Self {
         Self {
-            api_base_url,
+            api_origin: default_api_origin(),
             rest_request_timeout: Duration::from_secs(10),
             websocket_connect_timeout: Duration::from_secs(10),
             websocket_operation_timeout: Duration::from_secs(30),
@@ -90,20 +111,14 @@ impl TsfClientConfig {
     }
 }
 
-impl Default for TsfClientConfig {
-    fn default() -> Self {
-        Self::new(default_api_base_url())
-    }
-}
-
 /// Exponential-backoff policy for idempotent operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetryPolicy {
-    /// Total attempts including the initial request. Zero is treated as one.
+    /// Total attempts including the initial request.
     pub max_attempts: usize,
-    /// Delay before the first retry.
+    /// Base delay before the first retry. Client-controlled delays are jittered.
     pub initial_backoff: Duration,
-    /// Maximum delay between attempts.
+    /// Maximum base delay and server retry hint honored by the client.
     pub max_backoff: Duration,
 }
 
@@ -117,15 +132,21 @@ impl RetryPolicy {
         }
     }
 
-    fn attempt_count(self) -> usize {
-        self.max_attempts.max(1)
-    }
-
     fn next_backoff(self, current: Duration) -> Duration {
         current
             .checked_mul(2)
             .unwrap_or(self.max_backoff)
             .min(self.max_backoff)
+    }
+
+    fn reconnect_delay(self, retry: usize) -> Duration {
+        let multiplier = 1_u32 << retry.min(30);
+        let backoff = self
+            .initial_backoff
+            .checked_mul(multiplier)
+            .unwrap_or(self.max_backoff)
+            .min(self.max_backoff);
+        jittered_backoff(backoff)
     }
 }
 
@@ -139,40 +160,62 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Cloneable TSF control-plane and v3 data-plane client.
+fn jittered_backoff(backoff: Duration) -> Duration {
+    if backoff.is_zero() {
+        Duration::ZERO
+    } else {
+        backoff
+            .mul_f64(rand::rng().random_range(0.5_f64..=1.5_f64))
+            .min(MAX_CLIENT_DELAY)
+    }
+}
+
+/// Cloneable TSF REST, SSE, and v1 WebSocket client.
 ///
-/// Anonymous stream creation is retried with one idempotency key. Other mutating REST operations
-/// are not retried because a timeout may occur after the service applies the mutation. Metadata
-/// reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by
-/// [`TsfProducer`].
+/// REST operations preserve their retry identity and use [`RetryPolicy`]. Stateless append retries
+/// can create physical duplicates, which logical transcript readers suppress. Durable WebSocket
+/// writer recovery is owned by [`TsfWriter`].
 #[derive(Clone)]
 pub struct TsfClient {
     config: TsfClientConfig,
     http: reqwest::Client,
 }
 
+/// Pagination controls for one link inventory request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ListLinksOptions {
+    /// Maximum number of links to return. The service accepts values from 1 through 100.
+    pub limit: Option<u8>,
+    /// Opaque cursor returned by the previous page.
+    pub cursor: Option<String>,
+}
+
 impl TsfClient {
     /// Creates a client for the default [tail.surf](https://tail.surf) API origin.
     pub fn new() -> Self {
-        Self::with_config(TsfClientConfig::default())
-    }
-
-    /// Creates a client for an explicit API origin with default timeouts.
-    pub fn with_api_base_url(api_base_url: Url) -> Self {
-        Self::with_config(TsfClientConfig::new(api_base_url))
-    }
-
-    /// Creates a client from a complete configuration.
-    pub fn with_config(config: TsfClientConfig) -> Self {
         Self {
-            config,
+            config: TsfClientConfig::default(),
             http: reqwest::Client::new(),
         }
     }
 
+    /// Creates a client for an explicit API origin with default timeouts.
+    pub fn with_api_origin(api_origin: Url) -> Result<Self, TsfClientError> {
+        Self::with_config(TsfClientConfig::new(api_origin)?)
+    }
+
+    /// Creates a client from a complete configuration.
+    pub fn with_config(config: TsfClientConfig) -> Result<Self, TsfClientError> {
+        validate_client_config(&config)?;
+        Ok(Self {
+            config,
+            http: reqwest::Client::new(),
+        })
+    }
+
     /// Returns the configured API origin without the `/api/v1` namespace.
-    pub fn api_base_url(&self) -> &Url {
-        &self.config.api_base_url
+    pub fn api_origin(&self) -> &Url {
+        &self.config.api_origin
     }
 
     /// Returns the complete immutable client configuration.
@@ -180,9 +223,10 @@ impl TsfClient {
         &self.config
     }
 
-    /// Creates a stream and returns its metadata and newly issued secret links.
+    /// Creates a stream and returns its metadata and initial link credentials.
     ///
-    /// The client generates one idempotency key for this logical call and reuses it while retrying
+    /// Construct the request once so its prepared link secrets remain stable. The client generates
+    /// one idempotency key for this logical call and reuses the complete request while retrying
     /// transient failures according to policy.
     pub async fn create_stream(
         &self,
@@ -193,23 +237,29 @@ impl TsfClient {
             .await
     }
 
-    /// Creates or recovers a logical stream creation using a caller-owned idempotency key.
+    /// Creates a logical stream using a caller-owned idempotency key.
     ///
-    /// The key is owner-equivalent recovery material. Generate and persist it securely before the
-    /// first request, then reuse it with the identical request after cancellation, process loss, or
-    /// an ambiguous response.
+    /// An exact retry requires the same prepared request. The idempotency key alone cannot return
+    /// the link credentials.
     pub async fn create_stream_with_idempotency_key(
         &self,
         request: &CreateStreamRequest,
         idempotency_key: &CreateStreamIdempotencyKey,
     ) -> Result<CreateStreamResponse, TsfClientError> {
+        if request
+            .links
+            .iter()
+            .any(|link| !is_canonical_base64url_32(link.secret.expose_secret()))
+        {
+            return Err(TsfClientError::InvalidLinkSecret);
+        }
         self.retry_when(
             || {
                 self.send_json_with_bearer(
                     self.http
                         .post(self.rest_url("/streams"))
                         .header("Idempotency-Key", idempotency_key.expose_secret())
-                        .json(request),
+                        .json(&request),
                     "create stream",
                     None,
                 )
@@ -226,280 +276,549 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
         link_secret: Option<&LinkSecret>,
-    ) -> Result<StreamInfoResponse, TsfClientError> {
+    ) -> Result<StreamMetadata, TsfClientError> {
         self.get_json_with_bearer(format!("/streams/{stream_id}"), "get stream", link_secret)
             .await
     }
 
-    /// Retrieves the current durable stream tail, retrying transient failures according to policy.
-    ///
-    /// Private streams require a read-capable stream link. Public streams may pass `None`.
-    pub async fn get_stream_tail(
-        &self,
-        stream_id: &StreamId,
-        link_secret: Option<&LinkSecret>,
-    ) -> Result<StreamTailResponse, TsfClientError> {
-        self.get_json_with_bearer(
-            format!("/streams/{stream_id}/tail"),
-            "check stream tail",
-            link_secret,
-        )
-        .await
-    }
-
-    /// Retrieves stream bounds, retrying transient failures according to policy.
-    ///
-    /// Private streams require a read-capable stream link. Public streams may pass `None`.
-    pub async fn get_stream_range(
-        &self,
-        stream_id: &StreamId,
-        link_secret: Option<&LinkSecret>,
-    ) -> Result<StreamRangeResponse, TsfClientError> {
-        self.get_json_with_bearer(
-            format!("/streams/{stream_id}/range"),
-            "check stream range",
-            link_secret,
-        )
-        .await
-    }
-
     /// Updates owner-controlled stream settings.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// Transient failures are retried with the same absolute update values.
     pub async fn update_stream(
         &self,
         stream_id: &StreamId,
         request: &UpdateStreamRequest,
         owner_link_secret: &LinkSecret,
-    ) -> Result<StreamInfoResponse, TsfClientError> {
-        self.send_json_with_bearer(
-            self.http
-                .patch(self.rest_url(&format!("/streams/{stream_id}")))
-                .json(request),
-            "update stream",
-            Some(owner_link_secret),
-        )
+    ) -> Result<StreamMetadata, TsfClientError> {
+        self.retry_transient(|| {
+            self.send_json_with_bearer(
+                self.http
+                    .patch(self.rest_url(&format!("/streams/{stream_id}")))
+                    .json(request),
+                "update stream",
+                Some(owner_link_secret),
+            )
+        })
         .await
     }
 
     /// Permanently deletes a stream.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// Transient failures are retried. Deletion is idempotent.
     pub async fn delete_stream(
         &self,
         stream_id: &StreamId,
         owner_link_secret: &LinkSecret,
     ) -> Result<(), TsfClientError> {
-        self.send_empty(
-            self.http
-                .delete(self.rest_url(&format!("/streams/{stream_id}"))),
-            "delete stream",
-            Some(owner_link_secret),
-        )
+        self.retry_transient(|| {
+            self.send_empty(
+                self.http
+                    .delete(self.rest_url(&format!("/streams/{stream_id}"))),
+                "delete stream",
+                Some(owner_link_secret),
+            )
+        })
         .await
     }
 
-    /// Issues a new secret stream link.
+    /// Creates a stream link idempotently.
     ///
-    /// This mutation is attempted once and is not transparently retried.
-    pub async fn issue_link(
+    /// Transient failures are retried with the same client-generated Link ID and secret.
+    pub async fn create_link(
         &self,
         stream_id: &StreamId,
-        request: &IssueLinkRequest,
+        request: &CreateLinkInput,
         owner_link_secret: &LinkSecret,
-    ) -> Result<IssueLinkResponse, TsfClientError> {
-        self.send_json_with_bearer(
-            self.http
-                .post(self.rest_url(&format!("/streams/{stream_id}/links")))
-                .json(request),
-            "issue link",
-            Some(owner_link_secret),
-        )
+    ) -> Result<StreamLinkCredential, TsfClientError> {
+        if !is_canonical_base64url_32(request.secret.expose_secret()) {
+            return Err(TsfClientError::InvalidLinkSecret);
+        }
+        let link_id = request.link_id.clone();
+        self.retry_transient(|| {
+            self.send_json_with_bearer(
+                self.http
+                    .put(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}")))
+                    .json(request),
+                "create link",
+                Some(owner_link_secret),
+            )
+        })
         .await
     }
 
-    /// Lists retained, non-secret link metadata, retrying transient failures according to policy.
+    /// Lists one page of retained, non-secret link metadata.
     pub async fn list_links(
+        &self,
+        stream_id: &StreamId,
+        options: &ListLinksOptions,
+        owner_link_secret: &LinkSecret,
+    ) -> Result<ListLinksResponse, TsfClientError> {
+        if options
+            .limit
+            .is_some_and(|limit| !(1..=MAX_LINK_PAGE_ITEMS as u8).contains(&limit))
+        {
+            return Err(TsfClientError::InvalidListLinksOptions(
+                "limit must be between 1 and 100",
+            ));
+        }
+        if options.cursor.as_deref() == Some("") {
+            return Err(TsfClientError::InvalidListLinksOptions(
+                "cursor must not be empty",
+            ));
+        }
+        let mut url = self.rest_url(&format!("/streams/{stream_id}/links"));
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(limit) = options.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(cursor) = &options.cursor {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        let page = self
+            .retry_transient(|| {
+                self.send_json_with_bearer(
+                    self.http.get(url.clone()),
+                    "list links",
+                    Some(owner_link_secret),
+                )
+            })
+            .await?;
+        validate_link_page(
+            &page,
+            options.limit.unwrap_or(MAX_LINK_PAGE_ITEMS as u8) as usize,
+        )?;
+        Ok(page)
+    }
+
+    /// Lists every retained link, following pagination until completion.
+    pub async fn list_all_links(
         &self,
         stream_id: &StreamId,
         owner_link_secret: &LinkSecret,
     ) -> Result<ListLinksResponse, TsfClientError> {
-        self.get_json_with_bearer(
-            format!("/streams/{stream_id}/links"),
-            "list links",
-            Some(owner_link_secret),
-        )
-        .await
-    }
-
-    /// Renames a stream link without changing its identity, secret, permissions, or expiry.
-    pub async fn rename_link(
-        &self,
-        stream_id: &StreamId,
-        link_id: &LinkId,
-        request: &RenameLinkRequest,
-        owner_link_secret: &LinkSecret,
-    ) -> Result<(), TsfClientError> {
-        self.send_empty(
-            self.http
-                .patch(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}")))
-                .json(request),
-            "rename link",
-            Some(owner_link_secret),
-        )
-        .await
+        let mut links = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut authorizing_link_id = None;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let page = self
+                .list_links(
+                    stream_id,
+                    &ListLinksOptions {
+                        limit: Some(MAX_LINK_PAGE_ITEMS as u8),
+                        cursor,
+                    },
+                    owner_link_secret,
+                )
+                .await?;
+            if authorizing_link_id
+                .as_ref()
+                .is_some_and(|expected| expected != &page.authorizing_link_id)
+            {
+                return Err(TsfClientError::InvalidLinkPage(
+                    "authorizing link changed across pages",
+                ));
+            }
+            authorizing_link_id.get_or_insert(page.authorizing_link_id);
+            links.extend(page.links);
+            match page.next_cursor {
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => {
+                    return Err(TsfClientError::InvalidLinkPage(
+                        "link pagination cursor repeated",
+                    ));
+                }
+                None => break,
+            }
+        }
+        Ok(ListLinksResponse {
+            authorizing_link_id: authorizing_link_id
+                .expect("link inventory always contains an authorizing link ID"),
+            links,
+            next_cursor: None,
+        })
     }
 
     /// Revokes a stream link by its non-secret identifier.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// Transient failures are retried. Revocation is idempotent.
     pub async fn revoke_link(
         &self,
         stream_id: &StreamId,
         link_id: &LinkId,
         owner_link_secret: &LinkSecret,
     ) -> Result<(), TsfClientError> {
-        self.send_empty(
-            self.http
-                .delete(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}"))),
-            "revoke link",
-            Some(owner_link_secret),
-        )
-        .await
-    }
-
-    /// Connects the standard bounded, reconnecting durable producer.
-    pub async fn connect_producer(
-        &self,
-        options: WriteStreamOptions,
-    ) -> Result<TsfProducer, TsfClientError> {
-        self.connect_producer_with_config(options, TsfProducerConfig::default())
-            .await
-    }
-
-    /// Connects a durable producer with explicit in-flight and reconnect bounds.
-    pub async fn connect_producer_with_config(
-        &self,
-        options: WriteStreamOptions,
-        config: TsfProducerConfig,
-    ) -> Result<TsfProducer, TsfClientError> {
-        let session = self.connect_append_session(options.clone()).await?;
-        TsfProducer::new(self.clone(), options, session, config)
-    }
-
-    /// Connects a low-level append session that sends records and receives ack ranges directly.
-    ///
-    /// Unlike [`TsfProducer`], this session does not retain or resend unacknowledged records.
-    pub async fn connect_append_session(
-        &self,
-        options: WriteStreamOptions,
-    ) -> Result<TsfAppendSession, TsfClientError> {
-        let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id), &[])?;
-        let connect_timeout = self.config.websocket_connect_timeout;
-        let operation_timeout = self.config.websocket_operation_timeout;
-
         self.retry_transient(|| {
-            let url = url.clone();
-            let options = options.clone();
-
-            async move {
-                let mut ws = connect_websocket(url, connect_timeout).await?;
-                with_timeout(
-                    operation_timeout,
-                    "authenticate writer",
-                    send_client_frame(
-                        &mut ws,
-                        ClientFrame::AuthWrite {
-                            writer_id: options.writer_id,
-                            link_secret: options.link_secret,
-                        },
-                    ),
-                )
-                .await?;
-                with_timeout(operation_timeout, "writer hello", expect_hello(&mut ws)).await?;
-
-                Ok(TsfAppendSession {
-                    ws,
-                    operation_timeout,
-                })
-            }
+            self.send_empty(
+                self.http
+                    .delete(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}"))),
+                "revoke link",
+                Some(owner_link_secret),
+            )
         })
         .await
     }
 
-    /// Connects a resumable read session at the requested position and bounds.
+    /// Atomically appends one durable JSON batch without opening a WebSocket.
     ///
-    /// An explicit tail offset, or the service-default offset of 80 records, is resolved to an
-    /// absolute S2 sequence number before the first socket is opened. Reconnects therefore resume
-    /// from the same position even if the stream advances before a record arrives.
+    /// A retry keeps client writer identity and writer sequence numbers stable. An ambiguous
+    /// response may create physical duplicates. Logical readers suppress those duplicates.
+    pub async fn append_records(
+        &self,
+        stream_id: &StreamId,
+        client_writer_id: ClientWriterId,
+        records: &[AppendRecord],
+        expected_next_seq_num: Option<u64>,
+        write_link_secret: &LinkSecret,
+    ) -> Result<AppendRange, TsfClientError> {
+        if records.is_empty() || records.len() > MAX_STATELESS_APPEND_RECORDS {
+            return Err(TsfClientError::InvalidStatelessAppend(
+                "record count must be between 1 and 128",
+            ));
+        }
+        let writer_start_seq_num = records[0].writer_seq_num;
+        let final_writer_seq_num = writer_start_seq_num
+            .checked_add((records.len() - 1) as u64)
+            .ok_or(TsfClientError::InvalidStatelessAppend(
+                "writer sequence overflow",
+            ))?;
+        if final_writer_seq_num == u64::MAX {
+            return Err(TsfClientError::InvalidStatelessAppend(
+                "writer sequence range must end before u64::MAX",
+            ));
+        }
+        if expected_next_seq_num.is_some_and(|value| value > MAX_READ_SELECTOR_VALUE) {
+            return Err(TsfClientError::InvalidStatelessAppend(
+                "expected next sequence exceeds the data adapter range",
+            ));
+        }
+        let mut json_records = Vec::with_capacity(records.len());
+        let mut payload_bytes = 0_usize;
+        for (index, record) in records.iter().enumerate() {
+            record.validate()?;
+            payload_bytes = payload_bytes.checked_add(record.data.len()).ok_or(
+                TsfClientError::InvalidStatelessAppend("payload size overflow"),
+            )?;
+            if record.writer_seq_num
+                != writer_start_seq_num.checked_add(index as u64).ok_or(
+                    TsfClientError::InvalidStatelessAppend("writer sequence overflow"),
+                )?
+            {
+                return Err(TsfClientError::InvalidStatelessAppend(
+                    "writer sequence numbers must be contiguous",
+                ));
+            }
+            let data = compact_record_data(&record.data);
+            json_records.push(AppendJsonRecord {
+                data,
+                format: record.format,
+                part: Some(RestRecordPart {
+                    index: record.part.index(),
+                    is_final: record.part.is_final(),
+                }),
+            });
+        }
+        if payload_bytes > MAX_STATELESS_APPEND_PAYLOAD_BYTES {
+            return Err(TsfClientError::InvalidStatelessAppend(
+                "append payload must not exceed 900 KiB",
+            ));
+        }
+        let request = AppendRecordsRequest {
+            client_writer_id: URL_SAFE_NO_PAD.encode(client_writer_id.as_bytes()),
+            writer_start_seq_num,
+            records: json_records,
+            expected_next_seq_num,
+        };
+        let range: AppendRange = self
+            .retry_transient(|| {
+                self.send_json_with_bearer(
+                    self.http
+                        .post(self.rest_url(&format!("/streams/{stream_id}/records")))
+                        .json(&request),
+                    "append records",
+                    Some(write_link_secret),
+                )
+            })
+            .await?;
+        validate_append_range(range, records.len())
+    }
+
+    /// Connects the standard bounded, reconnecting durable writer.
+    pub async fn connect_writer(
+        &self,
+        options: WriteStreamOptions,
+    ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_with_config(options, TsfWriterConfig::default())
+            .await
+    }
+
+    /// Connects a durable writer with explicit in-flight and reconnect bounds.
+    pub async fn connect_writer_with_config(
+        &self,
+        mut options: WriteStreamOptions,
+        config: TsfWriterConfig,
+    ) -> Result<TsfWriter, TsfClientError> {
+        let session = self.connect_write_session(options.clone()).await?;
+        options.expected_next_seq_num = None;
+        TsfWriter::new(self.clone(), options, session, config)
+    }
+
+    /// Connects a low-level write session that sends records and receives ack ranges directly.
+    ///
+    /// Unlike [`TsfWriter`], this session does not retain or resend unacknowledged records.
+    pub async fn connect_write_session(
+        &self,
+        options: WriteStreamOptions,
+    ) -> Result<TsfWriteSession, TsfClientError> {
+        self.retry_transient(|| self.connect_write_session_once(options.clone()))
+            .await
+    }
+
+    async fn connect_write_session_once(
+        &self,
+        options: WriteStreamOptions,
+    ) -> Result<TsfWriteSession, TsfClientError> {
+        let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id))?;
+        let connect_timeout = self.config.websocket_connect_timeout;
+        let operation_timeout = self.config.websocket_operation_timeout;
+        let opening_frame = ClientFrame::OpenWrite {
+            client_writer_id: options.client_writer_id,
+            link_secret: options.link_secret.clone(),
+            expected_next_seq_num: options.expected_next_seq_num,
+        }
+        .encode()?;
+
+        let mut ws =
+            connect_websocket(url, connect_timeout, operation_timeout, opening_frame).await?;
+        with_timeout(operation_timeout, "writer ready", expect_ready(&mut ws)).await?;
+
+        Ok(TsfWriteSession {
+            ws,
+            operation_timeout,
+        })
+    }
+
+    /// Connects a resumable read session at the requested position and bounds.
     pub async fn connect_reader(
         &self,
         mut options: ReadStreamOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
-        let tail_offset = match options.start {
-            None => Some(DEFAULT_READ_TAIL_OFFSET),
-            Some(ReadStart::TailOffset(offset)) => Some(offset),
-            Some(ReadStart::SeqNum(_) | ReadStart::TimestampMs(_)) => None,
+        let ConnectedReadSocket {
+            socket,
+            stream_metadata,
+            snapshot_boundary,
+        } = self.connect_read_socket(options.clone()).await?;
+        apply_snapshot_boundary(&mut options, snapshot_boundary);
+        Ok(TsfReadSession::new(
+            self.clone(),
+            options,
+            socket,
+            stream_metadata,
+            None,
+            snapshot_boundary,
+        ))
+    }
+
+    /// Connects a resumable SSE reader.
+    ///
+    /// Private credentials stay in the bearer header. Reconnects reuse the original URL and send
+    /// the latest versioned event cursor in `Last-Event-ID`. The REST request timeout bounds each
+    /// opening handshake but not the established event body.
+    pub async fn connect_sse_reader(
+        &self,
+        mut options: ReadStreamOptions,
+    ) -> Result<TsfSseReadSession, TsfClientError> {
+        validate_read_options(&options)?;
+        let request_options = options.clone();
+        let connection = self
+            .open_sse_connection(&request_options, None)
+            .await?
+            .ok_or(TsfClientError::InvalidSse(
+                "initial read completed without stream_metadata",
+            ))?;
+        if let Some(boundary) = connection.snapshot_boundary {
+            apply_snapshot_boundary(&mut options, Some(boundary));
+        }
+        Ok(TsfSseReadSession {
+            client: self.clone(),
+            options,
+            request_options,
+            body: connection.body,
+            parser: connection.parser,
+            queued_records: VecDeque::new(),
+            stream_metadata: connection
+                .stream_metadata
+                .expect("validated stream_metadata event"),
+            last_caught_up: None,
+            snapshot_boundary: connection.snapshot_boundary,
+            reconnect_attempts: 0,
+            last_event_id: connection.resume_event_id,
+            finished: false,
+        })
+    }
+
+    async fn open_sse_connection(
+        &self,
+        options: &ReadStreamOptions,
+        last_event_id: Option<&str>,
+    ) -> Result<Option<SseConnection>, TsfClientError> {
+        let handshake_timeout = self.config.rest_request_timeout;
+        self.retry_transient(|| async {
+            with_timeout(
+                handshake_timeout,
+                "SSE handshake",
+                self.open_sse_connection_once(options, last_event_id),
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn open_sse_connection_once(
+        &self,
+        options: &ReadStreamOptions,
+        last_event_id: Option<&str>,
+    ) -> Result<Option<SseConnection>, TsfClientError> {
+        let mut url = self.rest_url(&format!("/streams/{}/records", options.stream_id));
+        append_sse_query(&mut url, options);
+        let mut request = self.apply_rest_auth(
+            self.http.get(url).header("Accept", "text/event-stream"),
+            options.link_secret.as_ref(),
+        )?;
+        if let Some(last_event_id) = last_event_id {
+            request = request.header("Last-Event-ID", last_event_id);
+        }
+        let response = request.send().await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(http_status_error(response, "read SSE").await);
+        }
+        let mut connection = SseConnection {
+            body: Box::pin(response.bytes_stream()),
+            parser: SseParser::default(),
+            stream_metadata: None,
+            snapshot_boundary: None,
+            resume_event_id: None,
         };
-        if let Some(offset) = tail_offset {
-            let tail = self
-                .get_stream_tail(&options.stream_id, options.link_secret.as_ref())
-                .await?;
-            options.start = Some(ReadStart::SeqNum(
-                tail.next_s2_seq_num.saturating_sub(offset),
+        let event = next_sse_event(&mut connection.body, &mut connection.parser)
+            .await?
+            .ok_or(TsfClientError::InvalidSse(
+                "response ended before stream_metadata",
+            ))?;
+        if event.event != "stream_metadata" {
+            return Err(TsfClientError::InvalidSse(
+                "first event is not stream_metadata",
             ));
         }
-        let socket = self.connect_read_socket(options.clone()).await?;
-        Ok(TsfReadSession::new(self.clone(), options, socket))
+        connection.stream_metadata = Some(
+            serde_json::from_str(&event.data)
+                .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?,
+        );
+        if event.id.is_some() {
+            connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
+        }
+        if options.snapshot {
+            let event = next_sse_event(&mut connection.body, &mut connection.parser)
+                .await?
+                .ok_or(TsfClientError::InvalidSse(
+                    "response ended before snapshot_boundary",
+                ))?;
+            if event.event != "snapshot_boundary" {
+                return Err(TsfClientError::InvalidSse(
+                    "snapshot_boundary must follow stream_metadata",
+                ));
+            }
+            let (event_id, cursor) = sse_resume_cursor(&event)?;
+            let boundary: SseSnapshotBoundaryData = serde_json::from_str(&event.data)
+                .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
+            let boundary = SnapshotBoundary {
+                end_seq_num: boundary.end_seq_num,
+                last_timestamp_ms: boundary.last_timestamp_ms,
+            };
+            let previous = last_event_id.map(parse_sse_resume_cursor).transpose()?;
+            validate_sse_snapshot_cursor(boundary, cursor, previous)?;
+            connection.resume_event_id = Some(event_id.to_owned());
+            connection.snapshot_boundary = Some(boundary);
+        }
+        Ok(Some(connection))
     }
 
     async fn connect_read_socket(
         &self,
         options: ReadStreamOptions,
-    ) -> Result<ReadSocket, TsfClientError> {
-        let query = options.query_pairs();
-        let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id), &query)?;
+    ) -> Result<ConnectedReadSocket, TsfClientError> {
+        if let Some(start) = options.start {
+            let value = match start {
+                ReadStart::SeqNum(value)
+                | ReadStart::TimestampMs(value)
+                | ReadStart::TailOffset(value) => value,
+            };
+            if value > MAX_READ_SELECTOR_VALUE {
+                return Err(TsfClientError::InvalidReadSelector {
+                    value,
+                    maximum: MAX_READ_SELECTOR_VALUE,
+                });
+            }
+        }
+        if let Some(rate) = options.playback_rate_permille {
+            if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
+                return Err(TsfClientError::InvalidPlaybackRate {
+                    value: rate,
+                    minimum: MIN_PLAYBACK_RATE_PERMILLE,
+                    maximum: MAX_PLAYBACK_RATE_PERMILLE,
+                });
+            }
+            if options.end_seq_num.is_none() && !options.snapshot {
+                return Err(TsfClientError::PlaybackRequiresEnd);
+            }
+        }
+        if options.snapshot && options.end_seq_num.is_some() {
+            return Err(TsfClientError::SnapshotWithEnd);
+        }
+        let opening_frame = ClientFrame::OpenRead {
+            link_secret: options.link_secret.clone(),
+            start: options
+                .start
+                .unwrap_or(ReadStart::TailOffset(DEFAULT_READ_TAIL_OFFSET)),
+            limit: options.limit,
+            end_seq_num: options.end_seq_num,
+            playback_rate_permille: options.playback_rate_permille,
+            snapshot: options.snapshot,
+        }
+        .encode()?;
+        let url = self.websocket_url(&format!("/streams/{}/read", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
         let read_idle_timeout = self.config.websocket_read_idle_timeout;
+        let snapshot = options.snapshot;
 
         self.retry_transient(|| {
             let url = url.clone();
-            let link_secret = options.link_secret.clone();
+            let opening_frame = opening_frame.clone();
 
             async move {
-                let mut ws = connect_websocket(url, connect_timeout).await?;
-
-                match with_timeout(
-                    operation_timeout,
-                    "reader hello",
-                    next_server_frame(&mut ws),
-                )
-                .await?
-                {
-                    Some(ServerFrame::Hello { version }) => ensure_protocol_version(version)?,
-                    Some(ServerFrame::AuthRequired) => {
-                        let link_secret = link_secret.ok_or(TsfClientError::MissingReadLink)?;
-                        with_timeout(
-                            operation_timeout,
-                            "authenticate reader",
-                            send_client_frame(&mut ws, ClientFrame::AuthRead { link_secret }),
-                        )
+                let mut ws =
+                    connect_websocket(url, connect_timeout, operation_timeout, opening_frame)
                         .await?;
-                        with_timeout(operation_timeout, "reader hello", expect_hello(&mut ws))
-                            .await?;
-                    }
-                    Some(frame) => {
-                        return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
-                            &frame,
-                        )));
-                    }
-                    None => return Err(TsfClientError::WebSocketClosed),
-                }
+                let handshake = with_timeout(
+                    operation_timeout,
+                    "reader handshake",
+                    expect_read_handshake(&mut ws, snapshot),
+                )
+                .await?;
 
-                Ok(ReadSocket {
-                    ws,
-                    read_idle_timeout,
+                Ok(ConnectedReadSocket {
+                    socket: ReadSocket {
+                        ws,
+                        read_idle_timeout,
+                        pending_records: VecDeque::new(),
+                    },
+                    stream_metadata: handshake.stream_metadata,
+                    snapshot_boundary: handshake.snapshot_boundary,
                 })
             }
         })
@@ -507,7 +826,7 @@ impl TsfClient {
     }
 
     fn rest_url(&self, path: &str) -> Url {
-        let mut url = self.config.api_base_url.clone();
+        let mut url = self.config.api_origin.clone();
         url.set_path(&format!("{API_PREFIX}{path}"));
         url.set_query(None);
         url.set_fragment(None);
@@ -518,19 +837,18 @@ impl TsfClient {
         &self,
         request: reqwest::RequestBuilder,
         link_secret: Option<&LinkSecret>,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, TsfClientError> {
         if let Some(secret) = link_secret {
-            request.bearer_auth(secret.expose_secret())
+            if !is_canonical_base64url_32(secret.expose_secret()) {
+                return Err(TsfClientError::InvalidLinkSecret);
+            }
+            Ok(request.bearer_auth(secret.expose_secret()))
         } else {
-            request
+            Ok(request)
         }
     }
 
-    fn websocket_url(
-        &self,
-        path: &str,
-        query: &[(&'static str, String)],
-    ) -> Result<Url, TsfClientError> {
+    fn websocket_url(&self, path: &str) -> Result<Url, TsfClientError> {
         let mut url = self.rest_url(path);
         let scheme = match url.scheme() {
             "http" => "ws",
@@ -539,12 +857,6 @@ impl TsfClient {
         };
         url.set_scheme(scheme)
             .map_err(|_| TsfClientError::InvalidWebSocketScheme(url.scheme().to_owned()))?;
-
-        if !query.is_empty() {
-            url.query_pairs_mut()
-                .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
-        }
-
         Ok(url)
     }
 
@@ -568,7 +880,7 @@ impl TsfClient {
         link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
         let response = self
-            .apply_rest_auth(request, link_secret)
+            .apply_rest_auth(request, link_secret)?
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -582,7 +894,7 @@ impl TsfClient {
         link_secret: Option<&LinkSecret>,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request, link_secret)
+            .apply_rest_auth(request, link_secret)?
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -590,11 +902,7 @@ impl TsfClient {
         if status == StatusCode::NO_CONTENT {
             return Ok(());
         }
-        Err(TsfClientError::HttpStatus {
-            operation,
-            status,
-            body: http_status_body(response).await,
-        })
+        Err(http_status_error(response, operation).await)
     }
 
     async fn retry_transient<T, Fut>(&self, run: impl FnMut() -> Fut) -> Result<T, TsfClientError>
@@ -613,15 +921,19 @@ impl TsfClient {
         Fut: Future<Output = Result<T, TsfClientError>>,
     {
         let retry_policy = self.config.retry_policy;
-        let attempts = retry_policy.attempt_count();
+        let attempts = retry_policy.max_attempts;
         let mut backoff = retry_policy.initial_backoff;
 
         for attempt in 1..=attempts {
             match run().await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < attempts && should_retry(&error) => {
-                    if !backoff.is_zero() {
-                        sleep(backoff).await;
+                    let delay = error
+                        .retry_after()
+                        .map(|delay| delay.min(retry_policy.max_backoff))
+                        .unwrap_or_else(|| jittered_backoff(backoff));
+                    if !delay.is_zero() {
+                        sleep(delay).await;
                     }
                     backoff = retry_policy.next_backoff(backoff);
                 }
@@ -640,11 +952,11 @@ impl Default for TsfClient {
 }
 
 /// Returns the default `https://tail.surf` API origin.
-pub fn default_api_base_url() -> Url {
+pub fn default_api_origin() -> Url {
     Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
 }
 
-/// Owner-equivalent recovery key for one logical stream-creation request.
+/// Non-authorizing idempotency key for one logical stream-creation request.
 #[derive(Clone, Debug)]
 pub struct CreateStreamIdempotencyKey(LinkSecret);
 
@@ -681,85 +993,69 @@ impl ExposeSecret<str> for CreateStreamIdempotencyKey {
 pub struct InvalidCreateStreamIdempotencyKey;
 
 /// Low-level authenticated write socket without retained-record recovery.
-pub struct TsfAppendSession {
+pub struct TsfWriteSession {
     ws: ClientWebSocket,
     operation_timeout: Duration,
 }
 
-/// Maximum payload bytes a producer may retain before acknowledgement.
+/// Maximum payload bytes a writer may retain before acknowledgement.
 ///
 /// This matches the TSF writer socket's hard queued-payload bound.
-pub const MAX_PRODUCER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
-/// Maximum records a producer may retain before acknowledgement.
+pub const MAX_WRITER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum records a writer may retain before acknowledgement.
 ///
-/// This matches the TSF writer socket's hard queued-message bound.
-pub const MAX_PRODUCER_UNACKED_RECORDS: usize = 128;
+/// This matches the TSF writer socket's hard queued-record bound.
+pub const MAX_WRITER_UNACKED_RECORDS: usize = 128;
 
-/// Memory, concurrency, and reconnect bounds for [`TsfProducer`].
+/// Memory and concurrency bounds for [`TsfWriter`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TsfProducerConfig {
+pub struct TsfWriterConfig {
     /// Maximum total payload bytes retained until durability acknowledgement. Must not exceed
-    /// [`MAX_PRODUCER_UNACKED_PAYLOAD_BYTES`].
+    /// [`MAX_WRITER_UNACKED_PAYLOAD_BYTES`].
     pub max_unacked_bytes: usize,
     /// Maximum number of records retained until durability acknowledgement. Must not exceed
-    /// [`MAX_PRODUCER_UNACKED_RECORDS`].
+    /// [`MAX_WRITER_UNACKED_RECORDS`].
     pub max_unacked_records: usize,
-    /// Maximum consecutive producer reconnect attempts before failing pending records.
-    pub max_reconnect_attempts: usize,
 }
 
-impl TsfProducerConfig {
+impl TsfWriterConfig {
     fn validate(self) -> Result<Self, TsfClientError> {
         if self.max_unacked_bytes == 0 {
-            return Err(TsfClientError::InvalidProducerConfig(
+            return Err(TsfClientError::InvalidWriterConfig(
                 "max_unacked_bytes must be greater than zero".to_owned(),
             ));
         }
-        if self.max_unacked_bytes > MAX_PRODUCER_UNACKED_PAYLOAD_BYTES {
-            return Err(TsfClientError::InvalidProducerConfig(format!(
+        if self.max_unacked_bytes > MAX_WRITER_UNACKED_PAYLOAD_BYTES {
+            return Err(TsfClientError::InvalidWriterConfig(format!(
                 "max_unacked_bytes must not exceed {}",
-                MAX_PRODUCER_UNACKED_PAYLOAD_BYTES
+                MAX_WRITER_UNACKED_PAYLOAD_BYTES
             )));
         }
         if self.max_unacked_records == 0 {
-            return Err(TsfClientError::InvalidProducerConfig(
+            return Err(TsfClientError::InvalidWriterConfig(
                 "max_unacked_records must be greater than zero".to_owned(),
             ));
         }
-        if self.max_unacked_records > MAX_PRODUCER_UNACKED_RECORDS {
-            return Err(TsfClientError::InvalidProducerConfig(format!(
+        if self.max_unacked_records > MAX_WRITER_UNACKED_RECORDS {
+            return Err(TsfClientError::InvalidWriterConfig(format!(
                 "max_unacked_records must not exceed {}",
-                MAX_PRODUCER_UNACKED_RECORDS
+                MAX_WRITER_UNACKED_RECORDS
             )));
         }
         Ok(self)
     }
 }
 
-impl Default for TsfProducerConfig {
+impl Default for TsfWriterConfig {
     fn default() -> Self {
         Self {
-            max_unacked_bytes: MAX_PRODUCER_UNACKED_PAYLOAD_BYTES,
-            max_unacked_records: MAX_PRODUCER_UNACKED_RECORDS,
-            max_reconnect_attempts: 3,
+            max_unacked_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+            max_unacked_records: MAX_WRITER_UNACKED_RECORDS,
         }
     }
 }
 
-/// One physical record submitted by a writer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WriteRecord {
-    /// Writer-local sequence number, reused if this record is retransmitted.
-    pub writer_seq_num: u64,
-    /// Logical split-part metadata.
-    pub part: PartHeader,
-    /// Presentation hint for the payload.
-    pub format: RecordFormat,
-    /// Exact payload bytes, bounded by the TSF physical record limit.
-    pub data: Bytes,
-}
-
-impl WriteRecord {
+impl AppendRecord {
     /// Creates a physical record without allocating when the input already owns compatible bytes.
     pub fn new(
         writer_seq_num: u64,
@@ -791,32 +1087,39 @@ impl WriteRecord {
     }
 }
 
-/// Server acknowledgement mapping a contiguous writer range to durable S2 sequence numbers.
+/// Server acknowledgement mapping a contiguous writer range to durable sequence numbers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppendAck {
     /// First acknowledged writer-local sequence number.
-    pub writer_seq_start: u64,
-    /// Last acknowledged writer-local sequence number, inclusive.
-    pub writer_seq_end: u64,
-    /// S2 sequence number assigned to the first acknowledged record.
-    pub s2_seq_start: u64,
-    /// S2 sequence number assigned to the last acknowledged record, inclusive.
-    pub s2_seq_end: u64,
+    pub writer_start_seq_num: u64,
+    /// Exclusive writer-local sequence after the acknowledged range.
+    pub writer_end_seq_num: u64,
+    /// Durable sequence number assigned to the first acknowledged record.
+    pub start_seq_num: u64,
+    /// Exclusive durable sequence after the acknowledged range.
+    pub end_seq_num: u64,
 }
 
 impl AppendAck {
-    /// Returns whether the inclusive writer range contains a sequence number.
+    /// Returns whether the half-open writer range contains a sequence number.
     pub const fn contains_writer_seq(self, writer_seq_num: u64) -> bool {
-        self.writer_seq_start <= writer_seq_num && writer_seq_num <= self.writer_seq_end
+        self.writer_start_seq_num <= writer_seq_num && writer_seq_num < self.writer_end_seq_num
     }
 
-    /// Returns the number of records when writer and S2 ranges are valid and equal in length.
+    /// Returns the number of records when writer and durable ranges are valid and equal in length.
     pub fn record_count(self) -> Result<u64, TsfClientError> {
-        let writer_count = inclusive_range_len(self.writer_seq_start, self.writer_seq_end)
+        let writer_count = self
+            .writer_end_seq_num
+            .checked_sub(self.writer_start_seq_num)
             .ok_or(TsfClientError::InvalidAppendAck(self))?;
-        let s2_count = inclusive_range_len(self.s2_seq_start, self.s2_seq_end)
+        let durable_count = self
+            .end_seq_num
+            .checked_sub(self.start_seq_num)
             .ok_or(TsfClientError::InvalidAppendAck(self))?;
-        if writer_count != s2_count {
+        if writer_count == 0 {
+            return Err(TsfClientError::InvalidAppendAck(self));
+        }
+        if writer_count != durable_count {
             return Err(TsfClientError::InvalidAppendAck(self));
         }
         Ok(writer_count)
@@ -833,9 +1136,9 @@ impl AppendAck {
 pub struct AppendReceipt {
     /// Submitted writer-local sequence number.
     pub writer_seq_num: u64,
-    /// Durable S2 sequence number assigned by the service.
-    pub s2_seq_num: u64,
-    /// Ack range that covered this record.
+    /// Durable sequence number assigned by the service.
+    pub seq_num: u64,
+    /// Append acknowledgement range that covered this record.
     pub ack: AppendAck,
 }
 
@@ -853,7 +1156,7 @@ impl AppendTicket {
             Ok(result) => Some(result),
             Err(oneshot::error::TryRecvError::Empty) => None,
             Err(oneshot::error::TryRecvError::Closed) => {
-                Some(Err(TsfClientError::AppendProducerDropped))
+                Some(Err(TsfClientError::AppendWriterDropped))
             }
         }
     }
@@ -865,33 +1168,33 @@ impl Future for AppendTicket {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.rx).poll(cx) {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(TsfClientError::AppendProducerDropped)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(TsfClientError::AppendWriterDropped)),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-/// Bounded durable producer that retains unacknowledged records and resends them across transient
+/// Bounded durable writer that retains unacknowledged records and resends them across transient
 /// interruptions.
-pub struct TsfProducer {
-    cmd_tx: mpsc::Sender<ProducerCommand>,
+pub struct TsfWriter {
+    cmd_tx: mpsc::Sender<WriterCommand>,
     byte_permits: Arc<Semaphore>,
     record_permits: Arc<Semaphore>,
     max_unacked_bytes: usize,
     task: Option<JoinHandle<()>>,
 }
 
-impl TsfProducer {
+impl TsfWriter {
     fn new(
         client: TsfClient,
         options: WriteStreamOptions,
-        session: TsfAppendSession,
-        config: TsfProducerConfig,
+        session: TsfWriteSession,
+        config: TsfWriterConfig,
     ) -> Result<Self, TsfClientError> {
         let config = config.validate()?;
         let command_capacity = config.max_unacked_records + 1;
         let (cmd_tx, cmd_rx) = mpsc::channel(command_capacity);
-        let task = tokio::spawn(run_producer(client, options, session, cmd_rx, config));
+        let task = tokio::spawn(run_writer(client, options, session, cmd_rx));
 
         Ok(Self {
             cmd_tx,
@@ -903,7 +1206,7 @@ impl TsfProducer {
     }
 
     /// Waits for window capacity, submits a record, and returns its durability ticket.
-    pub async fn submit(&self, record: WriteRecord) -> Result<AppendTicket, TsfClientError> {
+    pub async fn submit(&self, record: AppendRecord) -> Result<AppendTicket, TsfClientError> {
         let permit = self.reserve(record.unacked_bytes()).await?;
         permit.submit(record)
     }
@@ -914,7 +1217,7 @@ impl TsfProducer {
     pub async fn reserve(&self, bytes: usize) -> Result<WritePermit, TsfClientError> {
         let bytes = bytes.max(1);
         if bytes > self.max_unacked_bytes {
-            return Err(TsfClientError::AppendRecordExceedsProducerWindow {
+            return Err(TsfClientError::AppendRecordExceedsWriterWindow {
                 bytes,
                 max_unacked_bytes: self.max_unacked_bytes,
             });
@@ -925,19 +1228,19 @@ impl TsfProducer {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
         let byte_permit = self
             .byte_permits
             .clone()
             .acquire_many_owned(bytes as u32)
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
         let cmd_tx_permit = self
             .cmd_tx
             .clone()
             .reserve_owned()
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
 
         Ok(WritePermit {
             cmd_tx_permit,
@@ -948,28 +1251,28 @@ impl TsfProducer {
     }
 
     /// Stops accepting records, waits for every pending durability acknowledgement, and joins the
-    /// producer task.
+    /// writer task.
     pub async fn close(mut self) -> Result<(), TsfClientError> {
         let (done_tx, done_rx) = oneshot::channel();
         self.cmd_tx
-            .send(ProducerCommand::Close { done_tx })
+            .send(WriterCommand::Close { done_tx })
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
 
         let result = done_rx
             .await
-            .map_err(|_| TsfClientError::AppendProducerDropped)?;
+            .map_err(|_| TsfClientError::AppendWriterDropped)?;
 
         if let Some(task) = self.task.take() {
             task.await
-                .map_err(|error| TsfClientError::AppendProducerFailed(error.to_string()))?;
+                .map_err(|error| TsfClientError::AppendWriterFailed(error.to_string()))?;
         }
 
         result
     }
 }
 
-impl Drop for TsfProducer {
+impl Drop for TsfWriter {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -977,11 +1280,11 @@ impl Drop for TsfProducer {
     }
 }
 
-/// Owned capacity in a producer's record and byte windows.
+/// Owned capacity in a writer's record and byte windows.
 ///
 /// Dropping an unused permit releases its capacity.
 pub struct WritePermit {
-    cmd_tx_permit: mpsc::OwnedPermit<ProducerCommand>,
+    cmd_tx_permit: mpsc::OwnedPermit<WriterCommand>,
     byte_permit: OwnedSemaphorePermit,
     record_permit: OwnedSemaphorePermit,
     reserved_bytes: usize,
@@ -989,7 +1292,7 @@ pub struct WritePermit {
 
 impl WritePermit {
     /// Submits a record no larger than the reserved capacity without awaiting another window slot.
-    pub fn submit(self, record: WriteRecord) -> Result<AppendTicket, TsfClientError> {
+    pub fn submit(self, record: AppendRecord) -> Result<AppendTicket, TsfClientError> {
         record.validate()?;
         let bytes = record.unacked_bytes();
         if bytes > self.reserved_bytes {
@@ -1000,7 +1303,7 @@ impl WritePermit {
         }
 
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx_permit.send(ProducerCommand::Submit {
+        self.cmd_tx_permit.send(WriterCommand::Submit {
             record,
             ack_tx,
             byte_permit: self.byte_permit,
@@ -1011,7 +1314,7 @@ impl WritePermit {
     }
 }
 
-/// Conversion into payload bytes accepted by [`WriteRecord::new`].
+/// Conversion into payload bytes accepted by [`AppendRecord::new`].
 pub trait IntoRecordData {
     /// Converts this value into reference-counted immutable bytes.
     fn into_record_data(self) -> Bytes;
@@ -1053,32 +1356,38 @@ impl IntoRecordData for &str {
     }
 }
 
-impl TsfAppendSession {
-    /// Sends one physical append frame under the operation timeout.
-    pub async fn send(&mut self, record: WriteRecord) -> Result<(), TsfClientError> {
+impl TsfWriteSession {
+    /// Sends one physical record under the operation timeout.
+    pub async fn send(&mut self, record: AppendRecord) -> Result<(), TsfClientError> {
         let operation_timeout = self.operation_timeout;
 
         with_timeout(operation_timeout, "send append frame", async move {
-            self.buffer(&record).await?;
+            self.buffer_batch(std::iter::once(&record)).await?;
             self.flush().await
         })
         .await
     }
 
-    /// Encodes one record into the socket's write buffer, leaving the flush to the caller.
-    async fn buffer(&mut self, record: &WriteRecord) -> Result<(), TsfClientError> {
-        let frame = ClientFrame::AppendRecord {
-            writer_seq_num: record.writer_seq_num,
-            part: record.part,
-            format: record.format,
-            data: record.data.clone(),
-        }
-        .encode()?;
+    /// Encodes one batch into the socket's write buffer, leaving the flush to the caller.
+    async fn buffer_batch<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a AppendRecord>,
+    ) -> Result<(), TsfClientError> {
+        let records = records
+            .into_iter()
+            .map(|record| AppendRecord {
+                writer_seq_num: record.writer_seq_num,
+                part: record.part,
+                format: record.format,
+                data: record.data.clone(),
+            })
+            .collect();
+        let frame = ClientFrame::AppendBatch(records).encode()?;
         self.ws.feed(Message::Binary(frame)).await?;
         Ok(())
     }
 
-    /// Writes every buffered append frame to the transport in one flush.
+    /// Writes every buffered append batch to the transport in one flush.
     async fn flush(&mut self) -> Result<(), TsfClientError> {
         self.ws.flush().await?;
         Ok(())
@@ -1088,23 +1397,31 @@ impl TsfAppendSession {
     ///
     /// Returns `None` when the service closes the socket normally before another ack.
     pub async fn next_ack(&mut self) -> Result<Option<AppendAck>, TsfClientError> {
-        match with_timeout(
+        let frame = with_timeout(
             self.operation_timeout,
             "append acknowledgement",
             next_server_frame(&mut self.ws),
         )
-        .await?
-        {
-            Some(ServerFrame::Ack {
-                writer_seq_start,
-                writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
+        .await
+        .map_err(|error| match error {
+            TsfClientError::WebSocketClosedWithReason { code: 1008, reason }
+                if reason == "sequence_mismatch" =>
+            {
+                TsfClientError::SequenceMismatch
+            }
+            other => other,
+        })?;
+        match frame {
+            Some(ServerFrame::AppendAck {
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
+                end_seq_num,
             }) => AppendAck {
-                writer_seq_start,
-                writer_seq_end,
-                s2_seq_start,
-                s2_seq_end,
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
+                end_seq_num,
             }
             .validate()
             .map(Some),
@@ -1116,9 +1433,9 @@ impl TsfAppendSession {
     }
 }
 
-enum ProducerCommand {
+enum WriterCommand {
     Submit {
-        record: WriteRecord,
+        record: AppendRecord,
         ack_tx: oneshot::Sender<Result<AppendReceipt, TsfClientError>>,
         byte_permit: OwnedSemaphorePermit,
         record_permit: OwnedSemaphorePermit,
@@ -1129,18 +1446,17 @@ enum ProducerCommand {
 }
 
 struct PendingAppend {
-    record: WriteRecord,
+    record: AppendRecord,
     ack_tx: oneshot::Sender<Result<AppendReceipt, TsfClientError>>,
     _byte_permit: OwnedSemaphorePermit,
     _record_permit: OwnedSemaphorePermit,
 }
 
-async fn run_producer(
+async fn run_writer(
     client: TsfClient,
     options: WriteStreamOptions,
-    mut session: TsfAppendSession,
-    mut cmd_rx: mpsc::Receiver<ProducerCommand>,
-    config: TsfProducerConfig,
+    mut session: TsfWriteSession,
+    mut cmd_rx: mpsc::Receiver<WriterCommand>,
 ) {
     let mut pending = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
@@ -1160,18 +1476,17 @@ async fn run_producer(
                                 &client,
                                 &options,
                                 &pending,
-                                config.max_reconnect_attempts,
                                 &mut reconnect_attempts,
                                 error,
                             )
                             .await
                         {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                     }
                     None => {
-                        fail_pending(&mut pending, "append producer dropped");
+                        fail_pending(&mut pending, "append writer dropped");
                         return;
                     }
                 }
@@ -1181,7 +1496,7 @@ async fn run_producer(
                 match ack {
                     Ok(Some(ack)) => {
                         if let Err(error) = dispatch_ack(ack, &mut pending) {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                         reconnect_attempts = 0;
@@ -1192,13 +1507,12 @@ async fn run_producer(
                             &client,
                             &options,
                             &pending,
-                            config.max_reconnect_attempts,
                             &mut reconnect_attempts,
                             TsfClientError::WebSocketClosed,
                         )
                         .await
                         {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                     }
@@ -1208,13 +1522,12 @@ async fn run_producer(
                             &client,
                             &options,
                             &pending,
-                            config.max_reconnect_attempts,
                             &mut reconnect_attempts,
                             error,
                         )
                         .await
                         {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                     }
@@ -1237,13 +1550,13 @@ async fn run_producer(
 /// write leaves every record in `pending` for reconnect resend.
 fn drain_submissions(
     pending: &mut VecDeque<PendingAppend>,
-    cmd_rx: &mut mpsc::Receiver<ProducerCommand>,
+    cmd_rx: &mut mpsc::Receiver<WriterCommand>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
-    first: ProducerCommand,
+    first: WriterCommand,
 ) {
     let mut command = Some(first);
 
-    while let Some(ProducerCommand::Submit {
+    while let Some(WriterCommand::Submit {
         record,
         ack_tx,
         byte_permit,
@@ -1259,14 +1572,14 @@ fn drain_submissions(
         command = cmd_rx.try_recv().ok();
     }
 
-    if let Some(ProducerCommand::Close { done_tx }) = command {
+    if let Some(WriterCommand::Close { done_tx }) = command {
         *close_tx = Some(done_tx);
     }
 }
 
 /// Writes the records from `from` onwards under one operation timeout and one flush.
 async fn send_retained(
-    session: &mut TsfAppendSession,
+    session: &mut TsfWriteSession,
     pending: &VecDeque<PendingAppend>,
     from: usize,
 ) -> Result<(), TsfClientError> {
@@ -1276,19 +1589,34 @@ async fn send_retained(
     let operation_timeout = session.operation_timeout;
 
     with_timeout(operation_timeout, "send append frames", async move {
-        for pending in pending.iter().skip(from) {
-            session.buffer(&pending.record).await?;
+        let mut records = pending.iter().skip(from).peekable();
+        while records.peek().is_some() {
+            let mut batch = Vec::with_capacity(MAX_APPEND_BATCH_RECORDS);
+            let mut payload_bytes = 0;
+            while batch.len() < MAX_APPEND_BATCH_RECORDS {
+                let Some(next) = records.peek() else {
+                    break;
+                };
+                if !batch.is_empty()
+                    && next.record.data.len() > MAX_BATCH_PAYLOAD_BYTES - payload_bytes
+                {
+                    break;
+                }
+                let next = records.next().expect("peeked record");
+                payload_bytes += next.record.data.len();
+                batch.push(&next.record);
+            }
+            session.buffer_batch(batch).await?;
         }
         session.flush().await
     })
     .await
 }
 async fn recover_pending_appends(
-    session: &mut TsfAppendSession,
+    session: &mut TsfWriteSession,
     client: &TsfClient,
     options: &WriteStreamOptions,
     pending: &VecDeque<PendingAppend>,
-    max_reconnect_attempts: usize,
     reconnect_attempts: &mut usize,
     mut error: TsfClientError,
 ) -> Result<(), TsfClientError> {
@@ -1296,9 +1624,15 @@ async fn recover_pending_appends(
         return Err(error);
     }
 
-    while *reconnect_attempts < max_reconnect_attempts {
+    let retry_policy = client.config.retry_policy;
+    let max_reconnects = retry_policy.max_attempts.saturating_sub(1);
+    while *reconnect_attempts < max_reconnects {
+        let delay = retry_policy.reconnect_delay(*reconnect_attempts);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
         *reconnect_attempts += 1;
-        match client.connect_append_session(options.clone()).await {
+        match client.connect_write_session_once(options.clone()).await {
             Ok(mut connected) => match send_retained(&mut connected, pending, 0).await {
                 Ok(()) => {
                     *session = connected;
@@ -1328,7 +1662,7 @@ fn dispatch_ack(
     for (item, writer_seq_num) in pending
         .iter()
         .take(record_count)
-        .zip(ack.writer_seq_start..=ack.writer_seq_end)
+        .zip(ack.writer_start_seq_num..ack.writer_end_seq_num)
     {
         if item.record.writer_seq_num < writer_seq_num {
             return Err(TsfClientError::AppendNotAcknowledged {
@@ -1341,14 +1675,14 @@ fn dispatch_ack(
         }
     }
 
-    for ((item, writer_seq_num), s2_seq_num) in pending
+    for ((item, writer_seq_num), seq_num) in pending
         .drain(..record_count)
-        .zip(ack.writer_seq_start..=ack.writer_seq_end)
-        .zip(ack.s2_seq_start..=ack.s2_seq_end)
+        .zip(ack.writer_start_seq_num..ack.writer_end_seq_num)
+        .zip(ack.start_seq_num..ack.end_seq_num)
     {
         let _ = item.ack_tx.send(Ok(AppendReceipt {
             writer_seq_num,
-            s2_seq_num,
+            seq_num,
             ack,
         }));
     }
@@ -1356,7 +1690,17 @@ fn dispatch_ack(
     Ok(())
 }
 
-fn finish_producer_error(
+fn validate_append_range(
+    range: AppendRange,
+    expected_records: usize,
+) -> Result<AppendRange, TsfClientError> {
+    if range.end_seq_num.checked_sub(range.start_seq_num) != Some(expected_records as u64) {
+        return Err(TsfClientError::InvalidAppendRange(range));
+    }
+    Ok(range)
+}
+
+fn finish_writer_error(
     pending: &mut VecDeque<PendingAppend>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
     error: TsfClientError,
@@ -1372,24 +1716,196 @@ fn fail_pending(pending: &mut VecDeque<PendingAppend>, message: impl Into<String
     while let Some(pending) = pending.pop_front() {
         let _ = pending
             .ack_tx
-            .send(Err(TsfClientError::AppendProducerFailed(message.clone())));
+            .send(Err(TsfClientError::AppendWriterFailed(message.clone())));
     }
 }
 
-fn inclusive_range_len(start: u64, end: u64) -> Option<u64> {
-    end.checked_sub(start)?.checked_add(1)
+/// Streaming body for one SSE connection.
+type SseBody = Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+struct ParsedSseEvent {
+    event: String,
+    data: String,
+    id: Option<String>,
 }
 
-/// Resumable reader that advances its sequence position after every delivered record.
+struct SseConnection {
+    body: SseBody,
+    parser: SseParser,
+    stream_metadata: Option<StreamMetadata>,
+    snapshot_boundary: Option<SnapshotBoundary>,
+    resume_event_id: Option<String>,
+}
+
+/// Resumable HTTP event-stream reader.
 ///
-/// Transient transport and service interruptions reconnect from the next S2 sequence number. Normal
+/// Transient transport and service interruptions reconnect from the next sequence number. Normal
+/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
+pub struct TsfSseReadSession {
+    client: TsfClient,
+    options: ReadStreamOptions,
+    request_options: ReadStreamOptions,
+    body: SseBody,
+    parser: SseParser,
+    queued_records: VecDeque<ReadRecord>,
+    stream_metadata: StreamMetadata,
+    last_caught_up: Option<CaughtUpPosition>,
+    snapshot_boundary: Option<SnapshotBoundary>,
+    reconnect_attempts: usize,
+    last_event_id: Option<String>,
+    finished: bool,
+}
+
+impl TsfSseReadSession {
+    /// Returns authorized stream metadata from the opening event.
+    pub fn stream_metadata(&self) -> &StreamMetadata {
+        &self.stream_metadata
+    }
+
+    /// Returns the fixed boundary captured for a snapshot read.
+    pub fn snapshot_boundary(&self) -> Option<SnapshotBoundary> {
+        self.snapshot_boundary
+    }
+
+    /// Returns the most recent reconnect-safe caught-up position.
+    pub fn last_caught_up(&self) -> Option<CaughtUpPosition> {
+        self.last_caught_up
+    }
+
+    /// Returns the next record, reconnecting from the last safe absolute cursor when needed.
+    pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
+        loop {
+            if self.finished || read_options_exhausted(&self.options) {
+                return Ok(None);
+            }
+            if let Some(record) = self.queued_records.pop_front() {
+                self.finished = advance_read_options(&mut self.options, record.seq_num);
+                return Ok(Some(record));
+            }
+            let event = match next_sse_event(&mut self.body, &mut self.parser).await {
+                Ok(event) => event,
+                Err(error) if error.is_resumable_sse_interruption() => None,
+                Err(error) => return Err(error),
+            };
+            let Some(event) = event else {
+                let retry_policy = self.client.config.retry_policy;
+                let attempts = retry_policy.max_attempts;
+                if self.reconnect_attempts + 1 >= attempts {
+                    return Err(TsfClientError::ReadReconnectLimitExceeded {
+                        max_connection_attempts: attempts,
+                    });
+                }
+                let delay = retry_policy.reconnect_delay(self.reconnect_attempts);
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+                self.reconnect_attempts += 1;
+                let Some(connection) = self
+                    .client
+                    .open_sse_connection(&self.request_options, self.last_event_id.as_deref())
+                    .await?
+                else {
+                    self.finished = true;
+                    return Ok(None);
+                };
+                if let Some(boundary) = connection.snapshot_boundary {
+                    if self
+                        .snapshot_boundary
+                        .is_some_and(|previous| previous != boundary)
+                    {
+                        return Err(TsfClientError::InvalidSse(
+                            "snapshot boundary changed during resume",
+                        ));
+                    }
+                    self.snapshot_boundary = Some(boundary);
+                }
+                if connection.resume_event_id.is_some() {
+                    self.last_event_id = connection.resume_event_id;
+                }
+                self.body = connection.body;
+                self.parser = connection.parser;
+                self.stream_metadata = connection
+                    .stream_metadata
+                    .expect("validated stream_metadata event");
+                self.reconnect_attempts = 0;
+                continue;
+            };
+            match event.event.as_str() {
+                "read_batch" => {
+                    let batch: SseReadBatchData = serde_json::from_str(&event.data)
+                        .map_err(|_| TsfClientError::InvalidSse("invalid read_batch event"))?;
+                    validate_sse_read_batch_count(batch.records.len())?;
+                    let records = batch
+                        .records
+                        .into_iter()
+                        .map(sse_read_record)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    validate_sse_read_batch(&records, &self.options)?;
+                    let (event_id, cursor) = sse_resume_cursor(&event)?;
+                    let previous = self
+                        .last_event_id
+                        .as_deref()
+                        .map(parse_sse_resume_cursor)
+                        .transpose()?;
+                    validate_sse_read_batch_cursor(
+                        &records,
+                        cursor,
+                        previous,
+                        &self.options,
+                        self.snapshot_boundary,
+                    )?;
+                    self.last_event_id = Some(event_id.to_owned());
+                    self.queued_records.extend(records);
+                    self.reconnect_attempts = 0;
+                }
+                "caught_up" => {
+                    let value: SseCaughtUpData = serde_json::from_str(&event.data)
+                        .map_err(|_| TsfClientError::InvalidSse("invalid caught_up event"))?;
+                    let caught_up = CaughtUpPosition {
+                        next_seq_num: value.next_seq_num,
+                        last_timestamp_ms: value.last_timestamp_ms,
+                    };
+                    let (event_id, cursor) = sse_resume_cursor(&event)?;
+                    let previous = self
+                        .last_event_id
+                        .as_deref()
+                        .map(parse_sse_resume_cursor)
+                        .transpose()?;
+                    validate_sse_caught_up_cursor(
+                        caught_up,
+                        cursor,
+                        previous,
+                        &self.options,
+                        self.snapshot_boundary,
+                    )?;
+                    self.last_event_id = Some(event_id.to_owned());
+                    self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
+                    self.last_caught_up = Some(caught_up);
+                    self.reconnect_attempts = 0;
+                }
+                "error" => return Err(TsfClientError::SseTerminal(event.data)),
+                "stream_metadata" => {
+                    self.stream_metadata = serde_json::from_str(&event.data)
+                        .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Resumable WebSocket reader.
+///
+/// Transient transport and service interruptions reconnect from the next sequence number. Normal
 /// completion and configured bounds return `None`; protocol and policy failures surface as errors.
 pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
     socket: ReadSocket,
+    stream_metadata: StreamMetadata,
     finished: bool,
-    last_observed_tail: Option<ReadTail>,
+    last_caught_up: Option<CaughtUpPosition>,
+    snapshot_boundary: Option<SnapshotBoundary>,
     no_progress_reconnects: usize,
     reconnect_backoff: Duration,
     pending_reconnect_backoff: Duration,
@@ -1397,14 +1913,23 @@ pub struct TsfReadSession {
 }
 
 impl TsfReadSession {
-    fn new(client: TsfClient, options: ReadStreamOptions, socket: ReadSocket) -> Self {
+    fn new(
+        client: TsfClient,
+        options: ReadStreamOptions,
+        socket: ReadSocket,
+        stream_metadata: StreamMetadata,
+        last_caught_up: Option<CaughtUpPosition>,
+        snapshot_boundary: Option<SnapshotBoundary>,
+    ) -> Self {
         let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
             client,
             options,
             socket,
+            stream_metadata,
             finished: false,
-            last_observed_tail: None,
+            last_caught_up,
+            snapshot_boundary,
             no_progress_reconnects: 0,
             reconnect_backoff,
             pending_reconnect_backoff: Duration::ZERO,
@@ -1412,9 +1937,19 @@ impl TsfReadSession {
         }
     }
 
-    /// Returns the latest tail reported by the active read session.
-    pub const fn last_observed_tail(&self) -> Option<ReadTail> {
-        self.last_observed_tail
+    /// Returns the latest reconnect-safe position reported after preceding records were delivered.
+    pub const fn last_caught_up(&self) -> Option<CaughtUpPosition> {
+        self.last_caught_up
+    }
+
+    /// Returns the fixed exclusive end captured for a snapshot read.
+    pub const fn snapshot_boundary(&self) -> Option<SnapshotBoundary> {
+        self.snapshot_boundary
+    }
+
+    /// Returns metadata supplied by the latest successful read handshake.
+    pub const fn stream_metadata(&self) -> &StreamMetadata {
+        &self.stream_metadata
     }
 
     /// Waits for the next physical record using the configured idle timeout.
@@ -1442,15 +1977,17 @@ impl TsfReadSession {
 
             match self.socket.next_outcome().await {
                 Ok(ReadSocketOutcome::Record(record)) => {
-                    self.record_delivered(record.s2_seq_num);
+                    self.record_delivered(record.seq_num);
                     return Ok(Some(record));
                 }
-                Ok(ReadSocketOutcome::Tail(tail)) => {
-                    self.last_observed_tail = Some(tail);
+                Ok(ReadSocketOutcome::Records(records)) => {
+                    validate_read_batch_for_request(&records, &self.options)?;
+                    self.socket.pending_records.extend(records);
                 }
-                Ok(ReadSocketOutcome::ReconnectAdvised) => {
-                    self.require_reconnect()?;
-                    self.reconnect().await?;
+                Ok(ReadSocketOutcome::CaughtUp(caught_up)) => {
+                    validate_caught_up_for_request(caught_up, &self.options)?;
+                    self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
+                    self.last_caught_up = Some(caught_up);
                 }
                 Ok(ReadSocketOutcome::Closed) => {
                     self.finished = true;
@@ -1467,14 +2004,26 @@ impl TsfReadSession {
 
     async fn reconnect(&mut self) -> Result<(), TsfClientError> {
         debug_assert!(self.reconnect_needed);
-        if !self.pending_reconnect_backoff.is_zero() {
-            sleep(self.pending_reconnect_backoff).await;
+        let delay = jittered_backoff(self.pending_reconnect_backoff);
+        if !delay.is_zero() {
+            sleep(delay).await;
         }
-        let socket = self
+        let ConnectedReadSocket {
+            socket,
+            stream_metadata,
+            snapshot_boundary,
+        } = self
             .client
             .connect_read_socket(self.options.clone())
             .await?;
         self.socket = socket;
+        self.stream_metadata = stream_metadata;
+        apply_snapshot_boundary(&mut self.options, snapshot_boundary);
+        if snapshot_boundary.is_some() {
+            self.snapshot_boundary = snapshot_boundary;
+        }
+        self.no_progress_reconnects = 0;
+        self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
         Ok(())
@@ -1485,10 +2034,10 @@ impl TsfReadSession {
             return Ok(());
         }
         let retry_policy = self.client.config.retry_policy;
-        let max_reconnects = retry_policy.attempt_count().saturating_sub(1);
+        let max_reconnects = retry_policy.max_attempts.saturating_sub(1);
         if self.no_progress_reconnects >= max_reconnects {
             return Err(TsfClientError::ReadReconnectLimitExceeded {
-                max_connection_attempts: retry_policy.attempt_count(),
+                max_connection_attempts: retry_policy.max_attempts,
             });
         }
         self.no_progress_reconnects += 1;
@@ -1498,45 +2047,108 @@ impl TsfReadSession {
         Ok(())
     }
 
-    fn record_delivered(&mut self, s2_seq_num: u64) {
+    fn record_delivered(&mut self, seq_num: u64) {
         self.no_progress_reconnects = 0;
         self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
-        match s2_seq_num.checked_add(1) {
-            Some(next_seq_num) => self.options.start = Some(ReadStart::SeqNum(next_seq_num)),
-            None => self.finished = true,
-        }
-
-        if let Some(count) = self.options.count.as_mut() {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.finished = true;
-            }
-        }
-
-        if self.options.until.is_some_and(|until| s2_seq_num >= until) {
-            self.finished = true;
-        }
+        self.finished = advance_read_options(&mut self.options, seq_num);
     }
 }
 
+fn advance_read_options(options: &mut ReadStreamOptions, seq_num: u64) -> bool {
+    let Some(next_seq_num) = seq_num.checked_add(1) else {
+        return true;
+    };
+    options.start = Some(ReadStart::SeqNum(next_seq_num));
+    if let Some(remaining) = options.limit.as_mut() {
+        *remaining = remaining.saturating_sub(1);
+    }
+    read_options_exhausted(options)
+}
+
 fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
-    options.count == Some(0)
+    options.limit == Some(0)
         || matches!(
-            (options.start, options.until),
-            (Some(ReadStart::SeqNum(start)), Some(until)) if start > until
+            (options.start, options.end_seq_num),
+            (Some(ReadStart::SeqNum(start)), Some(end_seq_num)) if start >= end_seq_num
         )
+}
+
+fn validate_read_batch_for_request(
+    records: &[ReadRecord],
+    options: &ReadStreamOptions,
+) -> Result<(), TsfClientError> {
+    let Some(first) = records.first() else {
+        return Err(TsfClientError::InvalidReadResponse("ReadBatch is empty"));
+    };
+    let wrong_start = match options.start {
+        Some(ReadStart::SeqNum(start)) => first.seq_num != start,
+        Some(ReadStart::TimestampMs(start)) => first.timestamp_ms < start,
+        Some(ReadStart::TailOffset(_)) | None => false,
+    };
+    if wrong_start {
+        return Err(TsfClientError::InvalidReadResponse(
+            "ReadBatch does not begin at the requested position",
+        ));
+    }
+    if options
+        .limit
+        .is_some_and(|remaining| records.len() as u64 > remaining)
+    {
+        return Err(TsfClientError::InvalidReadResponse(
+            "ReadBatch exceeds the remaining record limit",
+        ));
+    }
+    if options
+        .end_seq_num
+        .is_some_and(|end_seq_num| records.iter().any(|record| record.seq_num >= end_seq_num))
+    {
+        return Err(TsfClientError::InvalidReadResponse(
+            "ReadBatch crosses the requested end sequence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_caught_up_for_request(
+    caught_up: CaughtUpPosition,
+    options: &ReadStreamOptions,
+) -> Result<(), TsfClientError> {
+    if matches!(options.start, Some(ReadStart::SeqNum(next)) if caught_up.next_seq_num != next) {
+        return Err(TsfClientError::InvalidReadResponse(
+            "CaughtUp does not match the next requested sequence",
+        ));
+    }
+    Ok(())
 }
 
 struct ReadSocket {
     ws: ClientWebSocket,
     read_idle_timeout: Option<Duration>,
+    pending_records: VecDeque<ReadRecord>,
+}
+
+struct ConnectedReadSocket {
+    socket: ReadSocket,
+    stream_metadata: StreamMetadata,
+    snapshot_boundary: Option<SnapshotBoundary>,
+}
+
+fn apply_snapshot_boundary(options: &mut ReadStreamOptions, boundary: Option<SnapshotBoundary>) {
+    let Some(boundary) = boundary else {
+        return;
+    };
+    options.snapshot = false;
+    options.end_seq_num = Some(boundary.end_seq_num);
 }
 
 impl ReadSocket {
     async fn next_outcome(&mut self) -> Result<ReadSocketOutcome, TsfClientError> {
         loop {
+            if let Some(record) = self.pending_records.pop_front() {
+                return Ok(ReadSocketOutcome::Record(record));
+            }
             let outcome = if let Some(read_idle_timeout) = self.read_idle_timeout {
                 with_timeout(
                     read_idle_timeout,
@@ -1556,25 +2168,27 @@ impl ReadSocket {
 
 enum ReadSocketOutcome {
     Record(ReadRecord),
-    Tail(ReadTail),
-    ReconnectAdvised,
+    Records(Vec<ReadRecord>),
+    CaughtUp(CaughtUpPosition),
     Closed,
 }
 
 async fn connect_websocket(
     url: Url,
     connect_timeout: Duration,
+    operation_timeout: Duration,
+    opening_frame: Bytes,
 ) -> Result<ClientWebSocket, TsfClientError> {
-    // TSF v3 sends one frame per message, so Nagle would hold a small append back for an ACK.
+    // TSF v1 sends each batch in one message, so Nagle could hold a small append back for an ACK.
     const DISABLE_NAGLE: bool = true;
 
     let mut request = url.as_str().into_client_request()?;
     request.headers_mut().insert(
         SEC_WEBSOCKET_PROTOCOL,
-        HeaderValue::from_static(TSF_WS_PROTOCOL),
+        HeaderValue::from_static(TSF_WEBSOCKET_PROTOCOL),
     );
 
-    let (ws, response) = timeout(
+    let (mut ws, response) = timeout(
         connect_timeout,
         connect_async_with_config(request, None, DISABLE_NAGLE),
     )
@@ -1589,11 +2203,17 @@ async fn connect_websocket(
         .transpose()
         .map_err(|_| TsfClientError::InvalidWebSocketProtocolHeader)?;
 
-    if selected_protocol.as_deref() != Some(TSF_WS_PROTOCOL) {
+    if selected_protocol.as_deref() != Some(TSF_WEBSOCKET_PROTOCOL) {
         return Err(TsfClientError::UnexpectedWebSocketProtocol(
             selected_protocol,
         ));
     }
+
+    timeout(operation_timeout, ws.send(Message::Binary(opening_frame)))
+        .await
+        .map_err(|_| TsfClientError::Timeout {
+            operation: "send opening frame",
+        })??;
 
     Ok(ws)
 }
@@ -1608,32 +2228,590 @@ async fn with_timeout<T>(
         .map_err(|_| TsfClientError::Timeout { operation })?
 }
 
+fn validate_read_options(options: &ReadStreamOptions) -> Result<(), TsfClientError> {
+    if let Some(start) = options.start {
+        let value = match start {
+            ReadStart::SeqNum(value)
+            | ReadStart::TimestampMs(value)
+            | ReadStart::TailOffset(value) => value,
+        };
+        if value > MAX_READ_SELECTOR_VALUE {
+            return Err(TsfClientError::InvalidReadSelector {
+                value,
+                maximum: MAX_READ_SELECTOR_VALUE,
+            });
+        }
+    }
+    if let Some(rate) = options.playback_rate_permille {
+        if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
+            return Err(TsfClientError::InvalidPlaybackRate {
+                value: rate,
+                minimum: MIN_PLAYBACK_RATE_PERMILLE,
+                maximum: MAX_PLAYBACK_RATE_PERMILLE,
+            });
+        }
+        if options.end_seq_num.is_none() && !options.snapshot {
+            return Err(TsfClientError::PlaybackRequiresEnd);
+        }
+    }
+    if options.snapshot && options.end_seq_num.is_some() {
+        return Err(TsfClientError::SnapshotWithEnd);
+    }
+    Ok(())
+}
+
+fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
+    let mut query = url.query_pairs_mut();
+    match options.start {
+        Some(ReadStart::SeqNum(value)) => {
+            query.append_pair("seq_num", &value.to_string());
+        }
+        Some(ReadStart::TimestampMs(value)) => {
+            query.append_pair("timestamp_ms", &value.to_string());
+        }
+        Some(ReadStart::TailOffset(value)) => {
+            query.append_pair("tail_offset", &value.to_string());
+        }
+        None => {}
+    }
+    if let Some(value) = options.limit {
+        query.append_pair("limit", &value.to_string());
+    }
+    if let Some(value) = options.end_seq_num {
+        query.append_pair("end_seq_num", &value.to_string());
+    }
+    if let Some(value) = options.playback_rate_permille {
+        query.append_pair("playback_rate_permille", &value.to_string());
+    }
+    if options.snapshot {
+        query.append_pair("snapshot", "true");
+    }
+}
+
+#[derive(Default)]
+struct SseParser {
+    buffer: Vec<u8>,
+    offset: usize,
+    validated: bool,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &[u8]) {
+        self.compact();
+        self.buffer.extend_from_slice(chunk);
+        self.validated = false;
+    }
+
+    fn next_event(&mut self) -> Result<Option<ParsedSseEvent>, TsfClientError> {
+        if !self.validated {
+            validate_sse_buffer(&self.buffer[self.offset..])?;
+            self.validated = true;
+        }
+        loop {
+            let Some((index, length)) = sse_boundary(&self.buffer[self.offset..]) else {
+                return Ok(None);
+            };
+            let start = self.offset;
+            self.offset += index + length;
+            if let Some(event) = parse_sse_block(&self.buffer[start..start + index])? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    fn compact(&mut self) {
+        if self.offset >= 64 * 1024 && self.offset >= self.buffer.len() / 2 {
+            self.buffer.drain(..self.offset);
+            self.offset = 0;
+        }
+    }
+}
+
+async fn next_sse_event(
+    body: &mut SseBody,
+    parser: &mut SseParser,
+) -> Result<Option<ParsedSseEvent>, TsfClientError> {
+    loop {
+        if let Some(event) = parser.next_event()? {
+            return Ok(Some(event));
+        }
+        match body.next().await {
+            Some(Ok(chunk)) => {
+                parser.push(&chunk);
+            }
+            Some(Err(error)) => return Err(error.into()),
+            None => return Ok(None),
+        }
+    }
+}
+
+fn validate_sse_buffer(buffer: &[u8]) -> Result<(), TsfClientError> {
+    let mut offset = 0;
+    while let Some((index, length)) = sse_boundary(&buffer[offset..]) {
+        if index + length > MAX_SSE_EVENT_BYTES {
+            return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
+        }
+        offset += index + length;
+    }
+    if buffer.len() - offset > MAX_SSE_UNTERMINATED_EVENT_BYTES {
+        return Err(TsfClientError::InvalidSse(
+            "unterminated event exceeds 2 MiB",
+        ));
+    }
+    Ok(())
+}
+
+fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len().saturating_sub(1) {
+        if buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+    }
+    None
+}
+
+fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientError> {
+    let text =
+        std::str::from_utf8(block).map_err(|_| TsfClientError::InvalidSse("event is not UTF-8"))?;
+    let mut event = "message".to_owned();
+    let mut id = None;
+    let mut data = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (name, value) = line.split_once(':').map_or((line, ""), |(name, value)| {
+            (name, value.strip_prefix(' ').unwrap_or(value))
+        });
+        match name {
+            "event" => event = value.to_owned(),
+            "id" => id = Some(value.to_owned()),
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+    if data.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ParsedSseEvent {
+            event,
+            data: data.join("\n"),
+            id,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedSseResumeCursor {
+    next_seq_num: u64,
+    consumed_records: u64,
+    snapshot: Option<(u64, u64)>,
+}
+
+fn sse_resume_event_id(event: &ParsedSseEvent) -> Result<&str, TsfClientError> {
+    Ok(sse_resume_cursor(event)?.0)
+}
+
+fn sse_resume_cursor(
+    event: &ParsedSseEvent,
+) -> Result<(&str, ParsedSseResumeCursor), TsfClientError> {
+    let Some(id) = event.id.as_deref() else {
+        return Err(invalid_sse_resume_cursor());
+    };
+    Ok((id, parse_sse_resume_cursor(id)?))
+}
+
+fn parse_sse_resume_cursor(id: &str) -> Result<ParsedSseResumeCursor, TsfClientError> {
+    let mut fields = id.split(',');
+    if fields.next() != Some("v1") {
+        return Err(invalid_sse_resume_cursor());
+    }
+    let Some(next_seq_num) = fields.next().and_then(parse_sse_cursor_u64) else {
+        return Err(invalid_sse_resume_cursor());
+    };
+    let Some(consumed_count) = fields.next().and_then(parse_sse_cursor_u64) else {
+        return Err(invalid_sse_resume_cursor());
+    };
+    let snapshot = match (fields.next(), fields.next()) {
+        (None, None) => None,
+        (Some(next), Some(timestamp)) => Some((
+            parse_sse_cursor_u64(next).ok_or_else(invalid_sse_resume_cursor)?,
+            parse_sse_cursor_u64(timestamp).ok_or_else(invalid_sse_resume_cursor)?,
+        )),
+        _ => return Err(invalid_sse_resume_cursor()),
+    };
+    if fields.next().is_some()
+        || next_seq_num > MAX_READ_SELECTOR_VALUE
+        || consumed_count > next_seq_num
+        || snapshot.is_some_and(|(snapshot_end_seq_num, snapshot_last_timestamp_ms)| {
+            snapshot_end_seq_num > MAX_READ_SELECTOR_VALUE
+                || next_seq_num > snapshot_end_seq_num
+                || snapshot_last_timestamp_ms > MAX_READ_SELECTOR_VALUE
+                || (snapshot_end_seq_num == 0 && snapshot_last_timestamp_ms != 0)
+        })
+    {
+        return Err(invalid_sse_resume_cursor());
+    }
+    Ok(ParsedSseResumeCursor {
+        next_seq_num,
+        consumed_records: consumed_count,
+        snapshot,
+    })
+}
+
+fn parse_sse_cursor_u64(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || (value != "0" && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn invalid_sse_resume_cursor() -> TsfClientError {
+    TsfClientError::InvalidSse("SSE event does not carry a valid resume cursor")
+}
+
+fn compact_record_data(bytes: &[u8]) -> RecordData {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes));
+    };
+    let utf8 = RecordData::Utf8(text.to_owned());
+    let utf8_len = serde_json::to_vec(&utf8)
+        .expect("record data serialization is infallible")
+        .len();
+    let base64url_len =
+        br#"{"encoding":"base64url","value":""}"#.len() + bytes.len().saturating_mul(4).div_ceil(3);
+    if utf8_len <= base64url_len {
+        utf8
+    } else {
+        RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes))
+    }
+}
+
+fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
+    let writer = URL_SAFE_NO_PAD
+        .decode(record.writer_id)
+        .map_err(|_| TsfClientError::InvalidSse("invalid writer_id"))?;
+    let writer: [u8; WriterId::BYTE_LEN] = writer
+        .try_into()
+        .map_err(|_| TsfClientError::InvalidSse("invalid writer_id length"))?;
+    let data = match record.data {
+        RecordData::Utf8(value) => Bytes::from(value),
+        RecordData::Base64url(value) => {
+            let data = URL_SAFE_NO_PAD
+                .decode(value)
+                .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?;
+            Bytes::from(data)
+        }
+    };
+    if data.len() > MAX_RECORD_BYTES {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch contains an oversized record",
+        ));
+    }
+    let part = PartHeader::new(record.part.index, record.part.is_final)?;
+    Ok(ReadRecord {
+        seq_num: record.seq_num,
+        timestamp_ms: record.timestamp_ms,
+        writer_id: WriterId::from_bytes(writer),
+        writer_seq_num: record.writer_seq_num,
+        part,
+        format: record.format,
+        data,
+    })
+}
+
+fn validate_sse_read_batch(
+    records: &[ReadRecord],
+    options: &ReadStreamOptions,
+) -> Result<(), TsfClientError> {
+    let mut payload_bytes = 0_usize;
+    let mut previous_seq_num = None;
+    for record in records {
+        payload_bytes = payload_bytes.saturating_add(record.data.len());
+        if payload_bytes > MAX_SSE_READ_BATCH_PAYLOAD_BYTES {
+            return Err(TsfClientError::InvalidSse(
+                "read_batch exceeds the decoded payload limit",
+            ));
+        }
+        if previous_seq_num
+            .is_some_and(|previous: u64| previous.checked_add(1) != Some(record.seq_num))
+        {
+            return Err(TsfClientError::InvalidSse(
+                "read_batch sequence numbers are not contiguous",
+            ));
+        }
+        if options
+            .end_seq_num
+            .is_some_and(|end_seq_num| record.seq_num >= end_seq_num)
+        {
+            return Err(TsfClientError::InvalidSse(
+                "read_batch crosses the requested end sequence",
+            ));
+        }
+        previous_seq_num = Some(record.seq_num);
+    }
+    if options
+        .limit
+        .is_some_and(|remaining| records.len() as u64 > remaining)
+    {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch exceeds the remaining record limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sse_read_batch_count(record_count: usize) -> Result<(), TsfClientError> {
+    if record_count == 0 || record_count > MAX_SSE_READ_BATCH_RECORDS {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch record count is outside the protocol limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sse_read_batch_cursor(
+    records: &[ReadRecord],
+    cursor: ParsedSseResumeCursor,
+    previous: Option<ParsedSseResumeCursor>,
+    options: &ReadStreamOptions,
+    snapshot_boundary: Option<SnapshotBoundary>,
+) -> Result<(), TsfClientError> {
+    let Some(first) = records.first() else {
+        return Err(TsfClientError::InvalidSse("read_batch is empty"));
+    };
+    let Some(expected_next_seq_num) = records
+        .last()
+        .and_then(|record| record.seq_num.checked_add(1))
+    else {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch cursor cannot follow its records",
+        ));
+    };
+    if cursor.next_seq_num != expected_next_seq_num {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch cursor does not follow its records",
+        ));
+    }
+    if previous.is_some_and(|value| first.seq_num != value.next_seq_num) {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch does not resume at the previous cursor",
+        ));
+    }
+    if previous.is_none()
+        && matches!(options.start, Some(ReadStart::SeqNum(start)) if first.seq_num != start)
+    {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch does not begin at the requested sequence",
+        ));
+    }
+    if previous.is_none()
+        && matches!(options.start, Some(ReadStart::TimestampMs(start)) if first.timestamp_ms < start)
+    {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch begins before the requested timestamp",
+        ));
+    }
+    let expected_consumed = previous
+        .map_or(0, |value| value.consumed_records)
+        .checked_add(records.len() as u64)
+        .ok_or(TsfClientError::InvalidSse(
+            "read_batch consumed count overflowed",
+        ))?;
+    if cursor.consumed_records != expected_consumed {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch cursor has the wrong consumed count",
+        ));
+    }
+    validate_sse_cursor_boundary(cursor, previous, snapshot_boundary)
+}
+
+fn validate_sse_caught_up_cursor(
+    caught_up: CaughtUpPosition,
+    cursor: ParsedSseResumeCursor,
+    previous: Option<ParsedSseResumeCursor>,
+    options: &ReadStreamOptions,
+    snapshot_boundary: Option<SnapshotBoundary>,
+) -> Result<(), TsfClientError> {
+    if cursor.next_seq_num != caught_up.next_seq_num {
+        return Err(TsfClientError::InvalidSse(
+            "caught_up cursor does not match its position",
+        ));
+    }
+    if let Some(previous) = previous {
+        if cursor.next_seq_num != previous.next_seq_num
+            || cursor.consumed_records != previous.consumed_records
+        {
+            return Err(TsfClientError::InvalidSse(
+                "caught_up does not continue the previous cursor",
+            ));
+        }
+    } else if cursor.consumed_records != 0 {
+        return Err(TsfClientError::InvalidSse(
+            "initial caught_up cursor has a consumed count",
+        ));
+    }
+    if previous.is_none()
+        && matches!(options.start, Some(ReadStart::SeqNum(start)) if cursor.next_seq_num != start)
+    {
+        return Err(TsfClientError::InvalidSse(
+            "initial caught_up does not match the requested sequence",
+        ));
+    }
+    validate_sse_cursor_boundary(cursor, previous, snapshot_boundary)
+}
+
+fn validate_sse_snapshot_cursor(
+    boundary: SnapshotBoundary,
+    cursor: ParsedSseResumeCursor,
+    previous: Option<ParsedSseResumeCursor>,
+) -> Result<(), TsfClientError> {
+    if cursor.snapshot != Some((boundary.end_seq_num, boundary.last_timestamp_ms)) {
+        return Err(TsfClientError::InvalidSse(
+            "snapshot_boundary cursor does not match its boundary",
+        ));
+    }
+    if let Some(previous) = previous {
+        if cursor.next_seq_num != previous.next_seq_num
+            || cursor.consumed_records != previous.consumed_records
+        {
+            return Err(TsfClientError::InvalidSse(
+                "snapshot_boundary does not continue the previous cursor",
+            ));
+        }
+    } else if cursor.consumed_records != 0 {
+        return Err(TsfClientError::InvalidSse(
+            "initial snapshot_boundary cursor has a consumed count",
+        ));
+    }
+    validate_sse_cursor_boundary(cursor, previous, Some(boundary))
+}
+
+fn validate_sse_cursor_boundary(
+    cursor: ParsedSseResumeCursor,
+    previous: Option<ParsedSseResumeCursor>,
+    boundary: Option<SnapshotBoundary>,
+) -> Result<(), TsfClientError> {
+    let expected_snapshot = boundary.map(|value| (value.end_seq_num, value.last_timestamp_ms));
+    if cursor.snapshot != expected_snapshot
+        || previous.is_some_and(|value| cursor.snapshot != value.snapshot)
+    {
+        return Err(TsfClientError::InvalidSse(
+            "SSE resume cursor changed its snapshot boundary",
+        ));
+    }
+    Ok(())
+}
+
 async fn json_response<T: DeserializeOwned>(
     response: reqwest::Response,
     operation: &'static str,
 ) -> Result<T, TsfClientError> {
     let status = response.status();
     if !status.is_success() {
-        let body = http_status_body(response).await;
-        return Err(TsfClientError::HttpStatus {
+        return Err(http_status_error(response, operation).await);
+    }
+
+    let body = bounded_response_body(response, operation, MAX_REST_RESPONSE_BYTES).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+async fn http_status_error(response: reqwest::Response, operation: &'static str) -> TsfClientError {
+    let status = response.status();
+    let header_request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let header_retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after);
+    let raw = bounded_response_body(response, operation, MAX_REST_ERROR_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    let parsed = serde_json::from_slice::<ApiErrorResponse>(&raw).ok();
+    let request_id = header_request_id.or_else(|| {
+        parsed
+            .as_ref()
+            .map(|response| response.error.request_id.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    let retry_after = header_retry_after.or_else(|| {
+        parsed
+            .as_ref()
+            .and_then(|response| response.error.retry_after_ms)
+            .map(Duration::from_millis)
+    });
+    let actual_next_seq_num = parsed
+        .as_ref()
+        .and_then(|response| response.error.actual_next_seq_num);
+    let api_code = parsed
+        .as_ref()
+        .map(|response| response.error.code.clone())
+        .filter(|value| !value.is_empty());
+    let raw = String::from_utf8(raw).unwrap_or_default();
+    let body = api_error_message(&raw).unwrap_or(raw);
+    TsfClientError::HttpStatus {
+        operation,
+        status,
+        body,
+        api_code,
+        request_id,
+        retry_after,
+        actual_next_seq_num,
+    }
+}
+
+async fn bounded_response_body(
+    response: reqwest::Response,
+    operation: &'static str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, TsfClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_bytes as u64)
+    {
+        return Err(TsfClientError::ResponseTooLarge {
             operation,
-            status,
-            body,
+            maximum_bytes,
         });
     }
 
-    Ok(response.json().await?)
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        if chunk.len() > maximum_bytes.saturating_sub(body.len()) {
+            return Err(TsfClientError::ResponseTooLarge {
+                operation,
+                maximum_bytes,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
-async fn http_status_body(response: reqwest::Response) -> String {
-    let body = response.text().await.unwrap_or_default();
-    api_error_message(&body).unwrap_or(body)
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 fn api_error_message(body: &str) -> Option<String> {
-    let response = serde_json::from_str::<ApiErrorResponse>(body).ok()?;
-    let code = response.error.code.trim();
-    let message = response.error.message.trim();
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = response["error"]["code"].as_str()?.trim();
+    let message = response["error"]["message"].as_str()?.trim();
 
     match (code.is_empty(), message.is_empty()) {
         (true, true) => None,
@@ -1641,25 +2819,6 @@ fn api_error_message(body: &str) -> Option<String> {
         (false, true) => Some(code.to_owned()),
         (false, false) => Some(format!("{code}: {message}")),
     }
-}
-
-#[derive(Deserialize)]
-struct ApiErrorResponse {
-    error: ApiErrorBody,
-}
-
-#[derive(Deserialize)]
-struct ApiErrorBody {
-    code: String,
-    message: String,
-}
-
-async fn send_client_frame(
-    ws: &mut ClientWebSocket,
-    frame: ClientFrame,
-) -> Result<(), TsfClientError> {
-    ws.send(Message::Binary(frame.encode()?)).await?;
-    Ok(())
 }
 
 async fn next_server_frame(
@@ -1691,10 +2850,9 @@ async fn next_read_socket_frame(
     ws: &mut ClientWebSocket,
 ) -> Result<Option<ReadSocketOutcome>, TsfClientError> {
     match next_server_frame(ws).await? {
-        Some(ServerFrame::ReadRecord(record)) => Ok(Some(ReadSocketOutcome::Record(record))),
-        Some(ServerFrame::ReadTail(tail)) => Ok(Some(ReadSocketOutcome::Tail(tail))),
+        Some(ServerFrame::ReadBatch(records)) => Ok(Some(ReadSocketOutcome::Records(records))),
+        Some(ServerFrame::CaughtUp(caught_up)) => Ok(Some(ReadSocketOutcome::CaughtUp(caught_up))),
         Some(ServerFrame::Heartbeat) => Ok(None),
-        Some(ServerFrame::ReconnectAdvised { .. }) => Ok(Some(ReadSocketOutcome::ReconnectAdvised)),
         Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
             &frame,
         ))),
@@ -1702,9 +2860,9 @@ async fn next_read_socket_frame(
     }
 }
 
-async fn expect_hello(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
+async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
     match next_server_frame(ws).await? {
-        Some(ServerFrame::Hello { version }) => ensure_protocol_version(version),
+        Some(ServerFrame::Ready) => Ok(()),
         Some(frame) => Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
             &frame,
         ))),
@@ -1712,32 +2870,168 @@ async fn expect_hello(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
     }
 }
 
-fn ensure_protocol_version(version: u16) -> Result<(), TsfClientError> {
-    if version == TSF_V3 {
-        Ok(())
+struct ReadHandshake {
+    stream_metadata: StreamMetadata,
+    snapshot_boundary: Option<SnapshotBoundary>,
+}
+
+async fn expect_read_handshake(
+    ws: &mut ClientWebSocket,
+    snapshot: bool,
+) -> Result<ReadHandshake, TsfClientError> {
+    expect_ready(ws).await?;
+    let stream_metadata = match next_server_frame(ws).await? {
+        Some(ServerFrame::StreamMetadata(stream_metadata)) => stream_metadata,
+        Some(frame) => {
+            return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+                &frame,
+            )));
+        }
+        None => return Err(TsfClientError::WebSocketClosed),
+    };
+    let snapshot_boundary = if snapshot {
+        match next_server_frame(ws).await? {
+            Some(ServerFrame::SnapshotBoundary(boundary)) => Some(boundary),
+            Some(frame) => {
+                return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
+                    &frame,
+                )));
+            }
+            None => return Err(TsfClientError::WebSocketClosed),
+        }
     } else {
-        Err(TsfClientError::UnsupportedProtocolVersion(version))
-    }
+        None
+    };
+    Ok(ReadHandshake {
+        stream_metadata,
+        snapshot_boundary,
+    })
 }
 
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
     match frame {
-        ServerFrame::Hello { .. } => "hello",
-        ServerFrame::AuthRequired => "auth required",
-        ServerFrame::Ack { .. } => "ack",
-        ServerFrame::ReadRecord(_) => "read record",
+        ServerFrame::Ready => "ready",
+        ServerFrame::AppendAck { .. } => "append_ack",
+        ServerFrame::ReadBatch(_) => "read_batch",
         ServerFrame::Heartbeat => "heartbeat",
-        ServerFrame::ReconnectAdvised { .. } => "reconnect advised",
-        ServerFrame::ReadTail(_) => "read tail",
+        ServerFrame::CaughtUp(_) => "caught_up",
+        ServerFrame::StreamMetadata(_) => "stream_metadata",
+        ServerFrame::SnapshotBoundary(_) => "snapshot_boundary",
     }
 }
 
-/// Error surfaced by REST operations, socket setup, reads, and durable producers.
+fn validate_api_origin(origin: &Url) -> Result<(), TsfClientError> {
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(TsfClientError::InvalidApiOrigin(origin.clone()));
+    }
+    Ok(())
+}
+
+fn validate_link_page(
+    page: &ListLinksResponse,
+    maximum_links: usize,
+) -> Result<(), TsfClientError> {
+    if page.links.len() > maximum_links {
+        return Err(TsfClientError::InvalidLinkPage(
+            "page contains more links than requested",
+        ));
+    }
+    if page.next_cursor.is_some() && page.links.is_empty() {
+        return Err(TsfClientError::InvalidLinkPage(
+            "empty page carries a next cursor",
+        ));
+    }
+    let mut link_ids = HashSet::with_capacity(page.links.len());
+    if page
+        .links
+        .iter()
+        .any(|link| !link_ids.insert(&link.link_id))
+    {
+        return Err(TsfClientError::InvalidLinkPage(
+            "page contains duplicate link IDs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_client_config(config: &TsfClientConfig) -> Result<(), TsfClientError> {
+    validate_api_origin(&config.api_origin)?;
+    for (name, value) in [
+        ("rest_request_timeout", config.rest_request_timeout),
+        (
+            "websocket_connect_timeout",
+            config.websocket_connect_timeout,
+        ),
+        (
+            "websocket_operation_timeout",
+            config.websocket_operation_timeout,
+        ),
+    ] {
+        if value.is_zero() || value > MAX_CLIENT_DELAY {
+            return Err(TsfClientError::InvalidClientConfig(format!(
+                "{name} must be greater than zero and at most {} milliseconds",
+                MAX_CLIENT_DELAY.as_millis()
+            )));
+        }
+    }
+    if config
+        .websocket_read_idle_timeout
+        .is_some_and(|timeout| timeout.is_zero() || timeout > MAX_CLIENT_DELAY)
+    {
+        return Err(TsfClientError::InvalidClientConfig(format!(
+            "websocket_read_idle_timeout must be greater than zero and at most {} milliseconds when set",
+            MAX_CLIENT_DELAY.as_millis()
+        )));
+    }
+    if config.retry_policy.max_attempts == 0 {
+        return Err(TsfClientError::InvalidClientConfig(
+            "retry_policy.max_attempts must be at least one".to_owned(),
+        ));
+    }
+    if config.retry_policy.initial_backoff > config.retry_policy.max_backoff {
+        return Err(TsfClientError::InvalidClientConfig(
+            "retry_policy.initial_backoff must not exceed retry_policy.max_backoff".to_owned(),
+        ));
+    }
+    if config.retry_policy.max_backoff > MAX_CLIENT_DELAY {
+        return Err(TsfClientError::InvalidClientConfig(format!(
+            "retry_policy delays must not exceed {} milliseconds",
+            MAX_CLIENT_DELAY.as_millis()
+        )));
+    }
+    Ok(())
+}
+
+/// Error surfaced by REST operations, socket setup, reads, and durable writers.
 #[derive(Debug, thiserror::Error)]
 pub enum TsfClientError {
+    /// The configured API origin is not a bare HTTP or HTTPS origin.
+    #[error("API origin must be HTTP(S) without credentials, path, query, or fragment: {0}")]
+    InvalidApiOrigin(Url),
+    /// Client timeout or retry settings are incoherent.
+    #[error("invalid client config: {0}")]
+    InvalidClientConfig(String),
     /// HTTP transport or response-decoding failure.
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
+    /// A REST response contained malformed JSON.
+    #[error("invalid JSON in REST response: {0}")]
+    Json(#[from] serde_json::Error),
+    /// A REST response exceeded the SDK memory-safety bound.
+    #[error("{operation} response exceeds {maximum_bytes} bytes")]
+    ResponseTooLarge {
+        /// Stable operation label.
+        operation: &'static str,
+        /// Maximum bytes buffered by the SDK.
+        maximum_bytes: usize,
+    },
     /// Non-success HTTP response.
     #[error("HTTP {operation} failed with {status}: {body}")]
     HttpStatus {
@@ -1747,7 +3041,30 @@ pub enum TsfClientError {
         status: StatusCode,
         /// Parsed API error or fallback response body.
         body: String,
+        /// Stable API error code when the response was JSON.
+        api_code: Option<String>,
+        /// Server request ID used for support and tracing.
+        request_id: Option<String>,
+        /// Server-requested retry delay.
+        retry_after: Option<Duration>,
+        /// Actual stream next sequence for a failed sequence precondition.
+        actual_next_seq_num: Option<u64>,
     },
+    /// Stateless append input violates the local protocol contract.
+    #[error("invalid stateless append: {0}")]
+    InvalidStatelessAppend(&'static str),
+    /// A link secret is not a canonical 32-byte unpadded base64url value.
+    #[error("link secret must be canonical 43-character unpadded base64url")]
+    InvalidLinkSecret,
+    /// SSE response violated the public event contract.
+    #[error("invalid SSE response: {0}")]
+    InvalidSse(&'static str),
+    /// WebSocket read response violated the requested stream contract.
+    #[error("invalid WebSocket read response: {0}")]
+    InvalidReadResponse(&'static str),
+    /// The server ended an SSE session with a stable terminal error event.
+    #[error("SSE terminal error: {0}")]
+    SseTerminal(String),
     /// A bounded client operation exceeded its timeout.
     #[error("{operation} timed out")]
     Timeout {
@@ -1766,7 +3083,7 @@ pub enum TsfClientError {
     /// The server returned a non-text WebSocket protocol header.
     #[error("server selected invalid WebSocket protocol header")]
     InvalidWebSocketProtocolHeader,
-    /// The server did not select `tsf.v3` during upgrade.
+    /// The server did not select `tsf.v1` during upgrade.
     #[error("server selected unsupported WebSocket protocol {0:?}")]
     UnexpectedWebSocketProtocol(Option<String>),
     /// The server closed without a non-normal close reason.
@@ -1780,9 +3097,21 @@ pub enum TsfClientError {
         /// Stable server close reason when available.
         reason: String,
     },
+    /// The stream did not start the writer session at its requested sequence.
+    #[error("stream next sequence did not match the writer session precondition")]
+    SequenceMismatch,
+    /// Link-list pagination controls are outside the supported range.
+    #[error("invalid list links options: {0}")]
+    InvalidListLinksOptions(&'static str),
+    /// A link inventory page violated pagination invariants.
+    #[error("invalid link page: {0}")]
+    InvalidLinkPage(&'static str),
     /// The server returned an invalid or mismatched ack range.
     #[error("server sent invalid append acknowledgement {0:?}")]
     InvalidAppendAck(AppendAck),
+    /// The server returned a stateless append range with the wrong length.
+    #[error("server sent invalid stateless append range {0:?}")]
+    InvalidAppendRange(AppendRange),
     /// An ack skipped a pending writer-local sequence number.
     #[error("server acknowledgement advanced past writer seq {writer_seq_num}: {ack:?}")]
     AppendNotAcknowledged {
@@ -1791,15 +3120,15 @@ pub enum TsfClientError {
         /// Invalid ack that advanced past the pending record.
         ack: AppendAck,
     },
-    /// Producer bounds are zero or not representable by the semaphore implementation.
-    #[error("invalid append producer config: {0}")]
-    InvalidProducerConfig(String),
-    /// A requested reservation is larger than the entire producer byte window.
-    #[error("append record reserves {bytes} bytes, above producer window {max_unacked_bytes}")]
-    AppendRecordExceedsProducerWindow {
+    /// Writer bounds are zero or not representable by the semaphore implementation.
+    #[error("invalid append writer config: {0}")]
+    InvalidWriterConfig(String),
+    /// A requested reservation is larger than the entire writer byte window.
+    #[error("append record reserves {bytes} bytes, above writer window {max_unacked_bytes}")]
+    AppendRecordExceedsWriterWindow {
         /// Requested reservation size.
         bytes: usize,
-        /// Configured producer byte window.
+        /// Configured writer byte window.
         max_unacked_bytes: usize,
     },
     /// A record is larger than its previously acquired reservation.
@@ -1810,18 +3139,15 @@ pub enum TsfClientError {
         /// Capacity owned by the permit.
         reserved_bytes: usize,
     },
-    /// The producer command channel is closed.
-    #[error("append producer is closed")]
-    AppendProducerClosed,
-    /// The producer task ended before resolving a pending ticket.
-    #[error("append producer dropped with unacknowledged records")]
-    AppendProducerDropped,
-    /// The producer background task failed or could not be joined.
-    #[error("append producer failed: {0}")]
-    AppendProducerFailed(String),
-    /// A private read requested authentication but no link was configured.
-    #[error("private stream read requires a read link")]
-    MissingReadLink,
+    /// The writer command channel is closed.
+    #[error("append writer is closed")]
+    AppendWriterClosed,
+    /// The writer task ended before resolving a pending ticket.
+    #[error("append writer dropped with unacknowledged records")]
+    AppendWriterDropped,
+    /// The writer background task failed or could not be joined.
+    #[error("append writer failed: {0}")]
+    AppendWriterFailed(String),
     /// Consecutive read connections ended or requested reconnect without delivering a record.
     #[error(
         "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"
@@ -1830,18 +3156,73 @@ pub enum TsfClientError {
         /// Configured maximum consecutive connection attempts, including the initial connection.
         max_connection_attempts: usize,
     },
+    /// A selector exceeds the range supported by the active data adapter.
+    #[error("read selector {value} exceeds the supported maximum {maximum}")]
+    InvalidReadSelector {
+        /// Requested selector value.
+        value: u64,
+        /// Largest supported selector value.
+        maximum: u64,
+    },
+    /// A timestamp playback rate is outside the protocol range.
+    #[error("playback rate {value} must be between {minimum} and {maximum} permille")]
+    InvalidPlaybackRate {
+        /// Requested playback rate.
+        value: u64,
+        /// Slowest accepted playback rate.
+        minimum: u64,
+        /// Fastest accepted playback rate.
+        maximum: u64,
+    },
+    /// Timestamp playback needs a stable exclusive ending sequence.
+    #[error("playback rate requires an exclusive end_seq_num sequence")]
+    PlaybackRequiresEnd,
+    /// A snapshot request also supplied an explicit ending sequence.
+    #[error("snapshot and end_seq_num are mutually exclusive")]
+    SnapshotWithEnd,
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
-    /// The server selected a TSF protocol version unsupported by this client.
-    #[error("server sent unsupported protocol version {0}")]
-    UnsupportedProtocolVersion(u16),
     /// The server sent a text WebSocket message instead of one binary TSF frame.
     #[error("server sent an unexpected text WebSocket message")]
     UnexpectedTextMessage,
 }
 
 impl TsfClientError {
+    /// Returns the request ID attached to an HTTP failure.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::HttpStatus { request_id, .. } => request_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable API code attached to an HTTP failure.
+    pub fn api_code(&self) -> Option<&str> {
+        match self {
+            Self::HttpStatus { api_code, .. } => api_code.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the server-requested retry delay.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::HttpStatus { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Returns the actual stream next sequence attached to a failed sequence precondition.
+    pub fn actual_next_seq_num(&self) -> Option<u64> {
+        match self {
+            Self::HttpStatus {
+                actual_next_seq_num,
+                ..
+            } => *actual_next_seq_num,
+            _ => None,
+        }
+    }
     /// Returns whether retrying a failed create with the same idempotency key and request is safe
     /// and may succeed.
     pub fn is_recoverable_create_failure(&self) -> bool {
@@ -1849,19 +3230,19 @@ impl TsfClientError {
             Self::Http(error) => {
                 error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
             }
+            Self::Json(_) => true,
             Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
             _ => false,
         }
     }
 
     fn is_retryable(&self) -> bool {
+        if self.is_resumable_read_interruption() {
+            return true;
+        }
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
             Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
-            Self::Timeout { .. } => true,
-            Self::WebSocket(error) => is_retryable_websocket_error(error),
-            Self::WebSocketClosed => true,
-            Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),
             _ => false,
         }
     }
@@ -1872,6 +3253,17 @@ impl TsfClientError {
             Self::WebSocket(error) => is_retryable_websocket_error(error),
             Self::WebSocketClosed => true,
             Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),
+            _ => false,
+        }
+    }
+
+    fn is_resumable_sse_interruption(&self) -> bool {
+        match self {
+            Self::Http(error) => {
+                error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
+            }
+            Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
+            Self::Timeout { .. } => true,
             _ => false,
         }
     }
@@ -1899,9 +3291,116 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::connect_async;
 
     use super::*;
+
+    #[test]
+    fn parses_structured_http_error_details() {
+        let body = r#"{"error":{"code":"sequence_mismatch","message":"position changed","request_id":"request-42","retry_after_ms":125,"actual_next_seq_num":"42","future_field":true}}"#;
+        let parsed: ApiErrorResponse = serde_json::from_str(body).expect("structured API error");
+
+        assert_eq!(
+            api_error_message(body).as_deref(),
+            Some("sequence_mismatch: position changed")
+        );
+        assert_eq!(parsed.error.request_id, "request-42");
+        assert_eq!(parsed.error.retry_after_ms, Some(125));
+        assert_eq!(parsed.error.actual_next_seq_num, Some(42));
+        for invalid in ["", "00", "01", "-1", "18446744073709551616"] {
+            let body = format!(
+                r#"{{"error":{{"code":"sequence_mismatch","message":"position changed","request_id":"request-42","actual_next_seq_num":"{invalid}"}}}}"#,
+            );
+            assert!(serde_json::from_str::<ApiErrorResponse>(&body).is_err());
+        }
+        assert_eq!(api_error_message("plain failure"), None);
+    }
+
+    #[tokio::test]
+    async fn sse_handshake_uses_the_rest_request_timeout() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind SSE listener");
+        let address = listener.local_addr().expect("SSE listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept SSE request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.expect("read SSE request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write SSE headers");
+            sleep(Duration::from_secs(1)).await;
+        });
+        let mut config =
+            TsfClientConfig::new(Url::parse(&format!("http://{address}")).expect("SSE API origin"))
+                .expect("valid client config");
+        config.rest_request_timeout = Duration::from_millis(20);
+        config.retry_policy = RetryPolicy::none();
+        let client = TsfClient::with_config(config).expect("SSE client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+
+        let started_at = std::time::Instant::now();
+        let result = client
+            .connect_sse_reader(ReadStreamOptions::new(stream_id))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::Timeout {
+                operation: "SSE handshake"
+            })
+        ));
+        assert!(started_at.elapsed() < Duration::from_millis(200));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn rest_response_rejects_declared_body_above_memory_bound() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind REST listener");
+        let address = listener.local_addr().expect("REST listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept REST request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.expect("read REST request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_REST_RESPONSE_BYTES + 1
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write REST headers");
+        });
+        let mut config = TsfClientConfig::new(
+            Url::parse(&format!("http://{address}")).expect("REST API origin"),
+        )
+        .expect("valid client config");
+        config.retry_policy = RetryPolicy::none();
+        let client = TsfClient::with_config(config).expect("REST client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+
+        let result = client.get_stream(&stream_id, None).await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::ResponseTooLarge {
+                operation: "get stream",
+                maximum_bytes: MAX_REST_RESPONSE_BYTES,
+            })
+        ));
+        server.await.expect("join REST server");
+    }
 
     async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1942,6 +3441,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_handshake_returns_metadata() {
+        let (mut client, mut server) = connected_websockets().await;
+        let stream_metadata = StreamMetadata {
+            stream_id: "00000000000000000000000000000000"
+                .parse()
+                .expect("stream ID"),
+            title: None,
+            visibility: crate::protocol::rest::Visibility::Private,
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+            expires_at: "2026-08-23T00:00:00Z".to_owned(),
+        };
+        let expected_stream_metadata = stream_metadata.clone();
+        let sender = tokio::spawn(async move {
+            for frame in [
+                ServerFrame::Ready,
+                ServerFrame::StreamMetadata(stream_metadata),
+            ] {
+                server
+                    .send(Message::Binary(
+                        frame.encode().expect("encode handshake frame"),
+                    ))
+                    .await
+                    .expect("send handshake frame");
+            }
+        });
+
+        let handshake = expect_read_handshake(&mut client, false)
+            .await
+            .expect("read handshake");
+
+        assert_eq!(handshake.stream_metadata, expected_stream_metadata);
+        assert_eq!(handshake.snapshot_boundary, None);
+        sender.await.expect("join handshake sender");
+    }
+
+    #[tokio::test]
     async fn read_idle_timeout_resets_on_protocol_heartbeat() {
         let (client, mut server) = connected_websockets().await;
         let sender = tokio::spawn(async move {
@@ -1956,28 +3491,29 @@ mod tests {
             }
             server
                 .send(Message::Binary(
-                    ServerFrame::ReadTail(ReadTail {
-                        next_s2_seq_num: 42,
-                        timestamp_ms: 1_786_377_600_000,
+                    ServerFrame::CaughtUp(CaughtUpPosition {
+                        next_seq_num: 42,
+                        last_timestamp_ms: 1_786_377_600_000,
                     })
                     .encode()
-                    .expect("encode read tail"),
+                    .expect("encode caught up"),
                 ))
                 .await
-                .expect("send read tail");
+                .expect("send caught up");
         });
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_millis(100)),
+            pending_records: VecDeque::new(),
         };
 
-        let outcome = socket.next_outcome().await.expect("read tail outcome");
+        let outcome = socket.next_outcome().await.expect("caught-up outcome");
 
         assert!(matches!(
             outcome,
-            ReadSocketOutcome::Tail(ReadTail {
-                next_s2_seq_num: 42,
-                timestamp_ms: 1_786_377_600_000,
+            ReadSocketOutcome::CaughtUp(CaughtUpPosition {
+                next_seq_num: 42,
+                last_timestamp_ms: 1_786_377_600_000,
             })
         ));
         sender.await.expect("join heartbeat sender");
@@ -2000,6 +3536,7 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_secs(1)),
+            pending_records: VecDeque::new(),
         };
 
         let result = with_timeout(
@@ -2028,6 +3565,7 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_millis(50)),
+            pending_records: VecDeque::new(),
         };
 
         let result = socket.next_outcome().await;
@@ -2042,79 +3580,230 @@ mod tests {
     }
 
     #[test]
-    fn retry_policy_always_attempts_at_least_once() {
-        let retry_policy = RetryPolicy {
-            max_attempts: 0,
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-        };
+    fn rejects_incoherent_client_config() {
+        let mut config = TsfClientConfig::default();
+        config.retry_policy.max_attempts = 0;
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
 
-        assert_eq!(retry_policy.attempt_count(), 1);
+        let mut config = TsfClientConfig::default();
+        config.retry_policy.initial_backoff = Duration::from_secs(2);
+        config.retry_policy.max_backoff = Duration::from_secs(1);
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
+
+        let config = TsfClientConfig {
+            rest_request_timeout: Duration::ZERO,
+            ..TsfClientConfig::default()
+        };
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
+
+        let config = TsfClientConfig {
+            websocket_connect_timeout: MAX_CLIENT_DELAY + Duration::from_millis(1),
+            ..TsfClientConfig::default()
+        };
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
+
+        let mut config = TsfClientConfig::default();
+        config.retry_policy.max_backoff = MAX_CLIENT_DELAY + Duration::from_millis(1);
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
     }
 
     #[test]
-    fn producer_window_cannot_exceed_server_queue_contract() {
-        let default = TsfProducerConfig::default();
-        assert_eq!(
-            default.max_unacked_bytes,
-            MAX_PRODUCER_UNACKED_PAYLOAD_BYTES
-        );
-        assert_eq!(default.max_unacked_records, MAX_PRODUCER_UNACKED_RECORDS);
+    fn rejects_invalid_link_page_invariants() {
+        let link = serde_json::json!({
+            "link_id": "reader",
+            "permissions": "r",
+            "status": "active",
+            "created_at": "2026-08-13T00:00:00Z",
+            "expires_at": null,
+            "revoked_at": null
+        });
+        let duplicate: ListLinksResponse = serde_json::from_value(serde_json::json!({
+            "authorizing_link_id": "owner",
+            "links": [link.clone(), link],
+            "next_cursor": null
+        }))
+        .expect("decodable duplicate page");
+        assert!(matches!(
+            validate_link_page(&duplicate, 100),
+            Err(TsfClientError::InvalidLinkPage(_))
+        ));
+
+        let empty_with_cursor: ListLinksResponse = serde_json::from_value(serde_json::json!({
+            "authorizing_link_id": "owner",
+            "links": [],
+            "next_cursor": "next"
+        }))
+        .expect("decodable empty page");
+        assert!(matches!(
+            validate_link_page(&empty_with_cursor, 100),
+            Err(TsfClientError::InvalidLinkPage(_))
+        ));
+    }
+
+    #[test]
+    fn writer_window_cannot_exceed_server_queue_contract() {
+        let default = TsfWriterConfig::default();
+        assert_eq!(default.max_unacked_bytes, MAX_WRITER_UNACKED_PAYLOAD_BYTES);
+        assert_eq!(default.max_unacked_records, MAX_WRITER_UNACKED_RECORDS);
         assert!(default.validate().is_ok());
 
         for config in [
-            TsfProducerConfig {
-                max_unacked_bytes: MAX_PRODUCER_UNACKED_PAYLOAD_BYTES + 1,
-                ..TsfProducerConfig::default()
+            TsfWriterConfig {
+                max_unacked_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES + 1,
+                ..TsfWriterConfig::default()
             },
-            TsfProducerConfig {
-                max_unacked_records: MAX_PRODUCER_UNACKED_RECORDS + 1,
-                ..TsfProducerConfig::default()
+            TsfWriterConfig {
+                max_unacked_records: MAX_WRITER_UNACKED_RECORDS + 1,
+                ..TsfWriterConfig::default()
             },
         ] {
             assert!(matches!(
                 config.validate(),
-                Err(TsfClientError::InvalidProducerConfig(_))
+                Err(TsfClientError::InvalidWriterConfig(_))
             ));
         }
     }
 
     #[test]
-    fn builds_versioned_rest_urls_from_api_origin() {
-        let client = TsfClient::with_api_base_url(
-            Url::parse("http://localhost:8787/ignored?query=yes#fragment").expect("API origin"),
-        );
+    fn builds_versioned_rest_and_path_only_websocket_urls() {
+        let client =
+            TsfClient::with_api_origin(Url::parse("https://example.com").expect("API origin"))
+                .expect("valid API origin");
 
         assert_eq!(
             client.rest_url("/streams").as_str(),
-            "http://localhost:8787/api/v1/streams"
+            "https://example.com/api/v1/streams"
         );
-    }
-
-    #[test]
-    fn builds_versioned_websocket_urls_with_read_query() {
-        let client =
-            TsfClient::with_api_base_url(Url::parse("https://example.com").expect("API origin"));
-
         assert_eq!(
             client
-                .websocket_url(
-                    "/streams/0123456789abcdefghjkmnpqrstvwxyz/read",
-                    &[("seq_num", "42".to_owned()), ("count", "3".to_owned())],
-                )
+                .websocket_url("/streams/0123456789abcdefghjkmnpqrstvwxyz/read")
                 .expect("WebSocket URL")
                 .as_str(),
-            "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read?seq_num=42&count=3"
+            "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read"
         );
     }
 
     #[test]
-    fn append_ack_counts_inclusive_matching_ranges() {
+    fn rejects_non_origin_api_urls() {
+        for value in [
+            "https://user@example.com",
+            "https://example.com/api",
+            "https://example.com?region=west",
+            "https://example.com#api",
+            "wss://example.com",
+        ] {
+            assert!(matches!(
+                TsfClient::with_api_origin(Url::parse(value).expect("URL")),
+                Err(TsfClientError::InvalidApiOrigin(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sse_query_keeps_the_original_absolute_selector_and_limit() {
+        let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+            .parse()
+            .expect("stream ID");
+        let mut options = ReadStreamOptions::new(stream_id);
+        options.start = Some(ReadStart::SeqNum(42));
+        options.limit = Some(7);
+        options.snapshot = true;
+        let mut url = Url::parse("https://tail.surf/api/v1/streams/id/records").expect("SSE URL");
+
+        append_sse_query(&mut url, &options);
+
+        assert_eq!(url.query(), Some("seq_num=42&limit=7&snapshot=true"));
+    }
+
+    #[test]
+    fn sse_parser_retains_only_strict_versioned_resume_ids() {
+        let cursor = "v1,4,0";
+        let block = format!(
+            "id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"4\",\"last_timestamp_ms\":\"0\"}}"
+        );
+        let event = parse_sse_block(block.as_bytes())
+            .expect("parse SSE event")
+            .expect("data event");
+
+        assert_eq!(sse_resume_event_id(&event).expect("resume cursor"), cursor);
+
+        let snapshot_cursor = "v1,4,0,5,0";
+        let snapshot_event = ParsedSseEvent {
+            event: "read_batch".to_owned(),
+            data: "{}".to_owned(),
+            id: Some(snapshot_cursor.to_owned()),
+        };
+        assert_eq!(
+            sse_resume_event_id(&snapshot_event).expect("snapshot resume cursor"),
+            snapshot_cursor
+        );
+
+        for invalid in [
+            "v2,4,0",
+            "v1,04,0",
+            "v1,4,5",
+            "v1,4,0,5",
+            "v1,4,0,3,6",
+            "v1,4,0,5,6,7",
+            "v1,0,0,0,1",
+            "v1,1,0,1,9007199254740992",
+            "v1,4, 0",
+        ] {
+            let event = ParsedSseEvent {
+                event: "caught_up".to_owned(),
+                data: "{}".to_owned(),
+                id: Some(invalid.to_owned()),
+            };
+            assert!(matches!(
+                sse_resume_event_id(&event),
+                Err(TsfClientError::InvalidSse(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_read_selectors_outside_the_adapter_range() {
+        let client =
+            TsfClient::with_api_origin(Url::parse("http://localhost").expect("API origin"))
+                .expect("valid API origin");
+        let mut options = ReadStreamOptions::new(
+            "0123456789abcdefghjkmnpqrstvwxyz"
+                .parse()
+                .expect("stream ID"),
+        );
+        options.start = Some(ReadStart::TailOffset(MAX_READ_SELECTOR_VALUE + 1));
+
+        assert!(matches!(
+            client.connect_reader(options).await,
+            Err(TsfClientError::InvalidReadSelector {
+                value,
+                maximum: MAX_READ_SELECTOR_VALUE,
+            }) if value == MAX_READ_SELECTOR_VALUE + 1
+        ));
+    }
+
+    #[test]
+    fn append_ack_counts_half_open_matching_ranges() {
         let ack = AppendAck {
-            writer_seq_start: 7,
-            writer_seq_end: 9,
-            s2_seq_start: 42,
-            s2_seq_end: 44,
+            writer_start_seq_num: 7,
+            writer_end_seq_num: 10,
+            start_seq_num: 42,
+            end_seq_num: 45,
         };
 
         assert_eq!(ack.record_count().expect("record count"), 3);
@@ -2124,10 +3813,10 @@ mod tests {
     #[test]
     fn append_ack_rejects_mismatched_range_lengths() {
         let ack = AppendAck {
-            writer_seq_start: 7,
-            writer_seq_end: 9,
-            s2_seq_start: 42,
-            s2_seq_end: 43,
+            writer_start_seq_num: 7,
+            writer_end_seq_num: 9,
+            start_seq_num: 42,
+            end_seq_num: 43,
         };
 
         assert!(matches!(
@@ -2137,10 +3826,42 @@ mod tests {
     }
 
     #[test]
+    fn read_and_stateless_append_responses_match_the_requested_ranges() {
+        assert!(matches!(
+            validate_append_range(
+                AppendRange {
+                    start_seq_num: 4,
+                    end_seq_num: 6,
+                },
+                1,
+            ),
+            Err(TsfClientError::InvalidAppendRange(_))
+        ));
+
+        let mut options = ReadStreamOptions::new(
+            "00000000000000000000000000000000"
+                .parse()
+                .expect("stream ID"),
+        );
+        options.start = Some(ReadStart::SeqNum(2));
+        assert!(validate_read_batch_for_request(&[sse_test_record(1, 0)], &options).is_err());
+        assert!(
+            validate_caught_up_for_request(
+                CaughtUpPosition {
+                    next_seq_num: 1,
+                    last_timestamp_ms: 0,
+                },
+                &options,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn dispatch_ack_rejects_more_records_than_are_pending() {
         let permits = Arc::new(Semaphore::new(2));
         let (ack_tx, _ack_rx) = oneshot::channel();
-        let record = WriteRecord::new(7, PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new());
+        let record = AppendRecord::new(7, PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new());
         let mut pending = VecDeque::from([PendingAppend {
             record,
             ack_tx,
@@ -2148,10 +3869,10 @@ mod tests {
             _record_permit: permits.try_acquire_owned().expect("record permit"),
         }]);
         let ack = AppendAck {
-            writer_seq_start: 7,
-            writer_seq_end: 8,
-            s2_seq_start: 42,
-            s2_seq_end: 43,
+            writer_start_seq_num: 7,
+            writer_end_seq_num: 9,
+            start_seq_num: 42,
+            end_seq_num: 44,
         };
 
         assert!(matches!(
@@ -2168,7 +3889,7 @@ mod tests {
         for writer_seq_num in [7, 9] {
             let (ack_tx, _ack_rx) = oneshot::channel();
             pending.push_back(PendingAppend {
-                record: WriteRecord::new(
+                record: AppendRecord::new(
                     writer_seq_num,
                     PartHeader::unsplit(),
                     RecordFormat::Bytes,
@@ -2180,10 +3901,10 @@ mod tests {
             });
         }
         let ack = AppendAck {
-            writer_seq_start: 7,
-            writer_seq_end: 8,
-            s2_seq_start: 42,
-            s2_seq_end: 43,
+            writer_start_seq_num: 7,
+            writer_end_seq_num: 9,
+            start_seq_num: 42,
+            end_seq_num: 44,
         };
 
         assert!(matches!(
@@ -2199,19 +3920,306 @@ mod tests {
         );
     }
 
-    #[test]
-    fn api_error_message_extracts_stable_code_and_message() {
-        let body = r#"{"error":{"code":"forbidden","message":"owner link required"}}"#;
+    #[tokio::test]
+    async fn sse_parser_accepts_multiple_complete_events_in_one_large_chunk() {
+        let payload = format!(
+            "event: first\ndata: {}\n\nevent: second\ndata: {}\n\n",
+            "a".repeat(1_100_000),
+            "b".repeat(1_100_000),
+        );
+        let mut body: SseBody =
+            Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                Bytes::from(payload),
+            )]));
+        let mut parser = SseParser::default();
 
         assert_eq!(
-            api_error_message(body).as_deref(),
-            Some("forbidden: owner link required")
+            next_sse_event(&mut body, &mut parser)
+                .await
+                .expect("first event")
+                .expect("first event value")
+                .event,
+            "first"
+        );
+        assert_eq!(
+            next_sse_event(&mut body, &mut parser)
+                .await
+                .expect("second event")
+                .expect("second event value")
+                .event,
+            "second"
         );
     }
 
+    #[tokio::test]
+    async fn sse_parser_accepts_an_event_fragmented_across_chunks() {
+        let payload = "event: read_batch\ndata: split 😀 payload\n\n".as_bytes();
+        let chunks = payload
+            .chunks(7)
+            .map(|chunk| Ok::<_, reqwest::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(chunks));
+        let mut parser = SseParser::default();
+
+        let event = next_sse_event(&mut body, &mut parser)
+            .await
+            .expect("fragmented event")
+            .expect("fragmented event value");
+        assert_eq!(event.event, "read_batch");
+        assert_eq!(event.data, "split 😀 payload");
+    }
+
+    #[tokio::test]
+    async fn sse_parser_rejects_one_oversized_completed_event() {
+        let payload = format!(
+            "event: read_batch\ndata: {}\n\n",
+            "a".repeat(MAX_SSE_EVENT_BYTES)
+        );
+        let mut body: SseBody =
+            Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                Bytes::from(payload),
+            )]));
+        let mut parser = SseParser::default();
+
+        assert!(matches!(
+            next_sse_event(&mut body, &mut parser).await,
+            Err(TsfClientError::InvalidSse("event exceeds 2 MiB"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_parser_rejects_an_oversized_fragmented_event() {
+        let first = format!(
+            "event: read_batch\ndata: {}",
+            "a".repeat(MAX_SSE_UNTERMINATED_EVENT_BYTES / 2)
+        );
+        let second = "a".repeat(MAX_SSE_UNTERMINATED_EVENT_BYTES / 2 + 1);
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(vec![
+            Ok::<_, reqwest::Error>(Bytes::from(first)),
+            Ok::<_, reqwest::Error>(Bytes::from(second)),
+        ]));
+        let mut parser = SseParser::default();
+
+        assert!(matches!(
+            next_sse_event(&mut body, &mut parser).await,
+            Err(TsfClientError::InvalidSse(
+                "unterminated event exceeds 2 MiB"
+            ))
+        ));
+    }
+
     #[test]
-    fn api_error_message_leaves_non_standard_body_for_fallback() {
-        assert_eq!(api_error_message("plain failure"), None);
+    fn sse_batch_validation_enforces_decoded_bounds_and_read_limits() {
+        assert!(validate_sse_read_batch_count(0).is_err());
+        assert!(validate_sse_read_batch_count(MAX_SSE_READ_BATCH_RECORDS + 1).is_err());
+
+        let mut options = ReadStreamOptions::new(
+            "00000000000000000000000000000000"
+                .parse()
+                .expect("stream ID"),
+        );
+        let aggregate = [0, 1, 2].map(|seq_num| sse_test_record(seq_num, 400 * 1024));
+        assert!(validate_sse_read_batch(&aggregate, &options).is_err());
+
+        options.limit = Some(1);
+        let two = [sse_test_record(0, 0), sse_test_record(1, 0)];
+        assert!(validate_sse_read_batch(&two, &options).is_err());
+
+        options.limit = None;
+        options.end_seq_num = Some(1);
+        assert!(validate_sse_read_batch(&two, &options).is_err());
+
+        let non_contiguous = [sse_test_record(0, 0), sse_test_record(2, 0)];
+        options.end_seq_num = None;
+        assert!(validate_sse_read_batch(&non_contiguous, &options).is_err());
+
+        let oversized = SseReadRecord {
+            seq_num: 0,
+            timestamp_ms: 0,
+            writer_id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
+            writer_seq_num: 0,
+            part: RestRecordPart {
+                index: 0,
+                is_final: true,
+            },
+            format: RecordFormat::Bytes,
+            data: RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_BYTES + 1])),
+        };
+        assert!(sse_read_record(oversized).is_err());
+    }
+
+    #[test]
+    fn sse_cursor_validation_binds_positions_counts_and_snapshot_timestamps() {
+        let mut options = ReadStreamOptions::new(
+            "00000000000000000000000000000000"
+                .parse()
+                .expect("stream ID"),
+        );
+        options.start = Some(ReadStart::SeqNum(0));
+        let records = [sse_test_record(0, 0)];
+        assert!(
+            validate_sse_read_batch_cursor(
+                &records,
+                ParsedSseResumeCursor {
+                    next_seq_num: 2,
+                    consumed_records: 1,
+                    snapshot: None,
+                },
+                None,
+                &options,
+                None,
+            )
+            .is_err()
+        );
+        let previous = ParsedSseResumeCursor {
+            next_seq_num: 1,
+            consumed_records: 1,
+            snapshot: None,
+        };
+        assert!(
+            validate_sse_caught_up_cursor(
+                CaughtUpPosition {
+                    next_seq_num: 2,
+                    last_timestamp_ms: 0,
+                },
+                ParsedSseResumeCursor {
+                    next_seq_num: 2,
+                    consumed_records: 1,
+                    snapshot: None,
+                },
+                Some(previous),
+                &options,
+                None,
+            )
+            .is_err()
+        );
+
+        let boundary = SnapshotBoundary {
+            end_seq_num: 2,
+            last_timestamp_ms: 10,
+        };
+        assert!(
+            validate_sse_snapshot_cursor(
+                boundary,
+                ParsedSseResumeCursor {
+                    next_seq_num: 0,
+                    consumed_records: 0,
+                    snapshot: Some((2, 11)),
+                },
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    fn sse_test_record(seq_num: u64, payload_bytes: usize) -> ReadRecord {
+        ReadRecord {
+            seq_num,
+            timestamp_ms: seq_num,
+            writer_id: WriterId::from_bytes([0_u8; 16]),
+            writer_seq_num: seq_num,
+            part: PartHeader::unsplit(),
+            format: RecordFormat::Bytes,
+            data: Bytes::from(vec![0_u8; payload_bytes]),
+        }
+    }
+
+    #[test]
+    fn stateless_append_compacts_an_escape_heavy_maximum_record() {
+        let data = vec![0_u8; MAX_RECORD_BYTES];
+        let encoded = compact_record_data(&data);
+        assert!(matches!(encoded, RecordData::Base64url(_)));
+        let request = AppendRecordsRequest {
+            client_writer_id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
+            writer_start_seq_num: 0,
+            records: vec![AppendJsonRecord {
+                part: None,
+                format: RecordFormat::Transcript,
+                data: encoded,
+            }],
+            expected_next_seq_num: None,
+        };
+        let json = serde_json::to_vec(&request).expect("append request JSON");
+        assert!(json.len() <= crate::protocol::rest::MAX_STATELESS_APPEND_JSON_BYTES);
+    }
+
+    #[tokio::test]
+    async fn stateless_append_rejects_aggregate_payload_and_max_writer_sequence() {
+        let client = TsfClient::new();
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let secret = LinkSecret::from("A".repeat(43));
+        let large = vec![
+            AppendRecord::new(
+                0,
+                PartHeader::unsplit(),
+                RecordFormat::Bytes,
+                Bytes::from(vec![0; 500 * 1024]),
+            ),
+            AppendRecord::new(
+                1,
+                PartHeader::unsplit(),
+                RecordFormat::Bytes,
+                Bytes::from(vec![0; 500 * 1024]),
+            ),
+        ];
+        assert!(matches!(
+            client
+                .append_records(
+                    &stream_id,
+                    ClientWriterId::from_bytes([0; 16]),
+                    &large,
+                    None,
+                    &secret
+                )
+                .await,
+            Err(TsfClientError::InvalidStatelessAppend(
+                "append payload must not exceed 900 KiB"
+            ))
+        ));
+
+        let endpoint = [AppendRecord::new(
+            u64::MAX,
+            PartHeader::unsplit(),
+            RecordFormat::Bytes,
+            Bytes::new(),
+        )];
+        assert!(matches!(
+            client
+                .append_records(
+                    &stream_id,
+                    ClientWriterId::from_bytes([0; 16]),
+                    &endpoint,
+                    None,
+                    &secret,
+                )
+                .await,
+            Err(TsfClientError::InvalidStatelessAppend(
+                "writer sequence range must end before u64::MAX"
+            ))
+        ));
+
+        let valid = [AppendRecord::new(
+            0,
+            PartHeader::unsplit(),
+            RecordFormat::Bytes,
+            Bytes::new(),
+        )];
+        assert!(matches!(
+            client
+                .append_records(
+                    &stream_id,
+                    ClientWriterId::from_bytes([0; 16]),
+                    &valid,
+                    Some(MAX_READ_SELECTOR_VALUE + 1),
+                    &secret,
+                )
+                .await,
+            Err(TsfClientError::InvalidStatelessAppend(
+                "expected next sequence exceeds the data adapter range"
+            ))
+        ));
     }
 
     #[test]

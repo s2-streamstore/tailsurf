@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     extract::{
         Path, Query, State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -23,21 +23,20 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    CreateStreamIdempotencyKey, LinkId, LinkLabel, LinkPermissions, LinkSecret, RetryPolicy,
-    StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfProducerConfig,
-    WriteRecord, WriterId,
+    AppendRecord, ClientWriterId, CreateStreamIdempotencyKey, LinkId, LinkPermissions, LinkSecret,
+    RetryPolicy, StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError,
+    TsfWriterConfig, WriterId,
     protocol::{
         rest::{
-            CreateStreamRequest, CreateStreamResponse, InitialStreamLink, IssueLinkRequest,
-            IssueLinkResponse, IssuedStreamLink, ListLinksResponse, RenameLinkRequest,
-            StreamInfoResponse, StreamLinkStatus, StreamLinkSummary, StreamTailResponse,
-            StreamTitleUpdate, UpdateStreamRequest, Visibility,
+            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, StreamLinkCredential,
+            StreamLinkStatus, StreamLinkSummary, StreamMetadata, StreamTitleUpdate,
+            UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat,
-                ServerFrame, TSF_V3, TSF_WS_PROTOCOL,
+                CaughtUpPosition, ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord,
+                RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -116,11 +115,11 @@ async fn new_outputs_json_and_link_files() {
             "Link file test",
             "--json",
             "--link",
-            "owner=Owner",
+            "owner=owner",
             "--link",
-            "read=Reader",
+            "reader=read",
             "--link",
-            "write=Writer",
+            "writer=write",
             "--owner-link-file",
             owner_file.to_str().expect("owner path"),
             "--read-link-file",
@@ -144,9 +143,9 @@ async fn new_outputs_json_and_link_files() {
             .is_some_and(|links| links.iter().all(|link| link.get("secret").is_none()))
     );
     for (path, label) in [
-        (&owner_file, "Owner"),
-        (&read_file, "Reader"),
-        (&write_file, "Writer"),
+        (&owner_file, "owner"),
+        (&read_file, "reader"),
+        (&write_file, "writer"),
     ] {
         let url = created_link_url(&json, label);
         let locator = StreamLocator::parse(url).expect("matching URL parses");
@@ -179,7 +178,7 @@ async fn new_outputs_json_and_link_files() {
 }
 
 #[tokio::test]
-async fn new_prints_recovery_links_before_a_link_file_error() {
+async fn new_prints_created_links_before_a_link_file_error() {
     let server = TestServer::start().await;
     let unwritable_path = std::env::temp_dir().join(format!(
         "tsf-cli-unwritable-link-{}-{}",
@@ -204,8 +203,8 @@ async fn new_prints_recovery_links_before_a_link_file_error() {
     .await;
 
     assert!(!output.status.success());
-    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("recovery JSON");
-    let owner_link = created_link_url(&json, "Owner");
+    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("creation JSON");
+    let owner_link = created_link_url(&json, "owner");
     let locator = StreamLocator::parse(owner_link).expect("owner link parses");
     assert!(
         locator
@@ -248,13 +247,20 @@ async fn create_stream_recovers_a_committed_truncated_response() {
     server.fail_next_create_body();
     let key = CreateStreamIdempotencyKey::new_random();
     let exposed_key = key.expose_secret().to_owned();
+    let request = CreateStreamRequest::default();
+    let expected_owner_secret = request.links[0].secret.expose_secret().to_owned();
 
-    let created = TsfClient::with_api_base_url(server.api_url.clone())
-        .create_stream_with_idempotency_key(&CreateStreamRequest::default(), &key)
+    let created = TsfClient::with_api_origin(server.api_url.clone())
+        .expect("valid API origin")
+        .create_stream_with_idempotency_key(&request, &key)
         .await
         .expect("recover committed create");
 
     assert_eq!(created.links.len(), 1);
+    assert_eq!(
+        created.links[0].secret.expose_secret(),
+        expected_owner_secret
+    );
     let observed_keys = server.create_idempotency_keys();
     assert_eq!(observed_keys.len(), 2);
     assert!(
@@ -267,49 +273,9 @@ async fn create_stream_recovers_a_committed_truncated_response() {
 }
 
 #[tokio::test]
-async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
-    let server = TestServer::start_with_create_failures(3).await;
-
-    let failed = run_tsf(&server, ["new", "--json"], None).await;
-
-    assert!(!failed.status.success());
-    let recovery_key = failed
-        .stderr
-        .split("recovery key (keep it secret):\n")
-        .nth(1)
-        .and_then(|suffix| suffix.lines().next())
-        .expect("recovery key in error");
-    recovery_key
-        .parse::<CreateStreamIdempotencyKey>()
-        .expect("canonical recovery key");
-    assert!(failed.stderr.contains("TSF_CREATE_IDEMPOTENCY_KEY"));
-    assert!(!failed.stderr.contains("with --create-idempotency-key"));
-    let failed_keys = server.create_idempotency_keys();
-    assert_eq!(failed_keys.len(), 3);
-    assert!(
-        failed_keys
-            .iter()
-            .all(|observed| observed.as_deref() == Some(recovery_key))
-    );
-
-    let recovered = run_tsf(
-        &server,
-        ["new", "--json", "--create-idempotency-key", recovery_key],
-        None,
-    )
-    .await;
-
-    assert!(recovered.status.success(), "stderr={}", recovered.stderr);
-    let recovered_keys = server.create_idempotency_keys();
-    assert_eq!(recovered_keys.len(), 4);
-    assert_eq!(recovered_keys[3].as_deref(), Some(recovery_key));
-    server.abort();
-}
-
-#[tokio::test]
 async fn create_stream_is_always_anonymous() {
     let server = TestServer::start().await;
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
 
     client
         .create_stream(&CreateStreamRequest::default())
@@ -328,26 +294,26 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(private.status.success(), "stderr={}", private.stderr);
     assert_eq!(
         normalize_created_stream_output(&private.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
-    assert_created_links_parse(&private.stdout, &[("Reader", "r"), ("Owner", "o")]);
+    assert_created_links_parse(&private.stdout, &[("reader", "r"), ("owner", "o")]);
 
     let public = run_tsf(&server, ["new", "--public"], None).await;
     assert!(public.status.success(), "stderr={}", public.stderr);
     assert_eq!(
         normalize_created_stream_output(&public.stdout),
-        "Created public stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Public read <url> (public)\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created public stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Public read <url> (public)\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
-    assert_created_links_parse(&public.stdout, &[("Owner", "o")]);
+    assert_created_links_parse(&public.stdout, &[("owner", "o")]);
 
     let explicit = run_tsf(
         &server,
         [
             "new",
             "--link",
-            "read-write=Combined",
+            "combined=read-write",
             "--link",
-            "read=Reader",
+            "reader=read",
         ],
         None,
     )
@@ -355,23 +321,23 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Combined read-write <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  combined read-write <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert_created_links_parse(
         &explicit.stdout,
-        &[("Owner", "o"), ("Combined", "rw"), ("Reader", "r")],
+        &[("owner", "o"), ("combined", "rw"), ("reader", "r")],
     );
 
     server.abort();
 }
 
 #[tokio::test]
-async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
+async fn new_uses_an_explicit_owner_rejects_duplicate_ids_and_limits_links() {
     let server = TestServer::start().await;
 
     let deduplicated = run_tsf(
         &server,
-        ["new", "--link", "owner=Admin", "--link", "read=Reader"],
+        ["new", "--link", "admin=owner", "--link", "reader=read"],
         None,
     )
     .await;
@@ -380,18 +346,19 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
         "stderr={}",
         deduplicated.stderr
     );
-    assert_created_links_parse(&deduplicated.stdout, &[("Admin", "o"), ("Reader", "r")]);
+    assert_created_links_parse(&deduplicated.stdout, &[("admin", "o"), ("reader", "r")]);
 
-    let duplicate_labels = run_tsf(
+    let duplicate_ids = run_tsf(
         &server,
-        ["new", "--link", "read=Same", "--link", "write=Same"],
+        ["new", "--link", "same=read", "--link", "same=write"],
         None,
     )
     .await;
+    assert!(!duplicate_ids.status.success());
     assert!(
-        duplicate_labels.status.success(),
-        "stderr={}",
-        duplicate_labels.stderr
+        duplicate_ids
+            .stderr
+            .contains("initial Link IDs must be unique")
     );
 
     let too_many = run_tsf(
@@ -399,11 +366,11 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
         [
             "new",
             "--link",
-            "read=Reader",
+            "reader=read",
             "--link",
-            "write=Writer",
+            "writer=write",
             "--link",
-            "read-write=Combined",
+            "combined=read-write",
         ],
         None,
     )
@@ -412,11 +379,11 @@ async fn new_uses_an_explicit_owner_allows_duplicate_labels_and_limits_links() {
     assert!(
         too_many
             .stderr
-            .contains("at most 3 initial links may be issued"),
+            .contains("at most 3 initial links may be created"),
         "stderr={}",
         too_many.stderr
     );
-    assert_eq!(server.create_idempotency_keys().len(), 2);
+    assert_eq!(server.create_idempotency_keys().len(), 1);
 
     server.abort();
 }
@@ -430,7 +397,7 @@ async fn new_link_files_require_the_exact_requested_permission() {
         [
             "new",
             "--link",
-            "read-write=Combined",
+            "combined=read-write",
             "--write-link-file",
             "unused.link",
         ],
@@ -512,7 +479,7 @@ async fn piped_input_without_a_subcommand_creates_and_writes() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     StreamLocator::parse(read_link).expect("valid read link");
 
@@ -530,7 +497,7 @@ async fn capture_then_replay_round_trips_piped_input() {
     assert!(output.status.success(), "stderr={}", output.stderr);
     assert_eq!(
         normalize_created_stream_output(&output.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Reader read <url>\n  Owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert!(
         output.stderr.contains("1 record durable"),
@@ -540,7 +507,7 @@ async fn capture_then_replay_round_trips_piped_input() {
     let owner_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Owner"))
+        .find_map(|line| extract_link_line(line, "owner"))
         .expect("owner link");
     let owner_secret = StreamLocator::parse(owner_link)
         .expect("valid owner link")
@@ -552,7 +519,7 @@ async fn capture_then_replay_round_trips_piped_input() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     StreamLocator::parse(read_link).expect("valid read link");
 
@@ -595,7 +562,7 @@ async fn capture_command_streams_output_and_propagates_exit_status() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
 
     let replay = run_tsf(&server, ["replay", read_link], None).await;
@@ -618,16 +585,16 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_stream_link(read_link);
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.count = Some(3);
+    request.limit = Some(3);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut records = Vec::new();
@@ -674,7 +641,7 @@ async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() 
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link is printed before writing");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     assert_eq!(server.record_count(&locator.stream_id), 0);
@@ -692,16 +659,16 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_stream_link(read_link);
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.count = Some(16);
+    request.limit = Some(16);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut records = Vec::new();
@@ -760,16 +727,16 @@ async fn write_raw_flushes_on_linger() {
     let read_link = output
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Reader"))
+        .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_stream_link(read_link);
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.count = Some(2);
+    request.limit = Some(2);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut data = Vec::new();
@@ -812,7 +779,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         let mut line = String::new();
         let read = stdout.read_line(&mut line).await.expect("read created URL");
         assert!(read > 0, "tsf exited before printing a read link");
-        if let Some(url) = extract_link_line(&line, "Reader") {
+        if let Some(url) = extract_link_line(&line, "reader") {
             break url.trim_end().to_owned();
         }
     };
@@ -855,7 +822,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
 }
 
 #[tokio::test]
-async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
+async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret() {
     let server = FakeWriteServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -864,7 +831,12 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["write", write_link.as_str()],
+        [
+            "write",
+            write_link.as_str(),
+            "--expected-next-seq-num",
+            "12",
+        ],
         Some("retry me\n"),
     )
     .await;
@@ -872,9 +844,11 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
     assert!(output.status.success(), "stderr={}", output.stderr);
     let attempts = server.append_attempts();
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].writer_id, attempts[1].writer_id);
+    assert_eq!(attempts[0].client_writer_id, attempts[1].client_writer_id);
     assert_eq!(attempts[0].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[1].link_secret, TEST_STREAM_LINK);
+    assert_eq!(attempts[0].expected_next_seq_num, Some(12));
+    assert_eq!(attempts[1].expected_next_seq_num, None);
     assert_eq!(attempts[0].writer_seq_num, 0);
     assert_eq!(attempts[1].writer_seq_num, 0);
     assert_eq!(attempts[0].data.as_ref(), b"retry me\n");
@@ -888,54 +862,53 @@ async fn write_reconnect_reuses_writer_identity_and_unacked_sequence() {
 }
 
 #[tokio::test]
-async fn producer_close_is_not_blocked_by_an_unused_reservation() {
+async fn writer_close_is_not_blocked_by_an_unused_reservation() {
     let server = FakeWriteServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let producer = client
-        .connect_producer_with_config(
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let writer = client
+        .connect_writer_with_config(
             tailsurf::protocol::ws::WriteStreamOptions::new(
                 stream_id,
-                WriterId::new_random(),
-                "write-secret",
+                ClientWriterId::new_random(),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
-            TsfProducerConfig {
+            TsfWriterConfig {
                 max_unacked_bytes: 1,
                 max_unacked_records: 1,
-                max_reconnect_attempts: 0,
             },
         )
         .await
-        .expect("producer");
-    let _permit = producer.reserve(1).await.expect("reservation");
+        .expect("writer");
+    let _permit = writer.reserve(1).await.expect("reservation");
 
-    timeout(Duration::from_secs(1), producer.close())
+    timeout(Duration::from_secs(1), writer.close())
         .await
-        .expect("producer close must not wait for reservation")
-        .expect("producer close");
+        .expect("writer close must not wait for reservation")
+        .expect("writer close");
 
     server.abort();
 }
 
 #[tokio::test]
-async fn default_producer_enforces_record_and_byte_windows() {
-    assert_default_producer_window(128, Bytes::from_static(b"x")).await;
-    assert_default_producer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
+async fn default_writer_enforces_record_and_byte_windows() {
+    assert_default_writer_window(128, Bytes::from_static(b"x")).await;
+    assert_default_writer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
 }
 
-async fn assert_default_producer_window(capacity: usize, payload: Bytes) {
+async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
     let server = HoldingWriteServer::start(capacity).await;
-    let producer = connect_default_producer(&server.api_url).await;
+    let writer = connect_default_writer(&server.api_url).await;
     let record_count = u64::try_from(capacity).expect("window capacity fits u64");
     let mut tickets = Vec::new();
     for writer_seq_num in 0..record_count {
         tickets.push(
-            producer
+            writer
                 .submit(test_write_record(writer_seq_num, payload.clone()))
                 .await
-                .expect("submit within producer window"),
+                .expect("submit within writer window"),
         );
     }
     server.wait_for_records(capacity).await;
@@ -943,11 +916,11 @@ async fn assert_default_producer_window(capacity: usize, payload: Bytes) {
     assert!(
         timeout(
             Duration::from_millis(100),
-            producer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
+            writer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
         )
         .await
         .is_err(),
-        "submit beyond the producer window must wait for an acknowledgement"
+        "submit beyond the writer window must wait for an acknowledgement"
     );
 
     server.release_acknowledgements();
@@ -956,24 +929,24 @@ async fn assert_default_producer_window(capacity: usize, payload: Bytes) {
     }
     let final_ticket = timeout(
         Duration::from_secs(1),
-        producer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
+        writer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
     )
     .await
-    .expect("producer window reopened")
+    .expect("writer window reopened")
     .expect("final submit");
     final_ticket.await.expect("final acknowledgement");
-    producer.close().await.expect("producer close");
+    writer.close().await.expect("writer close");
     server.abort();
 }
 
 #[tokio::test]
-async fn producer_reconnect_resends_every_unacknowledged_record_in_order() {
+async fn writer_reconnect_resends_every_unacknowledged_record_in_order() {
     let server = HoldingWriteServer::start_reconnecting(3).await;
-    let producer = connect_default_producer(&server.api_url).await;
+    let writer = connect_default_writer(&server.api_url).await;
     let mut tickets = Vec::new();
     for writer_seq_num in 0..3 {
         tickets.push(
-            producer
+            writer
                 .submit(test_write_record(
                     writer_seq_num,
                     Bytes::from(format!("record-{writer_seq_num}")),
@@ -998,18 +971,18 @@ async fn producer_reconnect_resends_every_unacknowledged_record_in_order() {
     assert!(
         attempts
             .iter()
-            .all(|attempt| attempt.writer_id == attempts[0].writer_id)
+            .all(|attempt| attempt.client_writer_id == attempts[0].client_writer_id)
     );
     assert_eq!(attempts[0].data, attempts[3].data);
     assert_eq!(attempts[1].data, attempts[4].data);
     assert_eq!(attempts[2].data, attempts[5].data);
 
-    producer.close().await.expect("producer close");
+    writer.close().await.expect("writer close");
     server.abort();
 }
 
 #[tokio::test]
-async fn tail_reconnect_resumes_after_last_s2_sequence() {
+async fn tail_reconnect_resumes_after_last_sequence() {
     let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1030,22 +1003,76 @@ async fn tail_reconnect_resumes_after_last_s2_sequence() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[1].link_secret, TEST_STREAM_LINK);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(
-        attempts[1].query.get("seq_num").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(attempts[1].query.get("tail_offset"), None);
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(0));
+    assert_eq!(attempts[1].start, ReadStart::SeqNum(1));
 
     server.abort();
 }
 
 #[tokio::test]
-async fn tail_selector_flags_are_resolved_as_read_query() {
+async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
+    let server = FakeSseServer::start().await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
+    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+
+    let output = run_tsf_with_api_url(
+        server.api_url.clone(),
+        ["tail", "--sse", "--limit", "1", read_link.as_str()],
+        None,
+    )
+    .await;
+
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    assert_eq!(output.stdout, "");
+    let attempts = server.attempts();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].query, attempts[1].query);
+    let query = attempts[0].query.as_deref().expect("SSE query");
+    let query = Url::parse(&format!("http://localhost/?{query}")).expect("parse captured query");
+    assert_eq!(
+        query.query_pairs().collect::<HashMap<_, _>>(),
+        HashMap::from([
+            ("tail_offset".into(), "0".into()),
+            ("limit".into(), "1".into()),
+        ])
+    );
+    assert_eq!(attempts[0].last_event_id, None);
+    assert_eq!(attempts[1].last_event_id.as_deref(), Some("v1,0,0"));
+    assert!(attempts.iter().all(|attempt| {
+        attempt.authorization.as_deref() == Some(&format!("Bearer {TEST_STREAM_LINK}"))
+    }));
+    server.abort();
+}
+
+#[tokio::test]
+async fn sse_snapshot_receives_an_explicit_empty_boundary() {
+    let server = FakeSseServer::start().await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut options = ReadStreamOptions::new(stream_id);
+    options.start = Some(ReadStart::SeqNum(0));
+    options.snapshot = true;
+    options.link_secret = Some(TEST_STREAM_LINK.into());
+
+    let session = TsfClient::with_api_origin(server.api_url.clone())
+        .expect("valid API origin")
+        .connect_sse_reader(options)
+        .await
+        .expect("snapshot SSE session");
+
+    assert_eq!(
+        session.snapshot_boundary(),
+        Some(SnapshotBoundary {
+            end_seq_num: 0,
+            last_timestamp_ms: 0,
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn tail_selector_flags_are_sent_in_open_read() {
     let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1064,16 +1091,8 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     assert_eq!(tail_offset_output.stderr, "");
     let attempts = tail_offset_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("7")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(25));
+    assert_eq!(attempts[0].limit, Some(7));
     tail_offset_server.abort();
 
     let seq_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
@@ -1089,16 +1108,8 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     assert_eq!(seq_output.stderr, "");
     let attempts = seq_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("42")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(42));
+    assert_eq!(attempts[0].limit, Some(3));
     seq_server.abort();
 
     let timestamp_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
@@ -1119,18 +1130,13 @@ async fn tail_selector_flags_are_resolved_as_read_query() {
     assert_eq!(timestamp_output.stderr, "");
     let attempts = timestamp_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("timestamp").map(String::as_str),
-        Some("1781717406000")
-    );
-    assert_eq!(attempts[0].query.get("tail_offset"), None);
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
     timestamp_server.abort();
 }
 
 #[tokio::test]
-async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position() {
-    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+async fn empty_caught_up_establishes_the_reconnect_position() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectAfterEmptyCaughtUp).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1148,25 +1154,19 @@ async fn tail_offset_reconnect_before_first_record_keeps_the_resolved_position()
     assert_eq!(output.stderr, "");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert!(attempts.iter().all(|attempt| {
-        attempt.query.get("seq_num").map(String::as_str) == Some("5")
-            && !attempt.query.contains_key("tail_offset")
-    }));
-    assert_eq!(
-        server.tail_link_secrets(),
-        [Some(TEST_STREAM_LINK.to_owned())]
-    );
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
+    assert_eq!(attempts[1].start, ReadStart::SeqNum(5));
 
     server.abort();
 }
 
 #[tokio::test]
-async fn default_read_start_reconnect_before_first_record_keeps_tail_minus_eighty() {
+async fn default_read_start_reconnect_before_first_record_retries_the_default() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstDefault).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
     let request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1176,50 +1176,41 @@ async fn default_read_start_reconnect_before_first_record_keeps_tail_minus_eight
         .expect("read record")
         .expect("record");
 
-    assert_eq!(record.s2_seq_num, 20);
+    assert_eq!(record.seq_num, 20);
     assert_eq!(record.data.as_ref(), b"default\n");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert!(attempts.iter().all(|attempt| {
-        attempt.query.get("seq_num").map(String::as_str) == Some("20")
-            && !attempt.query.contains_key("tail_offset")
-    }));
-    assert_eq!(
-        server.tail_link_secrets(),
-        [Some(TEST_STREAM_LINK.to_owned())]
-    );
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(80));
+    assert_eq!(attempts[1].start, ReadStart::TailOffset(80));
 
     server.abort();
 }
 
 #[tokio::test]
-async fn reader_bounds_consecutive_reconnects_without_a_record() {
-    let server = FakeReadServer::start(FakeReadMode::ReconnectForever).await;
+async fn reader_restarts_retries_after_established_idle_connections() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectTwiceThenRecord).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone());
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
     config.retry_policy = RetryPolicy {
-        max_attempts: 3,
+        max_attempts: 2,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
     };
-    let client = TsfClient::with_config(config);
+    let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
-    let error = timeout(Duration::from_secs(2), reader.next_record())
+    let record = timeout(Duration::from_secs(2), reader.next_record())
         .await
         .expect("bounded reconnects")
-        .expect_err("no-progress reconnect limit");
+        .expect("recovered read")
+        .expect("record after reconnects");
 
-    assert!(matches!(
-        error,
-        TsfClientError::ReadReconnectLimitExceeded {
-            max_connection_attempts: 3
-        }
-    ));
+    assert_eq!(record.seq_num, 0);
+    assert_eq!(record.data.as_ref(), b"recovered\n");
     assert_eq!(server.read_attempts().len(), 3);
     server.abort();
 }
@@ -1230,13 +1221,13 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone());
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
     config.retry_policy = RetryPolicy {
         max_attempts: 100,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
     };
-    let client = TsfClient::with_config(config);
+    let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1261,11 +1252,11 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
 
 #[tokio::test]
 async fn reader_resumes_pending_reconnect_after_caller_timeout() {
-    let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstRecord).await;
+    let server = FakeReadServer::start(FakeReadMode::ReconnectAfterEmptyCaughtUp).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::TailOffset(2));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1286,7 +1277,7 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
         .expect("resumed reconnect")
         .expect("read record")
         .expect("record");
-    assert_eq!(record.s2_seq_num, 5);
+    assert_eq!(record.seq_num, 5);
     assert_eq!(record.data.as_ref(), b"stable\n");
     assert_eq!(server.read_attempts().len(), 2);
     server.abort();
@@ -1298,14 +1289,14 @@ async fn reader_reconnects_after_configured_idle_timeout() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone());
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
     config.websocket_read_idle_timeout = Some(Duration::from_millis(50));
     config.retry_policy = RetryPolicy {
         max_attempts: 3,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
     };
-    let client = TsfClient::with_config(config);
+    let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1316,14 +1307,14 @@ async fn reader_reconnects_after_configured_idle_timeout() {
         .expect("read record")
         .expect("record");
 
-    assert_eq!(record.s2_seq_num, 0);
+    assert_eq!(record.seq_num, 0);
     assert_eq!(record.data.as_ref(), b"after idle\n");
     assert_eq!(server.read_attempts().len(), 2);
     server.abort();
 }
 
 #[tokio::test]
-async fn zero_count_reads_complete_without_opening_a_socket() {
+async fn zero_limit_reads_complete_without_opening_a_socket() {
     let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1385,7 +1376,7 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
     let owner_link = public
         .stdout
         .lines()
-        .find_map(|line| extract_link_line(line, "Owner"))
+        .find_map(|line| extract_link_line(line, "owner"))
         .expect("owner link");
     let bad_owner_link = owner_link
         .split_once("#o=")
@@ -1447,11 +1438,32 @@ async fn replay_rejects_logical_records_above_configured_limit() {
 }
 
 #[tokio::test]
-async fn replay_selector_flags_are_sent_as_bounded_read_query() {
+async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+
+    let last_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
+    let last_output = run_tsf_with_api_url(
+        last_server.api_url.clone(),
+        ["replay", "--last", "2", read_link.as_str()],
+        None,
+    )
+    .await;
+
+    assert!(
+        last_output.status.success(),
+        "stderr={}",
+        last_output.stderr
+    );
+    let attempts = last_server.read_attempts();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
+    assert_eq!(attempts[0].end_seq_num, None);
+    assert_eq!(attempts[0].limit, None);
+    assert!(attempts[0].snapshot);
+    last_server.abort();
 
     let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
     let seq_output = run_tsf_with_api_url(
@@ -1464,19 +1476,10 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     assert!(seq_output.status.success(), "stderr={}", seq_output.stderr);
     let attempts = seq_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(2));
+    assert_eq!(attempts[0].end_seq_num, None);
+    assert_eq!(attempts[0].limit, None);
+    assert!(attempts[0].snapshot);
     seq_server.abort();
 
     let timestamp_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
@@ -1499,16 +1502,10 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     );
     let attempts = timestamp_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("timestamp").map(String::as_str),
-        Some("1781717406000")
-    );
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("3")
-    );
-    assert_eq!(attempts[0].query.get("count"), None);
-    assert_eq!(attempts[0].query.get("seq_num"), None);
+    assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
+    assert_eq!(attempts[0].end_seq_num, None);
+    assert_eq!(attempts[0].limit, None);
+    assert!(attempts[0].snapshot);
     timestamp_server.abort();
 
     let count_server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
@@ -1525,19 +1522,10 @@ async fn replay_selector_flags_are_sent_as_bounded_read_query() {
     );
     let attempts = count_server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("seq_num").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        attempts[0].query.get("count").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(attempts[0].query.get("timestamp"), None);
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(0));
+    assert_eq!(attempts[0].end_seq_num, None);
+    assert_eq!(attempts[0].limit, Some(1));
+    assert!(attempts[0].snapshot);
     count_server.abort();
 }
 
@@ -1560,10 +1548,8 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     assert_eq!(output.stderr, Vec::<u8>::new());
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].query.get("until").map(String::as_str),
-        Some("1")
-    );
+    assert_eq!(attempts[0].end_seq_num, None);
+    assert!(attempts[0].snapshot);
 
     server.abort();
 }
@@ -1580,16 +1566,16 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     assert!(created.status.success(), "stderr={}", created.stderr);
     let created_json: serde_json::Value =
         serde_json::from_str(&created.stdout).expect("create output");
-    let owner_link = created_link_url(&created_json, "Owner");
+    let owner_link = created_link_url(&created_json, "owner");
 
     let info = run_tsf(&server, ["info", owner_link, "--json"], None).await;
     assert!(info.status.success(), "stderr={}", info.stderr);
     let info_json: serde_json::Value =
-        serde_json::from_str(&info.stdout).expect("stream info output");
+        serde_json::from_str(&info.stdout).expect("stream metadata output");
     assert_eq!(info_json["stream_id"], created_json["stream_id"]);
     assert_eq!(info_json["title"], "Deploy log");
     assert_eq!(info_json["visibility"], "private");
-    assert_eq!(info_json["state"], "active");
+    assert!(info_json.get("state").is_none());
     assert_eq!(info_json["expires_at"], created_json["expires_at"]);
 
     let renewed = run_tsf(&server, ["renew", owner_link, "2d", "--json"], None).await;
@@ -1626,20 +1612,27 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         serde_json::from_str(&cleared.stdout).expect("title clear output");
     assert!(cleared_json["title"].is_null());
 
-    let issued = run_tsf(
+    let created_link = run_tsf(
         &server,
-        ["link", "issue", owner_link, "read=Deploy reader", "--json"],
+        ["link", "create", owner_link, "deploy-reader=read", "--json"],
         None,
     )
     .await;
-    assert!(issued.status.success(), "stderr={}", issued.stderr);
-    let issued_json: serde_json::Value =
-        serde_json::from_str(&issued.stdout).expect("issue output");
-    let issued_url = issued_json["url"].as_str().expect("issued URL");
-    StreamLocator::parse(issued_url).expect("issued URL parses");
-    let link_id = issued_json["link_id"].as_str().expect("link id").to_owned();
-    assert_eq!(issued_json["label"], "Deploy reader");
-    assert!(issued_json.get("secret").is_none());
+    assert!(
+        created_link.status.success(),
+        "stderr={}",
+        created_link.stderr
+    );
+    let created_link_json: serde_json::Value =
+        serde_json::from_str(&created_link.stdout).expect("create link output");
+    let created_url = created_link_json["url"].as_str().expect("created URL");
+    StreamLocator::parse(created_url).expect("created URL parses");
+    let link_id = created_link_json["link_id"]
+        .as_str()
+        .expect("link id")
+        .to_owned();
+    assert_eq!(created_link_json["link_id"], "deploy-reader");
+    assert!(created_link_json.get("secret").is_none());
 
     server.fail_next_link_list();
     let listed = run_tsf(&server, ["link", "list", owner_link, "--json"], None).await;
@@ -1655,41 +1648,9 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         Some(&serde_json::Value::String("active".to_owned()))
     );
 
-    let link_prefix = &link_id[..8];
-    let renamed = run_tsf(
-        &server,
-        [
-            "link",
-            "rename",
-            owner_link,
-            link_prefix,
-            "CI reader",
-            "--json",
-        ],
-        None,
-    )
-    .await;
-    assert!(renamed.status.success(), "stderr={}", renamed.stderr);
-    let renamed_json: serde_json::Value =
-        serde_json::from_str(&renamed.stdout).expect("rename output");
-    assert_eq!(renamed_json["link_id"], link_id);
-    assert_eq!(renamed_json["status"], "renamed");
-    assert_eq!(renamed_json["label"], "CI reader");
-
-    let listed = run_tsf(&server, ["link", "list", owner_link, "--json"], None).await;
-    let listed_json: serde_json::Value =
-        serde_json::from_str(&listed.stdout).expect("renamed link list output");
-    assert_eq!(
-        listed_json["links"]
-            .as_array()
-            .and_then(|links| links.iter().find(|link| link["link_id"] == link_id))
-            .map(|link| &link["label"]),
-        Some(&serde_json::Value::String("CI reader".to_owned()))
-    );
-
     let revoked = run_tsf(
         &server,
-        ["link", "revoke", owner_link, link_prefix, "--json"],
+        ["link", "revoke", owner_link, link_id.as_str(), "--json"],
         None,
     )
     .await;
@@ -1752,17 +1713,10 @@ impl TestServer {
                     .patch(test_update_stream)
                     .delete(test_delete_stream),
             )
-            .route(
-                "/api/v1/streams/{stream_id}/tail",
-                get(test_get_stream_tail),
-            )
-            .route(
-                "/api/v1/streams/{stream_id}/links",
-                get(test_list_links).post(test_issue_link),
-            )
+            .route("/api/v1/streams/{stream_id}/links", get(test_list_links))
             .route(
                 "/api/v1/streams/{stream_id}/links/{link_id}",
-                axum::routing::patch(test_rename_link).delete(test_revoke_link),
+                axum::routing::put(test_create_link).delete(test_revoke_link),
             )
             .route("/api/v1/streams/{stream_id}/write", get(test_write_socket))
             .route("/api/v1/streams/{stream_id}/read", get(test_read_socket))
@@ -1859,7 +1813,6 @@ impl TestServer {
 #[derive(Default)]
 struct TestApiState {
     next_stream: Mutex<u64>,
-    next_link: Mutex<u64>,
     create_failures_remaining: Mutex<usize>,
     create_invalid_json_remaining: Mutex<usize>,
     create_responses: Mutex<HashMap<String, CreateStreamResponse>>,
@@ -1883,15 +1836,20 @@ struct TestStream {
 #[derive(Clone)]
 struct TestLink {
     link_id: LinkId,
-    label: LinkLabel,
     permissions: LinkPermissions,
     secret: LinkSecret,
     active: bool,
 }
 
+#[derive(serde::Deserialize)]
+struct TestCreateLinkInput {
+    secret: String,
+    permissions: LinkPermissions,
+}
+
 #[derive(Clone)]
 struct TestRecord {
-    s2_seq_num: u64,
+    seq_num: u64,
     timestamp_ms: u64,
     writer_id: WriterId,
     writer_seq_num: u64,
@@ -1948,17 +1906,18 @@ async fn test_create_stream(
         return Json(response).into_response();
     }
 
-    let expires_in_secs = request.expires_in_secs.unwrap_or(864_000);
-    if expires_in_secs > 864_000 {
+    let expires_in_seconds = request.expires_in_seconds.unwrap_or(864_000);
+    if expires_in_seconds > 864_000 {
         return test_error(
             StatusCode::FORBIDDEN,
             "free_plan_limit",
             FREE_EXPIRY_LIMIT_MESSAGE,
         );
     }
-    let expires_at =
-        humantime::format_rfc3339_seconds(SystemTime::now() + Duration::from_secs(expires_in_secs))
-            .to_string();
+    let expires_at = humantime::format_rfc3339_seconds(
+        SystemTime::now() + Duration::from_secs(expires_in_seconds),
+    )
+    .to_string();
     let stream_id = {
         let mut next_stream = state.next_stream.lock().expect("next stream lock");
         let stream_id = format!("{:032x}", *next_stream)
@@ -1967,18 +1926,15 @@ async fn test_create_stream(
         *next_stream += 1;
         stream_id
     };
-    let requested_links = request
-        .issue_links
-        .unwrap_or_else(|| vec![test_initial_link("Owner", LinkPermissions::owner())]);
+    let requested_links = request.links;
     let links = requested_links
         .into_iter()
-        .map(|link| test_issue_stream_link(&state, link.label, link.permissions))
+        .map(|link| test_store_stream_link(link.link_id, link.secret, link.permissions))
         .collect::<Vec<_>>();
     let response_links = links
         .iter()
-        .map(|link| IssuedStreamLink {
-            link_id: link.link_id,
-            label: link.label.clone(),
+        .map(|link| StreamLinkCredential {
+            link_id: link.link_id.clone(),
             permissions: link.permissions,
             secret: link.secret.clone(),
         })
@@ -2001,6 +1957,7 @@ async fn test_create_stream(
         stream_id,
         title: request.title,
         visibility: request.visibility,
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at,
         links: response_links,
     };
@@ -2093,30 +2050,11 @@ async fn test_delete_stream(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn test_get_stream_tail(
+async fn test_create_link(
     State(state): State<Arc<TestApiState>>,
-    Path(stream_id): Path<String>,
-) -> Response {
-    let streams = state.streams.lock().expect("streams lock");
-    let Some(stream) = streams.get(&stream_id) else {
-        return test_error(StatusCode::NOT_FOUND, "not_found", "stream not found");
-    };
-    if stream.deleted {
-        return test_error(StatusCode::CONFLICT, "conflict", "stream is deleted");
-    }
-    Json(StreamTailResponse {
-        stream_id: stream.stream_id,
-        next_s2_seq_num: stream.records.len() as u64,
-        last_timestamp_ms: stream.records.last().map(|_| 1_781_717_406_000),
-    })
-    .into_response()
-}
-
-async fn test_issue_link(
-    State(state): State<Arc<TestApiState>>,
-    Path(stream_id): Path<String>,
+    Path((stream_id, link_id)): Path<(String, LinkId)>,
     headers: HeaderMap,
-    Json(request): Json<IssueLinkRequest>,
+    Json(request): Json<TestCreateLinkInput>,
 ) -> Response {
     let mut streams = state.streams.lock().expect("streams lock");
     let Some(stream) = streams.get_mut(&stream_id) else {
@@ -2128,10 +2066,9 @@ async fn test_issue_link(
     if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
-    let link = test_issue_stream_link(&state, request.label, request.permissions);
-    let response = IssueLinkResponse {
-        link_id: link.link_id,
-        label: link.label.clone(),
+    let link = test_store_stream_link(link_id, request.secret.into(), request.permissions);
+    let response = StreamLinkCredential {
+        link_id: link.link_id.clone(),
         permissions: link.permissions,
         secret: link.secret.clone(),
     };
@@ -2142,6 +2079,7 @@ async fn test_issue_link(
 async fn test_list_links(
     State(state): State<Arc<TestApiState>>,
     Path(stream_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     let fail = {
@@ -2173,25 +2111,40 @@ async fn test_list_links(
     if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
+    let start = query
+        .get("cursor")
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(stream.links.len());
+    let end = start.saturating_add(2).min(stream.links.len());
+    let authorizing_link_id = stream
+        .links
+        .iter()
+        .find(|link| link.active && link.permissions.allows_owner())
+        .expect("authorized stream has an active owner link")
+        .link_id
+        .clone();
     Json(ListLinksResponse {
+        authorizing_link_id,
         links: stream
             .links
+            .get(start..end)
+            .expect("bounded link page")
             .iter()
             .map(|link| StreamLinkSummary {
-                link_id: link.link_id,
-                label: link.label.clone(),
+                link_id: link.link_id.clone(),
                 permissions: link.permissions,
                 status: if link.active {
                     StreamLinkStatus::Active
                 } else {
                     StreamLinkStatus::Revoked
                 },
-                issued_at: "2026-08-07T12:00:00.000Z".to_owned(),
+                created_at: "2026-08-07T12:00:00.000Z".to_owned(),
                 expires_at: None,
                 revoked_at: (!link.active).then(|| "2026-08-07T12:01:00.000Z".to_owned()),
-                is_current: link.active && link.permissions.allows_owner(),
             })
             .collect(),
+        next_cursor: (end < stream.links.len()).then(|| end.to_string()),
     })
     .into_response()
 }
@@ -2219,35 +2172,12 @@ async fn test_revoke_link(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn test_rename_link(
-    State(state): State<Arc<TestApiState>>,
-    Path((stream_id, link_id)): Path<(String, LinkId)>,
-    headers: HeaderMap,
-    Json(request): Json<RenameLinkRequest>,
-) -> Response {
-    let mut streams = state.streams.lock().expect("streams lock");
-    let Some(stream) = streams.get_mut(&stream_id) else {
-        return test_error(StatusCode::NOT_FOUND, "not_found", "stream not found");
-    };
-    if stream.deleted {
-        return test_error(StatusCode::CONFLICT, "conflict", "stream is deleted");
-    }
-    if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
-        return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
-    }
-    let Some(link) = stream.links.iter_mut().find(|link| link.link_id == link_id) else {
-        return test_error(StatusCode::NOT_FOUND, "not_found", "link not found");
-    };
-    link.label = request.label;
-    StatusCode::NO_CONTENT.into_response()
-}
-
 async fn test_write_socket(
     State(state): State<Arc<TestApiState>>,
     Path(stream_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| test_write_flow(state, stream_id, socket))
 }
 
@@ -2255,9 +2185,10 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let Ok(ClientFrame::AuthWrite {
-        writer_id,
+    let Ok(ClientFrame::OpenWrite {
+        client_writer_id,
         link_secret,
+        ..
     }) = ClientFrame::decode_bytes(auth)
     else {
         return;
@@ -2282,44 +2213,56 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
             return;
         }
     }
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
+        .expect("send ready");
 
     while let Some(Ok(Message::Binary(append))) = socket.recv().await {
-        let Ok(ClientFrame::AppendRecord {
-            writer_seq_num,
-            part,
-            format,
-            data,
-        }) = ClientFrame::decode_bytes(append)
-        else {
+        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
             return;
         };
-        let s2_seq_num = {
+        let (writer_start_seq_num, writer_end_seq_num, start_seq_num, end_seq_num) = {
             let mut streams = state.streams.lock().expect("streams lock");
             let Some(stream) = streams.get_mut(&stream_id) else {
                 return;
             };
-            let s2_seq_num = stream.records.len() as u64;
-            stream.records.push(TestRecord {
-                s2_seq_num,
-                timestamp_ms: 1_781_717_406_000 + s2_seq_num,
-                writer_id,
-                writer_seq_num,
-                part,
-                format,
-                data,
-            });
-            s2_seq_num
+            let start_seq_num = stream.records.len() as u64;
+            let Some(writer_start_seq_num) = records.first().map(|record| record.writer_seq_num)
+            else {
+                return;
+            };
+            let Some(writer_end_seq_num) = records
+                .last()
+                .and_then(|record| record.writer_seq_num.checked_add(1))
+            else {
+                return;
+            };
+            for record in records {
+                let seq_num = stream.records.len() as u64;
+                stream.records.push(TestRecord {
+                    seq_num,
+                    timestamp_ms: 1_781_717_406_000 + seq_num,
+                    writer_id: WriterId::from_bytes(*client_writer_id.as_bytes()),
+                    writer_seq_num: record.writer_seq_num,
+                    part: record.part,
+                    format: record.format,
+                    data: record.data,
+                });
+            }
+            (
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
+                stream.records.len() as u64,
+            )
         };
         send_server_frame(
             &mut socket,
-            ServerFrame::Ack {
-                writer_seq_start: writer_seq_num,
-                writer_seq_end: writer_seq_num,
-                s2_seq_start: s2_seq_num,
-                s2_seq_end: s2_seq_num,
+            ServerFrame::AppendAck {
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
+                end_seq_num,
             },
         )
         .await
@@ -2330,29 +2273,28 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
 async fn test_read_socket(
     State(state): State<Arc<TestApiState>>,
     Path(stream_id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
-        .on_upgrade(move |socket| test_read_flow(state, stream_id, query, socket))
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
+        .on_upgrade(move |socket| test_read_flow(state, stream_id, socket))
 }
 
-async fn test_read_flow(
-    state: Arc<TestApiState>,
-    stream_id: String,
-    query: HashMap<String, String>,
-    mut socket: WebSocket,
-) {
-    send_server_frame(&mut socket, ServerFrame::AuthRequired)
-        .await
-        .expect("send auth required");
-    let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
+async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket: WebSocket) {
+    let Some(Ok(Message::Binary(opening))) = socket.recv().await else {
         return;
     };
-    let Ok(ClientFrame::AuthRead { link_secret }) = ClientFrame::decode_bytes(auth) else {
+    let Ok(ClientFrame::OpenRead {
+        link_secret: Some(link_secret),
+        start,
+        limit,
+        end_seq_num,
+        snapshot,
+        ..
+    }) = ClientFrame::decode_bytes(opening)
+    else {
         return;
     };
-    let records = {
+    let (stream_metadata, caught_up, records) = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
             return;
@@ -2366,69 +2308,96 @@ async fn test_read_flow(
         {
             return;
         }
-        test_select_records(stream, &query)
+        let caught_up = CaughtUpPosition {
+            next_seq_num: stream.records.len() as u64,
+            last_timestamp_ms: stream
+                .records
+                .last()
+                .map_or(0, |record| record.timestamp_ms),
+        };
+        (
+            test_read_stream_metadata(stream),
+            caught_up,
+            test_select_records(stream, start, limit, end_seq_num),
+        )
     };
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
-    for record in records {
+        .expect("send ready");
+    send_server_frame(&mut socket, ServerFrame::StreamMetadata(stream_metadata))
+        .await
+        .expect("send stream metadata");
+    if snapshot {
         send_server_frame(
             &mut socket,
-            ServerFrame::ReadRecord(ReadRecord {
-                s2_seq_num: record.s2_seq_num,
-                timestamp_ms: record.timestamp_ms,
-                writer_id: record.writer_id,
-                writer_seq_num: record.writer_seq_num,
-                part: record.part,
-                format: record.format,
-                data: record.data,
+            ServerFrame::SnapshotBoundary(SnapshotBoundary {
+                end_seq_num: caught_up.next_seq_num,
+                last_timestamp_ms: caught_up.last_timestamp_ms,
             }),
         )
         .await
-        .expect("send record");
+        .expect("send snapshot boundary");
     }
+    if !records.is_empty() {
+        send_server_frame(
+            &mut socket,
+            ServerFrame::ReadBatch(
+                records
+                    .into_iter()
+                    .map(|record| ReadRecord {
+                        seq_num: record.seq_num,
+                        timestamp_ms: record.timestamp_ms,
+                        writer_id: record.writer_id,
+                        writer_seq_num: record.writer_seq_num,
+                        part: record.part,
+                        format: record.format,
+                        data: record.data,
+                    })
+                    .collect(),
+            ),
+        )
+        .await
+        .expect("send records");
+    }
+    send_server_frame(&mut socket, ServerFrame::CaughtUp(caught_up))
+        .await
+        .expect("send caught up");
     socket
         .send(Message::Close(None))
         .await
         .expect("close read socket");
 }
 
-fn test_initial_link(label: &str, permissions: LinkPermissions) -> InitialStreamLink {
-    InitialStreamLink {
-        label: label.parse().expect("test link label"),
-        permissions,
-    }
-}
-
-fn test_issue_stream_link(
-    state: &TestApiState,
-    label: LinkLabel,
+fn test_store_stream_link(
+    link_id: LinkId,
+    secret: LinkSecret,
     permissions: LinkPermissions,
 ) -> TestLink {
-    let mut next_link = state.next_link.lock().expect("next link lock");
-    let link_id = format!("{:x}{:023x}", *next_link, *next_link)
-        .parse::<LinkId>()
-        .expect("link id");
-    let secret = LinkSecret::from(format!("{:042}A", *next_link));
-    *next_link += 1;
     TestLink {
         link_id,
-        label,
         permissions,
         secret,
         active: true,
     }
 }
 
-fn test_get_stream_response(stream: &TestStream) -> StreamInfoResponse {
-    StreamInfoResponse {
+fn test_get_stream_response(stream: &TestStream) -> StreamMetadata {
+    StreamMetadata {
         stream_id: stream.stream_id,
         title: stream.title.clone(),
-        basin: "test-basin".to_owned(),
         visibility: stream.visibility,
-        state: if stream.deleted { "deleted" } else { "active" }.to_owned(),
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at: stream.expires_at.clone(),
-        active_link_count: stream.links.iter().filter(|link| link.active).count(),
+    }
+}
+
+fn test_read_stream_metadata(stream: &TestStream) -> StreamMetadata {
+    StreamMetadata {
+        stream_id: stream.stream_id,
+        title: stream.title.clone(),
+        visibility: stream.visibility,
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
+        expires_at: stream.expires_at.clone(),
     }
 }
 
@@ -2466,31 +2435,29 @@ fn test_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-fn test_select_records(stream: &TestStream, query: &HashMap<String, String>) -> Vec<TestRecord> {
+fn test_select_records(
+    stream: &TestStream,
+    start: ReadStart,
+    limit: Option<u64>,
+    end_seq_num: Option<u64>,
+) -> Vec<TestRecord> {
     let mut records = stream.records.clone();
-    if let Some(seq_num) = query
-        .get("seq_num")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        records.retain(|record| record.s2_seq_num >= seq_num);
-    } else if let Some(tail_offset) = query
-        .get("tail_offset")
-        .and_then(|value| value.parse::<usize>().ok())
-    {
-        let start = records.len().saturating_sub(tail_offset);
-        records = records[start..].to_vec();
+    match start {
+        ReadStart::SeqNum(seq_num) => records.retain(|record| record.seq_num >= seq_num),
+        ReadStart::TimestampMs(timestamp_ms) => {
+            records.retain(|record| record.timestamp_ms >= timestamp_ms);
+        }
+        ReadStart::TailOffset(tail_offset) => {
+            let tail_offset = usize::try_from(tail_offset).unwrap_or(usize::MAX);
+            let start = records.len().saturating_sub(tail_offset);
+            records = records[start..].to_vec();
+        }
     }
-    if let Some(until) = query
-        .get("until")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        records.retain(|record| record.s2_seq_num <= until);
+    if let Some(end_seq_num) = end_seq_num {
+        records.retain(|record| record.seq_num < end_seq_num);
     }
-    if let Some(count) = query
-        .get("count")
-        .and_then(|value| value.parse::<usize>().ok())
-    {
-        records.truncate(count);
+    if let Some(limit) = limit {
+        records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
     records
 }
@@ -2632,11 +2599,18 @@ async fn run_tsf_until_stdout_contains<const N: usize>(
             );
         }
     };
-    assert!(
-        found,
-        "process exited before stdout contained expected bytes: {}",
-        String::from_utf8_lossy(&stdout)
-    );
+    if !found {
+        let status = child.wait().await.expect("wait for exited tsf");
+        let stderr = timeout(Duration::from_secs(1), stderr_task)
+            .await
+            .expect("timed out waiting for stderr")
+            .expect("stderr task");
+        panic!(
+            "process exited before stdout contained expected bytes; status={status}; stdout={}; stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
     child.kill().await.expect("kill tsf tail");
     let status = child.wait().await.expect("wait for tsf tail");
     let stderr = timeout(Duration::from_secs(1), stderr_task)
@@ -2686,19 +2660,19 @@ fn normalize_created_stream_output(output: &str) -> String {
         + "\n"
 }
 
-fn extract_link_line<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+fn extract_link_line<'a>(line: &'a str, link_id: &str) -> Option<&'a str> {
     let mut links = line.split_whitespace();
-    if links.next()? != label {
+    if links.next()? != link_id {
         return None;
     }
     let _permission = links.next()?;
     links.next().filter(|url| url.starts_with("http"))
 }
 
-fn created_link_url<'a>(json: &'a serde_json::Value, label: &str) -> &'a str {
+fn created_link_url<'a>(json: &'a serde_json::Value, link_id: &str) -> &'a str {
     json["links"]
         .as_array()
-        .and_then(|links| links.iter().find(|link| link["label"] == label))
+        .and_then(|links| links.iter().find(|link| link["link_id"] == link_id))
         .and_then(|link| link["url"].as_str())
         .expect("created link URL")
 }
@@ -2728,22 +2702,23 @@ fn assert_created_links_parse(output: &str, expected_links: &[(&str, &str)]) {
     }
 }
 
-async fn connect_default_producer(api_url: &Url) -> tailsurf::TsfProducer {
+async fn connect_default_writer(api_url: &Url) -> tailsurf::TsfWriter {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    TsfClient::with_api_base_url(api_url.clone())
-        .connect_producer(WriteStreamOptions::new(
+    TsfClient::with_api_origin(api_url.clone())
+        .expect("valid API origin")
+        .connect_writer(WriteStreamOptions::new(
             stream_id,
-            WriterId::new_random(),
-            "write-secret",
+            ClientWriterId::new_random(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ))
         .await
-        .expect("producer")
+        .expect("writer")
 }
 
-fn test_write_record(writer_seq_num: u64, data: Bytes) -> WriteRecord {
-    WriteRecord::new(
+fn test_write_record(writer_seq_num: u64, data: Bytes) -> AppendRecord {
+    AppendRecord::new(
         writer_seq_num,
         PartHeader::unsplit(),
         RecordFormat::Bytes,
@@ -2761,7 +2736,7 @@ struct HoldingWriteState {
 
 #[derive(Clone)]
 struct HoldingWriteAttempt {
-    writer_id: WriterId,
+    client_writer_id: ClientWriterId,
     writer_seq_num: u64,
     data: Bytes,
 }
@@ -2837,7 +2812,7 @@ async fn holding_write_socket(
     State(state): State<Arc<HoldingWriteState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| holding_write_flow(state, socket))
 }
 
@@ -2845,7 +2820,10 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let Ok(ClientFrame::AuthWrite { writer_id, .. }) = ClientFrame::decode_bytes(auth) else {
+    let Ok(ClientFrame::OpenWrite {
+        client_writer_id, ..
+    }) = ClientFrame::decode_bytes(auth)
+    else {
         return;
     };
     let connection_index = {
@@ -2854,34 +2832,34 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
         *connections += 1;
         connection_index
     };
-    if send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    if send_server_frame(&mut socket, ServerFrame::Ready)
         .await
         .is_err()
     {
         return;
     }
 
-    for _ in 0..state.expected_before_ack {
+    let mut received = 0;
+    while received < state.expected_before_ack {
         let Some(Ok(Message::Binary(append))) = socket.recv().await else {
             return;
         };
-        let Ok(ClientFrame::AppendRecord {
-            writer_seq_num,
-            data,
-            ..
-        }) = ClientFrame::decode_bytes(append)
-        else {
+        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
             return;
         };
+        if records.is_empty() || records.len() > state.expected_before_ack - received {
+            return;
+        }
+        received += records.len();
         state
             .attempts
             .lock()
             .expect("attempts lock")
-            .push(HoldingWriteAttempt {
-                writer_id,
-                writer_seq_num,
-                data,
-            });
+            .extend(records.into_iter().map(|record| HoldingWriteAttempt {
+                client_writer_id,
+                writer_seq_num: record.writer_seq_num,
+                data: record.data,
+            }));
     }
 
     if state.disconnect_first_batch && connection_index == 0 {
@@ -2897,27 +2875,25 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
     }
 
     while let Some(Ok(Message::Binary(append))) = socket.recv().await {
-        let Ok(ClientFrame::AppendRecord {
-            writer_seq_num,
-            data,
-            ..
-        }) = ClientFrame::decode_bytes(append)
-        else {
+        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
+            return;
+        };
+        let Some(start) = records.first().map(|record| record.writer_seq_num) else {
+            return;
+        };
+        let Some(end) = records.last().map(|record| record.writer_seq_num) else {
             return;
         };
         state
             .attempts
             .lock()
             .expect("attempts lock")
-            .push(HoldingWriteAttempt {
-                writer_id,
-                writer_seq_num,
-                data,
-            });
-        if send_test_ack(&mut socket, writer_seq_num, writer_seq_num)
-            .await
-            .is_err()
-        {
+            .extend(records.into_iter().map(|record| HoldingWriteAttempt {
+                client_writer_id,
+                writer_seq_num: record.writer_seq_num,
+                data: record.data,
+            }));
+        if send_test_ack(&mut socket, start, end).await.is_err() {
             return;
         }
     }
@@ -2926,11 +2902,11 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
 async fn send_test_ack(socket: &mut WebSocket, start: u64, end: u64) -> Result<(), axum::Error> {
     send_server_frame(
         socket,
-        ServerFrame::Ack {
-            writer_seq_start: start,
-            writer_seq_end: end,
-            s2_seq_start: start,
-            s2_seq_end: end,
+        ServerFrame::AppendAck {
+            writer_start_seq_num: start,
+            writer_end_seq_num: end + 1,
+            start_seq_num: start,
+            end_seq_num: end + 1,
         },
     )
     .await
@@ -2946,8 +2922,9 @@ async fn send_server_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AppendAttempt {
-    writer_id: WriterId,
+    client_writer_id: ClientWriterId,
     link_secret: String,
+    expected_next_seq_num: Option<u64>,
     writer_seq_num: u64,
     part: PartHeader,
     format: RecordFormat,
@@ -3000,7 +2977,7 @@ async fn fake_write_socket(
     State(state): State<Arc<FakeWriteState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| fake_write_flow(state, socket))
 }
 
@@ -3008,38 +2985,39 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
         return;
     };
-    let ClientFrame::AuthWrite {
-        writer_id,
+    let ClientFrame::OpenWrite {
+        client_writer_id,
         link_secret,
+        expected_next_seq_num,
     } = ClientFrame::decode_bytes(auth).expect("auth write")
     else {
         return;
     };
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
+        .expect("send ready");
 
     let Some(Ok(Message::Binary(append))) = socket.recv().await else {
         return;
     };
-    let ClientFrame::AppendRecord {
-        writer_seq_num,
-        part,
-        format,
-        data,
-    } = ClientFrame::decode_bytes(append).expect("append")
+    let ClientFrame::AppendBatch(mut records) = ClientFrame::decode_bytes(append).expect("append")
     else {
         return;
     };
+    if records.len() != 1 {
+        return;
+    }
+    let record = records.remove(0);
     let attempt_count = {
         let mut attempts = state.append_attempts.lock().expect("append attempts lock");
         attempts.push(AppendAttempt {
-            writer_id,
+            client_writer_id,
             link_secret: link_secret.expose_secret().to_owned(),
-            writer_seq_num,
-            part,
-            format,
-            data,
+            expected_next_seq_num,
+            writer_seq_num: record.writer_seq_num,
+            part: record.part,
+            format: record.format,
+            data: record.data,
         });
         attempts.len()
     };
@@ -3054,11 +3032,11 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
 
     send_server_frame(
         &mut socket,
-        ServerFrame::Ack {
-            writer_seq_start: writer_seq_num,
-            writer_seq_end: writer_seq_num,
-            s2_seq_start: 0,
-            s2_seq_end: 0,
+        ServerFrame::AppendAck {
+            writer_start_seq_num: record.writer_seq_num,
+            writer_end_seq_num: record.writer_seq_num + 1,
+            start_seq_num: 0,
+            end_seq_num: 1,
         },
     )
     .await
@@ -3066,23 +3044,123 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SseAttempt {
+    query: Option<String>,
+    last_event_id: Option<String>,
+    authorization: Option<String>,
+}
+
+#[derive(Default)]
+struct FakeSseState {
+    attempts: Mutex<Vec<SseAttempt>>,
+}
+
+struct FakeSseServer {
+    api_url: Url,
+    state: Arc<FakeSseState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeSseServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let state = Arc::new(FakeSseState::default());
+        let router = Router::new()
+            .route("/api/v1/streams/{stream_id}/records", get(fake_sse_read))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("fake SSE server");
+        });
+        Self {
+            api_url: Url::parse(&format!("http://{addr}")).expect("API URL"),
+            state,
+            task,
+        }
+    }
+
+    fn attempts(&self) -> Vec<SseAttempt> {
+        self.state
+            .attempts
+            .lock()
+            .expect("SSE attempts lock")
+            .clone()
+    }
+
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+async fn fake_sse_read(
+    State(state): State<Arc<FakeSseState>>,
+    Path(stream_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    let snapshot = request
+        .uri()
+        .query()
+        .is_some_and(|query| query.split('&').any(|pair| pair == "snapshot=true"));
+    let attempt_count = {
+        let mut attempts = state.attempts.lock().expect("SSE attempts lock");
+        attempts.push(SseAttempt {
+            query: request.uri().query().map(str::to_owned),
+            last_event_id: request
+                .headers()
+                .get("last-event-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            authorization: request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        });
+        attempts.len()
+    };
+    if attempt_count > 1 {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let snapshot_boundary = if snapshot {
+        "id: v1,0,0,0,0\nevent: snapshot_boundary\ndata: {\"end_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}\n\n"
+    } else {
+        ""
+    };
+    let cursor = if snapshot { "v1,0,0,0,0" } else { "v1,0,0" };
+    let body = format!(
+        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{snapshot_boundary}id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
+    );
+    (
+        StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadAttempt {
     link_secret: String,
-    query: HashMap<String, String>,
+    start: ReadStart,
+    limit: Option<u64>,
+    end_seq_num: Option<u64>,
+    playback_rate_permille: Option<u64>,
+    snapshot: bool,
 }
 
 struct FakeReadState {
     read_attempts: Mutex<Vec<ReadAttempt>>,
-    tail_link_secrets: Mutex<Vec<Option<String>>>,
     mode: FakeReadMode,
 }
 
 #[derive(Clone, Copy)]
 enum FakeReadMode {
     Reconnect,
-    ReconnectBeforeFirstRecord,
+    ReconnectAfterEmptyCaughtUp,
     ReconnectBeforeFirstDefault,
-    ReconnectForever,
+    ReconnectTwiceThenRecord,
     SlowReconnectForever,
     SilentThenRecord,
     ReplayTranscript,
@@ -3102,12 +3180,10 @@ impl FakeReadServer {
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(FakeReadState {
             read_attempts: Mutex::new(Vec::new()),
-            tail_link_secrets: Mutex::new(Vec::new()),
             mode,
         });
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/read", get(fake_read_socket))
-            .route("/api/v1/streams/{stream_id}/tail", get(fake_read_tail))
             .with_state(state.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.expect("fake server");
@@ -3127,73 +3203,56 @@ impl FakeReadServer {
             .clone()
     }
 
-    fn tail_link_secrets(&self) -> Vec<Option<String>> {
-        self.state
-            .tail_link_secrets
-            .lock()
-            .expect("tail bearer links lock")
-            .clone()
-    }
-
     fn abort(self) {
         self.task.abort();
     }
 }
 
-async fn fake_read_tail(
-    State(state): State<Arc<FakeReadState>>,
-    Path(stream_id): Path<String>,
-    headers: HeaderMap,
-) -> Json<serde_json::Value> {
-    let link_secret = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    state
-        .tail_link_secrets
-        .lock()
-        .expect("tail bearer links lock")
-        .push(link_secret);
-    let next_s2_seq_num = match state.mode {
+const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
+    match mode {
         FakeReadMode::Reconnect => 0,
-        FakeReadMode::ReconnectBeforeFirstRecord => 7,
+        FakeReadMode::ReconnectAfterEmptyCaughtUp => 7,
         FakeReadMode::ReconnectBeforeFirstDefault => 100,
-        FakeReadMode::ReconnectForever
+        FakeReadMode::ReconnectTwiceThenRecord
         | FakeReadMode::SlowReconnectForever
         | FakeReadMode::SilentThenRecord => 0,
         FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
-    };
-    Json(serde_json::json!({
-        "stream_id": stream_id,
-        "next_s2_seq_num": next_s2_seq_num,
-        "last_timestamp_ms": 1781717406000_u64
-    }))
+    }
+}
+
+fn fake_stream_metadata(stream_id: &str) -> StreamMetadata {
+    StreamMetadata {
+        stream_id: stream_id.parse().expect("fake stream ID"),
+        title: None,
+        visibility: Visibility::Private,
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
+        expires_at: "2026-08-23T00:00:00Z".to_owned(),
+    }
 }
 
 async fn fake_read_socket(
     State(state): State<Arc<FakeReadState>>,
-    Query(query): Query<HashMap<String, String>>,
+    Path(stream_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
-        .on_upgrade(move |socket| fake_read_flow(state, query, socket))
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
+        .on_upgrade(move |socket| fake_read_flow(state, stream_id, socket))
 }
 
-async fn fake_read_flow(
-    state: Arc<FakeReadState>,
-    query: HashMap<String, String>,
-    mut socket: WebSocket,
-) {
-    send_server_frame(&mut socket, ServerFrame::AuthRequired)
-        .await
-        .expect("send auth required");
-    let Some(Ok(Message::Binary(auth))) = socket.recv().await else {
+async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket: WebSocket) {
+    let Some(Ok(Message::Binary(opening))) = socket.recv().await else {
         return;
     };
-    let ClientFrame::AuthRead { link_secret } = ClientFrame::decode_bytes(auth).expect("auth read")
+    let ClientFrame::OpenRead {
+        link_secret: Some(link_secret),
+        start,
+        limit,
+        end_seq_num,
+        playback_rate_permille,
+        snapshot,
+    } = ClientFrame::decode_bytes(opening).expect("open read")
     else {
         return;
     };
@@ -3201,71 +3260,80 @@ async fn fake_read_flow(
         let mut attempts = state.read_attempts.lock().expect("read attempts lock");
         attempts.push(ReadAttempt {
             link_secret: link_secret.expose_secret().to_owned(),
-            query,
+            start,
+            limit,
+            end_seq_num,
+            playback_rate_permille,
+            snapshot,
         });
         attempts.len()
     };
-    send_server_frame(&mut socket, ServerFrame::Hello { version: TSF_V3 })
+    send_server_frame(&mut socket, ServerFrame::Ready)
         .await
-        .expect("send hello");
+        .expect("send ready");
     send_server_frame(
         &mut socket,
-        ServerFrame::ReadTail(ReadTail {
-            next_s2_seq_num: 10,
-            timestamp_ms: 1_781_717_406_010,
-        }),
+        ServerFrame::StreamMetadata(fake_stream_metadata(&stream_id)),
     )
     .await
-    .expect("send read tail");
-
+    .expect("send stream metadata");
+    if snapshot {
+        send_server_frame(
+            &mut socket,
+            ServerFrame::SnapshotBoundary(SnapshotBoundary {
+                end_seq_num: fake_read_next_seq_num(state.mode),
+                last_timestamp_ms: 1_781_717_406_000,
+            }),
+        )
+        .await
+        .expect("send snapshot boundary");
+    }
     match state.mode {
         FakeReadMode::Reconnect => {
+            let first_seq_num = match start {
+                ReadStart::SeqNum(value) => value,
+                ReadStart::TimestampMs(_) | ReadStart::TailOffset(_) => 0,
+            };
             if attempt_count == 1 {
-                send_read_record(&mut socket, 0, 0, b"first\n").await;
-                send_server_frame(
-                    &mut socket,
-                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
-                )
-                .await
-                .expect("send reconnect advised");
+                send_read_record(&mut socket, first_seq_num, 0, b"first\n").await;
+                close_retryable_read(&mut socket).await;
             } else {
-                send_read_record(&mut socket, 1, 1, b"second\n").await;
+                send_read_record(&mut socket, first_seq_num, 1, b"second\n").await;
             }
         }
-        FakeReadMode::ReconnectBeforeFirstRecord => {
+        FakeReadMode::ReconnectAfterEmptyCaughtUp => {
             if attempt_count == 1 {
                 send_server_frame(
                     &mut socket,
-                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
+                    ServerFrame::CaughtUp(CaughtUpPosition {
+                        next_seq_num: 5,
+                        last_timestamp_ms: 1_781_717_406_010,
+                    }),
                 )
                 .await
-                .expect("send reconnect advised");
+                .expect("send empty caught up");
+                close_retryable_read(&mut socket).await;
             } else {
                 send_read_record(&mut socket, 5, 0, b"stable\n").await;
             }
         }
         FakeReadMode::ReconnectBeforeFirstDefault => {
             if attempt_count == 1 {
-                send_server_frame(
-                    &mut socket,
-                    ServerFrame::ReconnectAdvised { deadline_secs: 0 },
-                )
-                .await
-                .expect("send reconnect advised");
+                close_retryable_read(&mut socket).await;
             } else {
                 send_read_record(&mut socket, 20, 0, b"default\n").await;
             }
         }
-        FakeReadMode::ReconnectForever | FakeReadMode::SlowReconnectForever => {
-            if matches!(state.mode, FakeReadMode::SlowReconnectForever) {
-                sleep(Duration::from_millis(40)).await;
+        FakeReadMode::ReconnectTwiceThenRecord => {
+            if attempt_count < 3 {
+                close_retryable_read(&mut socket).await;
+            } else {
+                send_read_record(&mut socket, 0, 0, b"recovered\n").await;
             }
-            send_server_frame(
-                &mut socket,
-                ServerFrame::ReconnectAdvised { deadline_secs: 0 },
-            )
-            .await
-            .expect("send reconnect advised");
+        }
+        FakeReadMode::SlowReconnectForever => {
+            sleep(Duration::from_millis(40)).await;
+            close_retryable_read(&mut socket).await;
         }
         FakeReadMode::SilentThenRecord => {
             if attempt_count == 1 {
@@ -3275,10 +3343,20 @@ async fn fake_read_flow(
             }
         }
         FakeReadMode::ReplayTranscript => {
-            send_read_record(&mut socket, 0, 0, b"dedupe\n").await;
-            send_read_record(&mut socket, 1, 0, b"dedupe\n").await;
-            send_read_record(&mut socket, 2, 1, b"stable\n").await;
-            send_read_record(&mut socket, 3, 1, b"changed\n").await;
+            let first_seq_num = match start {
+                ReadStart::SeqNum(value) => value,
+                ReadStart::TimestampMs(_) | ReadStart::TailOffset(_) => 0,
+            };
+            for (seq_num, writer_seq_num, data) in [
+                (0, 0, b"dedupe\n".as_slice()),
+                (1, 0, b"dedupe\n".as_slice()),
+                (2, 1, b"stable\n".as_slice()),
+                (3, 1, b"changed\n".as_slice()),
+            ] {
+                if seq_num >= first_seq_num {
+                    send_read_record(&mut socket, seq_num, writer_seq_num, data).await;
+                }
+            }
             socket
                 .send(Message::Close(None))
                 .await
@@ -3335,15 +3413,20 @@ async fn fake_read_flow(
     }
 }
 
-async fn send_read_record(
-    socket: &mut WebSocket,
-    s2_seq_num: u64,
-    writer_seq_num: u64,
-    data: &[u8],
-) {
+async fn close_retryable_read(socket: &mut WebSocket) {
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 1013,
+            reason: "upstream_unavailable".into(),
+        })))
+        .await
+        .expect("close retryable read");
+}
+
+async fn send_read_record(socket: &mut WebSocket, seq_num: u64, writer_seq_num: u64, data: &[u8]) {
     send_read_record_with_format(
         socket,
-        s2_seq_num,
+        seq_num,
         writer_seq_num,
         PartHeader::unsplit(),
         RecordFormat::Transcript,
@@ -3354,7 +3437,7 @@ async fn send_read_record(
 
 async fn send_read_record_with_format(
     socket: &mut WebSocket,
-    s2_seq_num: u64,
+    seq_num: u64,
     writer_seq_num: u64,
     part: PartHeader,
     format: RecordFormat,
@@ -3362,15 +3445,15 @@ async fn send_read_record_with_format(
 ) {
     send_server_frame(
         socket,
-        ServerFrame::ReadRecord(ReadRecord {
-            s2_seq_num,
-            timestamp_ms: 1_781_717_406_000 + s2_seq_num,
+        ServerFrame::ReadBatch(vec![ReadRecord {
+            seq_num,
+            timestamp_ms: 1_781_717_406_000 + seq_num,
             writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
             writer_seq_num,
             part,
             format,
             data: Bytes::copy_from_slice(data),
-        }),
+        }]),
     )
     .await
     .expect("send read record");

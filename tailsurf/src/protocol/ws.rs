@@ -1,21 +1,34 @@
-//! WebSocket connection options for TSF v3 readers and writers.
+//! WebSocket connection options for TSF v1 readers and writers.
 
-/// Binary TSF v3 frames and their codec.
+/// Binary TSF v1 frames and their codec.
 pub mod frame;
 
-use crate::{LinkSecret, StreamId, WriterId};
+use crate::{ClientWriterId, LinkSecret, StreamId};
 
-/// Position, bounds, and authorization for one read WebSocket.
+/// Largest read selector accepted by the current TypeScript data adapter.
+pub const MAX_READ_SELECTOR_VALUE: u64 = 9_007_199_254_740_991;
+/// Tail-relative start used when a reader does not select a position.
+pub const DEFAULT_READ_TAIL_OFFSET: u64 = 80;
+/// Slowest accepted timestamp playback rate.
+pub const MIN_PLAYBACK_RATE_PERMILLE: u64 = 100;
+/// Fastest accepted timestamp playback rate.
+pub const MAX_PLAYBACK_RATE_PERMILLE: u64 = 100_000;
+
+/// Position, bounds, and credentials for one read WebSocket.
 #[derive(Clone, Debug)]
 pub struct ReadStreamOptions {
     /// Stream to read.
     pub stream_id: StreamId,
-    /// Optional initial read position. No value uses the service default tail offset.
+    /// Optional initial read position. No value sends a tail offset of 80.
     pub start: Option<ReadStart>,
     /// Optional maximum number of physical records to deliver.
-    pub count: Option<u64>,
-    /// Optional inclusive ending S2 sequence number.
-    pub until: Option<u64>,
+    pub limit: Option<u64>,
+    /// Optional exclusive ending sequence number.
+    pub end_seq_num: Option<u64>,
+    /// Optional timestamp playback rate in thousandths. `1000` is recorded speed.
+    pub playback_rate_permille: Option<u64>,
+    /// Captures a fixed ending position when the socket opens.
+    pub snapshot: bool,
     /// Secret from a read-capable stream link for private streams.
     pub link_secret: Option<LinkSecret>,
 }
@@ -26,8 +39,10 @@ impl ReadStreamOptions {
         Self {
             stream_id,
             start: None,
-            count: None,
-            until: None,
+            limit: None,
+            end_seq_num: None,
+            playback_rate_permille: None,
+            snapshot: false,
             link_secret: None,
         }
     }
@@ -37,38 +52,12 @@ impl ReadStreamOptions {
         self.link_secret = Some(link_secret.into());
         self
     }
-
-    /// Sets a cloned stream link without exposing its secret value.
-    pub fn with_stream_link(self, link: &LinkSecret) -> Self {
-        self.with_link_secret(link.clone())
-    }
-
-    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
-        let mut pairs = Vec::new();
-        match self.start {
-            None => {}
-            Some(ReadStart::SeqNum(seq_num)) => pairs.push(("seq_num", seq_num.to_string())),
-            Some(ReadStart::TimestampMs(timestamp)) => {
-                pairs.push(("timestamp", timestamp.to_string()));
-            }
-            Some(ReadStart::TailOffset(tail_offset)) => {
-                pairs.push(("tail_offset", tail_offset.to_string()));
-            }
-        }
-        if let Some(count) = self.count {
-            pairs.push(("count", count.to_string()));
-        }
-        if let Some(until) = self.until {
-            pairs.push(("until", until.to_string()));
-        }
-        pairs
-    }
 }
 
 /// Initial read position. At most one selector can be sent per connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadStart {
-    /// First record whose S2 sequence number is at least this value.
+    /// First record whose absolute sequence number is at least this value.
     SeqNum(u64),
     /// First record whose timestamp is at least this Unix epoch millisecond value.
     TimestampMs(u64),
@@ -76,33 +65,37 @@ pub enum ReadStart {
     TailOffset(u64),
 }
 
-/// Stream, writer identity, and authorization for one write WebSocket.
+/// Stream, client writer identity, and credentials for one write WebSocket.
 #[derive(Clone, Debug)]
 pub struct WriteStreamOptions {
     /// Stream to append to.
     pub stream_id: StreamId,
-    /// Stable writer identity reused with sequence numbers across reconnects.
-    pub writer_id: WriterId,
+    /// Stable client writer identity reused with sequence numbers across reconnects.
+    pub client_writer_id: ClientWriterId,
     /// Secret from a write-capable stream link.
     pub link_secret: LinkSecret,
+    /// Initial stream sequence precondition for this writer session.
+    pub expected_next_seq_num: Option<u64>,
 }
 
 impl WriteStreamOptions {
     /// Creates write options from an owned stream link secret.
     pub fn new(
         stream_id: StreamId,
-        writer_id: WriterId,
+        client_writer_id: ClientWriterId,
         link_secret: impl Into<LinkSecret>,
     ) -> Self {
         Self {
             stream_id,
-            writer_id,
+            client_writer_id,
             link_secret: link_secret.into(),
+            expected_next_seq_num: None,
         }
     }
 
-    /// Creates write options by cloning a stream link without exposing it.
-    pub fn with_stream_link(stream_id: StreamId, writer_id: WriterId, link: &LinkSecret) -> Self {
-        Self::new(stream_id, writer_id, link.clone())
+    /// Requires the stream to start this writer session at the supplied sequence.
+    pub fn with_expected_next_seq_num(mut self, expected_next_seq_num: u64) -> Self {
+        self.expected_next_seq_num = Some(expected_next_seq_num);
+        self
     }
 }

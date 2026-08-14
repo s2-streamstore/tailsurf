@@ -1,19 +1,18 @@
-# tail.surf (tsf)
+# tail.surf (`tsf`)
 
-tail.surf is a streaming gist for live work and agent conversations.
+[tail.surf](https://tail.surf) is a streaming gist for live work and agent conversations.
 
 Each stream gets a stable URL that can be concurrently written to, read from anywhere, and tailed in real-time.
 
 Free to start with no sign-up required.
 
-Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or agent-to-agent messages. For example,
+Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or agent-to-agent messages. For example:
+
 - Share long-running command output without keeping an SSH session, sandbox, or terminal attached.
 - Give agents a reliable async channel with durable catch-up.
 - Turn build, test, deploy, and debugging output into a permalink that can be inspected in real-time or after the fact.
 
-`tsf` has an API and two first-class clients:
-- Full-featured CLI
-- Gist-style scrubbable live transcript with web UI
+Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or install the `tsf` CLI below. Rust SDK documentation and examples live in [Rustdoc](https://docs.rs/tailsurf).
 
 ## Install
 
@@ -53,26 +52,6 @@ Installer-owned binaries may contact GitHub Releases and print an update hint af
 
 Installations owned by a package manager do not check or print the hint. Cargo users rerun `cargo install tailsurf-cli --locked`. cargo-binstall users rerun `cargo binstall tailsurf-cli`.
 
-## SDK quickstart
-
-The [`create_write_read_delete`](https://github.com/s2-streamstore/tailsurf/blob/main/tailsurf/examples/create_write_read_delete.rs) example creates a private stream, writes one durable record through the reconnecting producer, reads it back, and deletes the stream with its owner link:
-
-```sh
-cargo run -p tailsurf --example create_write_read_delete
-```
-
-Set `TSF_API_URL` to use a non-default API origin. The SDK appends the versioned `/api/v1` namespace.
-
-Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession` is the lower-level frame/ack API.
-
-SDK readers and producers retry bounded transient WebSocket interruptions while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes fail immediately.
-
-REST authorization is stream-scoped. Read methods accept an optional link secret because public streams need none. Management methods require an owner link secret on each call. The client never retains a link secret as implicit authorization for later REST requests.
-
-The permission in a link fragment selects the intended client mode. The server resolves authoritative permissions from the secret. Changing the fragment cannot elevate permission, and clients do not need a remote permission preflight before choosing their initial mode.
-
-The default producer window is capped at the service's hard writer-queue contract: 128 records and 5 MiB of payload. Applications may configure smaller windows.
-
 ## CLI quickstart
 
 Create a private stream:
@@ -98,7 +77,7 @@ Streams expire after 10 days by default. Their complete history remains readable
 
 `tsf new` prints the title, Stream ID, expiry, and initial links. Private streams get a read link and an owner link. Public streams get a public URL and an owner link. The title is optional.
 
-Issue custom labeled links with `--link PERMISSION=LABEL`. Permissions are `read`, `write`, `read-write`, and `owner`. The short forms `r`, `w`, `rw`, and `o` are also accepted. A stream may have up to three initial links, including defaults. Links are shown once.
+Create custom links with `--link LINK_ID=PERMISSION`. Link IDs are short semantic names such as `deploy-bot`. Permissions are `read`, `write`, `read-write`, and `owner`. The short forms `r`, `w`, `rw`, and `o` are also accepted. A stream may have up to three initial links, including defaults. Links are shown once.
 
 Stream command output into a new stream:
 
@@ -134,7 +113,7 @@ cat artifact.bin | tsf new --raw
 cat artifact.bin | tsf write '{write-link}' --raw
 ```
 
-On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the producer, and exits with status 130.
+On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the writer, and exits with status 130.
 
 Tail or replay a link or public stream URL:
 
@@ -144,11 +123,14 @@ tsf tail -n 200 '{url}'
 tsf tail --seq 0 --limit 500 '{url}'
 tsf tail --since 15m '{url}'
 tsf replay '{url}'
+tsf tail --sse '{url}'
 ```
 
-`--last` or `-n` starts relative to the durable tail. `--seq` starts at an S2 sequence number. `--since` accepts a duration or RFC 3339 timestamp. `--limit` bounds the number of records.
+`--last` or `-n` starts relative to the durable tail. `--seq` starts at an absolute sequence number. `--since` accepts a duration or RFC 3339 timestamp. `--limit` bounds the number of records.
 
 `tail` follows new records unless `--limit` bounds it. `replay` snapshots the current durable tail and exits after printing that range.
+
+`--sse` uses the resumable HTTP event-stream transport. The default binary WebSocket transport remains best for interactive CLI use.
 
 Both commands preserve payload bytes. They exit successfully when a downstream pipe closes normally.
 
@@ -166,10 +148,9 @@ tsf visibility '{owner-link}' public
 tsf title set '{owner-link}' 'Production deploy — west'
 tsf title clear '{owner-link}'
 tsf renew '{owner-link}' 7d
-tsf link issue '{owner-link}' 'read=Deploy reader' --expires 7d
+tsf link create '{owner-link}' 'deploy-reader=read' --expires 7d
 tsf link list '{owner-link}'
-tsf link rename '{owner-link}' '{link_id_or_prefix}' 'CI reader'
-tsf link revoke '{owner-link}' '{link_id_or_prefix}'
+tsf link revoke '{owner-link}' 'deploy-reader'
 tsf delete '{owner-link}'
 ```
 
@@ -179,9 +160,7 @@ Renewal extends an active stream from the current time. Link expiry accepts dura
 
 A stream title contains 1 to 120 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Titles may be duplicated, changed, or cleared. The immutable Stream ID remains the stream identity and URL component.
 
-Every link has a required owner-visible label. Labels contain 1 to 64 Unicode code points. Leading or trailing whitespace, control characters, and line breaks are rejected. Labels may be renamed and do not need to be unique.
-
-Each link also has an immutable generated Link ID. Rename and revoke accept a full Link ID or an unambiguous prefix of at least four characters. Renaming does not change the secret, permissions, expiry, or established sessions.
+Every link has a client-chosen immutable Link ID. Link IDs contain 1 to 64 lowercase ASCII letters, digits, or hyphens. They cannot start or end with a hyphen. Link IDs are unique within a stream.
 
 Link file options write complete URLs. Any command that accepts a link also accepts `@PATH` to read one complete URL from a file. On Unix, `tsf` creates and tightens link files to mode `0600`.
 

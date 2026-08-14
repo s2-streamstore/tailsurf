@@ -1,22 +1,31 @@
-//! Cross-language TSF v3 frame conformance tests driven by packaged JSON fixtures.
+//! Cross-language TSF v1 frame conformance tests driven by packaged JSON fixtures.
 
 use bytes::Bytes;
 use serde::Deserialize;
 use tailsurf::{
-    LinkSecret, WriterId,
-    protocol::ws::frame::{
-        ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord, ReadTail, RecordFormat, ServerFrame,
-        TSF_V3, TSF_WS_PROTOCOL,
+    ClientWriterId, LinkSecret, WriterId,
+    protocol::{
+        rest::{StreamMetadata, Visibility},
+        ws::{
+            ReadStart,
+            frame::{
+                AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_BATCH_RECORDS,
+                MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader,
+                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
+            },
+        },
     },
 };
 
-const FIXTURES_JSON: &str = include_str!("../fixtures/v3.json");
+const FIXTURES_JSON: &str = include_str!("../fixtures/v1.json");
 
 #[derive(Deserialize)]
 struct Fixtures {
-    version: u16,
     websocket_protocol: String,
     max_record_bytes: usize,
+    max_append_batch_records: usize,
+    max_read_batch_records: usize,
+    max_batch_payload_bytes: usize,
     client_frames: Vec<FrameFixture<ClientFixture>>,
     server_frames: Vec<FrameFixture<ServerFixture>>,
 }
@@ -31,14 +40,22 @@ struct FrameFixture<T> {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientFixture {
-    AuthRead {
-        link_secret: String,
+    OpenRead {
+        start_type: String,
+        start_value: String,
+        limit: Option<String>,
+        end_seq_num: Option<String>,
+        playback_rate_permille: Option<String>,
+        #[serde(default)]
+        snapshot: bool,
+        link_secret: Option<String>,
     },
-    AuthWrite {
-        writer_id_hex: String,
+    OpenWrite {
+        client_writer_id_hex: String,
         link_secret: String,
+        expected_next_seq_num: Option<String>,
     },
-    AppendRecord {
+    AppendBatch {
         writer_seq_num: String,
         part_raw: String,
         format: u8,
@@ -49,18 +66,15 @@ enum ClientFixture {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerFixture {
-    Hello {
-        version: u16,
+    Ready,
+    AppendAck {
+        writer_start_seq_num: String,
+        writer_end_seq_num: String,
+        start_seq_num: String,
+        end_seq_num: String,
     },
-    AuthRequired,
-    Ack {
-        writer_seq_start: String,
-        writer_seq_end: String,
-        s2_seq_start: String,
-        s2_seq_end: String,
-    },
-    ReadRecord {
-        s2_seq_num: String,
+    ReadBatch {
+        seq_num: String,
         timestamp_ms: String,
         writer_id_hex: String,
         writer_seq_num: String,
@@ -69,26 +83,36 @@ enum ServerFixture {
         data_hex: String,
     },
     Heartbeat,
-    ReconnectAdvised {
-        deadline_secs: u8,
+    CaughtUp {
+        next_seq_num: String,
+        last_timestamp_ms: String,
     },
-    ReadTail {
-        next_s2_seq_num: String,
-        timestamp_ms: String,
+    SnapshotBoundary {
+        end_seq_num: String,
+        last_timestamp_ms: String,
+    },
+    StreamMetadata {
+        stream_id: String,
+        title: Option<String>,
+        visibility: Visibility,
+        created_at: String,
+        expires_at: String,
     },
 }
 
 #[test]
-fn protocol_constants_match_v3_fixtures() {
+fn protocol_constants_match_v1_fixtures() {
     let fixtures = fixtures();
 
-    assert_eq!(fixtures.version, TSF_V3);
-    assert_eq!(fixtures.websocket_protocol, TSF_WS_PROTOCOL);
+    assert_eq!(fixtures.websocket_protocol, TSF_WEBSOCKET_PROTOCOL);
     assert_eq!(fixtures.max_record_bytes, MAX_RECORD_BYTES);
+    assert_eq!(fixtures.max_append_batch_records, MAX_APPEND_BATCH_RECORDS);
+    assert_eq!(fixtures.max_read_batch_records, MAX_READ_BATCH_RECORDS);
+    assert_eq!(fixtures.max_batch_payload_bytes, MAX_BATCH_PAYLOAD_BYTES);
 }
 
 #[test]
-fn client_frames_match_v3_fixtures() {
+fn client_frames_match_v1_fixtures() {
     let fixtures = fixtures();
 
     for fixture in fixtures.client_frames {
@@ -108,7 +132,7 @@ fn client_frames_match_v3_fixtures() {
 }
 
 #[test]
-fn server_frames_match_v3_fixtures() {
+fn server_frames_match_v1_fixtures() {
     let fixtures = fixtures();
 
     for fixture in fixtures.server_frames {
@@ -126,77 +150,117 @@ fn server_frames_match_v3_fixtures() {
 }
 
 fn fixtures() -> Fixtures {
-    serde_json::from_str(FIXTURES_JSON).expect("v3 protocol fixtures are valid JSON")
+    serde_json::from_str(FIXTURES_JSON).expect("v1 protocol fixtures are valid JSON")
 }
 
 fn client_frame(fixture: ClientFixture) -> ClientFrame {
     match fixture {
-        ClientFixture::AuthRead { link_secret } => ClientFrame::AuthRead {
-            link_secret: LinkSecret::from(link_secret),
-        },
-        ClientFixture::AuthWrite {
-            writer_id_hex,
+        ClientFixture::OpenRead {
+            start_type,
+            start_value,
+            limit,
+            end_seq_num,
+            playback_rate_permille,
+            snapshot,
             link_secret,
-        } => ClientFrame::AuthWrite {
-            writer_id: decode_writer_id(&writer_id_hex),
-            link_secret: LinkSecret::from(link_secret),
+        } => ClientFrame::OpenRead {
+            link_secret: link_secret.map(LinkSecret::from),
+            start: read_start(&start_type, parse_u64(&start_value)),
+            limit: limit.as_deref().map(parse_u64),
+            end_seq_num: end_seq_num.as_deref().map(parse_u64),
+            playback_rate_permille: playback_rate_permille.as_deref().map(parse_u64),
+            snapshot,
         },
-        ClientFixture::AppendRecord {
+        ClientFixture::OpenWrite {
+            client_writer_id_hex,
+            link_secret,
+            expected_next_seq_num,
+        } => ClientFrame::OpenWrite {
+            client_writer_id: decode_client_writer_id(&client_writer_id_hex),
+            link_secret: LinkSecret::from(link_secret),
+            expected_next_seq_num: expected_next_seq_num.as_deref().map(parse_u64),
+        },
+        ClientFixture::AppendBatch {
             writer_seq_num,
             part_raw,
             format,
             data_hex,
-        } => ClientFrame::AppendRecord {
+        } => ClientFrame::AppendBatch(vec![AppendRecord {
             writer_seq_num: parse_u64(&writer_seq_num),
             part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
             format: parse_format(format),
             data: Bytes::from(decode_hex(&data_hex)),
-        },
+        }]),
+    }
+}
+
+fn read_start(kind: &str, value: u64) -> ReadStart {
+    match kind {
+        "seq_num" => ReadStart::SeqNum(value),
+        "timestamp_ms" => ReadStart::TimestampMs(value),
+        "tail_offset" => ReadStart::TailOffset(value),
+        other => panic!("unknown fixture read start {other}"),
     }
 }
 
 fn server_frame(fixture: ServerFixture) -> ServerFrame {
     match fixture {
-        ServerFixture::Hello { version } => ServerFrame::Hello { version },
-        ServerFixture::AuthRequired => ServerFrame::AuthRequired,
-        ServerFixture::Ack {
-            writer_seq_start,
-            writer_seq_end,
-            s2_seq_start,
-            s2_seq_end,
-        } => ServerFrame::Ack {
-            writer_seq_start: parse_u64(&writer_seq_start),
-            writer_seq_end: parse_u64(&writer_seq_end),
-            s2_seq_start: parse_u64(&s2_seq_start),
-            s2_seq_end: parse_u64(&s2_seq_end),
+        ServerFixture::Ready => ServerFrame::Ready,
+        ServerFixture::AppendAck {
+            writer_start_seq_num,
+            writer_end_seq_num,
+            start_seq_num,
+            end_seq_num,
+        } => ServerFrame::AppendAck {
+            writer_start_seq_num: parse_u64(&writer_start_seq_num),
+            writer_end_seq_num: parse_u64(&writer_end_seq_num),
+            start_seq_num: parse_u64(&start_seq_num),
+            end_seq_num: parse_u64(&end_seq_num),
         },
-        ServerFixture::ReadRecord {
-            s2_seq_num,
+        ServerFixture::ReadBatch {
+            seq_num,
             timestamp_ms,
             writer_id_hex,
             writer_seq_num,
             part_raw,
             format,
             data_hex,
-        } => ServerFrame::ReadRecord(ReadRecord {
-            s2_seq_num: parse_u64(&s2_seq_num),
+        } => ServerFrame::ReadBatch(vec![ReadRecord {
+            seq_num: parse_u64(&seq_num),
             timestamp_ms: parse_u64(&timestamp_ms),
             writer_id: decode_writer_id(&writer_id_hex),
             writer_seq_num: parse_u64(&writer_seq_num),
             part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
             format: parse_format(format),
             data: Bytes::from(decode_hex(&data_hex)),
-        }),
+        }]),
         ServerFixture::Heartbeat => ServerFrame::Heartbeat,
-        ServerFixture::ReconnectAdvised { deadline_secs } => {
-            ServerFrame::ReconnectAdvised { deadline_secs }
-        }
-        ServerFixture::ReadTail {
-            next_s2_seq_num,
-            timestamp_ms,
-        } => ServerFrame::ReadTail(ReadTail {
-            next_s2_seq_num: parse_u64(&next_s2_seq_num),
-            timestamp_ms: parse_u64(&timestamp_ms),
+        ServerFixture::CaughtUp {
+            next_seq_num,
+            last_timestamp_ms,
+        } => ServerFrame::CaughtUp(CaughtUpPosition {
+            next_seq_num: parse_u64(&next_seq_num),
+            last_timestamp_ms: parse_u64(&last_timestamp_ms),
+        }),
+        ServerFixture::SnapshotBoundary {
+            end_seq_num,
+            last_timestamp_ms,
+        } => ServerFrame::SnapshotBoundary(SnapshotBoundary {
+            end_seq_num: parse_u64(&end_seq_num),
+            last_timestamp_ms: parse_u64(&last_timestamp_ms),
+        }),
+        ServerFixture::StreamMetadata {
+            stream_id,
+            title,
+            visibility,
+            created_at,
+            expires_at,
+        } => ServerFrame::StreamMetadata(StreamMetadata {
+            stream_id: stream_id.parse().expect("fixture stream ID"),
+            title: title.map(|title| title.parse().expect("fixture stream title")),
+            visibility,
+            created_at,
+            expires_at,
         }),
     }
 }
@@ -218,6 +282,13 @@ fn decode_writer_id(value: &str) -> WriterId {
         .try_into()
         .expect("fixture writer ID has the correct length");
     WriterId::from_bytes(bytes)
+}
+
+fn decode_client_writer_id(value: &str) -> ClientWriterId {
+    let bytes: [u8; ClientWriterId::BYTE_LEN] = decode_hex(value)
+        .try_into()
+        .expect("fixture client writer ID has the correct length");
+    ClientWriterId::from_bytes(bytes)
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {

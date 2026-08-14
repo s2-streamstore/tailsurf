@@ -1,8 +1,34 @@
-//! JSON request and response models for the REST v1 control plane.
+//! JSON models for the REST v1 management and HTTP data planes.
 
+use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{LinkId, LinkLabel, LinkPermissions, LinkSecret, StreamId, StreamTitle};
+use crate::{
+    LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
+    ids::{encode_base64url_32, is_canonical_base64url_32},
+    protocol::ws::{MAX_READ_SELECTOR_VALUE, frame::RecordFormat},
+};
+
+/// Maximum records in one stateless atomic append.
+pub const MAX_STATELESS_APPEND_RECORDS: usize = 128;
+/// Maximum aggregate decoded record payload in one stateless atomic append.
+pub const MAX_STATELESS_APPEND_PAYLOAD_BYTES: usize = 900 * 1024;
+/// Maximum encoded JSON body in one stateless atomic append.
+pub const MAX_STATELESS_APPEND_JSON_BYTES: usize = 1_300_000;
+/// Maximum encoded JSON bytes buffered for one successful REST response.
+pub const MAX_REST_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum encoded JSON bytes inspected from one REST error response.
+pub const MAX_REST_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+/// Maximum entries returned in one link inventory page.
+pub const MAX_LINK_PAGE_ITEMS: usize = 100;
+/// Maximum physical records in one SSE `read_batch` event.
+pub const MAX_SSE_READ_BATCH_RECORDS: usize = 1_000;
+/// Maximum decoded record payload in one SSE `read_batch` event.
+pub const MAX_SSE_READ_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum encoded bytes in one completed SSE event, including its terminator.
+pub const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum encoded bytes retained for an SSE event whose terminator has not arrived.
+pub const MAX_SSE_UNTERMINATED_EVENT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -16,7 +42,7 @@ pub enum Visibility {
 }
 
 /// Options for creating a stream.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
     /// Optional human-facing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -26,37 +52,64 @@ pub struct CreateStreamRequest {
     pub visibility: Visibility,
     /// Requested lifetime in seconds, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_in_secs: Option<u64>,
-    /// Requested initial link permissions. The service adds an owner link when absent. At most
-    /// three effective links are allowed, including the owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issue_links: Option<Vec<InitialStreamLink>>,
+    pub expires_in_seconds: Option<u64>,
+    /// Prepared initial links. At least one must be an owner. At most three are allowed.
+    pub links: Vec<InitialStreamLink>,
+}
+
+impl Default for CreateStreamRequest {
+    fn default() -> Self {
+        Self {
+            title: None,
+            visibility: Visibility::Private,
+            expires_in_seconds: None,
+            links: vec![InitialStreamLink::new(
+                "owner".parse().expect("default owner Link ID is valid"),
+                LinkPermissions::owner(),
+            )],
+        }
+    }
 }
 
 /// One link requested atomically with stream creation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitialStreamLink {
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
+    /// Client-chosen immutable Link ID.
+    pub link_id: LinkId,
     /// Permissions carried by the link.
     pub permissions: LinkPermissions,
-}
-
-/// A stream link issued during stream creation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IssuedStreamLink {
-    /// Stable non-secret link identifier used for revocation.
-    pub link_id: LinkId,
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
-    /// Effective permissions carried by the link.
-    pub permissions: LinkPermissions,
-    /// Secret link value, returned only when issued.
+    /// Client-generated secret retained with this prepared request.
     #[serde(serialize_with = "crate::ids::serialize_link_secret")]
     pub secret: LinkSecret,
 }
 
-/// Created stream metadata and any atomically issued links.
+impl InitialStreamLink {
+    /// Creates one initial link with an independent random secret.
+    pub fn new(link_id: LinkId, permissions: LinkPermissions) -> Self {
+        Self {
+            link_id,
+            permissions,
+            secret: random_link_secret(),
+        }
+    }
+}
+
+/// A stream link credential returned during stream creation or link creation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamLinkCredential {
+    /// Stable non-secret link identifier used for revocation.
+    pub link_id: LinkId,
+    /// Effective permissions carried by the link.
+    pub permissions: LinkPermissions,
+    /// Secret link value returned only by the creating request.
+    #[serde(
+        serialize_with = "crate::ids::serialize_link_secret",
+        deserialize_with = "deserialize_link_secret"
+    )]
+    pub secret: LinkSecret,
+}
+
+/// Created stream metadata and its atomically created link credentials.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateStreamResponse {
     /// Stable stream identifier.
@@ -66,43 +119,48 @@ pub struct CreateStreamResponse {
     pub title: Option<StreamTitle>,
     /// Initial visibility.
     pub visibility: Visibility,
+    /// Absolute RFC 3339 stream creation timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
+    pub created_at: String,
     /// Absolute RFC 3339 stream expiration timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub expires_at: String,
-    /// Newly issued secret links.
-    pub links: Vec<IssuedStreamLink>,
+    /// Initial link credentials.
+    pub links: Vec<StreamLinkCredential>,
 }
 
-/// Options for issuing a stream link.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IssueLinkRequest {
-    /// Owner-visible label for the new link.
-    pub label: LinkLabel,
-    /// Permissions carried by the new link.
+/// Options for creating a stream link.
+#[derive(Clone, Debug, Serialize)]
+pub struct CreateLinkInput {
+    /// Client-generated stable link identifier carried in the request path.
+    #[serde(skip_serializing)]
+    pub link_id: LinkId,
+    /// Client-generated secret. The same request can be retried safely.
+    #[serde(serialize_with = "crate::ids::serialize_link_secret")]
+    pub secret: LinkSecret,
+    /// Permissions carried by the requested link.
     pub permissions: LinkPermissions,
     /// Optional RFC 3339 expiration timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
 
-/// A newly issued stream link.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IssueLinkResponse {
-    /// Stable non-secret link identifier used for revocation.
-    pub link_id: LinkId,
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
-    /// Effective permissions carried by the link.
-    pub permissions: LinkPermissions,
-    /// Secret link value, returned only when issued.
-    #[serde(serialize_with = "crate::ids::serialize_link_secret")]
-    pub secret: LinkSecret,
+impl CreateLinkInput {
+    /// Creates retry-safe link material.
+    pub fn new(link_id: LinkId, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
+        Self {
+            link_id,
+            secret: random_link_secret(),
+            permissions,
+            expires_at,
+        }
+    }
 }
 
-/// A request to rename one stream link.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RenameLinkRequest {
-    /// New owner-visible label.
-    pub label: LinkLabel,
+fn random_link_secret() -> LinkSecret {
+    let mut secret = [0_u8; 32];
+    rand::rng().fill_bytes(&mut secret);
+    encode_base64url_32(&secret).into()
 }
 
 /// Effective lifecycle state for a stream link.
@@ -117,52 +175,252 @@ pub enum StreamLinkStatus {
     Revoked,
 }
 
-/// Non-secret metadata for one issued stream link.
+/// Non-secret metadata for one stream link.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamLinkSummary {
     /// Stable non-secret link identifier used for revocation.
     pub link_id: LinkId,
-    /// Owner-visible label for the link.
-    pub label: LinkLabel,
     /// Effective permissions carried by the link.
     pub permissions: LinkPermissions,
     /// Current effective lifecycle state.
     pub status: StreamLinkStatus,
-    /// RFC 3339 issuance timestamp.
-    pub issued_at: String,
+    /// RFC 3339 creation timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
+    pub created_at: String,
     /// RFC 3339 expiration timestamp when configured.
+    #[serde(deserialize_with = "deserialize_nullable_rfc3339_string")]
     pub expires_at: Option<String>,
     /// RFC 3339 revocation timestamp when inactive.
+    #[serde(deserialize_with = "deserialize_nullable_rfc3339_string")]
     pub revoked_at: Option<String>,
-    /// Whether this link authenticated the inventory request.
-    pub is_current: bool,
 }
 
 /// Non-secret link inventory for a stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ListLinksResponse {
+    /// Link whose bearer credential authorized this request.
+    pub authorizing_link_id: LinkId,
     /// Retained link metadata ordered newest first.
     pub links: Vec<StreamLinkSummary>,
+    /// Opaque cursor for the next page.
+    #[serde(deserialize_with = "deserialize_nullable_non_empty_string")]
+    pub next_cursor: Option<String>,
 }
 
 /// Current stream metadata.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamInfoResponse {
+pub struct StreamMetadata {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Human-facing title when one has been set.
     #[serde(deserialize_with = "deserialize_nullable_stream_title")]
     pub title: Option<StreamTitle>,
-    /// Backing S2 basin name.
-    pub basin: String,
     /// Current visibility.
     pub visibility: Visibility,
-    /// Current lifecycle state.
-    pub state: String,
+    /// Absolute RFC 3339 stream creation timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
+    pub created_at: String,
     /// Absolute RFC 3339 stream expiration timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub expires_at: String,
-    /// Number of non-revoked stream links.
-    pub active_link_count: usize,
+}
+
+/// One split record part carried by JSON data-plane APIs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RestRecordPart {
+    /// Zero-based part index.
+    pub index: u32,
+    /// Whether this part ends the logical record.
+    pub is_final: bool,
+}
+
+/// JSON encoding for exact record bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "encoding", content = "value", rename_all = "lowercase")]
+pub enum RecordData {
+    /// UTF-8 text encoded directly in JSON.
+    Utf8(String),
+    /// Canonical unpadded base64url bytes.
+    Base64url(String),
+}
+
+/// One record in a stateless atomic append.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppendJsonRecord {
+    /// Split-part metadata, or an implicit unsplit record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<RestRecordPart>,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record bytes and their JSON encoding.
+    pub data: RecordData,
+}
+
+/// Stateless durable append request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppendRecordsRequest {
+    /// Canonical client writer ID.
+    pub client_writer_id: String,
+    /// Writer-local sequence assigned to the first record.
+    #[serde(with = "decimal_u64")]
+    pub writer_start_seq_num: u64,
+    /// Atomic record batch.
+    pub records: Vec<AppendJsonRecord>,
+    /// Optional expected stream next sequence.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_decimal_u64"
+    )]
+    pub expected_next_seq_num: Option<u64>,
+}
+
+/// Durable half-open physical sequence range for an atomic append.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppendRange {
+    /// First durable physical sequence number.
+    #[serde(with = "decimal_u64")]
+    pub start_seq_num: u64,
+    /// Exclusive end of the appended physical sequence range.
+    #[serde(with = "decimal_u64")]
+    pub end_seq_num: u64,
+}
+
+/// Stable error response returned by the REST API.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct ApiErrorResponse {
+    /// Structured error detail.
+    pub error: ApiError,
+}
+
+/// Stable error detail returned by the REST API.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct ApiError {
+    /// Stable lowercase snake_case error code.
+    pub code: String,
+    /// Human-readable diagnostic message.
+    pub message: String,
+    /// Request identifier used for support and tracing.
+    pub request_id: String,
+    /// Retry delay in milliseconds when supplied.
+    pub retry_after_ms: Option<u64>,
+    /// Actual stream next sequence for a failed sequence precondition.
+    #[serde(default, with = "optional_safe_decimal_u64")]
+    pub actual_next_seq_num: Option<u64>,
+}
+
+mod optional_safe_decimal_u64 {
+    use serde::{Deserialize, Deserializer};
+
+    use super::MAX_READ_SELECTOR_VALUE;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value
+            .map(|value| {
+                if value != "0" && value.starts_with('0') {
+                    return Err(serde::de::Error::custom("non-canonical decimal u64"));
+                }
+                let value: u64 = value.parse().map_err(serde::de::Error::custom)?;
+                if value > MAX_READ_SELECTOR_VALUE {
+                    return Err(serde::de::Error::custom(
+                        "sequence exceeds the data adapter range",
+                    ));
+                }
+                Ok(value)
+            })
+            .transpose()
+    }
+}
+
+/// One record in a batched SSE `read_batch` event.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct SseReadRecord {
+    /// Absolute physical sequence number.
+    #[serde(with = "decimal_u64")]
+    pub seq_num: u64,
+    /// Record timestamp in Unix milliseconds.
+    #[serde(with = "decimal_u64")]
+    pub timestamp_ms: u64,
+    /// Server-derived writer identity.
+    pub writer_id: String,
+    /// Writer-local sequence number.
+    #[serde(with = "decimal_u64")]
+    pub writer_seq_num: u64,
+    /// Split-part metadata.
+    pub part: RestRecordPart,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record bytes and their JSON encoding.
+    pub data: RecordData,
+}
+
+/// Payload of a batched SSE `read_batch` event.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct SseReadBatchData {
+    /// Ordered records in this event.
+    pub records: Vec<SseReadRecord>,
+}
+
+/// Payload of an SSE `caught_up` event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub struct SseCaughtUpData {
+    /// Next safe reconnect sequence.
+    #[serde(with = "decimal_u64")]
+    pub next_seq_num: u64,
+    /// Last record timestamp at the captured boundary.
+    #[serde(with = "decimal_u64")]
+    pub last_timestamp_ms: u64,
+}
+
+/// Payload of an SSE `snapshot_boundary` event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub struct SseSnapshotBoundaryData {
+    /// Exclusive end of the fixed snapshot.
+    #[serde(with = "decimal_u64")]
+    pub end_seq_num: u64,
+    /// Timestamp of the last record at the snapshot boundary.
+    #[serde(with = "decimal_u64")]
+    pub last_timestamp_ms: u64,
+}
+
+mod decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value != "0" && value.starts_with('0') {
+            return Err(serde::de::Error::custom("non-canonical decimal u64"));
+        }
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+mod optional_decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_some(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value
+            .map(|value| {
+                if value != "0" && value.starts_with('0') {
+                    return Err(serde::de::Error::custom("non-canonical decimal u64"));
+                }
+                value.parse().map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
 }
 
 /// Mutable stream settings. Absent fields are preserved.
@@ -226,7 +484,7 @@ where
     })
 }
 
-fn deserialize_nullable_stream_title<'de, D>(
+pub(crate) fn deserialize_nullable_stream_title<'de, D>(
     deserializer: D,
 ) -> Result<Option<StreamTitle>, D::Error>
 where
@@ -235,30 +493,117 @@ where
     Option::<StreamTitle>::deserialize(deserializer)
 }
 
-/// Current durable tail position for a stream.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamTailResponse {
-    /// Stable stream identifier.
-    pub stream_id: StreamId,
-    /// Sequence number assigned to the next durable append.
-    pub next_s2_seq_num: u64,
-    /// Timestamp of the last record, or `None` for an empty stream.
-    pub last_timestamp_ms: Option<u64>,
+fn deserialize_link_secret<'de, D>(deserializer: D) -> Result<LinkSecret, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if !is_canonical_base64url_32(&value) {
+        return Err(serde::de::Error::custom("invalid link secret"));
+    }
+    Ok(value.into())
 }
 
-/// Timestamp and sequence bounds for a stream.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamRangeResponse {
-    /// Stable stream identifier.
-    pub stream_id: StreamId,
-    /// Sequence number of the first record, or `None` when empty.
-    pub first_s2_seq_num: Option<u64>,
-    /// Timestamp of the first record, or `None` when empty.
-    pub first_timestamp_ms: Option<u64>,
-    /// Sequence number assigned to the next durable append.
-    pub next_s2_seq_num: u64,
-    /// Timestamp of the last record, or `None` when empty.
-    pub last_timestamp_ms: Option<u64>,
+fn deserialize_nullable_non_empty_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.as_deref() == Some("") {
+        return Err(serde::de::Error::custom("cursor must not be empty"));
+    }
+    Ok(value)
+}
+
+fn deserialize_rfc3339_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if !is_rfc3339_timestamp(&value) {
+        return Err(serde::de::Error::custom("invalid RFC 3339 timestamp"));
+    }
+    Ok(value)
+}
+
+fn deserialize_nullable_rfc3339_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_deref()
+        .is_some_and(|value| !is_rfc3339_timestamp(value))
+    {
+        return Err(serde::de::Error::custom("invalid RFC 3339 timestamp"));
+    }
+    Ok(value)
+}
+
+pub(crate) fn is_rfc3339_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let number = |start: usize, end: usize| -> Option<u32> {
+        std::str::from_utf8(bytes.get(start..end)?)
+            .ok()?
+            .parse()
+            .ok()
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0, 4),
+        number(5, 7),
+        number(8, 10),
+        number(11, 13),
+        number(14, 16),
+        number(17, 19),
+    ) else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == start {
+            return false;
+        }
+    }
+    match bytes.get(index..) {
+        Some(b"Z") => true,
+        Some(zone) if zone.len() == 6 && matches!(zone[0], b'+' | b'-') && zone[3] == b':' => {
+            let Ok(hour) = std::str::from_utf8(&zone[1..3]).unwrap_or("").parse::<u8>() else {
+                return false;
+            };
+            let Ok(minute) = std::str::from_utf8(&zone[4..6]).unwrap_or("").parse::<u8>() else {
+                return false;
+            };
+            hour <= 23 && minute <= 59
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -268,49 +613,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn omits_absent_create_stream_options() {
+    fn prepares_a_default_owner_for_stream_creation() {
         let request = CreateStreamRequest::default();
+        let value = serde_json::to_value(request).expect("serialize create request");
 
-        assert_eq!(
-            serde_json::to_value(request).expect("serialize create request"),
-            json!({ "visibility": "private" })
-        );
+        assert_eq!(value["visibility"], "private");
+        assert_eq!(value["links"][0]["link_id"], "owner");
+        assert_eq!(value["links"][0]["permissions"], "o");
+        assert!(value["links"][0]["secret"].is_string());
     }
 
     #[test]
     fn serializes_requested_stream_lifetime() {
         let request = CreateStreamRequest {
-            expires_in_secs: Some(604_800),
+            expires_in_seconds: Some(604_800),
             ..CreateStreamRequest::default()
         };
         let value = serde_json::to_value(request).expect("serialize create request");
-        assert_eq!(value["expires_in_secs"], json!(604_800));
+        assert_eq!(value["expires_in_seconds"], json!(604_800));
         assert_eq!(
             serde_json::from_value::<CreateStreamRequest>(value)
                 .expect("deserialize create request")
-                .expires_in_secs,
+                .expires_in_seconds,
             Some(604_800)
         );
     }
 
     #[test]
     fn serializes_link_mutations_and_omits_absent_stream_update() {
-        let link = IssueLinkRequest {
-            label: "Reader".parse().expect("label"),
-            permissions: LinkPermissions::read(),
-            expires_at: None,
-        };
-        assert_eq!(
-            serde_json::to_value(link).expect("serialize link request"),
-            json!({ "label": "Reader", "permissions": "r" })
+        let link = CreateLinkInput::new(
+            "reader".parse().expect("Link ID"),
+            LinkPermissions::read(),
+            None,
         );
-        assert_eq!(
-            serde_json::to_value(RenameLinkRequest {
-                label: "Deploy bot".parse().expect("label"),
-            })
-            .expect("serialize link rename request"),
-            json!({ "label": "Deploy bot" })
-        );
+        let link = serde_json::to_value(link).expect("serialize link request");
+        assert_eq!(link["permissions"], "r");
+        assert!(link.get("link_id").is_none());
+        assert!(link["secret"].is_string());
         assert_eq!(
             serde_json::to_value(UpdateStreamRequest::default()).expect("serialize update request"),
             json!({})
@@ -334,6 +673,36 @@ mod tests {
                 .expect("deserialize title clear")
                 .title,
             StreamTitleUpdate::Clear
+        );
+    }
+
+    #[test]
+    fn response_models_require_nullable_fields_and_rfc3339_timestamps() {
+        let stream = json!({
+            "stream_id": "00000000000000000000000000000000",
+            "visibility": "private",
+            "created_at": "2026-08-13T00:00:00Z",
+            "expires_at": "2026-08-23T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<StreamMetadata>(stream).is_err());
+
+        let invalid_time = json!({
+            "stream_id": "00000000000000000000000000000000",
+            "title": null,
+            "visibility": "private",
+            "created_at": "2026-02-30T00:00:00Z",
+            "expires_at": "2026-08-23T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<StreamMetadata>(invalid_time).is_err());
+
+        assert!(serde_json::from_value::<ListLinksResponse>(json!({ "links": [] })).is_err());
+        assert!(
+            serde_json::from_value::<ListLinksResponse>(json!({
+                "authorizing_link_id": "owner",
+                "links": [],
+                "next_cursor": ""
+            }))
+            .is_err()
         );
     }
 }
