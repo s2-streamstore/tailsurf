@@ -196,23 +196,26 @@ impl TsfClient {
             .await
     }
 
-    /// Creates or recovers a logical stream creation using a caller-owned idempotency key.
+    /// Creates a logical stream using a caller-owned idempotency key.
     ///
-    /// The key is owner-equivalent recovery material. Generate and persist it securely before the
-    /// first request, then reuse it with the identical request after cancellation, process loss, or
-    /// an ambiguous response.
+    /// Recovery also requires the request's separate `recovery_secret`. The idempotency key alone
+    /// cannot recover owner credentials.
     pub async fn create_stream_with_idempotency_key(
         &self,
         request: &CreateStreamRequest,
         idempotency_key: &CreateStreamIdempotencyKey,
     ) -> Result<CreateStreamResponse, TsfClientError> {
+        let mut request = request.clone();
+        request
+            .recovery_secret
+            .get_or_insert_with(random_link_secret);
         self.retry_when(
             || {
                 self.send_json_with_bearer(
                     self.http
                         .post(self.rest_url("/streams"))
                         .header("Idempotency-Key", idempotency_key.expose_secret())
-                        .json(request),
+                        .json(&request),
                     "create stream",
                     None,
                 )
@@ -796,7 +799,13 @@ pub fn default_api_base_url() -> Url {
     Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
 }
 
-/// Owner-equivalent recovery key for one logical stream-creation request.
+fn random_link_secret() -> LinkSecret {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    encode_base64url_32(&bytes).into()
+}
+
+/// Non-authorizing idempotency key for one logical stream-creation request.
 #[derive(Clone, Debug)]
 pub struct CreateStreamIdempotencyKey(LinkSecret);
 

@@ -17,12 +17,10 @@ use bytes::{Buf, Bytes, BytesMut};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
-use secrecy::ExposeSecret;
 use serde::Serialize;
 use tailsurf::{
-    AppendTicket, CreateStreamIdempotencyKey, LinkId, LinkLabel, LinkPermissions, LinkSecret,
-    StreamId, StreamTitle, TsfClient, TsfProducer, TsfReadSession, TsfSseReadSession, WriteRecord,
-    WriterId,
+    AppendTicket, LinkId, LinkLabel, LinkPermissions, LinkSecret, StreamId, StreamTitle, TsfClient,
+    TsfProducer, TsfReadSession, TsfSseReadSession, WriteRecord, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, InitialStreamLink, IssueLinkRequest,
@@ -137,15 +135,6 @@ struct NewArgs {
         help = "Stream lifetime, such as 6h or 7d"
     )]
     expires: Option<StreamExpiryArg>,
-    /// Owner-equivalent recovery key for resuming this exact create request.
-    #[arg(
-        long,
-        env = "TSF_CREATE_IDEMPOTENCY_KEY",
-        value_name = "KEY",
-        allow_hyphen_values = true,
-        help_heading = "Advanced"
-    )]
-    create_idempotency_key: Option<CreateStreamIdempotencyKey>,
     /// Print one JSON object instead of human-readable output.
     #[arg(long)]
     json: bool,
@@ -206,7 +195,6 @@ impl NewArgs {
             public: false,
             links: Vec::new(),
             expires: None,
-            create_idempotency_key: None,
             json: false,
             owner_link_file: None,
             read_link_file: None,
@@ -812,7 +800,6 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
         visibility,
         args.expires.map(StreamExpiryArg::seconds),
         issue_links,
-        args.create_idempotency_key.as_ref(),
     )
     .await?;
     print_created_stream(&web_url, &created, args.json)?;
@@ -929,33 +916,18 @@ async fn create_stream(
     visibility: Visibility,
     expires_in_secs: Option<u64>,
     issue_links: Vec<InitialStreamLink>,
-    supplied_key: Option<&CreateStreamIdempotencyKey>,
 ) -> eyre::Result<CreateStreamResponse> {
-    let generated_key;
-    let idempotency_key = match supplied_key {
-        Some(key) => key,
-        None => {
-            generated_key = CreateStreamIdempotencyKey::new_random();
-            &generated_key
-        }
-    };
     let result = TsfClient::with_api_base_url(api_url)
-        .create_stream_with_idempotency_key(
-            &CreateStreamRequest {
-                title,
-                visibility,
-                expires_in_secs,
-                issue_links: Some(issue_links),
-            },
-            idempotency_key,
-        )
+        .create_stream(&CreateStreamRequest {
+            title,
+            visibility,
+            expires_in_secs,
+            issue_links: Some(issue_links),
+            recovery_secret: None,
+        })
         .await;
     match result {
         Ok(created) => Ok(created),
-        Err(error) if error.is_recoverable_create_failure() => Err(error).wrap_err(format!(
-            "stream creation did not complete; recover this exact request by setting TSF_CREATE_IDEMPOTENCY_KEY to this owner-equivalent recovery key (keep it secret):\n{}",
-            idempotency_key.expose_secret()
-        )),
         Err(error) => Err(error).context("failed to create stream"),
     }
 }
@@ -2344,28 +2316,6 @@ mod tests {
         assert_eq!(existing.input.program, ["make", "test"]);
 
         assert!(Cli::try_parse_from(["tsf", "--title", "Build log"]).is_err());
-    }
-
-    #[test]
-    fn create_recovery_keys_may_start_with_a_hyphen() {
-        let recovery_key = format!("-{}", "A".repeat(42));
-        let parsed = Cli::try_parse_from([
-            "tsf",
-            "new",
-            "--create-idempotency-key",
-            recovery_key.as_str(),
-        ])
-        .expect("base64url recovery key starting with a hyphen");
-        let Some(Command::New(args)) = parsed.command else {
-            panic!("expected new command");
-        };
-
-        assert_eq!(
-            args.create_idempotency_key
-                .as_ref()
-                .map(ExposeSecret::expose_secret),
-            Some(recovery_key.as_str()),
-        );
     }
 
     #[test]

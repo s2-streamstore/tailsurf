@@ -1,4 +1,4 @@
-//! JSON request and response models for the REST v1 control plane.
+//! JSON models for the REST v1 management and HTTP data planes.
 
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -18,8 +18,15 @@ pub enum Visibility {
 }
 
 /// Options for creating a stream.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
+    /// Secret recovery material retained with one pending create request.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_link_secret"
+    )]
+    pub recovery_secret: Option<LinkSecret>,
     /// Optional human-facing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<StreamTitle>,
@@ -33,6 +40,19 @@ pub struct CreateStreamRequest {
     /// three effective links are allowed, including the owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_links: Option<Vec<InitialStreamLink>>,
+}
+
+fn serialize_optional_link_secret<S>(
+    secret: &Option<LinkSecret>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match secret {
+        Some(secret) => crate::ids::serialize_link_secret(secret, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// One link requested atomically with stream creation.

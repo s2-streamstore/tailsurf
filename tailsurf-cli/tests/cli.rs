@@ -267,46 +267,6 @@ async fn create_stream_recovers_a_committed_truncated_response() {
 }
 
 #[tokio::test]
-async fn new_reports_and_reuses_recovery_key_after_retry_exhaustion() {
-    let server = TestServer::start_with_create_failures(3).await;
-
-    let failed = run_tsf(&server, ["new", "--json"], None).await;
-
-    assert!(!failed.status.success());
-    let recovery_key = failed
-        .stderr
-        .split("recovery key (keep it secret):\n")
-        .nth(1)
-        .and_then(|suffix| suffix.lines().next())
-        .expect("recovery key in error");
-    recovery_key
-        .parse::<CreateStreamIdempotencyKey>()
-        .expect("canonical recovery key");
-    assert!(failed.stderr.contains("TSF_CREATE_IDEMPOTENCY_KEY"));
-    assert!(!failed.stderr.contains("with --create-idempotency-key"));
-    let failed_keys = server.create_idempotency_keys();
-    assert_eq!(failed_keys.len(), 3);
-    assert!(
-        failed_keys
-            .iter()
-            .all(|observed| observed.as_deref() == Some(recovery_key))
-    );
-
-    let recovered = run_tsf(
-        &server,
-        ["new", "--json", "--create-idempotency-key", recovery_key],
-        None,
-    )
-    .await;
-
-    assert!(recovered.status.success(), "stderr={}", recovered.stderr);
-    let recovered_keys = server.create_idempotency_keys();
-    assert_eq!(recovered_keys.len(), 4);
-    assert_eq!(recovered_keys[3].as_deref(), Some(recovery_key));
-    server.abort();
-}
-
-#[tokio::test]
 async fn create_stream_is_always_anonymous() {
     let server = TestServer::start().await;
     let client = TsfClient::with_api_base_url(server.api_url.clone());

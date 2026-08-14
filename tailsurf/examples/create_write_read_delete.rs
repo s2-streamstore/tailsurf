@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let created = client
         .create_stream(&CreateStreamRequest {
+            recovery_secret: None,
             title: Some("SDK lifecycle".parse()?),
             visibility: Visibility::Private,
             expires_in_secs: None,
