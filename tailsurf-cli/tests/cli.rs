@@ -1188,14 +1188,14 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
 }
 
 #[tokio::test]
-async fn reader_bounds_consecutive_reconnects_without_a_record() {
-    let server = FakeReadServer::start(FakeReadMode::ReconnectForever).await;
+async fn reader_restarts_retries_after_established_idle_connections() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectTwiceThenRecord).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
     let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
     config.retry_policy = RetryPolicy {
-        max_attempts: 3,
+        max_attempts: 2,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
     };
@@ -1204,17 +1204,14 @@ async fn reader_bounds_consecutive_reconnects_without_a_record() {
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
-    let error = timeout(Duration::from_secs(2), reader.next_record())
+    let record = timeout(Duration::from_secs(2), reader.next_record())
         .await
         .expect("bounded reconnects")
-        .expect_err("no-progress reconnect limit");
+        .expect("recovered read")
+        .expect("record after reconnects");
 
-    assert!(matches!(
-        error,
-        TsfClientError::ReadReconnectLimitExceeded {
-            max_connection_attempts: 3
-        }
-    ));
+    assert_eq!(record.seq_num, 0);
+    assert_eq!(record.data.as_ref(), b"recovered\n");
     assert_eq!(server.read_attempts().len(), 3);
     server.abort();
 }
@@ -3164,7 +3161,7 @@ enum FakeReadMode {
     Reconnect,
     ReconnectAfterEmptyCaughtUp,
     ReconnectBeforeFirstDefault,
-    ReconnectForever,
+    ReconnectTwiceThenRecord,
     SlowReconnectForever,
     SilentThenRecord,
     ReplayTranscript,
@@ -3217,7 +3214,7 @@ const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
         FakeReadMode::Reconnect => 0,
         FakeReadMode::ReconnectAfterEmptyCaughtUp => 7,
         FakeReadMode::ReconnectBeforeFirstDefault => 100,
-        FakeReadMode::ReconnectForever
+        FakeReadMode::ReconnectTwiceThenRecord
         | FakeReadMode::SlowReconnectForever
         | FakeReadMode::SilentThenRecord => 0,
         FakeReadMode::ReplayTranscript => 4,
@@ -3294,11 +3291,15 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
     }
     match state.mode {
         FakeReadMode::Reconnect => {
+            let first_seq_num = match start {
+                ReadStart::SeqNum(value) => value,
+                ReadStart::TimestampMs(_) | ReadStart::TailOffset(_) => 0,
+            };
             if attempt_count == 1 {
-                send_read_record(&mut socket, 0, 0, b"first\n").await;
+                send_read_record(&mut socket, first_seq_num, 0, b"first\n").await;
                 close_retryable_read(&mut socket).await;
             } else {
-                send_read_record(&mut socket, 1, 1, b"second\n").await;
+                send_read_record(&mut socket, first_seq_num, 1, b"second\n").await;
             }
         }
         FakeReadMode::ReconnectAfterEmptyCaughtUp => {
@@ -3324,10 +3325,15 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
                 send_read_record(&mut socket, 20, 0, b"default\n").await;
             }
         }
-        FakeReadMode::ReconnectForever | FakeReadMode::SlowReconnectForever => {
-            if matches!(state.mode, FakeReadMode::SlowReconnectForever) {
-                sleep(Duration::from_millis(40)).await;
+        FakeReadMode::ReconnectTwiceThenRecord => {
+            if attempt_count < 3 {
+                close_retryable_read(&mut socket).await;
+            } else {
+                send_read_record(&mut socket, 0, 0, b"recovered\n").await;
             }
+        }
+        FakeReadMode::SlowReconnectForever => {
+            sleep(Duration::from_millis(40)).await;
             close_retryable_read(&mut socket).await;
         }
         FakeReadMode::SilentThenRecord => {
@@ -3338,10 +3344,20 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
             }
         }
         FakeReadMode::ReplayTranscript => {
-            send_read_record(&mut socket, 0, 0, b"dedupe\n").await;
-            send_read_record(&mut socket, 1, 0, b"dedupe\n").await;
-            send_read_record(&mut socket, 2, 1, b"stable\n").await;
-            send_read_record(&mut socket, 3, 1, b"changed\n").await;
+            let first_seq_num = match start {
+                ReadStart::SeqNum(value) => value,
+                ReadStart::TimestampMs(_) | ReadStart::TailOffset(_) => 0,
+            };
+            for (seq_num, writer_seq_num, data) in [
+                (0, 0, b"dedupe\n".as_slice()),
+                (1, 0, b"dedupe\n".as_slice()),
+                (2, 1, b"stable\n".as_slice()),
+                (3, 1, b"changed\n".as_slice()),
+            ] {
+                if seq_num >= first_seq_num {
+                    send_read_record(&mut socket, seq_num, writer_seq_num, data).await;
+                }
+            }
             socket
                 .send(Message::Close(None))
                 .await

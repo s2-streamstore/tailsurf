@@ -78,7 +78,7 @@ pub struct TsfClientConfig {
     /// `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
     /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and
-    /// consecutive read reconnects without a delivered record.
+    /// consecutive read connection failures.
     pub retry_policy: RetryPolicy,
 }
 
@@ -447,6 +447,11 @@ impl TsfClient {
                 "writer sequence range must end before u64::MAX",
             ));
         }
+        if expected_next_seq_num.is_some_and(|value| value > MAX_READ_SELECTOR_VALUE) {
+            return Err(TsfClientError::InvalidStatelessAppend(
+                "expected next sequence exceeds the data adapter range",
+            ));
+        }
         let mut json_records = Vec::with_capacity(records.len());
         let mut payload_bytes = 0_usize;
         for (index, record) in records.iter().enumerate() {
@@ -484,16 +489,18 @@ impl TsfClient {
             records: json_records,
             expected_next_seq_num,
         };
-        self.retry_transient(|| {
-            self.send_json_with_bearer(
-                self.http
-                    .post(self.rest_url(&format!("/streams/{stream_id}/records")))
-                    .json(&request),
-                "append records",
-                Some(write_link_secret),
-            )
-        })
-        .await
+        let range: AppendRange = self
+            .retry_transient(|| {
+                self.send_json_with_bearer(
+                    self.http
+                        .post(self.rest_url(&format!("/streams/{stream_id}/records")))
+                        .json(&request),
+                    "append records",
+                    Some(write_link_secret),
+                )
+            })
+            .await?;
+        validate_append_range(range, records.len())
     }
 
     /// Connects the standard bounded, reconnecting durable writer.
@@ -1632,6 +1639,16 @@ fn dispatch_ack(
     Ok(())
 }
 
+fn validate_append_range(
+    range: AppendRange,
+    expected_records: usize,
+) -> Result<AppendRange, TsfClientError> {
+    if range.end_seq_num.checked_sub(range.start_seq_num) != Some(expected_records as u64) {
+        return Err(TsfClientError::InvalidAppendRange(range));
+    }
+    Ok(range)
+}
+
 fn finish_writer_error(
     pending: &mut VecDeque<PendingAppend>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
@@ -1773,6 +1790,7 @@ impl TsfSseReadSession {
                 self.stream_metadata = connection
                     .stream_metadata
                     .expect("validated stream_metadata event");
+                self.reconnect_attempts = 0;
                 continue;
             };
             match event.event.as_str() {
@@ -1820,6 +1838,7 @@ impl TsfSseReadSession {
                         caught_up,
                         cursor,
                         previous,
+                        &self.options,
                         self.snapshot_boundary,
                     )?;
                     self.last_event_id = Some(event_id.to_owned());
@@ -1921,10 +1940,12 @@ impl TsfReadSession {
                     self.record_delivered(record.seq_num);
                     return Ok(Some(record));
                 }
-                Ok(ReadSocketOutcome::Records(_)) => {
-                    unreachable!("batches are drained by ReadSocket")
+                Ok(ReadSocketOutcome::Records(records)) => {
+                    validate_read_batch_for_request(&records, &self.options)?;
+                    self.socket.pending_records.extend(records);
                 }
                 Ok(ReadSocketOutcome::CaughtUp(caught_up)) => {
+                    validate_caught_up_for_request(caught_up, &self.options)?;
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
                 }
@@ -1960,6 +1981,8 @@ impl TsfReadSession {
         if snapshot_boundary.is_some() {
             self.snapshot_boundary = snapshot_boundary;
         }
+        self.no_progress_reconnects = 0;
+        self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
         Ok(())
@@ -2017,6 +2040,54 @@ fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
         )
 }
 
+fn validate_read_batch_for_request(
+    records: &[ReadRecord],
+    options: &ReadStreamOptions,
+) -> Result<(), TsfClientError> {
+    let Some(first) = records.first() else {
+        return Err(TsfClientError::InvalidReadResponse("ReadBatch is empty"));
+    };
+    let wrong_start = match options.start {
+        Some(ReadStart::SeqNum(start)) => first.seq_num != start,
+        Some(ReadStart::TimestampMs(start)) => first.timestamp_ms < start,
+        Some(ReadStart::TailOffset(_)) | None => false,
+    };
+    if wrong_start {
+        return Err(TsfClientError::InvalidReadResponse(
+            "ReadBatch does not begin at the requested position",
+        ));
+    }
+    if options
+        .limit
+        .is_some_and(|remaining| records.len() as u64 > remaining)
+    {
+        return Err(TsfClientError::InvalidReadResponse(
+            "ReadBatch exceeds the remaining record limit",
+        ));
+    }
+    if options
+        .end_seq_num
+        .is_some_and(|end_seq_num| records.iter().any(|record| record.seq_num >= end_seq_num))
+    {
+        return Err(TsfClientError::InvalidReadResponse(
+            "ReadBatch crosses the requested end sequence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_caught_up_for_request(
+    caught_up: CaughtUpPosition,
+    options: &ReadStreamOptions,
+) -> Result<(), TsfClientError> {
+    if matches!(options.start, Some(ReadStart::SeqNum(next)) if caught_up.next_seq_num != next) {
+        return Err(TsfClientError::InvalidReadResponse(
+            "CaughtUp does not match the next requested sequence",
+        ));
+    }
+    Ok(())
+}
+
 struct ReadSocket {
     ws: ClientWebSocket,
     read_idle_timeout: Option<Duration>,
@@ -2053,9 +2124,7 @@ impl ReadSocket {
             } else {
                 next_read_socket_frame(&mut self.ws).await?
             };
-            if let Some(ReadSocketOutcome::Records(records)) = outcome {
-                self.pending_records.extend(records);
-            } else if let Some(outcome) = outcome {
+            if let Some(outcome) = outcome {
                 return Ok(outcome);
             }
         }
@@ -2507,6 +2576,13 @@ fn validate_sse_read_batch_cursor(
             "read_batch does not begin at the requested sequence",
         ));
     }
+    if previous.is_none()
+        && matches!(options.start, Some(ReadStart::TimestampMs(start)) if first.timestamp_ms < start)
+    {
+        return Err(TsfClientError::InvalidSse(
+            "read_batch begins before the requested timestamp",
+        ));
+    }
     let expected_consumed = previous
         .map_or(0, |value| value.consumed_records)
         .checked_add(records.len() as u64)
@@ -2525,6 +2601,7 @@ fn validate_sse_caught_up_cursor(
     caught_up: CaughtUpPosition,
     cursor: ParsedSseResumeCursor,
     previous: Option<ParsedSseResumeCursor>,
+    options: &ReadStreamOptions,
     snapshot_boundary: Option<SnapshotBoundary>,
 ) -> Result<(), TsfClientError> {
     if cursor.next_seq_num != caught_up.next_seq_num {
@@ -2543,6 +2620,13 @@ fn validate_sse_caught_up_cursor(
     } else if cursor.consumed_records != 0 {
         return Err(TsfClientError::InvalidSse(
             "initial caught_up cursor has a consumed count",
+        ));
+    }
+    if previous.is_none()
+        && matches!(options.start, Some(ReadStart::SeqNum(start)) if cursor.next_seq_num != start)
+    {
+        return Err(TsfClientError::InvalidSse(
+            "initial caught_up does not match the requested sequence",
         ));
     }
     validate_sse_cursor_boundary(cursor, previous, snapshot_boundary)
@@ -2806,6 +2890,9 @@ pub enum TsfClientError {
     /// SSE response violated the public event contract.
     #[error("invalid SSE response: {0}")]
     InvalidSse(&'static str),
+    /// WebSocket read response violated the requested stream contract.
+    #[error("invalid WebSocket read response: {0}")]
+    InvalidReadResponse(&'static str),
     /// The server ended an SSE session with a stable terminal error event.
     #[error("SSE terminal error: {0}")]
     SseTerminal(String),
@@ -2850,6 +2937,9 @@ pub enum TsfClientError {
     /// The server returned an invalid or mismatched ack range.
     #[error("server sent invalid append acknowledgement {0:?}")]
     InvalidAppendAck(AppendAck),
+    /// The server returned a stateless append range with the wrong length.
+    #[error("server sent invalid stateless append range {0:?}")]
+    InvalidAppendRange(AppendRange),
     /// An ack skipped a pending writer-local sequence number.
     #[error("server acknowledgement advanced past writer seq {writer_seq_num}: {ack:?}")]
     AppendNotAcknowledged {
@@ -3389,6 +3479,38 @@ mod tests {
     }
 
     #[test]
+    fn read_and_stateless_append_responses_match_the_requested_ranges() {
+        assert!(matches!(
+            validate_append_range(
+                AppendRange {
+                    start_seq_num: 4,
+                    end_seq_num: 6,
+                },
+                1,
+            ),
+            Err(TsfClientError::InvalidAppendRange(_))
+        ));
+
+        let mut options = ReadStreamOptions::new(
+            "00000000000000000000000000000000"
+                .parse()
+                .expect("stream ID"),
+        );
+        options.start = Some(ReadStart::SeqNum(2));
+        assert!(validate_read_batch_for_request(&[sse_test_record(1, 0)], &options).is_err());
+        assert!(
+            validate_caught_up_for_request(
+                CaughtUpPosition {
+                    next_seq_num: 1,
+                    last_timestamp_ms: 0,
+                },
+                &options,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn dispatch_ack_rejects_more_records_than_are_pending() {
         let permits = Arc::new(Semaphore::new(2));
         let (ack_tx, _ack_rx) = oneshot::channel();
@@ -3634,6 +3756,7 @@ mod tests {
                     snapshot: None,
                 },
                 Some(previous),
+                &options,
                 None,
             )
             .is_err()
@@ -3742,6 +3865,27 @@ mod tests {
                 .await,
             Err(TsfClientError::InvalidStatelessAppend(
                 "writer sequence range must end before u64::MAX"
+            ))
+        ));
+
+        let valid = [AppendRecord::new(
+            0,
+            PartHeader::unsplit(),
+            RecordFormat::Bytes,
+            Bytes::new(),
+        )];
+        assert!(matches!(
+            client
+                .append_records(
+                    &stream_id,
+                    ClientWriterId::from_bytes([0; 16]),
+                    &valid,
+                    Some(MAX_READ_SELECTOR_VALUE + 1),
+                    &secret,
+                )
+                .await,
+            Err(TsfClientError::InvalidStatelessAppend(
+                "expected next sequence exceeds the data adapter range"
             ))
         ));
     }

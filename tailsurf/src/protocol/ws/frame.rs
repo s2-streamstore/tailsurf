@@ -436,11 +436,14 @@ impl ServerFrame {
     /// Returns the exact wire length of this frame, validating the payload size for records.
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
-            Self::ReadBatch(records) => batch_encoded_len(
-                records.iter().map(|record| &record.data),
-                Self::READ_BODY_HEADER_LEN,
-                MAX_READ_BATCH_RECORDS,
-            ),
+            Self::ReadBatch(records) => {
+                validate_read_batch_sequence(records)?;
+                batch_encoded_len(
+                    records.iter().map(|record| &record.data),
+                    Self::READ_BODY_HEADER_LEN,
+                    MAX_READ_BATCH_RECORDS,
+                )
+            }
             Self::StreamMetadata(_) => Ok(1),
             _ => Ok(Self::MAX_FIXED_FRAME_LEN),
         }
@@ -751,6 +754,7 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
                 });
             }
             validate_batch(records.len(), payload_bytes, MAX_READ_BATCH_RECORDS)?;
+            validate_read_batch_sequence(&records)?;
             Ok(ServerFrame::ReadBatch(records))
         }
         ServerOp::Heartbeat => {
@@ -851,6 +855,16 @@ fn validate_batch(
             actual: payload_bytes,
             max: MAX_BATCH_PAYLOAD_BYTES,
         });
+    }
+    Ok(())
+}
+
+fn validate_read_batch_sequence(records: &[ReadRecord]) -> Result<(), FrameCodecError> {
+    if records
+        .windows(2)
+        .any(|pair| pair[0].seq_num.checked_add(1) != Some(pair[1].seq_num))
+    {
+        return Err(FrameCodecError::NonContiguousReadBatch);
     }
     Ok(())
 }
@@ -986,6 +1000,9 @@ pub enum FrameCodecError {
         /// Maximum accepted record count.
         max: usize,
     },
+    /// A read batch skipped or repeated a physical sequence number.
+    #[error("ReadBatch sequence numbers must be contiguous")]
+    NonContiguousReadBatch,
     /// Aggregate record payload exceeded [`MAX_BATCH_PAYLOAD_BYTES`].
     #[error("batch payload is {actual} bytes; maximum is {max}")]
     BatchPayloadTooLarge {
@@ -1424,8 +1441,8 @@ mod tests {
             Err(FrameCodecError::InvalidRecordLength)
         ));
 
-        let read_record = || ReadRecord {
-            seq_num: 0,
+        let read_record = |seq_num| ReadRecord {
+            seq_num,
             timestamp_ms: 0,
             writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
             writer_seq_num: 0,
@@ -1434,8 +1451,8 @@ mod tests {
             data: Bytes::new(),
         };
         let maximum_read = ServerFrame::ReadBatch(
-            std::iter::repeat_with(read_record)
-                .take(MAX_READ_BATCH_RECORDS)
+            (0..MAX_READ_BATCH_RECORDS as u64)
+                .map(read_record)
                 .collect(),
         );
         let encoded = maximum_read.encode().expect("encode maximum read batch");
@@ -1464,8 +1481,8 @@ mod tests {
         ));
         assert!(matches!(
             ServerFrame::ReadBatch(
-                std::iter::repeat_with(read_record)
-                    .take(MAX_READ_BATCH_RECORDS + 1)
+                (0..=MAX_READ_BATCH_RECORDS as u64)
+                    .map(read_record)
                     .collect()
             )
             .encode(),
@@ -1473,6 +1490,10 @@ mod tests {
                 max: MAX_READ_BATCH_RECORDS,
                 ..
             })
+        ));
+        assert!(matches!(
+            ServerFrame::ReadBatch(vec![read_record(0), read_record(0)]).encode(),
+            Err(FrameCodecError::NonContiguousReadBatch)
         ));
     }
 
