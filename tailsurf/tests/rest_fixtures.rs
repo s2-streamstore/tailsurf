@@ -3,7 +3,7 @@
 use serde_json::Value;
 use tailsurf::protocol::rest::{
     AppendRange, AppendRecordsRequest, CreateStreamRequest, MAX_SSE_EVENT_BYTES,
-    MAX_SSE_INCOMPLETE_EVENT_BYTES, MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS,
+    MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS, MAX_SSE_UNTERMINATED_EVENT_BYTES,
     MAX_STATELESS_APPEND_JSON_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
     MAX_STATELESS_APPEND_RECORDS, SseCaughtUpEvent, SseReadBatchEvent, SseSnapshotBoundaryEvent,
     StreamMetadata,
@@ -38,8 +38,8 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
         MAX_SSE_EVENT_BYTES
     );
     assert_eq!(
-        fixture_usize(&fixtures, "max_sse_incomplete_event_bytes"),
-        MAX_SSE_INCOMPLETE_EVENT_BYTES
+        fixture_usize(&fixtures, "max_sse_unterminated_event_bytes"),
+        MAX_SSE_UNTERMINATED_EVENT_BYTES
     );
     let create: CreateStreamRequest = fixture(&fixtures, "create_request");
     assert_eq!(create.links.len(), 2);

@@ -22,7 +22,7 @@ pub const MAX_SSE_READ_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Maximum encoded bytes in one completed SSE event, including its terminator.
 pub const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum encoded bytes retained for an SSE event whose terminator has not arrived.
-pub const MAX_SSE_INCOMPLETE_EVENT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_SSE_UNTERMINATED_EVENT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
