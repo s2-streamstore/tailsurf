@@ -27,6 +27,10 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
         fixtures["sse_resume_cursor"].as_str(),
         Some("v1,2,2,2,1786579200000")
     );
+    assert_eq!(
+        fixtures["sse_snapshot_cursor"].as_str(),
+        Some("v1,0,0,2,1786579200000")
+    );
     let snapshot: SseCaughtUpEvent = fixture(&fixtures, "sse_snapshot_boundary");
     assert_eq!(
         (snapshot.next_seq_num, snapshot.last_timestamp_ms),

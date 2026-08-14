@@ -3086,7 +3086,7 @@ async fn fake_sse_read(
         return StatusCode::NO_CONTENT.into_response();
     }
     let snapshot_boundary = if snapshot {
-        "event: snapshot_boundary\ndata: {\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}\n\n"
+        "id: v1,0,0,0,0\nevent: snapshot_boundary\ndata: {\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}\n\n"
     } else {
         ""
     };

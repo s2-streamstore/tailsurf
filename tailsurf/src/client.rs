@@ -528,7 +528,7 @@ impl TsfClient {
             last_caught_up: None,
             snapshot_boundary: connection.snapshot_boundary,
             reconnect_attempts: 0,
-            last_event_id: None,
+            last_event_id: connection.resume_event_id,
             finished: false,
         })
     }
@@ -561,6 +561,7 @@ impl TsfClient {
                 queued_events: VecDeque::new(),
                 stream_info: None,
                 snapshot_boundary: None,
+                resume_event_id: None,
             };
             let event = next_sse_event(
                 &mut connection.body,
@@ -578,6 +579,9 @@ impl TsfClient {
                 serde_json::from_str(&event.data)
                     .map_err(|_| TsfClientError::InvalidSse("invalid stream_info event"))?,
             );
+            if event.id.is_some() {
+                connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
+            }
             if options.snapshot {
                 let event = next_sse_event(
                     &mut connection.body,
@@ -593,6 +597,7 @@ impl TsfClient {
                         "snapshot_boundary must follow stream_info",
                     ));
                 }
+                connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
                 let boundary: SseCaughtUpEvent = serde_json::from_str(&event.data)
                     .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
                 connection.snapshot_boundary = Some(ReadSnapshotBoundary {
@@ -1590,6 +1595,7 @@ struct SseConnection {
     queued_events: VecDeque<ParsedSseEvent>,
     stream_info: Option<ReadStreamInfo>,
     snapshot_boundary: Option<ReadSnapshotBoundary>,
+    resume_event_id: Option<String>,
 }
 
 /// Resumable HTTP event-stream reader.
@@ -1682,6 +1688,9 @@ impl TsfSseReadSession {
                         ));
                     }
                     self.snapshot_boundary = Some(boundary);
+                }
+                if connection.resume_event_id.is_some() {
+                    self.last_event_id = connection.resume_event_id;
                 }
                 self.body = connection.body;
                 self.buffer = connection.buffer;
@@ -2197,7 +2206,7 @@ fn parse_sse_cursor_u64(value: &str) -> Option<u64> {
 }
 
 fn invalid_sse_resume_cursor() -> TsfClientError {
-    TsfClientError::InvalidSse("records and caught_up events require a valid resume cursor")
+    TsfClientError::InvalidSse("SSE event does not carry a valid resume cursor")
 }
 
 fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
