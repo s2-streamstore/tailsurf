@@ -243,13 +243,27 @@ pub struct StreamInfo {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Human-facing title when one has been set.
+    #[serde(deserialize_with = "crate::protocol::rest::deserialize_nullable_stream_title")]
     pub title: Option<StreamTitle>,
     /// Current visibility.
     pub visibility: Visibility,
     /// Absolute RFC 3339 stream creation timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub created_at: String,
     /// Absolute RFC 3339 stream expiration timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub expires_at: String,
+}
+
+fn deserialize_rfc3339_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if !crate::protocol::rest::is_rfc3339_timestamp(&value) {
+        return Err(serde::de::Error::custom("invalid RFC 3339 timestamp"));
+    }
+    Ok(value)
 }
 
 /// Frame sent from a reader or writer to the service.
@@ -1179,6 +1193,21 @@ mod tests {
                 expires_at: "2026-08-23T00:00:00Z".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn stream_info_requires_nullable_title_and_valid_timestamps() {
+        for json in [
+            br#"{"stream_id":"00000000000000000000000000000000","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#.as_slice(),
+            br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"not-a-time","expires_at":"2026-08-23T00:00:00Z"}"#.as_slice(),
+        ] {
+            let mut encoded = BytesMut::from(&[ServerOp::StreamInfo.byte()][..]);
+            encoded.extend_from_slice(json);
+            assert!(matches!(
+                ServerFrame::decode(&encoded),
+                Err(FrameCodecError::InvalidStreamInfo(_))
+            ));
+        }
     }
 
     #[test]

@@ -419,9 +419,23 @@ impl TsfClient {
             ));
         }
         let writer_start_seq_num = records[0].writer_seq_num;
+        let final_writer_seq_num = writer_start_seq_num
+            .checked_add((records.len() - 1) as u64)
+            .ok_or(TsfClientError::InvalidStatelessAppend(
+                "writer sequence overflow",
+            ))?;
+        if final_writer_seq_num == u64::MAX {
+            return Err(TsfClientError::InvalidStatelessAppend(
+                "writer sequence range must end before u64::MAX",
+            ));
+        }
         let mut json_records = Vec::with_capacity(records.len());
+        let mut payload_bytes = 0_usize;
         for (index, record) in records.iter().enumerate() {
             record.validate()?;
+            payload_bytes = payload_bytes.checked_add(record.data.len()).ok_or(
+                TsfClientError::InvalidStatelessAppend("payload size overflow"),
+            )?;
             if record.writer_seq_num
                 != writer_start_seq_num.checked_add(index as u64).ok_or(
                     TsfClientError::InvalidStatelessAppend("writer sequence overflow"),
@@ -447,6 +461,11 @@ impl TsfClient {
                     is_final: record.part.is_final(),
                 }),
             });
+        }
+        if payload_bytes > 900 * 1024 {
+            return Err(TsfClientError::InvalidStatelessAppend(
+                "append payload must not exceed 900 KiB",
+            ));
         }
         let request = AppendRecordsRequest {
             client_writer_id: URL_SAFE_NO_PAD.encode(client_writer_id.as_bytes()),
@@ -589,6 +608,9 @@ impl TsfClient {
             append_sse_query(&mut url, options);
             let mut request = self.http.get(url).header("Accept", "text/event-stream");
             if let Some(secret) = options.link_secret.as_ref() {
+                if !is_canonical_base64url_32(secret.expose_secret()) {
+                    return Err(TsfClientError::InvalidLinkSecret);
+                }
                 request = request.bearer_auth(secret.expose_secret());
             }
             if let Some(last_event_id) = last_event_id {
@@ -746,11 +768,14 @@ impl TsfClient {
         &self,
         request: reqwest::RequestBuilder,
         link_secret: Option<&LinkSecret>,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, TsfClientError> {
         if let Some(secret) = link_secret {
-            request.bearer_auth(secret.expose_secret())
+            if !is_canonical_base64url_32(secret.expose_secret()) {
+                return Err(TsfClientError::InvalidLinkSecret);
+            }
+            Ok(request.bearer_auth(secret.expose_secret()))
         } else {
-            request
+            Ok(request)
         }
     }
 
@@ -786,7 +811,7 @@ impl TsfClient {
         link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
         let response = self
-            .apply_rest_auth(request, link_secret)
+            .apply_rest_auth(request, link_secret)?
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -800,7 +825,7 @@ impl TsfClient {
         link_secret: Option<&LinkSecret>,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request, link_secret)
+            .apply_rest_auth(request, link_secret)?
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -1691,7 +1716,13 @@ impl TsfSseReadSession {
                 return Ok(None);
             }
             let event =
-                next_sse_event(&mut self.body, &mut self.buffer, &mut self.queued_events).await?;
+                match next_sse_event(&mut self.body, &mut self.buffer, &mut self.queued_events)
+                    .await
+                {
+                    Ok(event) => event,
+                    Err(error) if error.is_resumable_sse_interruption() => None,
+                    Err(error) => return Err(error),
+                };
             let Some(event) = event else {
                 let attempts = self.client.config.retry_policy.attempt_count();
                 if self.reconnect_attempts + 1 >= attempts {
@@ -2140,12 +2171,12 @@ async fn next_sse_event(
         if let Some(event) = queued.pop_front() {
             return Ok(Some(event));
         }
+        if buffer.len() > 2 * 1024 * 1024 {
+            return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
+        }
         match body.next().await {
             Some(Ok(chunk)) => {
                 buffer.extend_from_slice(&chunk);
-                if buffer.len() > 2 * 1024 * 1024 {
-                    return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
-                }
             }
             Some(Err(error)) => return Err(error.into()),
             None => return Ok(None),
@@ -2485,6 +2516,9 @@ pub enum TsfClientError {
     /// Stateless append input violates the local protocol contract.
     #[error("invalid stateless append: {0}")]
     InvalidStatelessAppend(&'static str),
+    /// A link secret is not a canonical 32-byte unpadded base64url value.
+    #[error("link secret must be canonical 43-character unpadded base64url")]
+    InvalidLinkSecret,
     /// SSE response violated the public event contract.
     #[error("invalid SSE response: {0}")]
     InvalidSse(&'static str),
@@ -2662,6 +2696,17 @@ impl TsfClientError {
             Self::WebSocket(error) => is_retryable_websocket_error(error),
             Self::WebSocketClosed => true,
             Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),
+            _ => false,
+        }
+    }
+
+    fn is_resumable_sse_interruption(&self) -> bool {
+        match self {
+            Self::Http(error) => {
+                error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
+            }
+            Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
+            Self::Timeout { .. } => true,
             _ => false,
         }
     }
@@ -3132,6 +3177,96 @@ mod tests {
     #[test]
     fn api_error_message_leaves_non_standard_body_for_fallback() {
         assert_eq!(api_error_message("plain failure"), None);
+    }
+
+    #[tokio::test]
+    async fn sse_parser_accepts_multiple_complete_events_in_one_large_chunk() {
+        let payload = format!(
+            "event: first\ndata: {}\n\nevent: second\ndata: {}\n\n",
+            "a".repeat(1_100_000),
+            "b".repeat(1_100_000),
+        );
+        let mut body: SseBody =
+            Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                Bytes::from(payload),
+            )]));
+        let mut buffer = Vec::new();
+        let mut queued = VecDeque::new();
+
+        assert_eq!(
+            next_sse_event(&mut body, &mut buffer, &mut queued)
+                .await
+                .expect("first event")
+                .expect("first event value")
+                .event,
+            "first"
+        );
+        assert_eq!(
+            next_sse_event(&mut body, &mut buffer, &mut queued)
+                .await
+                .expect("second event")
+                .expect("second event value")
+                .event,
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_append_rejects_aggregate_payload_and_max_writer_sequence() {
+        let client = TsfClient::new();
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let secret = LinkSecret::from("A".repeat(43));
+        let large = vec![
+            AppendRecord::new(
+                0,
+                PartHeader::unsplit(),
+                RecordFormat::Bytes,
+                Bytes::from(vec![0; 500 * 1024]),
+            ),
+            AppendRecord::new(
+                1,
+                PartHeader::unsplit(),
+                RecordFormat::Bytes,
+                Bytes::from(vec![0; 500 * 1024]),
+            ),
+        ];
+        assert!(matches!(
+            client
+                .append_records(
+                    &stream_id,
+                    WriterId::from_bytes([0; 16]),
+                    &large,
+                    None,
+                    &secret
+                )
+                .await,
+            Err(TsfClientError::InvalidStatelessAppend(
+                "append payload must not exceed 900 KiB"
+            ))
+        ));
+
+        let endpoint = [AppendRecord::new(
+            u64::MAX,
+            PartHeader::unsplit(),
+            RecordFormat::Bytes,
+            Bytes::new(),
+        )];
+        assert!(matches!(
+            client
+                .append_records(
+                    &stream_id,
+                    WriterId::from_bytes([0; 16]),
+                    &endpoint,
+                    None,
+                    &secret,
+                )
+                .await,
+            Err(TsfClientError::InvalidStatelessAppend(
+                "writer sequence range must end before u64::MAX"
+            ))
+        ));
     }
 
     #[test]

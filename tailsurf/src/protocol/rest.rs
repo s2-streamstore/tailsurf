@@ -4,7 +4,8 @@ use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle, ids::encode_base64url_32,
+    LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
+    ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::ws::frame::RecordFormat,
 };
 
@@ -80,7 +81,10 @@ pub struct StreamLinkCredential {
     /// Effective permissions carried by the link.
     pub permissions: LinkPermissions,
     /// Secret link value returned only by the creating request.
-    #[serde(serialize_with = "crate::ids::serialize_link_secret")]
+    #[serde(
+        serialize_with = "crate::ids::serialize_link_secret",
+        deserialize_with = "deserialize_link_secret"
+    )]
     pub secret: LinkSecret,
 }
 
@@ -95,8 +99,10 @@ pub struct CreateStreamResponse {
     /// Initial visibility.
     pub visibility: Visibility,
     /// Absolute RFC 3339 stream creation timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub created_at: String,
     /// Absolute RFC 3339 stream expiration timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub expires_at: String,
     /// Newly created link credentials.
     pub links: Vec<StreamLinkCredential>,
@@ -158,10 +164,13 @@ pub struct StreamLinkSummary {
     /// Current effective lifecycle state.
     pub status: StreamLinkStatus,
     /// RFC 3339 creation timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub created_at: String,
     /// RFC 3339 expiration timestamp when configured.
+    #[serde(deserialize_with = "deserialize_nullable_rfc3339_string")]
     pub expires_at: Option<String>,
     /// RFC 3339 revocation timestamp when inactive.
+    #[serde(deserialize_with = "deserialize_nullable_rfc3339_string")]
     pub revoked_at: Option<String>,
     /// Whether this link authenticated the inventory request.
     pub is_current: bool,
@@ -173,6 +182,7 @@ pub struct ListLinksResponse {
     /// Retained link metadata ordered newest first.
     pub links: Vec<StreamLinkSummary>,
     /// Opaque cursor for the next page.
+    #[serde(deserialize_with = "deserialize_nullable_string")]
     pub next_cursor: Option<String>,
 }
 
@@ -187,8 +197,10 @@ pub struct StreamMetadata {
     /// Current visibility.
     pub visibility: Visibility,
     /// Absolute RFC 3339 stream creation timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub created_at: String,
     /// Absolute RFC 3339 stream expiration timestamp.
+    #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub expires_at: String,
 }
 
@@ -402,13 +414,120 @@ where
     })
 }
 
-fn deserialize_nullable_stream_title<'de, D>(
+pub(crate) fn deserialize_nullable_stream_title<'de, D>(
     deserializer: D,
 ) -> Result<Option<StreamTitle>, D::Error>
 where
     D: Deserializer<'de>,
 {
     Option::<StreamTitle>::deserialize(deserializer)
+}
+
+fn deserialize_link_secret<'de, D>(deserializer: D) -> Result<LinkSecret, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if !is_canonical_base64url_32(&value) {
+        return Err(serde::de::Error::custom("invalid link secret"));
+    }
+    Ok(value.into())
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
+fn deserialize_rfc3339_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if !is_rfc3339_timestamp(&value) {
+        return Err(serde::de::Error::custom("invalid RFC 3339 timestamp"));
+    }
+    Ok(value)
+}
+
+fn deserialize_nullable_rfc3339_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_deref()
+        .is_some_and(|value| !is_rfc3339_timestamp(value))
+    {
+        return Err(serde::de::Error::custom("invalid RFC 3339 timestamp"));
+    }
+    Ok(value)
+}
+
+pub(crate) fn is_rfc3339_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let number = |start: usize, end: usize| -> Option<u32> {
+        std::str::from_utf8(bytes.get(start..end)?)
+            .ok()?
+            .parse()
+            .ok()
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0, 4),
+        number(5, 7),
+        number(8, 10),
+        number(11, 13),
+        number(14, 16),
+        number(17, 19),
+    ) else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == start {
+            return false;
+        }
+    }
+    match bytes.get(index..) {
+        Some(b"Z") => true,
+        Some(zone) if zone.len() == 6 && matches!(zone[0], b'+' | b'-') && zone[3] == b':' => {
+            let Ok(hour) = std::str::from_utf8(&zone[1..3]).unwrap_or("").parse::<u8>() else {
+                return false;
+            };
+            let Ok(minute) = std::str::from_utf8(&zone[4..6]).unwrap_or("").parse::<u8>() else {
+                return false;
+            };
+            hour <= 23 && minute <= 59
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -479,5 +598,27 @@ mod tests {
                 .title,
             StreamTitleUpdate::Clear
         );
+    }
+
+    #[test]
+    fn response_models_require_nullable_fields_and_rfc3339_timestamps() {
+        let stream = json!({
+            "stream_id": "00000000000000000000000000000000",
+            "visibility": "private",
+            "created_at": "2026-08-13T00:00:00Z",
+            "expires_at": "2026-08-23T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<StreamMetadata>(stream).is_err());
+
+        let invalid_time = json!({
+            "stream_id": "00000000000000000000000000000000",
+            "title": null,
+            "visibility": "private",
+            "created_at": "2026-02-30T00:00:00Z",
+            "expires_at": "2026-08-23T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<StreamMetadata>(invalid_time).is_err());
+
+        assert!(serde_json::from_value::<ListLinksResponse>(json!({ "links": [] })).is_err());
     }
 }
