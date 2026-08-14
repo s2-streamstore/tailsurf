@@ -1681,12 +1681,12 @@ async fn read_transcript(
 
     let client = TsfClient::with_api_origin(api_url)?;
     let reader = if sse {
-        TranscriptReader::Sse(
+        TranscriptReader::Sse(Box::new(
             client
                 .connect_sse_reader(options)
                 .await
                 .context("failed to connect SSE reader")?,
-        )
+        ))
     } else {
         TranscriptReader::WebSocket(Box::new(
             client
@@ -1738,7 +1738,7 @@ async fn write_transcript_records(
 
 enum TranscriptReader {
     WebSocket(Box<TsfReadSession>),
-    Sse(TsfSseReadSession),
+    Sse(Box<TsfSseReadSession>),
 }
 
 impl TranscriptReader {
