@@ -3,7 +3,7 @@
 use serde_json::Value;
 use tailsurf::protocol::rest::{
     AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, SseCaughtUpEvent,
-    SseRecordsEvent, StreamInfoResponse,
+    SseRecordsEvent, SseSnapshotBoundaryEvent, StreamInfoResponse,
 };
 
 #[test]
@@ -18,7 +18,7 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     assert_eq!(append.records.len(), 2);
     let acknowledgement: AppendRecordsResponse = fixture(&fixtures, "append_response");
     assert_eq!(
-        (acknowledgement.seq_start, acknowledgement.next_seq_num),
+        (acknowledgement.start_seq_num, acknowledgement.end_seq_num),
         (7, 9)
     );
     let records: SseRecordsEvent = fixture(&fixtures, "sse_records");
@@ -31,9 +31,9 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
         fixtures["sse_snapshot_cursor"].as_str(),
         Some("v1,0,0,2,1786579200000")
     );
-    let snapshot: SseCaughtUpEvent = fixture(&fixtures, "sse_snapshot_boundary");
+    let snapshot: SseSnapshotBoundaryEvent = fixture(&fixtures, "sse_snapshot_boundary");
     assert_eq!(
-        (snapshot.next_seq_num, snapshot.last_timestamp_ms),
+        (snapshot.end_seq_num, snapshot.last_timestamp_ms),
         (2, 1_786_579_200_000)
     );
     let caught_up: SseCaughtUpEvent = fixture(&fixtures, "sse_caught_up");

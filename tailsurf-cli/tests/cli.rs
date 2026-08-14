@@ -1056,7 +1056,7 @@ async fn sse_snapshot_receives_an_explicit_empty_boundary() {
     assert_eq!(
         session.snapshot_boundary(),
         Some(ReadSnapshotBoundary {
-            next_seq_num: 0,
+            end_seq_num: 0,
             last_timestamp_ms: 0,
         })
     );
@@ -2191,16 +2191,17 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
         let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
             return;
         };
-        let (writer_seq_start, writer_next_seq_num, seq_start, next_seq_num) = {
+        let (writer_start_seq_num, writer_end_seq_num, start_seq_num, end_seq_num) = {
             let mut streams = state.streams.lock().expect("streams lock");
             let Some(stream) = streams.get_mut(&stream_id) else {
                 return;
             };
-            let seq_start = stream.records.len() as u64;
-            let Some(writer_seq_start) = records.first().map(|record| record.writer_seq_num) else {
+            let start_seq_num = stream.records.len() as u64;
+            let Some(writer_start_seq_num) = records.first().map(|record| record.writer_seq_num)
+            else {
                 return;
             };
-            let Some(writer_next_seq_num) = records
+            let Some(writer_end_seq_num) = records
                 .last()
                 .and_then(|record| record.writer_seq_num.checked_add(1))
             else {
@@ -2219,19 +2220,19 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
                 });
             }
             (
-                writer_seq_start,
-                writer_next_seq_num,
-                seq_start,
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
                 stream.records.len() as u64,
             )
         };
         send_server_frame(
             &mut socket,
-            ServerFrame::Ack {
-                writer_seq_start,
-                writer_next_seq_num,
-                seq_start,
-                next_seq_num,
+            ServerFrame::AppendAck {
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
+                end_seq_num,
             },
         )
         .await
@@ -2300,7 +2301,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         send_server_frame(
             &mut socket,
             ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
-                next_seq_num: caught_up.next_seq_num,
+                end_seq_num: caught_up.next_seq_num,
                 last_timestamp_ms: caught_up.last_timestamp_ms,
             }),
         )
@@ -2867,11 +2868,11 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
 async fn send_test_ack(socket: &mut WebSocket, start: u64, end: u64) -> Result<(), axum::Error> {
     send_server_frame(
         socket,
-        ServerFrame::Ack {
-            writer_seq_start: start,
-            writer_next_seq_num: end + 1,
-            seq_start: start,
-            next_seq_num: end + 1,
+        ServerFrame::AppendAck {
+            writer_start_seq_num: start,
+            writer_end_seq_num: end + 1,
+            start_seq_num: start,
+            end_seq_num: end + 1,
         },
     )
     .await
@@ -2994,11 +2995,11 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
 
     send_server_frame(
         &mut socket,
-        ServerFrame::Ack {
-            writer_seq_start: record.writer_seq_num,
-            writer_next_seq_num: record.writer_seq_num + 1,
-            seq_start: 0,
-            next_seq_num: 1,
+        ServerFrame::AppendAck {
+            writer_start_seq_num: record.writer_seq_num,
+            writer_end_seq_num: record.writer_seq_num + 1,
+            start_seq_num: 0,
+            end_seq_num: 1,
         },
     )
     .await
@@ -3086,7 +3087,7 @@ async fn fake_sse_read(
         return StatusCode::NO_CONTENT.into_response();
     }
     let snapshot_boundary = if snapshot {
-        "id: v1,0,0,0,0\nevent: snapshot_boundary\ndata: {\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}\n\n"
+        "id: v1,0,0,0,0\nevent: snapshot_boundary\ndata: {\"end_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}\n\n"
     } else {
         ""
     };
@@ -3243,7 +3244,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
         send_server_frame(
             &mut socket,
             ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
-                next_seq_num: fake_read_next_seq_num(state.mode),
+                end_seq_num: fake_read_next_seq_num(state.mode),
                 last_timestamp_ms: 1_781_717_406_000,
             }),
         )

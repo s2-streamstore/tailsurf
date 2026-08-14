@@ -237,7 +237,6 @@ fn default_bytes_format() -> String {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppendJsonRecord {
     /// Tagged data payload.
-    #[serde(flatten)]
     pub data: AppendRecordData,
     /// Split-part metadata, or an implicit unsplit record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,7 +250,7 @@ pub struct AppendRecordsRequest {
     pub writer_id: String,
     /// Writer-local sequence assigned to the first record.
     #[serde(with = "decimal_u64")]
-    pub first_writer_seq_num: u64,
+    pub writer_start_seq_num: u64,
     /// Atomic record batch.
     pub records: Vec<AppendJsonRecord>,
     /// Optional expected current sequence position.
@@ -268,10 +267,10 @@ pub struct AppendRecordsRequest {
 pub struct AppendRecordsResponse {
     /// First durable physical sequence number.
     #[serde(with = "decimal_u64")]
-    pub seq_start: u64,
-    /// Exclusive sequence number after the appended records.
+    pub start_seq_num: u64,
+    /// Exclusive end of the appended physical sequence range.
     #[serde(with = "decimal_u64")]
-    pub next_seq_num: u64,
+    pub end_seq_num: u64,
 }
 
 /// One record in a batched SSE `records` event.
@@ -308,6 +307,17 @@ pub struct SseCaughtUpEvent {
     #[serde(with = "decimal_u64")]
     pub next_seq_num: u64,
     /// Last record timestamp at the captured boundary.
+    #[serde(with = "decimal_u64")]
+    pub last_timestamp_ms: u64,
+}
+
+/// Payload of an SSE `snapshot_boundary` event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub struct SseSnapshotBoundaryEvent {
+    /// Exclusive end of the fixed snapshot.
+    #[serde(with = "decimal_u64")]
+    pub end_seq_num: u64,
+    /// Timestamp of the last record at the snapshot boundary.
     #[serde(with = "decimal_u64")]
     pub last_timestamp_ms: u64,
 }

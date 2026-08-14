@@ -66,11 +66,11 @@ enum ClientFixture {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerFixture {
     Ready,
-    Ack {
-        writer_seq_start: String,
-        writer_next_seq_num: String,
-        seq_start: String,
-        next_seq_num: String,
+    AppendAck {
+        writer_start_seq_num: String,
+        writer_end_seq_num: String,
+        start_seq_num: String,
+        end_seq_num: String,
     },
     ReadBatch {
         seq_num: String,
@@ -87,7 +87,7 @@ enum ServerFixture {
         last_timestamp_ms: String,
     },
     SnapshotBoundary {
-        next_seq_num: String,
+        end_seq_num: String,
         last_timestamp_ms: String,
     },
     StreamInfo {
@@ -203,16 +203,16 @@ fn read_start(kind: &str, value: u64) -> ReadStart {
 fn server_frame(fixture: ServerFixture) -> ServerFrame {
     match fixture {
         ServerFixture::Ready => ServerFrame::Ready,
-        ServerFixture::Ack {
-            writer_seq_start,
-            writer_next_seq_num,
-            seq_start,
-            next_seq_num,
-        } => ServerFrame::Ack {
-            writer_seq_start: parse_u64(&writer_seq_start),
-            writer_next_seq_num: parse_u64(&writer_next_seq_num),
-            seq_start: parse_u64(&seq_start),
-            next_seq_num: parse_u64(&next_seq_num),
+        ServerFixture::AppendAck {
+            writer_start_seq_num,
+            writer_end_seq_num,
+            start_seq_num,
+            end_seq_num,
+        } => ServerFrame::AppendAck {
+            writer_start_seq_num: parse_u64(&writer_start_seq_num),
+            writer_end_seq_num: parse_u64(&writer_end_seq_num),
+            start_seq_num: parse_u64(&start_seq_num),
+            end_seq_num: parse_u64(&end_seq_num),
         },
         ServerFixture::ReadBatch {
             seq_num,
@@ -240,10 +240,10 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
         ServerFixture::SnapshotBoundary {
-            next_seq_num,
+            end_seq_num,
             last_timestamp_ms,
         } => ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
-            next_seq_num: parse_u64(&next_seq_num),
+            end_seq_num: parse_u64(&end_seq_num),
             last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
         ServerFixture::StreamInfo {

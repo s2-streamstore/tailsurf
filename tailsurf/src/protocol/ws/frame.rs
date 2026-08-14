@@ -73,7 +73,7 @@ const READ_START_TAIL_OFFSET: u8 = 0x03;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerOp {
     Ready = 0x80,
-    Ack = 0x81,
+    AppendAck = 0x81,
     ReadBatch = 0x82,
     Heartbeat = 0x83,
     CaughtUp = 0x84,
@@ -93,7 +93,7 @@ impl TryFrom<u8> for ServerOp {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             value if value == Self::Ready.byte() => Ok(Self::Ready),
-            value if value == Self::Ack.byte() => Ok(Self::Ack),
+            value if value == Self::AppendAck.byte() => Ok(Self::AppendAck),
             value if value == Self::ReadBatch.byte() => Ok(Self::ReadBatch),
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
@@ -227,8 +227,8 @@ pub struct ReadCaughtUp {
 /// Fixed exclusive ending position captured when a snapshot read opens.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadSnapshotBoundary {
-    /// Sequence number assigned to the next appended record.
-    pub next_seq_num: u64,
+    /// Exclusive end of the fixed snapshot.
+    pub end_seq_num: u64,
     /// Timestamp of the last record. This is zero when `next_seq_num` is zero.
     pub last_timestamp_ms: u64,
 }
@@ -283,15 +283,15 @@ pub enum ServerFrame {
     /// Confirms successful authorization and socket readiness.
     Ready,
     /// Confirms a contiguous range of writer records is durable.
-    Ack {
+    AppendAck {
         /// First acknowledged writer-local sequence number.
-        writer_seq_start: u64,
+        writer_start_seq_num: u64,
         /// Exclusive writer-local sequence after the acknowledged range.
-        writer_next_seq_num: u64,
+        writer_end_seq_num: u64,
         /// Durable sequence number assigned to the first acknowledged record.
-        seq_start: u64,
+        start_seq_num: u64,
         /// Exclusive durable sequence after the acknowledged range.
-        next_seq_num: u64,
+        end_seq_num: u64,
     },
     /// Delivers a bounded batch of physical stream records.
     ReadBatch(Vec<ReadRecord>),
@@ -424,7 +424,7 @@ impl ClientFrame {
 
 impl ServerFrame {
     const READ_BODY_HEADER_LEN: usize = 8 + 8 + WriterId::BYTE_LEN + 8 + 4 + 1;
-    /// Largest encoded size among the fixed-width frames, set by [`ServerFrame::Ack`].
+    /// Largest encoded size among the fixed-width frames, set by [`ServerFrame::AppendAck`].
     const MAX_FIXED_FRAME_LEN: usize = 1 + 4 * 8;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
@@ -444,17 +444,17 @@ impl ServerFrame {
     fn encode_into(&self, output: &mut BytesMut) -> Result<(), FrameCodecError> {
         match self {
             Self::Ready => output.put_u8(ServerOp::Ready.byte()),
-            Self::Ack {
-                writer_seq_start,
-                writer_next_seq_num,
-                seq_start,
-                next_seq_num,
+            Self::AppendAck {
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
+                end_seq_num,
             } => {
-                output.put_u8(ServerOp::Ack.byte());
-                output.put_u64(*writer_seq_start);
-                output.put_u64(*writer_next_seq_num);
-                output.put_u64(*seq_start);
-                output.put_u64(*next_seq_num);
+                output.put_u8(ServerOp::AppendAck.byte());
+                output.put_u64(*writer_start_seq_num);
+                output.put_u64(*writer_end_seq_num);
+                output.put_u64(*start_seq_num);
+                output.put_u64(*end_seq_num);
             }
             Self::ReadBatch(records) => {
                 output.put_u8(ServerOp::ReadBatch.byte());
@@ -483,7 +483,7 @@ impl ServerFrame {
             }
             Self::SnapshotBoundary(boundary) => {
                 output.put_u8(ServerOp::SnapshotBoundary.byte());
-                output.put_u64(boundary.next_seq_num);
+                output.put_u64(boundary.end_seq_num);
                 output.put_u64(boundary.last_timestamp_ms);
             }
         }
@@ -689,17 +689,17 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::Ready)
         }
-        ServerOp::Ack => {
-            let (writer_seq_start, body) = read_u64(body)?;
-            let (writer_next_seq_num, body) = read_u64(body)?;
-            let (seq_start, body) = read_u64(body)?;
-            let (next_seq_num, body) = read_u64(body)?;
+        ServerOp::AppendAck => {
+            let (writer_start_seq_num, body) = read_u64(body)?;
+            let (writer_end_seq_num, body) = read_u64(body)?;
+            let (start_seq_num, body) = read_u64(body)?;
+            let (end_seq_num, body) = read_u64(body)?;
             ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::Ack {
-                writer_seq_start,
-                writer_next_seq_num,
-                seq_start,
-                next_seq_num,
+            Ok(ServerFrame::AppendAck {
+                writer_start_seq_num,
+                writer_end_seq_num,
+                start_seq_num,
+                end_seq_num,
             })
         }
         ServerOp::ReadBatch => {
@@ -743,9 +743,9 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             .map(ServerFrame::StreamInfo)
             .map_err(FrameCodecError::InvalidStreamInfo),
         ServerOp::SnapshotBoundary => {
-            decode_position(op_byte, body, |next_seq_num, last_timestamp_ms| {
+            decode_position(op_byte, body, |end_seq_num, last_timestamp_ms| {
                 ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
-                    next_seq_num,
+                    end_seq_num,
                     last_timestamp_ms,
                 })
             })
@@ -758,10 +758,10 @@ fn decode_position(
     body: &[u8],
     frame: impl FnOnce(u64, u64) -> ServerFrame,
 ) -> Result<ServerFrame, FrameCodecError> {
-    let (next_seq_num, body) = read_u64(body)?;
+    let (seq_num, body) = read_u64(body)?;
     let (last_timestamp_ms, body) = read_u64(body)?;
     ensure_empty(op, body)?;
-    Ok(frame(next_seq_num, last_timestamp_ms))
+    Ok(frame(seq_num, last_timestamp_ms))
 }
 
 fn validate_link_secret(secret: &LinkSecret) -> Result<(), FrameCodecError> {
@@ -1104,7 +1104,7 @@ mod tests {
             Err(FrameCodecError::TruncatedFrame { .. })
         ));
         assert!(matches!(
-            ServerFrame::decode(&[ServerOp::Ack.byte(), 0]),
+            ServerFrame::decode(&[ServerOp::AppendAck.byte(), 0]),
             Err(FrameCodecError::TruncatedFrame { .. })
         ));
     }

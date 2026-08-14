@@ -69,11 +69,11 @@
     {
       "name": "append acknowledgement",
       "frame": {
-        "type": "ack",
-        "writer_seq_start": "42",
-        "writer_next_seq_num": "43",
-        "seq_start": "100",
-        "next_seq_num": "101"
+        "type": "append_ack",
+        "writer_start_seq_num": "42",
+        "writer_end_seq_num": "43",
+        "start_seq_num": "100",
+        "end_seq_num": "101"
       },
       "hex": "81000000000000002a000000000000002b00000000000000640000000000000065"
     },
@@ -141,7 +141,7 @@
       "name": "snapshot boundary",
       "frame": {
         "type": "snapshot_boundary",
-        "next_seq_num": "102",
+        "end_seq_num": "102",
         "last_timestamp_ms": "1786000000456"
       },
       "hex": "8600000000000000660000019fd5e545c8"
