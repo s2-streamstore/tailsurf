@@ -239,7 +239,7 @@ pub struct AppendRecordsRequest {
         skip_serializing_if = "Option::is_none",
         with = "optional_decimal_u64"
     )]
-    pub expected_end_seq_num: Option<u64>,
+    pub expected_next_seq_num: Option<u64>,
 }
 
 /// Durable half-open physical sequence range for an atomic append.

@@ -372,7 +372,7 @@ impl TsfClient {
         stream_id: &StreamId,
         writer_id: WriterId,
         records: &[WriteRecord],
-        expected_end_seq_num: Option<u64>,
+        expected_next_seq_num: Option<u64>,
         write_link_secret: &LinkSecret,
     ) -> Result<AppendRecordsResponse, TsfClientError> {
         if records.is_empty() || records.len() > 128 {
@@ -414,7 +414,7 @@ impl TsfClient {
             writer_id: URL_SAFE_NO_PAD.encode(writer_id.as_bytes()),
             writer_start_seq_num,
             records: json_records,
-            expected_end_seq_num,
+            expected_next_seq_num,
         };
         self.retry_transient(|| {
             self.send_json_with_bearer(
@@ -440,10 +440,11 @@ impl TsfClient {
     /// Connects a durable writer with explicit in-flight and reconnect bounds.
     pub async fn connect_writer_with_config(
         &self,
-        options: WriteStreamOptions,
+        mut options: WriteStreamOptions,
         config: TsfWriterConfig,
     ) -> Result<TsfWriter, TsfClientError> {
         let session = self.connect_append_session(options.clone()).await?;
+        options.expected_next_seq_num = None;
         TsfWriter::new(self.clone(), options, session, config)
     }
 
@@ -460,6 +461,7 @@ impl TsfClient {
         let opening_frame = ClientFrame::OpenWrite {
             writer_id: options.writer_id,
             link_secret: options.link_secret.clone(),
+            expected_next_seq_num: options.expected_next_seq_num,
         }
         .encode()?;
 
@@ -1279,13 +1281,21 @@ impl TsfAppendSession {
     ///
     /// Returns `None` when the service closes the socket normally before another ack.
     pub async fn next_ack(&mut self) -> Result<Option<AppendAck>, TsfClientError> {
-        match with_timeout(
+        let frame = with_timeout(
             self.operation_timeout,
             "append acknowledgement",
             next_server_frame(&mut self.ws),
         )
-        .await?
-        {
+        .await
+        .map_err(|error| match error {
+            TsfClientError::WebSocketClosedWithReason { code: 1008, reason }
+                if reason == "sequence_mismatch" =>
+            {
+                TsfClientError::WriterSequenceMismatch
+            }
+            other => other,
+        })?;
+        match frame {
             Some(ServerFrame::AppendAck {
                 writer_start_seq_num,
                 writer_end_seq_num,
@@ -2488,6 +2498,9 @@ pub enum TsfClientError {
         /// Stable server close reason when available.
         reason: String,
     },
+    /// The stream did not start the writer session at its requested sequence.
+    #[error("stream next sequence did not match the writer session precondition")]
+    WriterSequenceMismatch,
     /// The server returned an invalid or mismatched ack range.
     #[error("server sent invalid append acknowledgement {0:?}")]
     InvalidAppendAck(AppendAck),

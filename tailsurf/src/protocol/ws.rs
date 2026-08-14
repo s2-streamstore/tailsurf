@@ -74,6 +74,8 @@ pub struct WriteStreamOptions {
     pub writer_id: WriterId,
     /// Secret from a write-capable stream link.
     pub link_secret: LinkSecret,
+    /// Initial stream sequence precondition for this writer session.
+    pub expected_next_seq_num: Option<u64>,
 }
 
 impl WriteStreamOptions {
@@ -87,6 +89,13 @@ impl WriteStreamOptions {
             stream_id,
             writer_id,
             link_secret: link_secret.into(),
+            expected_next_seq_num: None,
         }
+    }
+
+    /// Requires the stream to start this writer session at the supplied sequence.
+    pub fn with_expected_next_seq_num(mut self, expected_next_seq_num: u64) -> Self {
+        self.expected_next_seq_num = Some(expected_next_seq_num);
+        self
     }
 }

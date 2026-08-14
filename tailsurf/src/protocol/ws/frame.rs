@@ -65,6 +65,9 @@ const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET
     | OPEN_READ_PLAYBACK_RATE
     | OPEN_READ_SNAPSHOT;
 
+const OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM: u8 = 0x01;
+const OPEN_WRITE_FLAGS: u8 = OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM;
+
 const READ_START_SEQ_NUM: u8 = 0x01;
 const READ_START_TIMESTAMP_MS: u8 = 0x02;
 const READ_START_TAIL_OFFSET: u8 = 0x03;
@@ -273,6 +276,8 @@ pub enum ClientFrame {
         writer_id: WriterId,
         /// Secret from a write-capable stream link.
         link_secret: LinkSecret,
+        /// Initial stream sequence precondition for this writer session.
+        expected_next_seq_num: Option<u64>,
     },
     /// Submits a bounded batch of physical records for durable append.
     AppendBatch(Vec<AppendRecord>),
@@ -333,9 +338,18 @@ impl ClientFrame {
                         .as_ref()
                         .map_or(0, |_| LINK_SECRET_ENCODED_LENGTH))
             }
-            Self::OpenWrite { link_secret, .. } => {
+            Self::OpenWrite {
+                link_secret,
+                expected_next_seq_num,
+                ..
+            } => {
                 validate_link_secret(link_secret)?;
-                Ok(1 + WriterId::BYTE_LEN + LINK_SECRET_ENCODED_LENGTH)
+                if let Some(value) = expected_next_seq_num {
+                    validate_expected_next_seq_num(*value)?;
+                }
+                Ok(2 + WriterId::BYTE_LEN
+                    + expected_next_seq_num.map_or(0, |_| 8)
+                    + LINK_SECRET_ENCODED_LENGTH)
             }
             Self::AppendBatch(records) => {
                 for record in records {
@@ -387,9 +401,15 @@ impl ClientFrame {
             Self::OpenWrite {
                 writer_id,
                 link_secret,
+                expected_next_seq_num,
             } => {
                 output.put_u8(ClientOp::OpenWrite.byte());
+                output
+                    .put_u8(expected_next_seq_num.map_or(0, |_| OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM));
                 output.put_slice(writer_id.as_bytes());
+                if let Some(value) = expected_next_seq_num {
+                    output.put_u64(*value);
+                }
                 output.put_slice(link_secret.expose_secret().as_bytes());
             }
             Self::AppendBatch(records) => {
@@ -535,7 +555,24 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
     match ClientOp::try_from(op_byte)? {
         ClientOp::OpenRead => decode_open_read(op_byte, body),
         ClientOp::OpenWrite => {
-            let (writer_id, secret_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            let (&flags, body) = body.split_first().ok_or(FrameCodecError::TruncatedFrame {
+                op: op_byte,
+                needed: 1,
+            })?;
+            if flags & !OPEN_WRITE_FLAGS != 0 {
+                return Err(FrameCodecError::UnknownOpenWriteFlags(
+                    flags & !OPEN_WRITE_FLAGS,
+                ));
+            }
+            let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            let (expected_next_seq_num, secret_bytes) =
+                if flags & OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM == 0 {
+                    (None, body)
+                } else {
+                    let (value, body) = read_u64(body)?;
+                    validate_expected_next_seq_num(value)?;
+                    (Some(value), body)
+                };
             if secret_bytes.len() != LINK_SECRET_ENCODED_LENGTH {
                 return Err(FrameCodecError::InvalidLinkSecret);
             }
@@ -544,6 +581,7 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
             Ok(ClientFrame::OpenWrite {
                 writer_id: WriterId::from_bytes(writer_id),
                 link_secret,
+                expected_next_seq_num,
             })
         }
         ClientOp::AppendBatch => {
@@ -789,6 +827,14 @@ fn validate_writer_seq_num(value: u64) -> Result<(), FrameCodecError> {
     }
 }
 
+fn validate_expected_next_seq_num(value: u64) -> Result<(), FrameCodecError> {
+    if value > MAX_READ_SELECTOR_VALUE {
+        Err(FrameCodecError::ExpectedNextSeqNumOutOfRange(value))
+    } else {
+        Ok(())
+    }
+}
+
 fn batch_encoded_len<'a>(
     records: impl ExactSizeIterator<Item = &'a Bytes>,
     record_header_len: usize,
@@ -912,12 +958,18 @@ pub enum FrameCodecError {
     /// An `OpenRead` flag bit is not defined by TSF v1.
     #[error("OpenRead has unknown flags 0x{0:02x}")]
     UnknownOpenReadFlags(u8),
+    /// An `OpenWrite` flag bit is not defined by TSF v1.
+    #[error("OpenWrite has unknown flags 0x{0:02x}")]
+    UnknownOpenWriteFlags(u8),
     /// An `OpenRead` selector tag is not defined by TSF v1.
     #[error("OpenRead has unknown start tag 0x{0:02x}")]
     UnknownReadStartTag(u8),
     /// A selector exceeds the exact integer range of the current data adapter.
     #[error("read selector {0} exceeds {MAX_READ_SELECTOR_VALUE}")]
     ReadSelectorOutOfRange(u64),
+    /// A write precondition exceeds the exact integer range of the current data adapter.
+    #[error("expected next sequence {0} exceeds {MAX_READ_SELECTOR_VALUE}")]
+    ExpectedNextSeqNumOutOfRange(u64),
     /// Timestamp playback was outside the accepted rate range.
     #[error(
         "playback rate {0} must be between {MIN_PLAYBACK_RATE_PERMILLE} and {MAX_PLAYBACK_RATE_PERMILLE} permille"
@@ -1306,6 +1358,35 @@ mod tests {
             }
             .encode(),
             Err(FrameCodecError::PlaybackRateOutOfRange(_))
+        ));
+    }
+
+    #[test]
+    fn open_write_strictly_validates_flags_preconditions_and_lengths() {
+        let valid = ClientFrame::OpenWrite {
+            writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
+            link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
+            expected_next_seq_num: Some(7),
+        }
+        .encode()
+        .expect("valid OpenWrite");
+
+        let mut unknown_flags = valid.to_vec();
+        unknown_flags[1] = 0x02;
+        assert!(matches!(
+            ClientFrame::decode(&unknown_flags),
+            Err(FrameCodecError::UnknownOpenWriteFlags(0x02))
+        ));
+        assert!(ClientFrame::decode(&valid[..valid.len() - 1]).is_err());
+        assert!(matches!(
+            ClientFrame::OpenWrite {
+                writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
+                link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
+                expected_next_seq_num: Some(MAX_READ_SELECTOR_VALUE + 1),
+            }
+            .encode(),
+            Err(FrameCodecError::ExpectedNextSeqNumOutOfRange(value))
+                if value == MAX_READ_SELECTOR_VALUE + 1
         ));
     }
 

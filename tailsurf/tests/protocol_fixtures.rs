@@ -54,6 +54,7 @@ enum ClientFixture {
     OpenWrite {
         writer_id_hex: String,
         link_secret: String,
+        expected_next_seq_num: Option<String>,
     },
     AppendBatch {
         writer_seq_num: String,
@@ -174,9 +175,11 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
         ClientFixture::OpenWrite {
             writer_id_hex,
             link_secret,
+            expected_next_seq_num,
         } => ClientFrame::OpenWrite {
             writer_id: decode_writer_id(&writer_id_hex),
             link_secret: LinkSecret::from(link_secret),
+            expected_next_seq_num: expected_next_seq_num.as_deref().map(parse_u64),
         },
         ClientFixture::AppendBatch {
             writer_seq_num,
