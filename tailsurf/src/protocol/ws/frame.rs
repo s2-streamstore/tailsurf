@@ -4,7 +4,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
-use crate::stream_url::LINK_SECRET_ENCODED_LENGTH;
 use crate::{
     LinkSecret, StreamId, StreamTitle, WriterId,
     ids::is_canonical_base64url_32,
@@ -15,6 +14,7 @@ use crate::{
             ReadStart,
         },
     },
+    stream_url::LINK_SECRET_ENCODED_LENGTH,
 };
 /// WebSocket subprotocol offered and selected for TSF v1 connections.
 pub const TSF_WS_PROTOCOL: &str = "tsf.v1";
