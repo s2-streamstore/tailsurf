@@ -1003,6 +1003,44 @@ async fn tail_reconnect_resumes_after_last_sequence() {
 }
 
 #[tokio::test]
+async fn sse_tail_reconnects_with_opaque_cursor_and_unchanged_query() {
+    let server = FakeSseServer::start().await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
+    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+
+    let output = run_tsf_with_api_url(
+        server.api_url.clone(),
+        ["tail", "--sse", "--limit", "1", read_link.as_str()],
+        None,
+    )
+    .await;
+
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    assert_eq!(output.stdout, "");
+    let attempts = server.attempts();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].query, attempts[1].query);
+    let query = attempts[0].query.as_deref().expect("SSE query");
+    let query = Url::parse(&format!("http://localhost/?{query}")).expect("parse captured query");
+    assert_eq!(
+        query.query_pairs().collect::<HashMap<_, _>>(),
+        HashMap::from([
+            ("tail_offset".into(), "0".into()),
+            ("count".into(), "1".into()),
+        ])
+    );
+    assert_eq!(attempts[0].last_event_id, None);
+    assert_eq!(
+        attempts[1].last_event_id.as_deref(),
+        Some("tsf1.AAAAAAAAAAAAAAAAAAAAAAA")
+    );
+    assert!(attempts.iter().all(|attempt| {
+        attempt.authorization.as_deref() == Some(&format!("Bearer {TEST_STREAM_LINK}"))
+    }));
+    server.abort();
+}
+
+#[tokio::test]
 async fn tail_selector_flags_are_sent_in_open_read() {
     let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
@@ -3012,6 +3050,93 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     )
     .await
     .expect("send ack");
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SseAttempt {
+    query: Option<String>,
+    last_event_id: Option<String>,
+    authorization: Option<String>,
+}
+
+#[derive(Default)]
+struct FakeSseState {
+    attempts: Mutex<Vec<SseAttempt>>,
+}
+
+struct FakeSseServer {
+    api_url: Url,
+    state: Arc<FakeSseState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeSseServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let state = Arc::new(FakeSseState::default());
+        let router = Router::new()
+            .route("/api/v1/streams/{stream_id}/records", get(fake_sse_read))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("fake SSE server");
+        });
+        Self {
+            api_url: Url::parse(&format!("http://{addr}")).expect("API URL"),
+            state,
+            task,
+        }
+    }
+
+    fn attempts(&self) -> Vec<SseAttempt> {
+        self.state
+            .attempts
+            .lock()
+            .expect("SSE attempts lock")
+            .clone()
+    }
+
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+async fn fake_sse_read(
+    State(state): State<Arc<FakeSseState>>,
+    Path(stream_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    let attempt_count = {
+        let mut attempts = state.attempts.lock().expect("SSE attempts lock");
+        attempts.push(SseAttempt {
+            query: request.uri().query().map(str::to_owned),
+            last_event_id: request
+                .headers()
+                .get("last-event-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            authorization: request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        });
+        attempts.len()
+    };
+    if attempt_count > 1 {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let body = format!(
+        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\nid: tsf1.AAAAAAAAAAAAAAAAAAAAAAA\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}}\n\n"
+    );
+    (
+        StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        body,
+    )
+        .into_response()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
