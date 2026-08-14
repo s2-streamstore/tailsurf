@@ -5,7 +5,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt,
     fs::{self, OpenOptions},
-    io::{ErrorKind, IsTerminal},
+    io::{ErrorKind, IsTerminal, Write as _},
     path::{Path, PathBuf},
     process::{ExitCode, ExitStatus, Stdio},
     str::FromStr,
@@ -1502,13 +1502,10 @@ async fn delete_stream(api_url: Url, args: DeleteArgs) -> eyre::Result<()> {
         .await
         .context("failed to delete stream")?;
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&DeleteOutput {
-                stream_id: locator.stream_id.to_string(),
-                status: "deleted",
-            })?
-        );
+        print_json(&DeleteOutput {
+            stream_id: locator.stream_id.to_string(),
+            status: "deleted",
+        })?;
     } else {
         println!("Deleted stream {}", locator.stream_id);
     }
@@ -1596,7 +1593,7 @@ async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
         .await
         .context("failed to list links")?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&inventory)?);
+        print_json(&inventory)?;
     } else {
         for link in &inventory.links {
             println!(
@@ -1843,16 +1840,27 @@ fn confirm_delete(stream_id: &StreamId, yes: bool) -> eyre::Result<bool> {
 
 fn print_link_revoked(link_id: &LinkId, json: bool) -> eyre::Result<()> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&LinkMutationOutput {
-                link_id: link_id.to_string(),
-                status: "revoked",
-            })?
-        );
+        print_json(&LinkMutationOutput {
+            link_id: link_id.to_string(),
+            status: "revoked",
+        })?;
     } else {
         println!("Revoked link {link_id}");
     }
+    Ok(())
+}
+
+fn print_json(value: &impl Serialize) -> eyre::Result<()> {
+    write_json(std::io::stdout().lock(), value)
+}
+
+fn write_json(writer: impl std::io::Write, value: &impl Serialize) -> eyre::Result<()> {
+    let mut writer = std::io::BufWriter::new(writer);
+    // serde_json::Error hides the io::Error from chain walking; unwrap it so broken-pipe
+    // classification and error reports see the real cause.
+    serde_json::to_writer_pretty(&mut writer, value).map_err(std::io::Error::from)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -1947,7 +1955,7 @@ fn print_created_stream(
             public_url: matches!(created.visibility, Visibility::Public)
                 .then(|| bare_stream_url(web_url, &created.stream_id).to_string()),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
     }
     Ok(())
 }
@@ -1966,7 +1974,7 @@ fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()
         println!("Created: {}", stream.created_at);
         println!("Expires: {}", stream.expires_at);
     } else {
-        println!("{}", serde_json::to_string_pretty(stream)?);
+        print_json(stream)?;
     }
     Ok(())
 }
@@ -1991,7 +1999,7 @@ fn print_created_link(
             permissions: permission_label(credential.permissions),
             url: url.to_string(),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
     }
     Ok(())
 }
@@ -2285,5 +2293,35 @@ mod tests {
         let connection_reset: eyre::Report =
             std::io::Error::new(ErrorKind::ConnectionReset, "reset consumer").into();
         assert!(!is_broken_pipe(&connection_reset));
+    }
+
+    #[test]
+    fn json_output_surfaces_io_errors_for_broken_pipe_classification() {
+        struct BrokenPipeWriter;
+        impl std::io::Write for BrokenPipeWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "closed consumer",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "closed consumer",
+                ))
+            }
+        }
+
+        // Larger than the BufWriter capacity: fails inside serde_json, exercising the
+        // io::Error unwrap; without it the chain ends at serde_json::Error.
+        let large = serde_json::json!({ "data": "x".repeat(16 * 1024) });
+        let error = write_json(BrokenPipeWriter, &large).expect_err("broken pipe");
+        assert!(is_broken_pipe(&error));
+
+        // Smaller than the buffer: fails at the final flush instead.
+        let small = serde_json::json!({ "a": 1 });
+        let error = write_json(BrokenPipeWriter, &small).expect_err("broken pipe");
+        assert!(is_broken_pipe(&error));
     }
 }
