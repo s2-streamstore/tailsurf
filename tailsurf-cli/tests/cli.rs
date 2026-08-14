@@ -1003,7 +1003,7 @@ async fn tail_reconnect_resumes_after_last_sequence() {
 }
 
 #[tokio::test]
-async fn sse_tail_reconnects_with_opaque_cursor_and_unchanged_query() {
+async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
     let server = FakeSseServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
@@ -1030,10 +1030,7 @@ async fn sse_tail_reconnects_with_opaque_cursor_and_unchanged_query() {
         ])
     );
     assert_eq!(attempts[0].last_event_id, None);
-    assert_eq!(
-        attempts[1].last_event_id.as_deref(),
-        Some("tsf1.AAAAAAAAAAAAAAAAAAAAAAA")
-    );
+    assert_eq!(attempts[1].last_event_id.as_deref(), Some("v1,0,0"));
     assert!(attempts.iter().all(|attempt| {
         attempt.authorization.as_deref() == Some(&format!("Bearer {TEST_STREAM_LINK}"))
     }));
@@ -3129,7 +3126,7 @@ async fn fake_sse_read(
         return StatusCode::NO_CONTENT.into_response();
     }
     let body = format!(
-        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\nid: tsf1.AAAAAAAAAAAAAAAAAAAAAAA\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}}\n\n"
+        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\nid: v1,0,0\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}}\n\n"
     );
     (
         StatusCode::OK,

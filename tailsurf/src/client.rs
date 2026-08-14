@@ -519,7 +519,7 @@ impl TsfClient {
     /// Connects a resumable SSE reader.
     ///
     /// Private credentials stay in the bearer header. Reconnects reuse the original URL and send
-    /// the latest opaque event cursor in `Last-Event-ID`.
+    /// the latest versioned event cursor in `Last-Event-ID`.
     pub async fn connect_sse_reader(
         &self,
         mut options: ReadStreamOptions,
@@ -2162,25 +2162,47 @@ fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientErro
 }
 
 fn sse_resume_event_id(event: &ParsedSseEvent) -> Result<&str, TsfClientError> {
-    let encoded = event
-        .id
-        .as_deref()
-        .and_then(|value| value.strip_prefix("tsf1."));
-    let Some(encoded) = encoded else {
-        return Err(TsfClientError::InvalidSse(
-            "records and caught_up events require a valid resume cursor",
-        ));
+    let Some(id) = event.id.as_deref() else {
+        return Err(invalid_sse_resume_cursor());
     };
-    if !matches!(encoded.len(), 23 | 34)
-        || !encoded
-            .bytes()
-            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
-    {
-        return Err(TsfClientError::InvalidSse(
-            "records and caught_up events require a valid resume cursor",
-        ));
+    let mut fields = id.split(',');
+    if fields.next() != Some("v1") {
+        return Err(invalid_sse_resume_cursor());
     }
-    Ok(event.id.as_deref().expect("validated event ID"))
+    let Some(next_seq_num) = fields.next().and_then(parse_sse_cursor_u64) else {
+        return Err(invalid_sse_resume_cursor());
+    };
+    let Some(consumed_count) = fields.next().and_then(parse_sse_cursor_u64) else {
+        return Err(invalid_sse_resume_cursor());
+    };
+    let snapshot_next_seq_num = if let Some(value) = fields.next() {
+        Some(parse_sse_cursor_u64(value).ok_or_else(invalid_sse_resume_cursor)?)
+    } else {
+        None
+    };
+    if fields.next().is_some()
+        || next_seq_num > MAX_READ_SELECTOR_VALUE
+        || consumed_count > next_seq_num
+        || snapshot_next_seq_num
+            .is_some_and(|snapshot| snapshot > MAX_READ_SELECTOR_VALUE || next_seq_num > snapshot)
+    {
+        return Err(invalid_sse_resume_cursor());
+    }
+    Ok(id)
+}
+
+fn parse_sse_cursor_u64(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || (value != "0" && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn invalid_sse_resume_cursor() -> TsfClientError {
+    TsfClientError::InvalidSse("records and caught_up events require a valid resume cursor")
 }
 
 fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
@@ -2867,7 +2889,7 @@ mod tests {
 
     #[test]
     fn sse_parser_retains_only_strict_versioned_resume_ids() {
-        let cursor = "tsf1.AAAAAAAAAAAEAAAAAAAAAAA";
+        let cursor = "v1,4,0";
         let block = format!(
             "id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"4\",\"last_timestamp_ms\":null}}"
         );
@@ -2878,9 +2900,12 @@ mod tests {
         assert_eq!(sse_resume_event_id(&event).expect("resume cursor"), cursor);
 
         for invalid in [
-            "tsf2.AAAAAAAAAAAAAAAAAAAAAAA",
-            "tsf1.short",
-            "tsf1.AAAAAAAAAAAAAAAAAAAAAA!",
+            "v2,4,0",
+            "v1,04,0",
+            "v1,4,5",
+            "v1,4,0,3",
+            "v1,4,0,5,6",
+            "v1,4, 0",
         ] {
             let event = ParsedSseEvent {
                 event: "caught_up".to_owned(),
