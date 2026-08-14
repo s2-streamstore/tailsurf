@@ -1,10 +1,11 @@
 //! Identifiers and link secret values used by the TSF API.
 
+use std::{fmt, str::FromStr};
+
 use base64::{Engine as _, alphabet, engine};
 use rand::Rng;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{fmt, str::FromStr};
 
 /// Stable 160-bit identifier for a stream.
 pub type StreamId = ubid::Ubid160;
