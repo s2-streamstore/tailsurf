@@ -21,15 +21,15 @@ pub mod transcript;
 
 pub use client::{
     AppendAck, AppendReceipt, AppendTicket, CreateStreamIdempotencyKey, IntoRecordData,
-    InvalidCreateStreamIdempotencyKey, MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-    MAX_WRITER_UNACKED_RECORDS, RetryPolicy, TsfAppendSession, TsfClient, TsfClientConfig,
-    TsfClientError, TsfReadSession, TsfSseReadSession, TsfWriter, TsfWriterConfig, WritePermit,
-    WriteRecord, default_api_origin,
+    InvalidCreateStreamIdempotencyKey, ListLinksOptions, MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+    MAX_WRITER_UNACKED_RECORDS, RetryPolicy, TsfClient, TsfClientConfig, TsfClientError,
+    TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, TsfWriterConfig, WritePermit,
+    default_api_origin,
 };
 pub use ids::{LinkId, LinkIdError, LinkSecret, MAX_LINK_ID_LEN, StreamId, WriterId};
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
-    rest::StreamInfoResponse,
-    ws::frame::{AppendRecord, CaughtUpPosition, ReadRecord, ReadStreamInfo, SnapshotBoundary},
+    rest::StreamMetadata,
+    ws::frame::{AppendRecord, CaughtUpPosition, ReadRecord, SnapshotBoundary, StreamInfo},
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

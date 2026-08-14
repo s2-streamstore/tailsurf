@@ -55,12 +55,12 @@ impl TryFrom<u8> for ClientOp {
 }
 
 const OPEN_READ_LINK_SECRET: u8 = 0x01;
-const OPEN_READ_COUNT: u8 = 0x02;
+const OPEN_READ_LIMIT: u8 = 0x02;
 const OPEN_READ_END_SEQ_NUM: u8 = 0x04;
 const OPEN_READ_PLAYBACK_RATE: u8 = 0x08;
 const OPEN_READ_SNAPSHOT: u8 = 0x10;
 const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET
-    | OPEN_READ_COUNT
+    | OPEN_READ_LIMIT
     | OPEN_READ_END_SEQ_NUM
     | OPEN_READ_PLAYBACK_RATE
     | OPEN_READ_SNAPSHOT;
@@ -239,7 +239,7 @@ pub struct SnapshotBoundary {
 
 /// Stream metadata supplied by an authorized read handshake.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReadStreamInfo {
+pub struct StreamInfo {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Human-facing title when one has been set.
@@ -262,7 +262,7 @@ pub enum ClientFrame {
         /// Initial absolute, timestamp, or tail-relative read position.
         start: ReadStart,
         /// Maximum number of physical records to deliver.
-        count: Option<u64>,
+        limit: Option<u64>,
         /// Exclusive ending sequence number.
         end_seq_num: Option<u64>,
         /// Timestamp playback rate in thousandths.
@@ -270,10 +270,10 @@ pub enum ClientFrame {
         /// Whether the server captures a fixed ending position.
         snapshot: bool,
     },
-    /// Opens a write connection and establishes authorization and writer identity.
+    /// Opens a write connection and establishes authorization and client writer identity.
     OpenWrite {
         /// Stable identity reused across reconnects.
-        writer_id: WriterId,
+        client_writer_id: WriterId,
         /// Secret from a write-capable stream link.
         link_secret: LinkSecret,
         /// Initial stream sequence precondition for this writer session.
@@ -306,7 +306,7 @@ pub enum ServerFrame {
     /// Confirms that every record preceding the captured position was delivered.
     CaughtUp(CaughtUpPosition),
     /// Supplies stream metadata from the read authorization result.
-    StreamInfo(ReadStreamInfo),
+    StreamInfo(StreamInfo),
     /// Supplies the fixed exclusive end for a snapshot read.
     SnapshotBoundary(SnapshotBoundary),
 }
@@ -321,7 +321,7 @@ impl ClientFrame {
             Self::OpenRead {
                 link_secret,
                 start,
-                count,
+                limit,
                 end_seq_num,
                 playback_rate_permille,
                 snapshot,
@@ -331,7 +331,7 @@ impl ClientFrame {
                     validate_link_secret(secret)?;
                 }
                 Ok(Self::OPEN_READ_FIXED_LEN
-                    + count.map_or(0, |_| 8)
+                    + limit.map_or(0, |_| 8)
                     + end_seq_num.map_or(0, |_| 8)
                     + playback_rate_permille.map_or(0, |_| 8)
                     + link_secret
@@ -370,14 +370,14 @@ impl ClientFrame {
             Self::OpenRead {
                 link_secret,
                 start,
-                count,
+                limit,
                 end_seq_num,
                 playback_rate_permille,
                 snapshot,
             } => {
                 output.put_u8(ClientOp::OpenRead.byte());
                 let flags = link_secret.as_ref().map_or(0, |_| OPEN_READ_LINK_SECRET)
-                    | count.map_or(0, |_| OPEN_READ_COUNT)
+                    | limit.map_or(0, |_| OPEN_READ_LIMIT)
                     | end_seq_num.map_or(0, |_| OPEN_READ_END_SEQ_NUM)
                     | playback_rate_permille.map_or(0, |_| OPEN_READ_PLAYBACK_RATE)
                     | if *snapshot { OPEN_READ_SNAPSHOT } else { 0 };
@@ -385,7 +385,7 @@ impl ClientFrame {
                 let (tag, value) = read_start_wire(*start);
                 output.put_u8(tag);
                 output.put_u64(value);
-                if let Some(value) = count {
+                if let Some(value) = limit {
                     output.put_u64(*value);
                 }
                 if let Some(value) = end_seq_num {
@@ -399,14 +399,14 @@ impl ClientFrame {
                 }
             }
             Self::OpenWrite {
-                writer_id,
+                client_writer_id,
                 link_secret,
                 expected_next_seq_num,
             } => {
                 output.put_u8(ClientOp::OpenWrite.byte());
                 output
                     .put_u8(expected_next_seq_num.map_or(0, |_| OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM));
-                output.put_slice(writer_id.as_bytes());
+                output.put_slice(client_writer_id.as_bytes());
                 if let Some(value) = expected_next_seq_num {
                     output.put_u64(*value);
                 }
@@ -564,7 +564,7 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
                     flags & !OPEN_WRITE_FLAGS,
                 ));
             }
-            let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            let (client_writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
             let (expected_next_seq_num, secret_bytes) =
                 if flags & OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM == 0 {
                     (None, body)
@@ -579,7 +579,7 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
             let link_secret = LinkSecret::from(utf8_tail(secret_bytes)?);
             validate_link_secret(&link_secret)?;
             Ok(ClientFrame::OpenWrite {
-                writer_id: WriterId::from_bytes(writer_id),
+                client_writer_id: WriterId::from_bytes(client_writer_id),
                 link_secret,
                 expected_next_seq_num,
             })
@@ -623,7 +623,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
     let (start_value, mut body) = read_u64(body)?;
     let start = read_start_from_wire(start_tag, start_value)?;
-    let count = if flags & OPEN_READ_COUNT == 0 {
+    let limit = if flags & OPEN_READ_LIMIT == 0 {
         None
     } else {
         let (value, tail) = read_u64(body)?;
@@ -664,7 +664,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
     Ok(ClientFrame::OpenRead {
         link_secret,
         start,
-        count,
+        limit,
         end_seq_num,
         playback_rate_permille,
         snapshot,
@@ -1169,7 +1169,7 @@ mod tests {
 
         assert_eq!(
             ServerFrame::decode(&encoded).expect("decode stream info"),
-            ServerFrame::StreamInfo(ReadStreamInfo {
+            ServerFrame::StreamInfo(StreamInfo {
                 stream_id: "00000000000000000000000000000000"
                     .parse()
                     .expect("stream ID"),
@@ -1268,7 +1268,7 @@ mod tests {
         let valid = ClientFrame::OpenRead {
             link_secret: None,
             start: ReadStart::TailOffset(80),
-            count: None,
+            limit: None,
             end_seq_num: None,
             playback_rate_permille: None,
             snapshot: false,
@@ -1339,7 +1339,7 @@ mod tests {
             ClientFrame::OpenRead {
                 link_secret: None,
                 start: ReadStart::SeqNum(0),
-                count: None,
+                limit: None,
                 end_seq_num: None,
                 playback_rate_permille: Some(1_000),
                 snapshot: false,
@@ -1351,7 +1351,7 @@ mod tests {
             ClientFrame::OpenRead {
                 link_secret: None,
                 start: ReadStart::SeqNum(0),
-                count: None,
+                limit: None,
                 end_seq_num: Some(1),
                 playback_rate_permille: Some(MAX_PLAYBACK_RATE_PERMILLE + 1),
                 snapshot: false,
@@ -1364,7 +1364,7 @@ mod tests {
     #[test]
     fn open_write_strictly_validates_flags_preconditions_and_lengths() {
         let valid = ClientFrame::OpenWrite {
-            writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
+            client_writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
             link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
             expected_next_seq_num: Some(7),
         }
@@ -1380,7 +1380,7 @@ mod tests {
         assert!(ClientFrame::decode(&valid[..valid.len() - 1]).is_err());
         assert!(matches!(
             ClientFrame::OpenWrite {
-                writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
+                client_writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
                 link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
                 expected_next_seq_num: Some(MAX_READ_SELECTOR_VALUE + 1),
             }

@@ -42,7 +42,7 @@ use crate::{
             AppendJsonRecord, AppendRecordsRequest, AppendRecordsResponse, CreateLinkRequest,
             CreateStreamRequest, CreateStreamResponse, ListLinksResponse, RecordData,
             RestRecordPart, SseCaughtUpEvent, SseReadRecord, SseRecordsEvent,
-            SseSnapshotBoundaryEvent, StreamInfoResponse, StreamLinkCredential,
+            SseSnapshotBoundaryEvent, StreamLinkCredential, StreamLinkSummary, StreamMetadata,
             UpdateStreamRequest,
         },
         ws::{
@@ -51,7 +51,7 @@ use crate::{
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
                 MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader,
-                ReadRecord, ReadStreamInfo, RecordFormat, ServerFrame, SnapshotBoundary,
+                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, StreamInfo,
                 TSF_WEBSOCKET_PROTOCOL,
             },
         },
@@ -163,6 +163,15 @@ pub struct TsfClient {
     http: reqwest::Client,
 }
 
+/// Pagination controls for one link inventory request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ListLinksOptions {
+    /// Maximum number of links to return. The service accepts values from 1 through 100.
+    pub limit: Option<u8>,
+    /// Opaque cursor returned by the previous page.
+    pub cursor: Option<String>,
+}
+
 impl TsfClient {
     /// Creates a client for the default [tail.surf](https://tail.surf) API origin.
     pub fn new() -> Self {
@@ -242,7 +251,7 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
         link_secret: Option<&LinkSecret>,
-    ) -> Result<StreamInfoResponse, TsfClientError> {
+    ) -> Result<StreamMetadata, TsfClientError> {
         self.get_json_with_bearer(format!("/streams/{stream_id}"), "get stream", link_secret)
             .await
     }
@@ -255,7 +264,7 @@ impl TsfClient {
         stream_id: &StreamId,
         request: &UpdateStreamRequest,
         owner_link_secret: &LinkSecret,
-    ) -> Result<StreamInfoResponse, TsfClientError> {
+    ) -> Result<StreamMetadata, TsfClientError> {
         self.retry_transient(|| {
             self.send_json_with_bearer(
                 self.http
@@ -309,26 +318,58 @@ impl TsfClient {
         .await
     }
 
-    /// Lists retained, non-secret link metadata, retrying transient failures according to policy.
+    /// Lists one page of retained, non-secret link metadata.
     pub async fn list_links(
         &self,
         stream_id: &StreamId,
+        options: &ListLinksOptions,
         owner_link_secret: &LinkSecret,
     ) -> Result<ListLinksResponse, TsfClientError> {
+        if options
+            .limit
+            .is_some_and(|limit| !(1..=100).contains(&limit))
+        {
+            return Err(TsfClientError::InvalidListLinksOptions(
+                "limit must be between 1 and 100",
+            ));
+        }
+        let mut url = self.rest_url(&format!("/streams/{stream_id}/links"));
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(limit) = options.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(cursor) = &options.cursor {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        self.retry_transient(|| {
+            self.send_json_with_bearer(
+                self.http.get(url.clone()),
+                "list links",
+                Some(owner_link_secret),
+            )
+        })
+        .await
+    }
+
+    /// Lists every retained link, following pagination until completion.
+    pub async fn list_all_links(
+        &self,
+        stream_id: &StreamId,
+        owner_link_secret: &LinkSecret,
+    ) -> Result<Vec<StreamLinkSummary>, TsfClientError> {
         let mut links = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let suffix = cursor.as_ref().map_or_else(String::new, |cursor| {
-                format!(
-                    "?limit=100&cursor={}",
-                    url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>()
-                )
-            });
-            let page: ListLinksResponse = self
-                .get_json_with_bearer(
-                    format!("/streams/{stream_id}/links{suffix}"),
-                    "list links",
-                    Some(owner_link_secret),
+            let page = self
+                .list_links(
+                    stream_id,
+                    &ListLinksOptions {
+                        limit: Some(100),
+                        cursor,
+                    },
+                    owner_link_secret,
                 )
                 .await?;
             links.extend(page.links);
@@ -337,10 +378,7 @@ impl TsfClient {
                 None => break,
             }
         }
-        Ok(ListLinksResponse {
-            links,
-            next_cursor: None,
-        })
+        Ok(links)
     }
 
     /// Revokes a stream link by its non-secret identifier.
@@ -365,13 +403,13 @@ impl TsfClient {
 
     /// Atomically appends one durable JSON batch without opening a WebSocket.
     ///
-    /// A retry keeps writer identity and writer sequence numbers stable. An ambiguous response may
-    /// create physical duplicates. Logical readers suppress those duplicates.
+    /// A retry keeps client writer identity and writer sequence numbers stable. An ambiguous
+    /// response may create physical duplicates. Logical readers suppress those duplicates.
     pub async fn append_records(
         &self,
         stream_id: &StreamId,
-        writer_id: WriterId,
-        records: &[WriteRecord],
+        client_writer_id: WriterId,
+        records: &[AppendRecord],
         expected_next_seq_num: Option<u64>,
         write_link_secret: &LinkSecret,
     ) -> Result<AppendRecordsResponse, TsfClientError> {
@@ -411,7 +449,7 @@ impl TsfClient {
             });
         }
         let request = AppendRecordsRequest {
-            writer_id: URL_SAFE_NO_PAD.encode(writer_id.as_bytes()),
+            client_writer_id: URL_SAFE_NO_PAD.encode(client_writer_id.as_bytes()),
             writer_start_seq_num,
             records: json_records,
             expected_next_seq_num,
@@ -443,23 +481,23 @@ impl TsfClient {
         mut options: WriteStreamOptions,
         config: TsfWriterConfig,
     ) -> Result<TsfWriter, TsfClientError> {
-        let session = self.connect_append_session(options.clone()).await?;
+        let session = self.connect_write_session(options.clone()).await?;
         options.expected_next_seq_num = None;
         TsfWriter::new(self.clone(), options, session, config)
     }
 
-    /// Connects a low-level append session that sends records and receives ack ranges directly.
+    /// Connects a low-level write session that sends records and receives ack ranges directly.
     ///
     /// Unlike [`TsfWriter`], this session does not retain or resend unacknowledged records.
-    pub async fn connect_append_session(
+    pub async fn connect_write_session(
         &self,
         options: WriteStreamOptions,
-    ) -> Result<TsfAppendSession, TsfClientError> {
+    ) -> Result<TsfWriteSession, TsfClientError> {
         let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
         let opening_frame = ClientFrame::OpenWrite {
-            writer_id: options.writer_id,
+            client_writer_id: options.client_writer_id,
             link_secret: options.link_secret.clone(),
             expected_next_seq_num: options.expected_next_seq_num,
         }
@@ -475,7 +513,7 @@ impl TsfClient {
                         .await?;
                 with_timeout(operation_timeout, "writer ready", expect_ready(&mut ws)).await?;
 
-                Ok(TsfAppendSession {
+                Ok(TsfWriteSession {
                     ws,
                     operation_timeout,
                 })
@@ -655,7 +693,7 @@ impl TsfClient {
             start: options
                 .start
                 .unwrap_or(ReadStart::TailOffset(DEFAULT_READ_TAIL_OFFSET)),
-            count: options.count,
+            limit: options.limit,
             end_seq_num: options.end_seq_num,
             playback_rate_permille: options.playback_rate_permille,
             snapshot: options.snapshot,
@@ -861,7 +899,7 @@ impl ExposeSecret<str> for CreateStreamIdempotencyKey {
 pub struct InvalidCreateStreamIdempotencyKey;
 
 /// Low-level authenticated write socket without retained-record recovery.
-pub struct TsfAppendSession {
+pub struct TsfWriteSession {
     ws: ClientWebSocket,
     operation_timeout: Duration,
 }
@@ -926,20 +964,7 @@ impl Default for TsfWriterConfig {
     }
 }
 
-/// One physical record submitted by a writer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WriteRecord {
-    /// Writer-local sequence number, reused if this record is retransmitted.
-    pub writer_seq_num: u64,
-    /// Logical split-part metadata.
-    pub part: PartHeader,
-    /// Presentation hint for the payload.
-    pub format: RecordFormat,
-    /// Exact payload bytes, bounded by the TSF physical record limit.
-    pub data: Bytes,
-}
-
-impl WriteRecord {
+impl AppendRecord {
     /// Creates a physical record without allocating when the input already owns compatible bytes.
     pub fn new(
         writer_seq_num: u64,
@@ -1072,7 +1097,7 @@ impl TsfWriter {
     fn new(
         client: TsfClient,
         options: WriteStreamOptions,
-        session: TsfAppendSession,
+        session: TsfWriteSession,
         config: TsfWriterConfig,
     ) -> Result<Self, TsfClientError> {
         let config = config.validate()?;
@@ -1090,7 +1115,7 @@ impl TsfWriter {
     }
 
     /// Waits for window capacity, submits a record, and returns its durability ticket.
-    pub async fn submit(&self, record: WriteRecord) -> Result<AppendTicket, TsfClientError> {
+    pub async fn submit(&self, record: AppendRecord) -> Result<AppendTicket, TsfClientError> {
         let permit = self.reserve(record.unacked_bytes()).await?;
         permit.submit(record)
     }
@@ -1176,7 +1201,7 @@ pub struct WritePermit {
 
 impl WritePermit {
     /// Submits a record no larger than the reserved capacity without awaiting another window slot.
-    pub fn submit(self, record: WriteRecord) -> Result<AppendTicket, TsfClientError> {
+    pub fn submit(self, record: AppendRecord) -> Result<AppendTicket, TsfClientError> {
         record.validate()?;
         let bytes = record.unacked_bytes();
         if bytes > self.reserved_bytes {
@@ -1198,7 +1223,7 @@ impl WritePermit {
     }
 }
 
-/// Conversion into payload bytes accepted by [`WriteRecord::new`].
+/// Conversion into payload bytes accepted by [`AppendRecord::new`].
 pub trait IntoRecordData {
     /// Converts this value into reference-counted immutable bytes.
     fn into_record_data(self) -> Bytes;
@@ -1240,9 +1265,9 @@ impl IntoRecordData for &str {
     }
 }
 
-impl TsfAppendSession {
+impl TsfWriteSession {
     /// Sends one physical record under the operation timeout.
-    pub async fn send(&mut self, record: WriteRecord) -> Result<(), TsfClientError> {
+    pub async fn send(&mut self, record: AppendRecord) -> Result<(), TsfClientError> {
         let operation_timeout = self.operation_timeout;
 
         with_timeout(operation_timeout, "send append frame", async move {
@@ -1255,7 +1280,7 @@ impl TsfAppendSession {
     /// Encodes one batch into the socket's write buffer, leaving the flush to the caller.
     async fn buffer_batch<'a>(
         &mut self,
-        records: impl IntoIterator<Item = &'a WriteRecord>,
+        records: impl IntoIterator<Item = &'a AppendRecord>,
     ) -> Result<(), TsfClientError> {
         let records = records
             .into_iter()
@@ -1291,7 +1316,7 @@ impl TsfAppendSession {
             TsfClientError::WebSocketClosedWithReason { code: 1008, reason }
                 if reason == "sequence_mismatch" =>
             {
-                TsfClientError::WriterSequenceMismatch
+                TsfClientError::SequenceMismatch
             }
             other => other,
         })?;
@@ -1319,7 +1344,7 @@ impl TsfAppendSession {
 
 enum WriterCommand {
     Submit {
-        record: WriteRecord,
+        record: AppendRecord,
         ack_tx: oneshot::Sender<Result<AppendReceipt, TsfClientError>>,
         byte_permit: OwnedSemaphorePermit,
         record_permit: OwnedSemaphorePermit,
@@ -1330,7 +1355,7 @@ enum WriterCommand {
 }
 
 struct PendingAppend {
-    record: WriteRecord,
+    record: AppendRecord,
     ack_tx: oneshot::Sender<Result<AppendReceipt, TsfClientError>>,
     _byte_permit: OwnedSemaphorePermit,
     _record_permit: OwnedSemaphorePermit,
@@ -1339,7 +1364,7 @@ struct PendingAppend {
 async fn run_writer(
     client: TsfClient,
     options: WriteStreamOptions,
-    mut session: TsfAppendSession,
+    mut session: TsfWriteSession,
     mut cmd_rx: mpsc::Receiver<WriterCommand>,
     config: TsfWriterConfig,
 ) {
@@ -1467,7 +1492,7 @@ fn drain_submissions(
 
 /// Writes the records from `from` onwards under one operation timeout and one flush.
 async fn send_retained(
-    session: &mut TsfAppendSession,
+    session: &mut TsfWriteSession,
     pending: &VecDeque<PendingAppend>,
     from: usize,
 ) -> Result<(), TsfClientError> {
@@ -1501,7 +1526,7 @@ async fn send_retained(
     .await
 }
 async fn recover_pending_appends(
-    session: &mut TsfAppendSession,
+    session: &mut TsfWriteSession,
     client: &TsfClient,
     options: &WriteStreamOptions,
     pending: &VecDeque<PendingAppend>,
@@ -1515,7 +1540,7 @@ async fn recover_pending_appends(
 
     while *reconnect_attempts < max_reconnect_attempts {
         *reconnect_attempts += 1;
-        match client.connect_append_session(options.clone()).await {
+        match client.connect_write_session(options.clone()).await {
             Ok(mut connected) => match send_retained(&mut connected, pending, 0).await {
                 Ok(()) => {
                     *session = connected;
@@ -1609,7 +1634,7 @@ struct SseConnection {
     body: SseBody,
     buffer: Vec<u8>,
     queued_events: VecDeque<ParsedSseEvent>,
-    stream_info: Option<ReadStreamInfo>,
+    stream_info: Option<StreamInfo>,
     snapshot_boundary: Option<SnapshotBoundary>,
     resume_event_id: Option<String>,
 }
@@ -1623,7 +1648,7 @@ pub struct TsfSseReadSession {
     buffer: Vec<u8>,
     queued_events: VecDeque<ParsedSseEvent>,
     queued_records: VecDeque<ReadRecord>,
-    stream_info: ReadStreamInfo,
+    stream_info: StreamInfo,
     last_caught_up: Option<CaughtUpPosition>,
     snapshot_boundary: Option<SnapshotBoundary>,
     reconnect_attempts: usize,
@@ -1633,7 +1658,7 @@ pub struct TsfSseReadSession {
 
 impl TsfSseReadSession {
     /// Returns authorized stream metadata from the opening event.
-    pub fn stream_info(&self) -> &ReadStreamInfo {
+    pub fn stream_info(&self) -> &StreamInfo {
         &self.stream_info
     }
 
@@ -1655,12 +1680,12 @@ impl TsfSseReadSession {
             }
             if let Some(record) = self.queued_records.pop_front() {
                 self.options.start = record.seq_num.checked_add(1).map(ReadStart::SeqNum);
-                if let Some(count) = self.options.count.as_mut() {
-                    *count = count.saturating_sub(1);
+                if let Some(remaining) = self.options.limit.as_mut() {
+                    *remaining = remaining.saturating_sub(1);
                 }
                 return Ok(Some(record));
             }
-            if self.options.count == Some(0)
+            if self.options.limit == Some(0)
                 || matches!((self.options.start, self.options.end_seq_num), (Some(ReadStart::SeqNum(next)), Some(end_seq_num)) if next >= end_seq_num)
             {
                 return Ok(None);
@@ -1755,7 +1780,7 @@ pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
     socket: ReadSocket,
-    stream_info: ReadStreamInfo,
+    stream_info: StreamInfo,
     finished: bool,
     last_caught_up: Option<CaughtUpPosition>,
     snapshot_boundary: Option<SnapshotBoundary>,
@@ -1770,7 +1795,7 @@ impl TsfReadSession {
         client: TsfClient,
         options: ReadStreamOptions,
         socket: ReadSocket,
-        stream_info: ReadStreamInfo,
+        stream_info: StreamInfo,
         last_caught_up: Option<CaughtUpPosition>,
         snapshot_boundary: Option<SnapshotBoundary>,
     ) -> Self {
@@ -1801,7 +1826,7 @@ impl TsfReadSession {
     }
 
     /// Returns metadata supplied by the latest successful read handshake.
-    pub const fn stream_info(&self) -> &ReadStreamInfo {
+    pub const fn stream_info(&self) -> &StreamInfo {
         &self.stream_info
     }
 
@@ -1905,9 +1930,9 @@ impl TsfReadSession {
             None => self.finished = true,
         }
 
-        if let Some(count) = self.options.count.as_mut() {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+        if let Some(remaining) = self.options.limit.as_mut() {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
                 self.finished = true;
             }
         }
@@ -1922,7 +1947,7 @@ impl TsfReadSession {
 }
 
 fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
-    options.count == Some(0)
+    options.limit == Some(0)
         || matches!(
             (options.start, options.end_seq_num),
             (Some(ReadStart::SeqNum(start)), Some(end_seq_num)) if start >= end_seq_num
@@ -1937,7 +1962,7 @@ struct ReadSocket {
 
 struct ConnectedReadSocket {
     socket: ReadSocket,
-    stream_info: ReadStreamInfo,
+    stream_info: StreamInfo,
     snapshot_boundary: Option<SnapshotBoundary>,
 }
 
@@ -2082,8 +2107,8 @@ fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
         }
         None => {}
     }
-    if let Some(value) = options.count {
-        query.append_pair("count", &value.to_string());
+    if let Some(value) = options.limit {
+        query.append_pair("limit", &value.to_string());
     }
     if let Some(value) = options.end_seq_num {
         query.append_pair("end_seq_num", &value.to_string());
@@ -2369,7 +2394,7 @@ async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
 }
 
 struct ReadHandshake {
-    stream_info: ReadStreamInfo,
+    stream_info: StreamInfo,
     snapshot_boundary: Option<SnapshotBoundary>,
 }
 
@@ -2500,7 +2525,10 @@ pub enum TsfClientError {
     },
     /// The stream did not start the writer session at its requested sequence.
     #[error("stream next sequence did not match the writer session precondition")]
-    WriterSequenceMismatch,
+    SequenceMismatch,
+    /// Link-list pagination controls are outside the supported range.
+    #[error("invalid list links options: {0}")]
+    InvalidListLinksOptions(&'static str),
     /// The server returned an invalid or mismatched ack range.
     #[error("server sent invalid append acknowledgement {0:?}")]
     InvalidAppendAck(AppendAck),
@@ -2706,7 +2734,7 @@ mod tests {
     #[tokio::test]
     async fn read_handshake_returns_metadata() {
         let (mut client, mut server) = connected_websockets().await;
-        let stream_info = ReadStreamInfo {
+        let stream_info = StreamInfo {
             stream_id: "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
@@ -2924,13 +2952,13 @@ mod tests {
             .expect("stream ID");
         let mut options = ReadStreamOptions::new(stream_id);
         options.start = Some(ReadStart::SeqNum(42));
-        options.count = Some(7);
+        options.limit = Some(7);
         options.snapshot = true;
         let mut url = Url::parse("https://tail.surf/api/v1/streams/id/records").expect("SSE URL");
 
         append_sse_query(&mut url, &options);
 
-        assert_eq!(url.query(), Some("seq_num=42&count=7&snapshot=true"));
+        assert_eq!(url.query(), Some("seq_num=42&limit=7&snapshot=true"));
     }
 
     #[test]
@@ -3032,7 +3060,7 @@ mod tests {
     fn dispatch_ack_rejects_more_records_than_are_pending() {
         let permits = Arc::new(Semaphore::new(2));
         let (ack_tx, _ack_rx) = oneshot::channel();
-        let record = WriteRecord::new(7, PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new());
+        let record = AppendRecord::new(7, PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new());
         let mut pending = VecDeque::from([PendingAppend {
             record,
             ack_tx,
@@ -3060,7 +3088,7 @@ mod tests {
         for writer_seq_num in [7, 9] {
             let (ack_tx, _ack_rx) = oneshot::channel();
             pending.push_back(PendingAppend {
-                record: WriteRecord::new(
+                record: AppendRecord::new(
                     writer_seq_num,
                     PartHeader::unsplit(),
                     RecordFormat::Bytes,

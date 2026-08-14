@@ -3,7 +3,7 @@
 use serde_json::Value;
 use tailsurf::protocol::rest::{
     AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, SseCaughtUpEvent,
-    SseRecordsEvent, SseSnapshotBoundaryEvent, StreamInfoResponse,
+    SseRecordsEvent, SseSnapshotBoundaryEvent, StreamMetadata,
 };
 
 #[test]
@@ -12,9 +12,10 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
         serde_json::from_str(include_str!("../fixtures/rest-v1.json")).expect("REST fixture JSON");
     let create: CreateStreamRequest = fixture(&fixtures, "create_request");
     assert_eq!(create.links.len(), 2);
-    let stream: StreamInfoResponse = fixture(&fixtures, "stream_resource");
+    let stream: StreamMetadata = fixture(&fixtures, "stream_resource");
     assert_eq!(stream.created_at, "2026-08-13T00:00:00Z");
     let append: AppendRecordsRequest = fixture(&fixtures, "append_request");
+    assert_eq!(append.client_writer_id, "AAECAwQFBgcICQoLDA0ODw");
     assert_eq!(append.records.len(), 2);
     let acknowledgement: AppendRecordsResponse = fixture(&fixtures, "append_response");
     assert_eq!(

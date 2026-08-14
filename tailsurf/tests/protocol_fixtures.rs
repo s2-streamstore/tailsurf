@@ -11,7 +11,7 @@ use tailsurf::{
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_BATCH_RECORDS,
                 MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader,
-                ReadRecord, ReadStreamInfo, RecordFormat, ServerFrame, SnapshotBoundary,
+                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, StreamInfo,
                 TSF_WEBSOCKET_PROTOCOL,
             },
         },
@@ -44,7 +44,7 @@ enum ClientFixture {
     OpenRead {
         start_type: String,
         start_value: String,
-        count: Option<String>,
+        limit: Option<String>,
         end_seq_num: Option<String>,
         playback_rate_permille: Option<String>,
         #[serde(default)]
@@ -52,7 +52,7 @@ enum ClientFixture {
         link_secret: Option<String>,
     },
     OpenWrite {
-        writer_id_hex: String,
+        client_writer_id_hex: String,
         link_secret: String,
         expected_next_seq_num: Option<String>,
     },
@@ -159,7 +159,7 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
         ClientFixture::OpenRead {
             start_type,
             start_value,
-            count,
+            limit,
             end_seq_num,
             playback_rate_permille,
             snapshot,
@@ -167,17 +167,17 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
         } => ClientFrame::OpenRead {
             link_secret: link_secret.map(LinkSecret::from),
             start: read_start(&start_type, parse_u64(&start_value)),
-            count: count.as_deref().map(parse_u64),
+            limit: limit.as_deref().map(parse_u64),
             end_seq_num: end_seq_num.as_deref().map(parse_u64),
             playback_rate_permille: playback_rate_permille.as_deref().map(parse_u64),
             snapshot,
         },
         ClientFixture::OpenWrite {
-            writer_id_hex,
+            client_writer_id_hex,
             link_secret,
             expected_next_seq_num,
         } => ClientFrame::OpenWrite {
-            writer_id: decode_writer_id(&writer_id_hex),
+            client_writer_id: decode_writer_id(&client_writer_id_hex),
             link_secret: LinkSecret::from(link_secret),
             expected_next_seq_num: expected_next_seq_num.as_deref().map(parse_u64),
         },
@@ -256,7 +256,7 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             visibility,
             created_at,
             expires_at,
-        } => ServerFrame::StreamInfo(ReadStreamInfo {
+        } => ServerFrame::StreamInfo(StreamInfo {
             stream_id: stream_id.parse().expect("fixture stream ID"),
             title: title.map(|title| title.parse().expect("fixture stream title")),
             visibility,

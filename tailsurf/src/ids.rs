@@ -78,22 +78,22 @@ pub struct LinkIdError;
 /// Secret value carried by a stream link.
 pub type LinkSecret = secrecy::SecretString;
 
-/// Stable 128-bit identity assigned by a writer and reused across reconnects.
+/// Stable 128-bit client writer identity reused across reconnects.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WriterId([u8; 16]);
 
 impl WriterId {
-    /// Encoded writer ID length.
+    /// Encoded client writer ID length.
     pub const BYTE_LEN: usize = 16;
 
-    /// Generates a cryptographically random writer ID.
+    /// Generates a cryptographically random client writer ID.
     pub fn new_random() -> Self {
         let mut bytes = [0_u8; Self::BYTE_LEN];
         fill_random(&mut bytes);
         Self(bytes)
     }
 
-    /// Creates a writer ID from its exact binary representation.
+    /// Creates a client writer ID from its exact binary representation.
     pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
         Self(bytes)
     }

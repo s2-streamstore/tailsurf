@@ -164,7 +164,7 @@ pub struct StreamLinkSummary {
     /// RFC 3339 revocation timestamp when inactive.
     pub revoked_at: Option<String>,
     /// Whether this link authenticated the inventory request.
-    pub is_authorizing: bool,
+    pub is_current: bool,
 }
 
 /// Non-secret link inventory for a stream.
@@ -178,7 +178,7 @@ pub struct ListLinksResponse {
 
 /// Current stream metadata.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamInfoResponse {
+pub struct StreamMetadata {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Human-facing title when one has been set.
@@ -227,7 +227,7 @@ pub struct AppendJsonRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppendRecordsRequest {
     /// Canonical client writer ID.
-    pub writer_id: String,
+    pub client_writer_id: String,
     /// Writer-local sequence assigned to the first record.
     #[serde(with = "decimal_u64")]
     pub writer_start_seq_num: u64,

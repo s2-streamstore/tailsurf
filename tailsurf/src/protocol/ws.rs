@@ -22,7 +22,7 @@ pub struct ReadStreamOptions {
     /// Optional initial read position. No value sends a tail offset of 80.
     pub start: Option<ReadStart>,
     /// Optional maximum number of physical records to deliver.
-    pub count: Option<u64>,
+    pub limit: Option<u64>,
     /// Optional exclusive ending sequence number.
     pub end_seq_num: Option<u64>,
     /// Optional timestamp playback rate in thousandths. `1000` is recorded speed.
@@ -39,7 +39,7 @@ impl ReadStreamOptions {
         Self {
             stream_id,
             start: None,
-            count: None,
+            limit: None,
             end_seq_num: None,
             playback_rate_permille: None,
             snapshot: false,
@@ -65,13 +65,13 @@ pub enum ReadStart {
     TailOffset(u64),
 }
 
-/// Stream, writer identity, and credentials for one write WebSocket.
+/// Stream, client writer identity, and credentials for one write WebSocket.
 #[derive(Clone, Debug)]
 pub struct WriteStreamOptions {
     /// Stream to append to.
     pub stream_id: StreamId,
-    /// Stable writer identity reused with sequence numbers across reconnects.
-    pub writer_id: WriterId,
+    /// Stable client writer identity reused with sequence numbers across reconnects.
+    pub client_writer_id: WriterId,
     /// Secret from a write-capable stream link.
     pub link_secret: LinkSecret,
     /// Initial stream sequence precondition for this writer session.
@@ -82,12 +82,12 @@ impl WriteStreamOptions {
     /// Creates write options from an owned stream link secret.
     pub fn new(
         stream_id: StreamId,
-        writer_id: WriterId,
+        client_writer_id: WriterId,
         link_secret: impl Into<LinkSecret>,
     ) -> Self {
         Self {
             stream_id,
-            writer_id,
+            client_writer_id,
             link_secret: link_secret.into(),
             expected_next_seq_num: None,
         }

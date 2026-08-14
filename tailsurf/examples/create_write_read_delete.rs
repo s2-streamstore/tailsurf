@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     let ticket = writer
-        .submit(tailsurf::WriteRecord::new(
+        .submit(tailsurf::AppendRecord::new(
             0,
             PartHeader::unsplit(),
             RecordFormat::Transcript,
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut read_request =
         ReadStreamOptions::new(created.stream_id).with_link_secret(read_link_secret);
     read_request.start = Some(ReadStart::SeqNum(0));
-    read_request.count = Some(1);
+    read_request.limit = Some(1);
     let mut reader = client.connect_reader(read_request).await?;
     if let Some(record) = reader.next_record().await? {
         print!("{}", String::from_utf8_lossy(&record.data));
