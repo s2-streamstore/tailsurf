@@ -875,10 +875,13 @@ impl TsfClient {
             match run().await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < attempts && should_retry(&error) => {
-                    let delay = error.retry_after().unwrap_or_else(|| {
-                        let jitter = rand::rng().random_range(0.5_f64..=1.5_f64);
-                        backoff.mul_f64(jitter)
-                    });
+                    let delay = error
+                        .retry_after()
+                        .map(|delay| delay.min(retry_policy.max_backoff))
+                        .unwrap_or_else(|| {
+                            let jitter = rand::rng().random_range(0.5_f64..=1.5_f64);
+                            backoff.mul_f64(jitter)
+                        });
                     if !delay.is_zero() {
                         sleep(delay).await;
                     }
