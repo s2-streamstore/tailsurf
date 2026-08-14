@@ -15,6 +15,12 @@ pub const MAX_STATELESS_APPEND_RECORDS: usize = 128;
 pub const MAX_STATELESS_APPEND_PAYLOAD_BYTES: usize = 900 * 1024;
 /// Maximum encoded JSON body in one stateless atomic append.
 pub const MAX_STATELESS_APPEND_JSON_BYTES: usize = 1_300_000;
+/// Maximum encoded JSON bytes buffered for one successful REST response.
+pub const MAX_REST_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum encoded JSON bytes inspected from one REST error response.
+pub const MAX_REST_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+/// Maximum entries returned in one link inventory page.
+pub const MAX_LINK_PAGE_ITEMS: usize = 100;
 /// Maximum physical records in one SSE `read_batch` event.
 pub const MAX_SSE_READ_BATCH_RECORDS: usize = 1_000;
 /// Maximum decoded record payload in one SSE `read_batch` event.
@@ -197,7 +203,7 @@ pub struct ListLinksResponse {
     /// Retained link metadata ordered newest first.
     pub links: Vec<StreamLinkSummary>,
     /// Opaque cursor for the next page.
-    #[serde(deserialize_with = "deserialize_nullable_string")]
+    #[serde(deserialize_with = "deserialize_nullable_non_empty_string")]
     pub next_cursor: Option<String>,
 }
 
@@ -498,11 +504,17 @@ where
     Ok(value.into())
 }
 
-fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_nullable_non_empty_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Option::<String>::deserialize(deserializer)
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.as_deref() == Some("") {
+        return Err(serde::de::Error::custom("cursor must not be empty"));
+    }
+    Ok(value)
 }
 
 fn deserialize_rfc3339_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -684,5 +696,13 @@ mod tests {
         assert!(serde_json::from_value::<StreamMetadata>(invalid_time).is_err());
 
         assert!(serde_json::from_value::<ListLinksResponse>(json!({ "links": [] })).is_err());
+        assert!(
+            serde_json::from_value::<ListLinksResponse>(json!({
+                "authorizing_link_id": "owner",
+                "links": [],
+                "next_cursor": ""
+            }))
+            .is_err()
+        );
     }
 }

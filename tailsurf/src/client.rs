@@ -1,7 +1,7 @@
 //! Bounded REST and WebSocket clients for the TSF service.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     future::Future,
     pin::Pin,
     str::FromStr,
@@ -40,7 +40,8 @@ use crate::{
     protocol::{
         rest::{
             ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest, CreateLinkInput,
-            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, MAX_SSE_EVENT_BYTES,
+            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, MAX_LINK_PAGE_ITEMS,
+            MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
             MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS,
             MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
             MAX_STATELESS_APPEND_RECORDS, RecordData, RestRecordPart, SseCaughtUpData,
@@ -68,7 +69,7 @@ const API_PREFIX: &str = "/api/v1";
 pub struct TsfClientConfig {
     /// Service origin without the `/api/v1` namespace.
     pub api_origin: Url,
-    /// Per-request timeout for REST operations.
+    /// Per-request timeout for REST operations and SSE opening handshakes.
     pub rest_request_timeout: Duration,
     /// Timeout for establishing and upgrading a WebSocket.
     pub websocket_connect_timeout: Duration,
@@ -113,7 +114,7 @@ impl Default for TsfClientConfig {
 /// Exponential-backoff policy for idempotent operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetryPolicy {
-    /// Total attempts including the initial request. Zero is treated as one.
+    /// Total attempts including the initial request.
     pub max_attempts: usize,
     /// Delay before the first retry.
     pub initial_backoff: Duration,
@@ -132,7 +133,7 @@ impl RetryPolicy {
     }
 
     fn attempt_count(self) -> usize {
-        self.max_attempts.max(1)
+        self.max_attempts
     }
 
     fn next_backoff(self, current: Duration) -> Duration {
@@ -189,7 +190,7 @@ impl TsfClient {
 
     /// Creates a client from a complete configuration.
     pub fn with_config(config: TsfClientConfig) -> Result<Self, TsfClientError> {
-        validate_api_origin(&config.api_origin)?;
+        validate_client_config(&config)?;
         Ok(Self {
             config,
             http: reqwest::Client::new(),
@@ -338,10 +339,15 @@ impl TsfClient {
     ) -> Result<ListLinksResponse, TsfClientError> {
         if options
             .limit
-            .is_some_and(|limit| !(1..=100).contains(&limit))
+            .is_some_and(|limit| !(1..=MAX_LINK_PAGE_ITEMS as u8).contains(&limit))
         {
             return Err(TsfClientError::InvalidListLinksOptions(
                 "limit must be between 1 and 100",
+            ));
+        }
+        if options.cursor.as_deref() == Some("") {
+            return Err(TsfClientError::InvalidListLinksOptions(
+                "cursor must not be empty",
             ));
         }
         let mut url = self.rest_url(&format!("/streams/{stream_id}/links"));
@@ -354,14 +360,20 @@ impl TsfClient {
                 query.append_pair("cursor", cursor);
             }
         }
-        self.retry_transient(|| {
-            self.send_json_with_bearer(
-                self.http.get(url.clone()),
-                "list links",
-                Some(owner_link_secret),
-            )
-        })
-        .await
+        let page = self
+            .retry_transient(|| {
+                self.send_json_with_bearer(
+                    self.http.get(url.clone()),
+                    "list links",
+                    Some(owner_link_secret),
+                )
+            })
+            .await?;
+        validate_link_page(
+            &page,
+            options.limit.unwrap_or(MAX_LINK_PAGE_ITEMS as u8) as usize,
+        )?;
+        Ok(page)
     }
 
     /// Lists every retained link, following pagination until completion.
@@ -373,21 +385,35 @@ impl TsfClient {
         let mut links = Vec::new();
         let mut cursor: Option<String> = None;
         let mut authorizing_link_id = None;
+        let mut seen_cursors = HashSet::new();
         loop {
             let page = self
                 .list_links(
                     stream_id,
                     &ListLinksOptions {
-                        limit: Some(100),
+                        limit: Some(MAX_LINK_PAGE_ITEMS as u8),
                         cursor,
                     },
                     owner_link_secret,
                 )
                 .await?;
+            if authorizing_link_id
+                .as_ref()
+                .is_some_and(|expected| expected != &page.authorizing_link_id)
+            {
+                return Err(TsfClientError::InvalidLinkPage(
+                    "authorizing link changed across pages",
+                ));
+            }
             authorizing_link_id.get_or_insert(page.authorizing_link_id);
             links.extend(page.links);
             match page.next_cursor {
-                Some(next) => cursor = Some(next),
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => {
+                    return Err(TsfClientError::InvalidLinkPage(
+                        "link pagination cursor repeated",
+                    ));
+                }
                 None => break,
             }
         }
@@ -2701,7 +2727,8 @@ async fn json_response<T: DeserializeOwned>(
         return Err(http_status_error(response, operation).await);
     }
 
-    Ok(response.json().await?)
+    let body = bounded_response_body(response, operation, MAX_REST_RESPONSE_BYTES).await?;
+    Ok(serde_json::from_slice(&body)?)
 }
 
 async fn http_status_error(response: reqwest::Response, operation: &'static str) -> TsfClientError {
@@ -2718,8 +2745,10 @@ async fn http_status_error(response: reqwest::Response, operation: &'static str)
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_retry_after);
-    let raw = response.text().await.unwrap_or_default();
-    let parsed = serde_json::from_str::<ApiErrorResponse>(&raw).ok();
+    let raw = bounded_response_body(response, operation, MAX_REST_ERROR_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    let parsed = serde_json::from_slice::<ApiErrorResponse>(&raw).ok();
     let request_id = header_request_id.or_else(|| {
         parsed
             .as_ref()
@@ -2741,6 +2770,7 @@ async fn http_status_error(response: reqwest::Response, operation: &'static str)
         .as_ref()
         .map(|response| response.error.code.clone())
         .filter(|value| !value.is_empty());
+    let raw = String::from_utf8(raw).unwrap_or_default();
     let body = api_error_message(&raw).unwrap_or(raw);
     TsfClientError::HttpStatus {
         operation,
@@ -2751,6 +2781,36 @@ async fn http_status_error(response: reqwest::Response, operation: &'static str)
         retry_after,
         actual_next_seq_num,
     }
+}
+
+async fn bounded_response_body(
+    response: reqwest::Response,
+    operation: &'static str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, TsfClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_bytes as u64)
+    {
+        return Err(TsfClientError::ResponseTooLarge {
+            operation,
+            maximum_bytes,
+        });
+    }
+
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        if chunk.len() > maximum_bytes.saturating_sub(body.len()) {
+            return Err(TsfClientError::ResponseTooLarge {
+                operation,
+                maximum_bytes,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn parse_retry_after(value: &str) -> Option<Duration> {
@@ -2883,15 +2943,96 @@ fn validate_api_origin(origin: &Url) -> Result<(), TsfClientError> {
     Ok(())
 }
 
+fn validate_link_page(
+    page: &ListLinksResponse,
+    maximum_links: usize,
+) -> Result<(), TsfClientError> {
+    if page.links.len() > maximum_links {
+        return Err(TsfClientError::InvalidLinkPage(
+            "page contains more links than requested",
+        ));
+    }
+    if page.next_cursor.is_some() && page.links.is_empty() {
+        return Err(TsfClientError::InvalidLinkPage(
+            "empty page carries a next cursor",
+        ));
+    }
+    let mut link_ids = HashSet::with_capacity(page.links.len());
+    if page
+        .links
+        .iter()
+        .any(|link| !link_ids.insert(&link.link_id))
+    {
+        return Err(TsfClientError::InvalidLinkPage(
+            "page contains duplicate link IDs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_client_config(config: &TsfClientConfig) -> Result<(), TsfClientError> {
+    validate_api_origin(&config.api_origin)?;
+    for (name, value) in [
+        ("rest_request_timeout", config.rest_request_timeout),
+        (
+            "websocket_connect_timeout",
+            config.websocket_connect_timeout,
+        ),
+        (
+            "websocket_operation_timeout",
+            config.websocket_operation_timeout,
+        ),
+    ] {
+        if value.is_zero() {
+            return Err(TsfClientError::InvalidClientConfig(format!(
+                "{name} must be greater than zero"
+            )));
+        }
+    }
+    if config
+        .websocket_read_idle_timeout
+        .is_some_and(|timeout| timeout.is_zero())
+    {
+        return Err(TsfClientError::InvalidClientConfig(
+            "websocket_read_idle_timeout must be greater than zero when set".to_owned(),
+        ));
+    }
+    if config.retry_policy.max_attempts == 0 {
+        return Err(TsfClientError::InvalidClientConfig(
+            "retry_policy.max_attempts must be at least one".to_owned(),
+        ));
+    }
+    if config.retry_policy.initial_backoff > config.retry_policy.max_backoff {
+        return Err(TsfClientError::InvalidClientConfig(
+            "retry_policy.initial_backoff must not exceed retry_policy.max_backoff".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Error surfaced by REST operations, socket setup, reads, and durable writers.
 #[derive(Debug, thiserror::Error)]
 pub enum TsfClientError {
     /// The configured API origin is not a bare HTTP or HTTPS origin.
     #[error("API origin must be HTTP(S) without credentials, path, query, or fragment: {0}")]
     InvalidApiOrigin(Url),
+    /// Client timeout or retry settings are incoherent.
+    #[error("invalid client config: {0}")]
+    InvalidClientConfig(String),
     /// HTTP transport or response-decoding failure.
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
+    /// A REST response contained malformed JSON.
+    #[error("invalid JSON in REST response: {0}")]
+    Json(#[from] serde_json::Error),
+    /// A REST response exceeded the SDK memory-safety bound.
+    #[error("{operation} response exceeds {maximum_bytes} bytes")]
+    ResponseTooLarge {
+        /// Stable operation label.
+        operation: &'static str,
+        /// Maximum bytes buffered by the SDK.
+        maximum_bytes: usize,
+    },
     /// Non-success HTTP response.
     #[error("HTTP {operation} failed with {status}: {body}")]
     HttpStatus {
@@ -2963,6 +3104,9 @@ pub enum TsfClientError {
     /// Link-list pagination controls are outside the supported range.
     #[error("invalid list links options: {0}")]
     InvalidListLinksOptions(&'static str),
+    /// A link inventory page violated pagination invariants.
+    #[error("invalid link page: {0}")]
+    InvalidLinkPage(&'static str),
     /// The server returned an invalid or mismatched ack range.
     #[error("server sent invalid append acknowledgement {0:?}")]
     InvalidAppendAck(AppendAck),
@@ -3087,6 +3231,7 @@ impl TsfClientError {
             Self::Http(error) => {
                 error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
             }
+            Self::Json(_) => true,
             Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
             _ => false,
         }
@@ -3215,6 +3360,47 @@ mod tests {
         assert!(started_at.elapsed() < Duration::from_millis(200));
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn rest_response_rejects_declared_body_above_memory_bound() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind REST listener");
+        let address = listener.local_addr().expect("REST listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept REST request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.expect("read REST request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_REST_RESPONSE_BYTES + 1
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write REST headers");
+        });
+        let mut config = TsfClientConfig::new(
+            Url::parse(&format!("http://{address}")).expect("REST API origin"),
+        )
+        .expect("valid client config");
+        config.retry_policy = RetryPolicy::none();
+        let client = TsfClient::with_config(config).expect("REST client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+
+        let result = client.get_stream(&stream_id, None).await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::ResponseTooLarge {
+                operation: "get stream",
+                maximum_bytes: MAX_REST_RESPONSE_BYTES,
+            })
+        ));
+        server.await.expect("join REST server");
     }
 
     async fn connected_websockets() -> (ClientWebSocket, WebSocketStream<TcpStream>) {
@@ -3395,14 +3581,63 @@ mod tests {
     }
 
     #[test]
-    fn retry_policy_always_attempts_at_least_once() {
-        let retry_policy = RetryPolicy {
-            max_attempts: 0,
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-        };
+    fn rejects_incoherent_client_config() {
+        let mut config = TsfClientConfig::default();
+        config.retry_policy.max_attempts = 0;
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
 
-        assert_eq!(retry_policy.attempt_count(), 1);
+        let mut config = TsfClientConfig::default();
+        config.retry_policy.initial_backoff = Duration::from_secs(2);
+        config.retry_policy.max_backoff = Duration::from_secs(1);
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
+
+        let config = TsfClientConfig {
+            rest_request_timeout: Duration::ZERO,
+            ..TsfClientConfig::default()
+        };
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_link_page_invariants() {
+        let link = serde_json::json!({
+            "link_id": "reader",
+            "permissions": "r",
+            "status": "active",
+            "created_at": "2026-08-13T00:00:00Z",
+            "expires_at": null,
+            "revoked_at": null
+        });
+        let duplicate: ListLinksResponse = serde_json::from_value(serde_json::json!({
+            "authorizing_link_id": "owner",
+            "links": [link.clone(), link],
+            "next_cursor": null
+        }))
+        .expect("decodable duplicate page");
+        assert!(matches!(
+            validate_link_page(&duplicate, 100),
+            Err(TsfClientError::InvalidLinkPage(_))
+        ));
+
+        let empty_with_cursor: ListLinksResponse = serde_json::from_value(serde_json::json!({
+            "authorizing_link_id": "owner",
+            "links": [],
+            "next_cursor": "next"
+        }))
+        .expect("decodable empty page");
+        assert!(matches!(
+            validate_link_page(&empty_with_cursor, 100),
+            Err(TsfClientError::InvalidLinkPage(_))
+        ));
     }
 
     #[test]
