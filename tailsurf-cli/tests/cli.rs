@@ -24,19 +24,20 @@ use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
     CreateStreamIdempotencyKey, LinkId, LinkPermissions, LinkSecret, RetryPolicy, StreamId,
-    StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfProducerConfig, WriteRecord,
+    StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfWriterConfig, WriteRecord,
     WriterId,
     protocol::{
         rest::{
-            CreateStreamRequest, CreateStreamResponse, IssueLinkResponse, IssuedStreamLink,
-            ListLinksResponse, StreamInfoResponse, StreamLinkStatus, StreamLinkSummary,
-            StreamTitleUpdate, UpdateStreamRequest, Visibility,
+            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, StreamInfoResponse,
+            StreamLinkCredential, StreamLinkStatus, StreamLinkSummary, StreamTitleUpdate,
+            UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
-                ReadSnapshotBoundary, ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+                CaughtUpPosition, ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord,
+                ReadStreamInfo, RecordFormat, ServerFrame, SnapshotBoundary,
+                TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -248,9 +249,10 @@ async fn create_stream_recovers_a_committed_truncated_response() {
     let key = CreateStreamIdempotencyKey::new_random();
     let exposed_key = key.expose_secret().to_owned();
     let request = CreateStreamRequest::default();
-    let expected_owner_secret = request.issue_links[0].secret.expose_secret().to_owned();
+    let expected_owner_secret = request.links[0].secret.expose_secret().to_owned();
 
-    let created = TsfClient::with_api_base_url(server.api_url.clone())
+    let created = TsfClient::with_api_origin(server.api_url.clone())
+        .expect("valid API origin")
         .create_stream_with_idempotency_key(&request, &key)
         .await
         .expect("recover committed create");
@@ -274,7 +276,7 @@ async fn create_stream_recovers_a_committed_truncated_response() {
 #[tokio::test]
 async fn create_stream_is_always_anonymous() {
     let server = TestServer::start().await;
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
 
     client
         .create_stream(&CreateStreamRequest::default())
@@ -378,7 +380,7 @@ async fn new_uses_an_explicit_owner_rejects_duplicate_ids_and_limits_links() {
     assert!(
         too_many
             .stderr
-            .contains("at most 3 initial links may be issued"),
+            .contains("at most 3 initial links may be created"),
         "stderr={}",
         too_many.stderr
     );
@@ -590,8 +592,8 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_stream_link(read_link);
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
     request.count = Some(3);
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -664,8 +666,8 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_stream_link(read_link);
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
     request.count = Some(16);
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -732,8 +734,8 @@ async fn write_raw_flushes_on_linger() {
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_stream_link(read_link);
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
     request.count = Some(2);
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -854,54 +856,54 @@ async fn write_reconnect_reuses_writer_identity_sequence_and_link_secret() {
 }
 
 #[tokio::test]
-async fn producer_close_is_not_blocked_by_an_unused_reservation() {
+async fn writer_close_is_not_blocked_by_an_unused_reservation() {
     let server = FakeWriteServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
-    let producer = client
-        .connect_producer_with_config(
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let writer = client
+        .connect_writer_with_config(
             tailsurf::protocol::ws::WriteStreamOptions::new(
                 stream_id,
                 WriterId::new_random(),
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
-            TsfProducerConfig {
+            TsfWriterConfig {
                 max_unacked_bytes: 1,
                 max_unacked_records: 1,
                 max_reconnect_attempts: 0,
             },
         )
         .await
-        .expect("producer");
-    let _permit = producer.reserve(1).await.expect("reservation");
+        .expect("writer");
+    let _permit = writer.reserve(1).await.expect("reservation");
 
-    timeout(Duration::from_secs(1), producer.close())
+    timeout(Duration::from_secs(1), writer.close())
         .await
-        .expect("producer close must not wait for reservation")
-        .expect("producer close");
+        .expect("writer close must not wait for reservation")
+        .expect("writer close");
 
     server.abort();
 }
 
 #[tokio::test]
-async fn default_producer_enforces_record_and_byte_windows() {
-    assert_default_producer_window(128, Bytes::from_static(b"x")).await;
-    assert_default_producer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
+async fn default_writer_enforces_record_and_byte_windows() {
+    assert_default_writer_window(128, Bytes::from_static(b"x")).await;
+    assert_default_writer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
 }
 
-async fn assert_default_producer_window(capacity: usize, payload: Bytes) {
+async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
     let server = HoldingWriteServer::start(capacity).await;
-    let producer = connect_default_producer(&server.api_url).await;
+    let writer = connect_default_writer(&server.api_url).await;
     let record_count = u64::try_from(capacity).expect("window capacity fits u64");
     let mut tickets = Vec::new();
     for writer_seq_num in 0..record_count {
         tickets.push(
-            producer
+            writer
                 .submit(test_write_record(writer_seq_num, payload.clone()))
                 .await
-                .expect("submit within producer window"),
+                .expect("submit within writer window"),
         );
     }
     server.wait_for_records(capacity).await;
@@ -909,11 +911,11 @@ async fn assert_default_producer_window(capacity: usize, payload: Bytes) {
     assert!(
         timeout(
             Duration::from_millis(100),
-            producer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
+            writer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
         )
         .await
         .is_err(),
-        "submit beyond the producer window must wait for an acknowledgement"
+        "submit beyond the writer window must wait for an acknowledgement"
     );
 
     server.release_acknowledgements();
@@ -922,24 +924,24 @@ async fn assert_default_producer_window(capacity: usize, payload: Bytes) {
     }
     let final_ticket = timeout(
         Duration::from_secs(1),
-        producer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
+        writer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
     )
     .await
-    .expect("producer window reopened")
+    .expect("writer window reopened")
     .expect("final submit");
     final_ticket.await.expect("final acknowledgement");
-    producer.close().await.expect("producer close");
+    writer.close().await.expect("writer close");
     server.abort();
 }
 
 #[tokio::test]
-async fn producer_reconnect_resends_every_unacknowledged_record_in_order() {
+async fn writer_reconnect_resends_every_unacknowledged_record_in_order() {
     let server = HoldingWriteServer::start_reconnecting(3).await;
-    let producer = connect_default_producer(&server.api_url).await;
+    let writer = connect_default_writer(&server.api_url).await;
     let mut tickets = Vec::new();
     for writer_seq_num in 0..3 {
         tickets.push(
-            producer
+            writer
                 .submit(test_write_record(
                     writer_seq_num,
                     Bytes::from(format!("record-{writer_seq_num}")),
@@ -970,7 +972,7 @@ async fn producer_reconnect_resends_every_unacknowledged_record_in_order() {
     assert_eq!(attempts[1].data, attempts[4].data);
     assert_eq!(attempts[2].data, attempts[5].data);
 
-    producer.close().await.expect("producer close");
+    writer.close().await.expect("writer close");
     server.abort();
 }
 
@@ -1048,14 +1050,15 @@ async fn sse_snapshot_receives_an_explicit_empty_boundary() {
     options.snapshot = true;
     options.link_secret = Some(TEST_STREAM_LINK.into());
 
-    let session = TsfClient::with_api_base_url(server.api_url.clone())
+    let session = TsfClient::with_api_origin(server.api_url.clone())
+        .expect("valid API origin")
         .connect_sse_reader(options)
         .await
         .expect("snapshot SSE session");
 
     assert_eq!(
         session.snapshot_boundary(),
-        Some(ReadSnapshotBoundary {
+        Some(SnapshotBoundary {
             end_seq_num: 0,
             last_timestamp_ms: 0,
         })
@@ -1158,7 +1161,7 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
     let request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1184,13 +1187,13 @@ async fn reader_bounds_consecutive_reconnects_without_a_record() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone());
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
     config.retry_policy = RetryPolicy {
         max_attempts: 3,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
     };
-    let client = TsfClient::with_config(config);
+    let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1216,13 +1219,13 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone());
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
     config.retry_policy = RetryPolicy {
         max_attempts: 100,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
     };
-    let client = TsfClient::with_config(config);
+    let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1251,7 +1254,7 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_base_url(server.api_url.clone());
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::TailOffset(2));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1284,14 +1287,14 @@ async fn reader_reconnects_after_configured_idle_timeout() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone());
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
     config.websocket_read_idle_timeout = Some(Duration::from_millis(50));
     config.retry_policy = RetryPolicy {
         max_attempts: 3,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
     };
-    let client = TsfClient::with_config(config);
+    let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1607,20 +1610,27 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         serde_json::from_str(&cleared.stdout).expect("title clear output");
     assert!(cleared_json["title"].is_null());
 
-    let issued = run_tsf(
+    let created_link = run_tsf(
         &server,
-        ["link", "issue", owner_link, "deploy-reader=read", "--json"],
+        ["link", "create", owner_link, "deploy-reader=read", "--json"],
         None,
     )
     .await;
-    assert!(issued.status.success(), "stderr={}", issued.stderr);
-    let issued_json: serde_json::Value =
-        serde_json::from_str(&issued.stdout).expect("issue output");
-    let issued_url = issued_json["url"].as_str().expect("issued URL");
-    StreamLocator::parse(issued_url).expect("issued URL parses");
-    let link_id = issued_json["link_id"].as_str().expect("link id").to_owned();
-    assert_eq!(issued_json["link_id"], "deploy-reader");
-    assert!(issued_json.get("secret").is_none());
+    assert!(
+        created_link.status.success(),
+        "stderr={}",
+        created_link.stderr
+    );
+    let created_link_json: serde_json::Value =
+        serde_json::from_str(&created_link.stdout).expect("create link output");
+    let created_url = created_link_json["url"].as_str().expect("created URL");
+    StreamLocator::parse(created_url).expect("created URL parses");
+    let link_id = created_link_json["link_id"]
+        .as_str()
+        .expect("link id")
+        .to_owned();
+    assert_eq!(created_link_json["link_id"], "deploy-reader");
+    assert!(created_link_json.get("secret").is_none());
 
     server.fail_next_link_list();
     let listed = run_tsf(&server, ["link", "list", owner_link, "--json"], None).await;
@@ -1704,7 +1714,7 @@ impl TestServer {
             .route("/api/v1/streams/{stream_id}/links", get(test_list_links))
             .route(
                 "/api/v1/streams/{stream_id}/links/{link_id}",
-                axum::routing::put(test_issue_link).delete(test_revoke_link),
+                axum::routing::put(test_create_link).delete(test_revoke_link),
             )
             .route("/api/v1/streams/{stream_id}/write", get(test_write_socket))
             .route("/api/v1/streams/{stream_id}/read", get(test_read_socket))
@@ -1830,7 +1840,7 @@ struct TestLink {
 }
 
 #[derive(serde::Deserialize)]
-struct TestIssueLinkRequest {
+struct TestCreateLinkRequest {
     secret: String,
     permissions: LinkPermissions,
 }
@@ -1894,17 +1904,18 @@ async fn test_create_stream(
         return Json(response).into_response();
     }
 
-    let expires_in_secs = request.expires_in_secs.unwrap_or(864_000);
-    if expires_in_secs > 864_000 {
+    let expires_in_seconds = request.expires_in_seconds.unwrap_or(864_000);
+    if expires_in_seconds > 864_000 {
         return test_error(
             StatusCode::FORBIDDEN,
             "free_plan_limit",
             FREE_EXPIRY_LIMIT_MESSAGE,
         );
     }
-    let expires_at =
-        humantime::format_rfc3339_seconds(SystemTime::now() + Duration::from_secs(expires_in_secs))
-            .to_string();
+    let expires_at = humantime::format_rfc3339_seconds(
+        SystemTime::now() + Duration::from_secs(expires_in_seconds),
+    )
+    .to_string();
     let stream_id = {
         let mut next_stream = state.next_stream.lock().expect("next stream lock");
         let stream_id = format!("{:032x}", *next_stream)
@@ -1913,14 +1924,14 @@ async fn test_create_stream(
         *next_stream += 1;
         stream_id
     };
-    let requested_links = request.issue_links;
+    let requested_links = request.links;
     let links = requested_links
         .into_iter()
         .map(|link| test_store_stream_link(link.link_id, link.secret, link.permissions))
         .collect::<Vec<_>>();
     let response_links = links
         .iter()
-        .map(|link| IssuedStreamLink {
+        .map(|link| StreamLinkCredential {
             link_id: link.link_id.clone(),
             permissions: link.permissions,
             secret: link.secret.clone(),
@@ -2037,11 +2048,11 @@ async fn test_delete_stream(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn test_issue_link(
+async fn test_create_link(
     State(state): State<Arc<TestApiState>>,
     Path((stream_id, link_id)): Path<(String, LinkId)>,
     headers: HeaderMap,
-    Json(request): Json<TestIssueLinkRequest>,
+    Json(request): Json<TestCreateLinkRequest>,
 ) -> Response {
     let mut streams = state.streams.lock().expect("streams lock");
     let Some(stream) = streams.get_mut(&stream_id) else {
@@ -2054,7 +2065,7 @@ async fn test_issue_link(
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
     let link = test_store_stream_link(link_id, request.secret.into(), request.permissions);
-    let response = IssueLinkResponse {
+    let response = StreamLinkCredential {
         link_id: link.link_id.clone(),
         permissions: link.permissions,
         secret: link.secret.clone(),
@@ -2109,10 +2120,10 @@ async fn test_list_links(
                 } else {
                     StreamLinkStatus::Revoked
                 },
-                issued_at: "2026-08-07T12:00:00.000Z".to_owned(),
+                created_at: "2026-08-07T12:00:00.000Z".to_owned(),
                 expires_at: None,
                 revoked_at: (!link.active).then(|| "2026-08-07T12:01:00.000Z".to_owned()),
-                is_current: link.active && link.permissions.allows_owner(),
+                is_authorizing: link.active && link.permissions.allows_owner(),
             })
             .collect(),
         next_cursor: None,
@@ -2148,7 +2159,7 @@ async fn test_write_socket(
     Path(stream_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| test_write_flow(state, stream_id, socket))
 }
 
@@ -2245,7 +2256,7 @@ async fn test_read_socket(
     Path(stream_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| test_read_flow(state, stream_id, socket))
 }
 
@@ -2278,7 +2289,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         {
             return;
         }
-        let caught_up = ReadCaughtUp {
+        let caught_up = CaughtUpPosition {
             next_seq_num: stream.records.len() as u64,
             last_timestamp_ms: stream
                 .records
@@ -2300,7 +2311,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
     if snapshot {
         send_server_frame(
             &mut socket,
-            ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+            ServerFrame::SnapshotBoundary(SnapshotBoundary {
                 end_seq_num: caught_up.next_seq_num,
                 last_timestamp_ms: caught_up.last_timestamp_ms,
             }),
@@ -2672,18 +2683,19 @@ fn assert_created_links_parse(output: &str, expected_links: &[(&str, &str)]) {
     }
 }
 
-async fn connect_default_producer(api_url: &Url) -> tailsurf::TsfProducer {
+async fn connect_default_writer(api_url: &Url) -> tailsurf::TsfWriter {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    TsfClient::with_api_base_url(api_url.clone())
-        .connect_producer(WriteStreamOptions::new(
+    TsfClient::with_api_origin(api_url.clone())
+        .expect("valid API origin")
+        .connect_writer(WriteStreamOptions::new(
             stream_id,
             WriterId::new_random(),
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ))
         .await
-        .expect("producer")
+        .expect("writer")
 }
 
 fn test_write_record(writer_seq_num: u64, data: Bytes) -> WriteRecord {
@@ -2781,7 +2793,7 @@ async fn holding_write_socket(
     State(state): State<Arc<HoldingWriteState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| holding_write_flow(state, socket))
 }
 
@@ -2942,7 +2954,7 @@ async fn fake_write_socket(
     State(state): State<Arc<FakeWriteState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| fake_write_flow(state, socket))
 }
 
@@ -3200,7 +3212,7 @@ async fn fake_read_socket(
     Path(stream_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.protocols([TSF_WS_PROTOCOL])
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
         .on_upgrade(move |socket| fake_read_flow(state, stream_id, socket))
 }
 
@@ -3243,7 +3255,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
     if snapshot {
         send_server_frame(
             &mut socket,
-            ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+            ServerFrame::SnapshotBoundary(SnapshotBoundary {
                 end_seq_num: fake_read_next_seq_num(state.mode),
                 last_timestamp_ms: 1_781_717_406_000,
             }),
@@ -3264,7 +3276,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
             if attempt_count == 1 {
                 send_server_frame(
                     &mut socket,
-                    ServerFrame::CaughtUp(ReadCaughtUp {
+                    ServerFrame::CaughtUp(CaughtUpPosition {
                         next_seq_num: 5,
                         last_timestamp_ms: 1_781_717_406_010,
                     }),

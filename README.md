@@ -77,7 +77,7 @@ Streams expire after 10 days by default. Their complete history remains readable
 
 `tsf new` prints the title, Stream ID, expiry, and initial links. Private streams get a read link and an owner link. Public streams get a public URL and an owner link. The title is optional.
 
-Issue custom links with `--link LINK_ID=PERMISSION`. Link IDs are short semantic names such as `deploy-bot`. Permissions are `read`, `write`, `read-write`, and `owner`. The short forms `r`, `w`, `rw`, and `o` are also accepted. A stream may have up to three initial links, including defaults. Links are shown once.
+Create custom links with `--link LINK_ID=PERMISSION`. Link IDs are short semantic names such as `deploy-bot`. Permissions are `read`, `write`, `read-write`, and `owner`. The short forms `r`, `w`, `rw`, and `o` are also accepted. A stream may have up to three initial links, including defaults. Links are shown once.
 
 Stream command output into a new stream:
 
@@ -113,7 +113,7 @@ cat artifact.bin | tsf new --raw
 cat artifact.bin | tsf write '{write-link}' --raw
 ```
 
-On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the producer, and exits with status 130.
+On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the writer, and exits with status 130.
 
 Tail or replay a link or public stream URL:
 
@@ -148,7 +148,7 @@ tsf visibility '{owner-link}' public
 tsf title set '{owner-link}' 'Production deploy — west'
 tsf title clear '{owner-link}'
 tsf renew '{owner-link}' 7d
-tsf link issue '{owner-link}' 'deploy-reader=read' --expires 7d
+tsf link create '{owner-link}' 'deploy-reader=read' --expires 7d
 tsf link list '{owner-link}'
 tsf link revoke '{owner-link}' 'deploy-reader'
 tsf delete '{owner-link}'
