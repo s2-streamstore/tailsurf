@@ -19,13 +19,13 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
-    AppendTicket, LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle, TsfClient,
-    TsfReadSession, TsfSseReadSession, TsfWriter, WriteRecord, WriterId,
+    AppendRecord, AppendTicket, LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
+    TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter, WriterId,
     protocol::{
         rest::{
             CreateLinkRequest, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
-            StreamInfoResponse, StreamLinkCredential, StreamLinkStatus, StreamTitleUpdate,
-            UpdateStreamRequest, Visibility,
+            ListLinksResponse, StreamLinkCredential, StreamLinkStatus, StreamMetadata,
+            StreamTitleUpdate, UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -587,14 +587,14 @@ enum WriteBuffering {
 
 #[derive(Debug)]
 struct WriterState {
-    writer_id: WriterId,
+    client_writer_id: WriterId,
     next_writer_seq: u64,
 }
 
 impl WriterState {
     fn new_random() -> Self {
         Self {
-            writer_id: WriterId::new_random(),
+            client_writer_id: WriterId::new_random(),
             next_writer_seq: 0,
         }
     }
@@ -947,7 +947,7 @@ async fn stream_stdin_to_writer(
 ) -> eyre::Result<()> {
     let client = TsfClient::with_api_origin(api_url)?;
     let mut state = WriterState::new_random();
-    let mut options = WriteStreamOptions::new(stream_id, state.writer_id, link);
+    let mut options = WriteStreamOptions::new(stream_id, state.client_writer_id, link);
     options.expected_next_seq_num = expected_next_seq_num;
     let writer = client
         .connect_writer(options)
@@ -1069,7 +1069,7 @@ async fn stream_command_to_writer(
 ) -> eyre::Result<()> {
     let client = TsfClient::with_api_origin(api_url)?;
     let mut state = WriterState::new_random();
-    let mut options = WriteStreamOptions::new(stream_id, state.writer_id, link);
+    let mut options = WriteStreamOptions::new(stream_id, state.client_writer_id, link);
     options.expected_next_seq_num = expected_next_seq_num;
     let writer = client
         .connect_writer(options)
@@ -1394,7 +1394,7 @@ impl WriterSession<'_> {
             .state
             .reserve_writer_seq()
             .context("failed to reserve writer sequence")?;
-        let record = WriteRecord::new(writer_seq_num, part, format, data);
+        let record = AppendRecord::new(writer_seq_num, part, format, data);
         let ticket = self
             .writer
             .submit(record)
@@ -1435,7 +1435,7 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
         args.read.since,
         ReadStart::TailOffset(0),
     ));
-    request.count = args.read.limit;
+    request.limit = args.read.limit;
     if let Some(link) = locator.link_declaring(LinkPermissions::allows_read) {
         request = request.with_link_secret(link.clone());
     }
@@ -1460,7 +1460,7 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
         ReadStart::SeqNum(0),
     ));
     request.snapshot = true;
-    request.count = args.read.limit;
+    request.limit = args.read.limit;
     let read_link = locator.link_declaring(LinkPermissions::allows_read);
     if let Some(link) = read_link {
         request = request.with_link_secret(link.clone());
@@ -1587,25 +1587,27 @@ async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Resul
 async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
         owner_client_from_link(api_url, args.owner_link.as_str())?;
-    let response = client
-        .list_links(&locator.stream_id, &owner_link_secret)
+    let links = client
+        .list_all_links(&locator.stream_id, &owner_link_secret)
         .await
         .context("failed to list links")?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ListLinksResponse {
+                links,
+                next_cursor: None,
+            })?
+        );
     } else {
-        for link in response.links {
+        for link in links {
             println!(
                 "{:<24}  {:<10}  {:<7}  expires {}{}",
                 link.link_id,
                 permission_label(link.permissions),
                 link_status_label(link.status),
                 link.expires_at.as_deref().unwrap_or("never"),
-                if link.is_authorizing {
-                    "  (current)"
-                } else {
-                    ""
-                }
+                if link.is_current { "  (current)" } else { "" }
             );
         }
     }
@@ -1670,7 +1672,7 @@ async fn read_transcript(
     options: ReadStreamOptions,
     max_logical_record_bytes: usize,
 ) -> eyre::Result<()> {
-    if options.count == Some(0) {
+    if options.limit == Some(0) {
         return Ok(());
     }
 
@@ -1699,7 +1701,7 @@ async fn read_transcript_sse(
     options: ReadStreamOptions,
     max_logical_record_bytes: usize,
 ) -> eyre::Result<()> {
-    if options.count == Some(0) {
+    if options.limit == Some(0) {
         return Ok(());
     }
     let client = TsfClient::with_api_origin(api_url)?;
@@ -1989,7 +1991,7 @@ fn print_created_stream(
     Ok(())
 }
 
-fn print_stream_info(stream: &StreamInfoResponse, json: bool) -> eyre::Result<()> {
+fn print_stream_info(stream: &StreamMetadata, json: bool) -> eyre::Result<()> {
     if !json {
         println!("Stream {}", stream.stream_id);
         println!(
