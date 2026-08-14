@@ -283,7 +283,7 @@ impl TsfClient {
         request: &IssueLinkRequest,
         owner_link_secret: &LinkSecret,
     ) -> Result<IssueLinkResponse, TsfClientError> {
-        let link_id = LinkId::generate();
+        let link_id = request.link_id;
         self.retry_transient(|| {
             self.send_json_with_bearer(
                 self.http

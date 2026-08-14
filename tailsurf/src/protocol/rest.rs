@@ -106,6 +106,9 @@ pub struct CreateStreamResponse {
 /// Options for issuing a stream link.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IssueLinkRequest {
+    /// Client-generated stable link identifier carried in the request path.
+    #[serde(skip_serializing, default = "LinkId::generate")]
+    pub link_id: LinkId,
     /// Client-generated secret. The same request can be retried safely.
     #[serde(serialize_with = "crate::ids::serialize_link_secret")]
     pub secret: LinkSecret,
@@ -122,6 +125,7 @@ impl IssueLinkRequest {
     /// Creates retry-safe link issuance material.
     pub fn new(label: LinkLabel, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
         Self {
+            link_id: LinkId::generate(),
             secret: random_link_secret(),
             label,
             permissions,
