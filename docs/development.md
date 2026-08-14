@@ -5,7 +5,7 @@ This repository is a Rust workspace with two crates:
 - `tailsurf`: SDK and common crate with API types, stream URL parsing, permissions, IDs, and binary frame encoding.
 - `tailsurf-cli`: CLI shell for stream workflows and URL validation. Its binary is named `tsf`.
 
-Language-neutral TSF v1 frame vectors live in `tailsurf/fixtures/v1.json`. They are packaged with the SDK and exercised by both the Rust and TypeScript implementations.
+Language-neutral TSF v1 frame vectors live in `tailsurf/fixtures/v1.json`. Forward-compatible REST and SSE examples live in `tailsurf/fixtures/rest-v1.json`. Both fixture sets are packaged with the SDK and exercised by the Rust and TypeScript implementations.
 
 ## Local installation
 
@@ -32,7 +32,7 @@ Run the workspace checks:
 
 ```sh
 cargo +nightly fmt --all --check
-cargo test --workspace
+cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 scripts/verify-packages.sh

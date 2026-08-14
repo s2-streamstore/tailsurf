@@ -1,4 +1,4 @@
-//! Language-neutral TSF control-plane and v1 data-plane models.
+//! Language-neutral TSF REST, SSE, and v1 WebSocket models.
 
 /// JSON request and response models for `/api/v1` REST endpoints.
 pub mod rest;

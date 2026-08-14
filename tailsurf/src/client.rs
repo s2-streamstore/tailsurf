@@ -1,4 +1,4 @@
-//! Bounded REST and WebSocket clients for the TSF service.
+//! Bounded REST, SSE, and WebSocket clients for the TSF service.
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -170,7 +170,7 @@ fn jittered_backoff(backoff: Duration) -> Duration {
     }
 }
 
-/// Cloneable TSF control-plane and v1 data-plane client.
+/// Cloneable TSF REST, SSE, and v1 WebSocket client.
 ///
 /// REST operations preserve their retry identity and use [`RetryPolicy`]. Stateless append retries
 /// can create physical duplicates, which logical transcript readers suppress. Durable WebSocket
@@ -223,7 +223,7 @@ impl TsfClient {
         &self.config
     }
 
-    /// Creates a stream and returns its metadata and newly created link credentials.
+    /// Creates a stream and returns its metadata and initial link credentials.
     ///
     /// Construct the request once so its prepared link secrets remain stable. The client generates
     /// one idempotency key for this logical call and reuses the complete request while retrying
@@ -239,8 +239,8 @@ impl TsfClient {
 
     /// Creates a logical stream using a caller-owned idempotency key.
     ///
-    /// Recovery requires the same prepared request. The idempotency key alone cannot recover link
-    /// credentials.
+    /// An exact retry requires the same prepared request. The idempotency key alone cannot return
+    /// the link credentials.
     pub async fn create_stream_with_idempotency_key(
         &self,
         request: &CreateStreamRequest,
@@ -1004,7 +1004,7 @@ pub struct TsfWriteSession {
 pub const MAX_WRITER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 /// Maximum records a writer may retain before acknowledgement.
 ///
-/// This matches the TSF writer socket's hard queued-message bound.
+/// This matches the TSF writer socket's hard queued-record bound.
 pub const MAX_WRITER_UNACKED_RECORDS: usize = 128;
 
 /// Memory and concurrency bounds for [`TsfWriter`].
@@ -1720,10 +1720,7 @@ fn fail_pending(pending: &mut VecDeque<PendingAppend>, message: impl Into<String
     }
 }
 
-/// Resumable reader that advances its sequence position after every delivered record.
-///
-/// Transient transport and service interruptions reconnect from the next sequence number. Normal
-/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
+/// Streaming body for one SSE connection.
 type SseBody = Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 struct ParsedSseEvent {
@@ -1741,6 +1738,9 @@ struct SseConnection {
 }
 
 /// Resumable HTTP event-stream reader.
+///
+/// Transient transport and service interruptions reconnect from the next sequence number. Normal
+/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
 pub struct TsfSseReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
@@ -1895,6 +1895,9 @@ impl TsfSseReadSession {
 }
 
 /// Resumable WebSocket reader.
+///
+/// Transient transport and service interruptions reconnect from the next sequence number. Normal
+/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
 pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,

@@ -125,7 +125,7 @@ pub struct CreateStreamResponse {
     /// Absolute RFC 3339 stream expiration timestamp.
     #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub expires_at: String,
-    /// Newly created link credentials.
+    /// Initial link credentials.
     pub links: Vec<StreamLinkCredential>,
 }
 
@@ -138,7 +138,7 @@ pub struct CreateLinkInput {
     /// Client-generated secret. The same request can be retried safely.
     #[serde(serialize_with = "crate::ids::serialize_link_secret")]
     pub secret: LinkSecret,
-    /// Permissions carried by the new link.
+    /// Permissions carried by the requested link.
     pub permissions: LinkPermissions,
     /// Optional RFC 3339 expiration timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,7 +266,7 @@ pub struct AppendRecordsRequest {
     pub writer_start_seq_num: u64,
     /// Atomic record batch.
     pub records: Vec<AppendJsonRecord>,
-    /// Optional expected current exclusive stream end.
+    /// Optional expected stream next sequence.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -296,7 +296,7 @@ pub struct ApiErrorResponse {
 /// Stable error detail returned by the REST API.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ApiError {
-    /// Stable lowercase snake-case error code.
+    /// Stable lowercase snake_case error code.
     pub code: String,
     /// Human-readable diagnostic message.
     pub message: String,
