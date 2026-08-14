@@ -13,6 +13,16 @@ use crate::{
 pub const MAX_STATELESS_APPEND_RECORDS: usize = 128;
 /// Maximum aggregate decoded record payload in one stateless atomic append.
 pub const MAX_STATELESS_APPEND_PAYLOAD_BYTES: usize = 900 * 1024;
+/// Maximum encoded JSON body in one stateless atomic append.
+pub const MAX_STATELESS_APPEND_JSON_BYTES: usize = 1_300_000;
+/// Maximum physical records in one SSE `read_batch` event.
+pub const MAX_SSE_READ_BATCH_RECORDS: usize = 1_000;
+/// Maximum decoded record payload in one SSE `read_batch` event.
+pub const MAX_SSE_READ_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum encoded bytes in one completed SSE event, including its terminator.
+pub const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum encoded bytes retained for an SSE event whose terminator has not arrived.
+pub const MAX_SSE_INCOMPLETE_EVENT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

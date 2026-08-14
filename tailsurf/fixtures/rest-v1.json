@@ -1,4 +1,11 @@
 {
+  "max_stateless_append_records": 128,
+  "max_stateless_append_payload_bytes": 921600,
+  "max_stateless_append_json_bytes": 1300000,
+  "max_sse_read_batch_records": 1000,
+  "max_sse_read_batch_payload_bytes": 1048576,
+  "max_sse_event_bytes": 2097152,
+  "max_sse_incomplete_event_bytes": 2097152,
   "create_request": { "title": "Deploy log", "visibility": "private", "links": [{ "link_id": "owner", "permissions": "o", "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, { "link_id": "deploy-bot", "permissions": "w", "secret": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE" }] },
   "stream_resource": { "stream_id": "00000000000000000000000000000000", "title": "Deploy log", "visibility": "private", "created_at": "2026-08-13T00:00:00Z", "expires_at": "2026-08-23T00:00:00Z", "future_field": true },
   "append_request": { "client_writer_id": "AAECAwQFBgcICQoLDA0ODw", "writer_start_seq_num": "41", "records": [{ "part": { "index": 0, "is_final": true }, "format": "transcript", "data": { "encoding": "utf8", "value": "hello\n" } }, { "format": "bytes", "data": { "encoding": "base64url", "value": "AP8" } }], "expected_next_seq_num": "7" },

@@ -40,10 +40,11 @@ use crate::{
     protocol::{
         rest::{
             AppendJsonRecord, AppendRange, AppendRecordsRequest, CreateLinkInput,
-            CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
-            MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, RecordData,
-            RestRecordPart, SseCaughtUpEvent, SseReadBatchEvent, SseReadRecord,
-            SseSnapshotBoundaryEvent, StreamLinkCredential, StreamMetadata, UpdateStreamRequest,
+            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, MAX_SSE_EVENT_BYTES,
+            MAX_SSE_INCOMPLETE_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
+            MAX_STATELESS_APPEND_RECORDS, RecordData, RestRecordPart, SseCaughtUpEvent,
+            SseReadBatchEvent, SseReadRecord, SseSnapshotBoundaryEvent, StreamLinkCredential,
+            StreamMetadata, UpdateStreamRequest,
         },
         ws::{
             DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
@@ -461,14 +462,7 @@ impl TsfClient {
                     "writer sequence numbers must be contiguous",
                 ));
             }
-            let data = if record.format == RecordFormat::Transcript {
-                match std::str::from_utf8(&record.data) {
-                    Ok(text) => RecordData::Utf8(text.to_owned()),
-                    Err(_) => RecordData::Base64url(URL_SAFE_NO_PAD.encode(&record.data)),
-                }
-            } else {
-                RecordData::Base64url(URL_SAFE_NO_PAD.encode(&record.data))
-            };
+            let data = compact_record_data(&record.data);
             json_records.push(AppendJsonRecord {
                 data,
                 format: record.format,
@@ -2184,6 +2178,9 @@ async fn next_sse_event(
             return Ok(Some(event));
         }
         while let Some((index, length)) = sse_boundary(buffer) {
+            if index + length > MAX_SSE_EVENT_BYTES {
+                return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
+            }
             let block = buffer.drain(..index).collect::<Vec<_>>();
             buffer.drain(..length);
             if let Some(event) = parse_sse_block(&block)? {
@@ -2193,8 +2190,8 @@ async fn next_sse_event(
         if let Some(event) = queued.pop_front() {
             return Ok(Some(event));
         }
-        if buffer.len() > 2 * 1024 * 1024 {
-            return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
+        if buffer.len() > MAX_SSE_INCOMPLETE_EVENT_BYTES {
+            return Err(TsfClientError::InvalidSse("unfinished event exceeds 2 MiB"));
         }
         match body.next().await {
             Some(Ok(chunk)) => {
@@ -2298,6 +2295,23 @@ fn parse_sse_cursor_u64(value: &str) -> Option<u64> {
 
 fn invalid_sse_resume_cursor() -> TsfClientError {
     TsfClientError::InvalidSse("SSE event does not carry a valid resume cursor")
+}
+
+fn compact_record_data(bytes: &[u8]) -> RecordData {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes));
+    };
+    let utf8 = RecordData::Utf8(text.to_owned());
+    let utf8_len = serde_json::to_vec(&utf8)
+        .expect("record data serialization is infallible")
+        .len();
+    let base64url_len =
+        br#"{"encoding":"base64url","value":""}"#.len() + bytes.len().saturating_mul(4).div_ceil(3);
+    if utf8_len <= base64url_len {
+        utf8
+    } else {
+        RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes))
+    }
 }
 
 fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
@@ -3234,6 +3248,83 @@ mod tests {
                 .event,
             "second"
         );
+    }
+
+    #[tokio::test]
+    async fn sse_parser_accepts_an_event_fragmented_across_chunks() {
+        let payload = "event: read_batch\ndata: split 😀 payload\n\n".as_bytes();
+        let chunks = payload
+            .chunks(7)
+            .map(|chunk| Ok::<_, reqwest::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(chunks));
+        let mut buffer = Vec::new();
+        let mut queued = VecDeque::new();
+
+        let event = next_sse_event(&mut body, &mut buffer, &mut queued)
+            .await
+            .expect("fragmented event")
+            .expect("fragmented event value");
+        assert_eq!(event.event, "read_batch");
+        assert_eq!(event.data, "split 😀 payload");
+    }
+
+    #[tokio::test]
+    async fn sse_parser_rejects_one_oversized_completed_event() {
+        let payload = format!(
+            "event: read_batch\ndata: {}\n\n",
+            "a".repeat(MAX_SSE_EVENT_BYTES)
+        );
+        let mut body: SseBody =
+            Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                Bytes::from(payload),
+            )]));
+        let mut buffer = Vec::new();
+        let mut queued = VecDeque::new();
+
+        assert!(matches!(
+            next_sse_event(&mut body, &mut buffer, &mut queued).await,
+            Err(TsfClientError::InvalidSse("event exceeds 2 MiB"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_parser_rejects_an_oversized_fragmented_event() {
+        let first = format!(
+            "event: read_batch\ndata: {}",
+            "a".repeat(MAX_SSE_INCOMPLETE_EVENT_BYTES / 2)
+        );
+        let second = "a".repeat(MAX_SSE_INCOMPLETE_EVENT_BYTES / 2 + 1);
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(vec![
+            Ok::<_, reqwest::Error>(Bytes::from(first)),
+            Ok::<_, reqwest::Error>(Bytes::from(second)),
+        ]));
+        let mut buffer = Vec::new();
+        let mut queued = VecDeque::new();
+
+        assert!(matches!(
+            next_sse_event(&mut body, &mut buffer, &mut queued).await,
+            Err(TsfClientError::InvalidSse("unfinished event exceeds 2 MiB"))
+        ));
+    }
+
+    #[test]
+    fn stateless_append_compacts_an_escape_heavy_maximum_record() {
+        let data = vec![0_u8; MAX_RECORD_BYTES];
+        let encoded = compact_record_data(&data);
+        assert!(matches!(encoded, RecordData::Base64url(_)));
+        let request = AppendRecordsRequest {
+            client_writer_id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
+            writer_start_seq_num: 0,
+            records: vec![AppendJsonRecord {
+                part: None,
+                format: RecordFormat::Transcript,
+                data: encoded,
+            }],
+            expected_next_seq_num: None,
+        };
+        let json = serde_json::to_vec(&request).expect("append request JSON");
+        assert!(json.len() <= crate::protocol::rest::MAX_STATELESS_APPEND_JSON_BYTES);
     }
 
     #[tokio::test]

@@ -13,8 +13,8 @@ use crate::{
 pub const DEFAULT_MAX_LOGICAL_RECORD_BYTES: usize = MAX_RECORD_BYTES * 32;
 /// Default maximum writer identities retained for deduplication and reassembly.
 pub const DEFAULT_MAX_WRITER_STATES: usize = 4_096;
-/// Default maximum payload bytes retained across all unfinished split records: 64 MiB.
-pub const DEFAULT_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+/// SDK memory-safety limit across all unfinished split records: 16 MiB.
+pub const DEFAULT_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum physical parts retained across all unfinished split records.
 pub const DEFAULT_MAX_PENDING_PARTS: usize = 16_384;
 

@@ -2,14 +2,45 @@
 
 use serde_json::Value;
 use tailsurf::protocol::rest::{
-    AppendRange, AppendRecordsRequest, CreateStreamRequest, SseCaughtUpEvent, SseReadBatchEvent,
-    SseSnapshotBoundaryEvent, StreamMetadata,
+    AppendRange, AppendRecordsRequest, CreateStreamRequest, MAX_SSE_EVENT_BYTES,
+    MAX_SSE_INCOMPLETE_EVENT_BYTES, MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS,
+    MAX_STATELESS_APPEND_JSON_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
+    MAX_STATELESS_APPEND_RECORDS, SseCaughtUpEvent, SseReadBatchEvent, SseSnapshotBoundaryEvent,
+    StreamMetadata,
 };
 
 #[test]
 fn rest_v1_fixtures_decode_forward_compatibly() {
     let fixtures: Value =
         serde_json::from_str(include_str!("../fixtures/rest-v1.json")).expect("REST fixture JSON");
+    assert_eq!(
+        fixture_usize(&fixtures, "max_stateless_append_records"),
+        MAX_STATELESS_APPEND_RECORDS
+    );
+    assert_eq!(
+        fixture_usize(&fixtures, "max_stateless_append_payload_bytes"),
+        MAX_STATELESS_APPEND_PAYLOAD_BYTES
+    );
+    assert_eq!(
+        fixture_usize(&fixtures, "max_stateless_append_json_bytes"),
+        MAX_STATELESS_APPEND_JSON_BYTES
+    );
+    assert_eq!(
+        fixture_usize(&fixtures, "max_sse_read_batch_records"),
+        MAX_SSE_READ_BATCH_RECORDS
+    );
+    assert_eq!(
+        fixture_usize(&fixtures, "max_sse_read_batch_payload_bytes"),
+        MAX_SSE_READ_BATCH_PAYLOAD_BYTES
+    );
+    assert_eq!(
+        fixture_usize(&fixtures, "max_sse_event_bytes"),
+        MAX_SSE_EVENT_BYTES
+    );
+    assert_eq!(
+        fixture_usize(&fixtures, "max_sse_incomplete_event_bytes"),
+        MAX_SSE_INCOMPLETE_EVENT_BYTES
+    );
     let create: CreateStreamRequest = fixture(&fixtures, "create_request");
     assert_eq!(create.links.len(), 2);
     let stream: StreamMetadata = fixture(&fixtures, "stream_resource");
@@ -43,4 +74,8 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
 
 fn fixture<T: serde::de::DeserializeOwned>(fixtures: &Value, name: &str) -> T {
     serde_json::from_value(fixtures[name].clone()).expect("valid REST fixture")
+}
+
+fn fixture_usize(fixtures: &Value, name: &str) -> usize {
+    fixtures[name].as_u64().expect("numeric limit") as usize
 }
