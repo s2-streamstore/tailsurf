@@ -52,11 +52,6 @@ impl ReadStreamOptions {
         self.link_secret = Some(link_secret.into());
         self
     }
-
-    /// Sets a cloned stream link without exposing its secret value.
-    pub fn with_stream_link(self, link: &LinkSecret) -> Self {
-        self.with_link_secret(link.clone())
-    }
 }
 
 /// Initial read position. At most one selector can be sent per connection.
@@ -93,10 +88,5 @@ impl WriteStreamOptions {
             writer_id,
             link_secret: link_secret.into(),
         }
-    }
-
-    /// Creates write options by cloning a stream link without exposing it.
-    pub fn with_stream_link(stream_id: StreamId, writer_id: WriterId, link: &LinkSecret) -> Self {
-        Self::new(stream_id, writer_id, link.clone())
     }
 }

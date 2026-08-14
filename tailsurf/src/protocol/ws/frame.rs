@@ -17,7 +17,7 @@ use crate::{
     stream_url::LINK_SECRET_ENCODED_LENGTH,
 };
 /// WebSocket subprotocol offered and selected for TSF v1 connections.
-pub const TSF_WS_PROTOCOL: &str = "tsf.v1";
+pub const TSF_WEBSOCKET_PROTOCOL: &str = "tsf.v1";
 /// Maximum data payload in one physical record.
 pub const MAX_RECORD_BYTES: usize = 512 * 1024;
 /// Maximum physical records carried by one append batch.
@@ -155,7 +155,8 @@ impl PartHeader {
 
 /// Presentation hint carried with each record without transforming its bytes.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RecordFormat {
     /// Opaque binary bytes.
     #[default]
@@ -190,7 +191,7 @@ pub struct ReadRecord {
     pub seq_num: u64,
     /// Record timestamp as Unix epoch milliseconds.
     pub timestamp_ms: u64,
-    /// Stable identity of the producer that wrote this record.
+    /// Stable identity of the writer that wrote this record.
     pub writer_id: WriterId,
     /// Writer-local sequence number reused if this record is retransmitted.
     pub writer_seq_num: u64,
@@ -217,7 +218,7 @@ pub struct AppendRecord {
 
 /// Reconnect-safe position emitted after all preceding records have been delivered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadCaughtUp {
+pub struct CaughtUpPosition {
     /// Sequence number assigned to the next appended record.
     pub next_seq_num: u64,
     /// Timestamp of the last record. This is zero when `next_seq_num` is zero.
@@ -226,10 +227,10 @@ pub struct ReadCaughtUp {
 
 /// Fixed exclusive ending position captured when a snapshot read opens.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadSnapshotBoundary {
+pub struct SnapshotBoundary {
     /// Exclusive end of the fixed snapshot.
     pub end_seq_num: u64,
-    /// Timestamp of the last record. This is zero when `next_seq_num` is zero.
+    /// Timestamp of the last record. This is zero when `end_seq_num` is zero.
     pub last_timestamp_ms: u64,
 }
 
@@ -298,11 +299,11 @@ pub enum ServerFrame {
     /// Keeps an otherwise idle unbounded read connection active.
     Heartbeat,
     /// Confirms that every record preceding the captured position was delivered.
-    CaughtUp(ReadCaughtUp),
+    CaughtUp(CaughtUpPosition),
     /// Supplies stream metadata from the read authorization result.
     StreamInfo(ReadStreamInfo),
     /// Supplies the fixed exclusive end for a snapshot read.
-    SnapshotBoundary(ReadSnapshotBoundary),
+    SnapshotBoundary(SnapshotBoundary),
 }
 
 impl ClientFrame {
@@ -734,7 +735,7 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             Ok(ServerFrame::Heartbeat)
         }
         ServerOp::CaughtUp => decode_position(op_byte, body, |next_seq_num, last_timestamp_ms| {
-            ServerFrame::CaughtUp(ReadCaughtUp {
+            ServerFrame::CaughtUp(CaughtUpPosition {
                 next_seq_num,
                 last_timestamp_ms,
             })
@@ -744,7 +745,7 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             .map_err(FrameCodecError::InvalidStreamInfo),
         ServerOp::SnapshotBoundary => {
             decode_position(op_byte, body, |end_seq_num, last_timestamp_ms| {
-                ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+                ServerFrame::SnapshotBoundary(SnapshotBoundary {
                     end_seq_num,
                     last_timestamp_ms,
                 })

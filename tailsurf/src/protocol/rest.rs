@@ -3,7 +3,10 @@
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle, ids::encode_base64url_32};
+use crate::{
+    LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle, ids::encode_base64url_32,
+    protocol::ws::frame::RecordFormat,
+};
 
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -27,9 +30,9 @@ pub struct CreateStreamRequest {
     pub visibility: Visibility,
     /// Requested lifetime in seconds, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_in_secs: Option<u64>,
+    pub expires_in_seconds: Option<u64>,
     /// Prepared initial links. At least one must be an owner. At most three are allowed.
-    pub issue_links: Vec<InitialStreamLink>,
+    pub links: Vec<InitialStreamLink>,
 }
 
 impl Default for CreateStreamRequest {
@@ -37,8 +40,8 @@ impl Default for CreateStreamRequest {
         Self {
             title: None,
             visibility: Visibility::Private,
-            expires_in_secs: None,
-            issue_links: vec![InitialStreamLink::new(
+            expires_in_seconds: None,
+            links: vec![InitialStreamLink::new(
                 "owner".parse().expect("default owner Link ID is valid"),
                 LinkPermissions::owner(),
             )],
@@ -69,19 +72,19 @@ impl InitialStreamLink {
     }
 }
 
-/// A stream link issued during stream creation.
+/// A stream link credential returned during stream creation or link creation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IssuedStreamLink {
+pub struct StreamLinkCredential {
     /// Stable non-secret link identifier used for revocation.
     pub link_id: LinkId,
     /// Effective permissions carried by the link.
     pub permissions: LinkPermissions,
-    /// Secret link value, returned only when issued.
+    /// Secret link value returned only by the creating request.
     #[serde(serialize_with = "crate::ids::serialize_link_secret")]
     pub secret: LinkSecret,
 }
 
-/// Created stream metadata and any atomically issued links.
+/// Created stream metadata and its atomically created link credentials.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateStreamResponse {
     /// Stable stream identifier.
@@ -95,13 +98,13 @@ pub struct CreateStreamResponse {
     pub created_at: String,
     /// Absolute RFC 3339 stream expiration timestamp.
     pub expires_at: String,
-    /// Newly issued secret links.
-    pub links: Vec<IssuedStreamLink>,
+    /// Newly created link credentials.
+    pub links: Vec<StreamLinkCredential>,
 }
 
-/// Options for issuing a stream link.
+/// Options for creating a stream link.
 #[derive(Clone, Debug, Serialize)]
-pub struct IssueLinkRequest {
+pub struct CreateLinkRequest {
     /// Client-generated stable link identifier carried in the request path.
     #[serde(skip_serializing)]
     pub link_id: LinkId,
@@ -115,8 +118,8 @@ pub struct IssueLinkRequest {
     pub expires_at: Option<String>,
 }
 
-impl IssueLinkRequest {
-    /// Creates retry-safe link issuance material.
+impl CreateLinkRequest {
+    /// Creates retry-safe link material.
     pub fn new(link_id: LinkId, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
         Self {
             link_id,
@@ -133,18 +136,6 @@ fn random_link_secret() -> LinkSecret {
     encode_base64url_32(&secret).into()
 }
 
-/// A newly issued stream link.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IssueLinkResponse {
-    /// Stable non-secret link identifier used for revocation.
-    pub link_id: LinkId,
-    /// Effective permissions carried by the link.
-    pub permissions: LinkPermissions,
-    /// Secret link value, returned only when issued.
-    #[serde(serialize_with = "crate::ids::serialize_link_secret")]
-    pub secret: LinkSecret,
-}
-
 /// Effective lifecycle state for a stream link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -157,7 +148,7 @@ pub enum StreamLinkStatus {
     Revoked,
 }
 
-/// Non-secret metadata for one issued stream link.
+/// Non-secret metadata for one stream link.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamLinkSummary {
     /// Stable non-secret link identifier used for revocation.
@@ -166,14 +157,14 @@ pub struct StreamLinkSummary {
     pub permissions: LinkPermissions,
     /// Current effective lifecycle state.
     pub status: StreamLinkStatus,
-    /// RFC 3339 issuance timestamp.
-    pub issued_at: String,
+    /// RFC 3339 creation timestamp.
+    pub created_at: String,
     /// RFC 3339 expiration timestamp when configured.
     pub expires_at: Option<String>,
     /// RFC 3339 revocation timestamp when inactive.
     pub revoked_at: Option<String>,
     /// Whether this link authenticated the inventory request.
-    pub is_current: bool,
+    pub is_authorizing: bool,
 }
 
 /// Non-secret link inventory for a stream.
@@ -210,37 +201,26 @@ pub struct RestRecordPart {
     pub is_final: bool,
 }
 
-/// Strict tagged JSON record data for append requests.
+/// JSON encoding for exact record bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum AppendRecordData {
-    /// UTF-8 transcript data.
-    Text {
-        /// UTF-8 content.
-        text: String,
-    },
+#[serde(tag = "encoding", content = "value", rename_all = "lowercase")]
+pub enum RecordData {
+    /// UTF-8 text encoded directly in JSON.
+    Utf8(String),
     /// Canonical unpadded base64url bytes.
-    Bytes {
-        /// Canonical unpadded base64url content.
-        base64: String,
-        /// `bytes` or `transcript`.
-        #[serde(default = "default_bytes_format")]
-        format: String,
-    },
-}
-
-fn default_bytes_format() -> String {
-    "bytes".to_owned()
+    Base64url(String),
 }
 
 /// One record in a stateless atomic append.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppendJsonRecord {
-    /// Tagged data payload.
-    pub data: AppendRecordData,
     /// Split-part metadata, or an implicit unsplit record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<RestRecordPart>,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record bytes and their JSON encoding.
+    pub data: RecordData,
 }
 
 /// Stateless durable append request.
@@ -253,13 +233,13 @@ pub struct AppendRecordsRequest {
     pub writer_start_seq_num: u64,
     /// Atomic record batch.
     pub records: Vec<AppendJsonRecord>,
-    /// Optional expected current sequence position.
+    /// Optional expected current exclusive stream end.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "optional_decimal_u64"
     )]
-    pub match_seq_num: Option<u64>,
+    pub expected_end_seq_num: Option<u64>,
 }
 
 /// Durable half-open physical sequence range for an atomic append.
@@ -289,8 +269,10 @@ pub struct SseReadRecord {
     pub writer_seq_num: u64,
     /// Split-part metadata.
     pub part: RestRecordPart,
-    /// Tagged data payload.
-    pub data: AppendRecordData,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record bytes and their JSON encoding.
+    pub data: RecordData,
 }
 
 /// Payload of a batched SSE `records` event.
@@ -441,30 +423,30 @@ mod tests {
         let value = serde_json::to_value(request).expect("serialize create request");
 
         assert_eq!(value["visibility"], "private");
-        assert_eq!(value["issue_links"][0]["link_id"], "owner");
-        assert_eq!(value["issue_links"][0]["permissions"], "o");
-        assert!(value["issue_links"][0]["secret"].is_string());
+        assert_eq!(value["links"][0]["link_id"], "owner");
+        assert_eq!(value["links"][0]["permissions"], "o");
+        assert!(value["links"][0]["secret"].is_string());
     }
 
     #[test]
     fn serializes_requested_stream_lifetime() {
         let request = CreateStreamRequest {
-            expires_in_secs: Some(604_800),
+            expires_in_seconds: Some(604_800),
             ..CreateStreamRequest::default()
         };
         let value = serde_json::to_value(request).expect("serialize create request");
-        assert_eq!(value["expires_in_secs"], json!(604_800));
+        assert_eq!(value["expires_in_seconds"], json!(604_800));
         assert_eq!(
             serde_json::from_value::<CreateStreamRequest>(value)
                 .expect("deserialize create request")
-                .expires_in_secs,
+                .expires_in_seconds,
             Some(604_800)
         );
     }
 
     #[test]
     fn serializes_link_mutations_and_omits_absent_stream_update() {
-        let link = IssueLinkRequest::new(
+        let link = CreateLinkRequest::new(
             "reader".parse().expect("Link ID"),
             LinkPermissions::read(),
             None,

@@ -17,7 +17,7 @@ use url::Url;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = if let Ok(api_url) = env::var("TSF_API_URL") {
-        TsfClient::with_api_base_url(Url::parse(&api_url)?)
+        TsfClient::with_api_origin(Url::parse(&api_url)?)?
     } else {
         TsfClient::new()
     };
@@ -26,8 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create_stream(&CreateStreamRequest {
             title: Some("SDK lifecycle".parse()?),
             visibility: Visibility::Private,
-            expires_in_secs: None,
-            issue_links: vec![
+            expires_in_seconds: None,
+            links: vec![
                 InitialStreamLink::new("owner".parse()?, LinkPermissions::owner()),
                 InitialStreamLink::new("example-writer".parse()?, LinkPermissions::write()),
                 InitialStreamLink::new("example-reader".parse()?, LinkPermissions::read()),
@@ -57,10 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
 
     let writer = client
-        .connect_producer(WriteStreamOptions::with_stream_link(
+        .connect_writer(WriteStreamOptions::new(
             created.stream_id,
             WriterId::new_random(),
-            &write_link_secret,
+            write_link_secret,
         ))
         .await?;
     let ticket = writer
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.close().await?;
 
     let mut read_request =
-        ReadStreamOptions::new(created.stream_id).with_stream_link(&read_link_secret);
+        ReadStreamOptions::new(created.stream_id).with_link_secret(read_link_secret);
     read_request.start = Some(ReadStart::SeqNum(0));
     read_request.count = Some(1);
     let mut reader = client.connect_reader(read_request).await?;

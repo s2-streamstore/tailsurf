@@ -1,10 +1,10 @@
 //! Async Rust SDK and shared TSF v1 protocol types for [tail.surf](https://tail.surf).
 //!
-//! Use [`TsfClient`] for control-plane requests, [`TsfProducer`] for durable reconnecting writes,
+//! Use [`TsfClient`] for control-plane requests, [`TsfWriter`] for durable reconnecting writes,
 //! and [`TsfReadSession`] for resumable reads. Stream links and transcript reconstruction are
 //! available in [`stream_url`] and [`transcript`].
 
-/// HTTP and WebSocket clients, retry policy, and durable producer types.
+/// HTTP and WebSocket clients, retry policy, and durable writer types.
 pub mod client;
 /// Stream and link IDs, link secrets, and writer identities.
 pub mod ids;
@@ -21,15 +21,15 @@ pub mod transcript;
 
 pub use client::{
     AppendAck, AppendReceipt, AppendTicket, CreateStreamIdempotencyKey, IntoRecordData,
-    InvalidCreateStreamIdempotencyKey, MAX_PRODUCER_UNACKED_PAYLOAD_BYTES,
-    MAX_PRODUCER_UNACKED_RECORDS, RetryPolicy, TsfAppendSession, TsfClient, TsfClientConfig,
-    TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession, TsfSseReadSession, WritePermit,
-    WriteRecord, default_api_base_url,
+    InvalidCreateStreamIdempotencyKey, MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+    MAX_WRITER_UNACKED_RECORDS, RetryPolicy, TsfAppendSession, TsfClient, TsfClientConfig,
+    TsfClientError, TsfReadSession, TsfSseReadSession, TsfWriter, TsfWriterConfig, WritePermit,
+    WriteRecord, default_api_origin,
 };
 pub use ids::{LinkId, LinkIdError, LinkSecret, MAX_LINK_ID_LEN, StreamId, WriterId};
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     rest::StreamInfoResponse,
-    ws::frame::{AppendRecord, ReadCaughtUp, ReadRecord, ReadSnapshotBoundary, ReadStreamInfo},
+    ws::frame::{AppendRecord, CaughtUpPosition, ReadRecord, ReadStreamInfo, SnapshotBoundary},
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

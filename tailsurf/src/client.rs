@@ -39,18 +39,20 @@ use crate::{
     ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::{
         rest::{
-            AppendJsonRecord, AppendRecordData, AppendRecordsRequest, AppendRecordsResponse,
-            CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
-            ListLinksResponse, RestRecordPart, SseCaughtUpEvent, SseReadRecord, SseRecordsEvent,
-            SseSnapshotBoundaryEvent, StreamInfoResponse, UpdateStreamRequest,
+            AppendJsonRecord, AppendRecordsRequest, AppendRecordsResponse, CreateLinkRequest,
+            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, RecordData,
+            RestRecordPart, SseCaughtUpEvent, SseReadRecord, SseRecordsEvent,
+            SseSnapshotBoundaryEvent, StreamInfoResponse, StreamLinkCredential,
+            UpdateStreamRequest,
         },
         ws::{
             DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
             MIN_PLAYBACK_RATE_PERMILLE, ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                AppendRecord, ClientFrame, FrameCodecError, MAX_APPEND_BATCH_RECORDS,
-                MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
-                ReadSnapshotBoundary, ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+                AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
+                MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader,
+                ReadRecord, ReadStreamInfo, RecordFormat, ServerFrame, SnapshotBoundary,
+                TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -64,7 +66,7 @@ const API_PREFIX: &str = "/api/v1";
 #[derive(Clone, Debug)]
 pub struct TsfClientConfig {
     /// Service origin without the `/api/v1` namespace.
-    pub api_base_url: Url,
+    pub api_origin: Url,
     /// Per-request timeout for REST operations.
     pub rest_request_timeout: Duration,
     /// Timeout for establishing and upgrading a WebSocket.
@@ -81,21 +83,29 @@ pub struct TsfClientConfig {
 
 impl TsfClientConfig {
     /// Creates a configuration with bounded defaults for the supplied API origin.
-    pub fn new(api_base_url: Url) -> Self {
+    pub fn new(api_origin: Url) -> Result<Self, TsfClientError> {
+        validate_api_origin(&api_origin)?;
+        Ok(Self {
+            api_origin,
+            rest_request_timeout: Duration::from_secs(10),
+            websocket_connect_timeout: Duration::from_secs(10),
+            websocket_operation_timeout: Duration::from_secs(30),
+            websocket_read_idle_timeout: Some(Duration::from_secs(60)),
+            retry_policy: RetryPolicy::default(),
+        })
+    }
+}
+
+impl Default for TsfClientConfig {
+    fn default() -> Self {
         Self {
-            api_base_url,
+            api_origin: default_api_origin(),
             rest_request_timeout: Duration::from_secs(10),
             websocket_connect_timeout: Duration::from_secs(10),
             websocket_operation_timeout: Duration::from_secs(30),
             websocket_read_idle_timeout: Some(Duration::from_secs(60)),
             retry_policy: RetryPolicy::default(),
         }
-    }
-}
-
-impl Default for TsfClientConfig {
-    fn default() -> Self {
-        Self::new(default_api_base_url())
     }
 }
 
@@ -144,10 +154,9 @@ impl Default for RetryPolicy {
 
 /// Cloneable TSF control-plane and v1 data-plane client.
 ///
-/// Anonymous stream creation is retried with one idempotency key. Other mutating REST operations
-/// are not retried because a timeout may occur after the service applies the mutation. Metadata
-/// reads and initial socket setup use [`RetryPolicy`]. Durable writer recovery is owned by
-/// [`TsfProducer`].
+/// REST operations preserve their retry identity and use [`RetryPolicy`]. Stateless append retries
+/// can create physical duplicates, which logical transcript readers suppress. Durable WebSocket
+/// writer recovery is owned by [`TsfWriter`].
 #[derive(Clone)]
 pub struct TsfClient {
     config: TsfClientConfig,
@@ -157,25 +166,29 @@ pub struct TsfClient {
 impl TsfClient {
     /// Creates a client for the default [tail.surf](https://tail.surf) API origin.
     pub fn new() -> Self {
-        Self::with_config(TsfClientConfig::default())
-    }
-
-    /// Creates a client for an explicit API origin with default timeouts.
-    pub fn with_api_base_url(api_base_url: Url) -> Self {
-        Self::with_config(TsfClientConfig::new(api_base_url))
-    }
-
-    /// Creates a client from a complete configuration.
-    pub fn with_config(config: TsfClientConfig) -> Self {
         Self {
-            config,
+            config: TsfClientConfig::default(),
             http: reqwest::Client::new(),
         }
     }
 
+    /// Creates a client for an explicit API origin with default timeouts.
+    pub fn with_api_origin(api_origin: Url) -> Result<Self, TsfClientError> {
+        Self::with_config(TsfClientConfig::new(api_origin)?)
+    }
+
+    /// Creates a client from a complete configuration.
+    pub fn with_config(config: TsfClientConfig) -> Result<Self, TsfClientError> {
+        validate_api_origin(&config.api_origin)?;
+        Ok(Self {
+            config,
+            http: reqwest::Client::new(),
+        })
+    }
+
     /// Returns the configured API origin without the `/api/v1` namespace.
-    pub fn api_base_url(&self) -> &Url {
-        &self.config.api_base_url
+    pub fn api_origin(&self) -> &Url {
+        &self.config.api_origin
     }
 
     /// Returns the complete immutable client configuration.
@@ -183,7 +196,7 @@ impl TsfClient {
         &self.config
     }
 
-    /// Creates a stream and returns its metadata and newly issued secret links.
+    /// Creates a stream and returns its metadata and newly created link credentials.
     ///
     /// Construct the request once so its prepared link secrets remain stable. The client generates
     /// one idempotency key for this logical call and reuses the complete request while retrying
@@ -236,7 +249,7 @@ impl TsfClient {
 
     /// Updates owner-controlled stream settings.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// Transient failures are retried with the same absolute update values.
     pub async fn update_stream(
         &self,
         stream_id: &StreamId,
@@ -257,7 +270,7 @@ impl TsfClient {
 
     /// Permanently deletes a stream.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// Transient failures are retried. Deletion is idempotent.
     pub async fn delete_stream(
         &self,
         stream_id: &StreamId,
@@ -274,22 +287,22 @@ impl TsfClient {
         .await
     }
 
-    /// Issues a new secret stream link.
+    /// Creates a stream link idempotently.
     ///
-    /// This mutation is attempted once and is not transparently retried.
-    pub async fn issue_link(
+    /// Transient failures are retried with the same client-generated Link ID and secret.
+    pub async fn create_link(
         &self,
         stream_id: &StreamId,
-        request: &IssueLinkRequest,
+        request: &CreateLinkRequest,
         owner_link_secret: &LinkSecret,
-    ) -> Result<IssueLinkResponse, TsfClientError> {
+    ) -> Result<StreamLinkCredential, TsfClientError> {
         let link_id = request.link_id.clone();
         self.retry_transient(|| {
             self.send_json_with_bearer(
                 self.http
                     .put(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}")))
                     .json(request),
-                "issue link",
+                "create link",
                 Some(owner_link_secret),
             )
         })
@@ -332,7 +345,7 @@ impl TsfClient {
 
     /// Revokes a stream link by its non-secret identifier.
     ///
-    /// This mutation is attempted once and is not transparently retried.
+    /// Transient failures are retried. Revocation is idempotent.
     pub async fn revoke_link(
         &self,
         stream_id: &StreamId,
@@ -359,7 +372,7 @@ impl TsfClient {
         stream_id: &StreamId,
         writer_id: WriterId,
         records: &[WriteRecord],
-        match_seq_num: Option<u64>,
+        expected_end_seq_num: Option<u64>,
         write_link_secret: &LinkSecret,
     ) -> Result<AppendRecordsResponse, TsfClientError> {
         if records.is_empty() || records.len() > 128 {
@@ -382,22 +395,15 @@ impl TsfClient {
             }
             let data = if record.format == RecordFormat::Transcript {
                 match std::str::from_utf8(&record.data) {
-                    Ok(text) => AppendRecordData::Text {
-                        text: text.to_owned(),
-                    },
-                    Err(_) => AppendRecordData::Bytes {
-                        base64: URL_SAFE_NO_PAD.encode(&record.data),
-                        format: "transcript".to_owned(),
-                    },
+                    Ok(text) => RecordData::Utf8(text.to_owned()),
+                    Err(_) => RecordData::Base64url(URL_SAFE_NO_PAD.encode(&record.data)),
                 }
             } else {
-                AppendRecordData::Bytes {
-                    base64: URL_SAFE_NO_PAD.encode(&record.data),
-                    format: "bytes".to_owned(),
-                }
+                RecordData::Base64url(URL_SAFE_NO_PAD.encode(&record.data))
             };
             json_records.push(AppendJsonRecord {
                 data,
+                format: record.format,
                 part: Some(RestRecordPart {
                     index: record.part.index(),
                     is_final: record.part.is_final(),
@@ -408,7 +414,7 @@ impl TsfClient {
             writer_id: URL_SAFE_NO_PAD.encode(writer_id.as_bytes()),
             writer_start_seq_num,
             records: json_records,
-            match_seq_num,
+            expected_end_seq_num,
         };
         self.retry_transient(|| {
             self.send_json_with_bearer(
@@ -422,28 +428,28 @@ impl TsfClient {
         .await
     }
 
-    /// Connects the standard bounded, reconnecting durable producer.
-    pub async fn connect_producer(
+    /// Connects the standard bounded, reconnecting durable writer.
+    pub async fn connect_writer(
         &self,
         options: WriteStreamOptions,
-    ) -> Result<TsfProducer, TsfClientError> {
-        self.connect_producer_with_config(options, TsfProducerConfig::default())
+    ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_with_config(options, TsfWriterConfig::default())
             .await
     }
 
-    /// Connects a durable producer with explicit in-flight and reconnect bounds.
-    pub async fn connect_producer_with_config(
+    /// Connects a durable writer with explicit in-flight and reconnect bounds.
+    pub async fn connect_writer_with_config(
         &self,
         options: WriteStreamOptions,
-        config: TsfProducerConfig,
-    ) -> Result<TsfProducer, TsfClientError> {
+        config: TsfWriterConfig,
+    ) -> Result<TsfWriter, TsfClientError> {
         let session = self.connect_append_session(options.clone()).await?;
-        TsfProducer::new(self.clone(), options, session, config)
+        TsfWriter::new(self.clone(), options, session, config)
     }
 
     /// Connects a low-level append session that sends records and receives ack ranges directly.
     ///
-    /// Unlike [`TsfProducer`], this session does not retain or resend unacknowledged records.
+    /// Unlike [`TsfWriter`], this session does not retain or resend unacknowledged records.
     pub async fn connect_append_session(
         &self,
         options: WriteStreamOptions,
@@ -600,7 +606,7 @@ impl TsfClient {
                 connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
                 let boundary: SseSnapshotBoundaryEvent = serde_json::from_str(&event.data)
                     .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
-                connection.snapshot_boundary = Some(ReadSnapshotBoundary {
+                connection.snapshot_boundary = Some(SnapshotBoundary {
                     end_seq_num: boundary.end_seq_num,
                     last_timestamp_ms: boundary.last_timestamp_ms,
                 });
@@ -689,7 +695,7 @@ impl TsfClient {
     }
 
     fn rest_url(&self, path: &str) -> Url {
-        let mut url = self.config.api_base_url.clone();
+        let mut url = self.config.api_origin.clone();
         url.set_path(&format!("{API_PREFIX}{path}"));
         url.set_query(None);
         url.set_fragment(None);
@@ -812,7 +818,7 @@ impl Default for TsfClient {
 }
 
 /// Returns the default `https://tail.surf` API origin.
-pub fn default_api_base_url() -> Url {
+pub fn default_api_origin() -> Url {
     Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
 }
 
@@ -858,61 +864,61 @@ pub struct TsfAppendSession {
     operation_timeout: Duration,
 }
 
-/// Maximum payload bytes a producer may retain before acknowledgement.
+/// Maximum payload bytes a writer may retain before acknowledgement.
 ///
 /// This matches the TSF writer socket's hard queued-payload bound.
-pub const MAX_PRODUCER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
-/// Maximum records a producer may retain before acknowledgement.
+pub const MAX_WRITER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum records a writer may retain before acknowledgement.
 ///
 /// This matches the TSF writer socket's hard queued-message bound.
-pub const MAX_PRODUCER_UNACKED_RECORDS: usize = 128;
+pub const MAX_WRITER_UNACKED_RECORDS: usize = 128;
 
-/// Memory, concurrency, and reconnect bounds for [`TsfProducer`].
+/// Memory, concurrency, and reconnect bounds for [`TsfWriter`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TsfProducerConfig {
+pub struct TsfWriterConfig {
     /// Maximum total payload bytes retained until durability acknowledgement. Must not exceed
-    /// [`MAX_PRODUCER_UNACKED_PAYLOAD_BYTES`].
+    /// [`MAX_WRITER_UNACKED_PAYLOAD_BYTES`].
     pub max_unacked_bytes: usize,
     /// Maximum number of records retained until durability acknowledgement. Must not exceed
-    /// [`MAX_PRODUCER_UNACKED_RECORDS`].
+    /// [`MAX_WRITER_UNACKED_RECORDS`].
     pub max_unacked_records: usize,
-    /// Maximum consecutive producer reconnect attempts before failing pending records.
+    /// Maximum consecutive writer reconnect attempts before failing pending records.
     pub max_reconnect_attempts: usize,
 }
 
-impl TsfProducerConfig {
+impl TsfWriterConfig {
     fn validate(self) -> Result<Self, TsfClientError> {
         if self.max_unacked_bytes == 0 {
-            return Err(TsfClientError::InvalidProducerConfig(
+            return Err(TsfClientError::InvalidWriterConfig(
                 "max_unacked_bytes must be greater than zero".to_owned(),
             ));
         }
-        if self.max_unacked_bytes > MAX_PRODUCER_UNACKED_PAYLOAD_BYTES {
-            return Err(TsfClientError::InvalidProducerConfig(format!(
+        if self.max_unacked_bytes > MAX_WRITER_UNACKED_PAYLOAD_BYTES {
+            return Err(TsfClientError::InvalidWriterConfig(format!(
                 "max_unacked_bytes must not exceed {}",
-                MAX_PRODUCER_UNACKED_PAYLOAD_BYTES
+                MAX_WRITER_UNACKED_PAYLOAD_BYTES
             )));
         }
         if self.max_unacked_records == 0 {
-            return Err(TsfClientError::InvalidProducerConfig(
+            return Err(TsfClientError::InvalidWriterConfig(
                 "max_unacked_records must be greater than zero".to_owned(),
             ));
         }
-        if self.max_unacked_records > MAX_PRODUCER_UNACKED_RECORDS {
-            return Err(TsfClientError::InvalidProducerConfig(format!(
+        if self.max_unacked_records > MAX_WRITER_UNACKED_RECORDS {
+            return Err(TsfClientError::InvalidWriterConfig(format!(
                 "max_unacked_records must not exceed {}",
-                MAX_PRODUCER_UNACKED_RECORDS
+                MAX_WRITER_UNACKED_RECORDS
             )));
         }
         Ok(self)
     }
 }
 
-impl Default for TsfProducerConfig {
+impl Default for TsfWriterConfig {
     fn default() -> Self {
         Self {
-            max_unacked_bytes: MAX_PRODUCER_UNACKED_PAYLOAD_BYTES,
-            max_unacked_records: MAX_PRODUCER_UNACKED_RECORDS,
+            max_unacked_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+            max_unacked_records: MAX_WRITER_UNACKED_RECORDS,
             max_reconnect_attempts: 3,
         }
     }
@@ -1032,7 +1038,7 @@ impl AppendTicket {
             Ok(result) => Some(result),
             Err(oneshot::error::TryRecvError::Empty) => None,
             Err(oneshot::error::TryRecvError::Closed) => {
-                Some(Err(TsfClientError::AppendProducerDropped))
+                Some(Err(TsfClientError::AppendWriterDropped))
             }
         }
     }
@@ -1044,33 +1050,33 @@ impl Future for AppendTicket {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.rx).poll(cx) {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(TsfClientError::AppendProducerDropped)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(TsfClientError::AppendWriterDropped)),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-/// Bounded durable producer that retains unacknowledged records and resends them across transient
+/// Bounded durable writer that retains unacknowledged records and resends them across transient
 /// interruptions.
-pub struct TsfProducer {
-    cmd_tx: mpsc::Sender<ProducerCommand>,
+pub struct TsfWriter {
+    cmd_tx: mpsc::Sender<WriterCommand>,
     byte_permits: Arc<Semaphore>,
     record_permits: Arc<Semaphore>,
     max_unacked_bytes: usize,
     task: Option<JoinHandle<()>>,
 }
 
-impl TsfProducer {
+impl TsfWriter {
     fn new(
         client: TsfClient,
         options: WriteStreamOptions,
         session: TsfAppendSession,
-        config: TsfProducerConfig,
+        config: TsfWriterConfig,
     ) -> Result<Self, TsfClientError> {
         let config = config.validate()?;
         let command_capacity = config.max_unacked_records + 1;
         let (cmd_tx, cmd_rx) = mpsc::channel(command_capacity);
-        let task = tokio::spawn(run_producer(client, options, session, cmd_rx, config));
+        let task = tokio::spawn(run_writer(client, options, session, cmd_rx, config));
 
         Ok(Self {
             cmd_tx,
@@ -1093,7 +1099,7 @@ impl TsfProducer {
     pub async fn reserve(&self, bytes: usize) -> Result<WritePermit, TsfClientError> {
         let bytes = bytes.max(1);
         if bytes > self.max_unacked_bytes {
-            return Err(TsfClientError::AppendRecordExceedsProducerWindow {
+            return Err(TsfClientError::AppendRecordExceedsWriterWindow {
                 bytes,
                 max_unacked_bytes: self.max_unacked_bytes,
             });
@@ -1104,19 +1110,19 @@ impl TsfProducer {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
         let byte_permit = self
             .byte_permits
             .clone()
             .acquire_many_owned(bytes as u32)
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
         let cmd_tx_permit = self
             .cmd_tx
             .clone()
             .reserve_owned()
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
 
         Ok(WritePermit {
             cmd_tx_permit,
@@ -1127,28 +1133,28 @@ impl TsfProducer {
     }
 
     /// Stops accepting records, waits for every pending durability acknowledgement, and joins the
-    /// producer task.
+    /// writer task.
     pub async fn close(mut self) -> Result<(), TsfClientError> {
         let (done_tx, done_rx) = oneshot::channel();
         self.cmd_tx
-            .send(ProducerCommand::Close { done_tx })
+            .send(WriterCommand::Close { done_tx })
             .await
-            .map_err(|_| TsfClientError::AppendProducerClosed)?;
+            .map_err(|_| TsfClientError::AppendWriterClosed)?;
 
         let result = done_rx
             .await
-            .map_err(|_| TsfClientError::AppendProducerDropped)?;
+            .map_err(|_| TsfClientError::AppendWriterDropped)?;
 
         if let Some(task) = self.task.take() {
             task.await
-                .map_err(|error| TsfClientError::AppendProducerFailed(error.to_string()))?;
+                .map_err(|error| TsfClientError::AppendWriterFailed(error.to_string()))?;
         }
 
         result
     }
 }
 
-impl Drop for TsfProducer {
+impl Drop for TsfWriter {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -1156,11 +1162,11 @@ impl Drop for TsfProducer {
     }
 }
 
-/// Owned capacity in a producer's record and byte windows.
+/// Owned capacity in a writer's record and byte windows.
 ///
 /// Dropping an unused permit releases its capacity.
 pub struct WritePermit {
-    cmd_tx_permit: mpsc::OwnedPermit<ProducerCommand>,
+    cmd_tx_permit: mpsc::OwnedPermit<WriterCommand>,
     byte_permit: OwnedSemaphorePermit,
     record_permit: OwnedSemaphorePermit,
     reserved_bytes: usize,
@@ -1179,7 +1185,7 @@ impl WritePermit {
         }
 
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx_permit.send(ProducerCommand::Submit {
+        self.cmd_tx_permit.send(WriterCommand::Submit {
             record,
             ack_tx,
             byte_permit: self.byte_permit,
@@ -1301,7 +1307,7 @@ impl TsfAppendSession {
     }
 }
 
-enum ProducerCommand {
+enum WriterCommand {
     Submit {
         record: WriteRecord,
         ack_tx: oneshot::Sender<Result<AppendReceipt, TsfClientError>>,
@@ -1320,12 +1326,12 @@ struct PendingAppend {
     _record_permit: OwnedSemaphorePermit,
 }
 
-async fn run_producer(
+async fn run_writer(
     client: TsfClient,
     options: WriteStreamOptions,
     mut session: TsfAppendSession,
-    mut cmd_rx: mpsc::Receiver<ProducerCommand>,
-    config: TsfProducerConfig,
+    mut cmd_rx: mpsc::Receiver<WriterCommand>,
+    config: TsfWriterConfig,
 ) {
     let mut pending = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
@@ -1351,12 +1357,12 @@ async fn run_producer(
                             )
                             .await
                         {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                     }
                     None => {
-                        fail_pending(&mut pending, "append producer dropped");
+                        fail_pending(&mut pending, "append writer dropped");
                         return;
                     }
                 }
@@ -1366,7 +1372,7 @@ async fn run_producer(
                 match ack {
                     Ok(Some(ack)) => {
                         if let Err(error) = dispatch_ack(ack, &mut pending) {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                         reconnect_attempts = 0;
@@ -1383,7 +1389,7 @@ async fn run_producer(
                         )
                         .await
                         {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                     }
@@ -1399,7 +1405,7 @@ async fn run_producer(
                         )
                         .await
                         {
-                            finish_producer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(&mut pending, &mut close_tx, error);
                             return;
                         }
                     }
@@ -1422,13 +1428,13 @@ async fn run_producer(
 /// write leaves every record in `pending` for reconnect resend.
 fn drain_submissions(
     pending: &mut VecDeque<PendingAppend>,
-    cmd_rx: &mut mpsc::Receiver<ProducerCommand>,
+    cmd_rx: &mut mpsc::Receiver<WriterCommand>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
-    first: ProducerCommand,
+    first: WriterCommand,
 ) {
     let mut command = Some(first);
 
-    while let Some(ProducerCommand::Submit {
+    while let Some(WriterCommand::Submit {
         record,
         ack_tx,
         byte_permit,
@@ -1444,7 +1450,7 @@ fn drain_submissions(
         command = cmd_rx.try_recv().ok();
     }
 
-    if let Some(ProducerCommand::Close { done_tx }) = command {
+    if let Some(WriterCommand::Close { done_tx }) = command {
         *close_tx = Some(done_tx);
     }
 }
@@ -1557,7 +1563,7 @@ fn dispatch_ack(
     Ok(())
 }
 
-fn finish_producer_error(
+fn finish_writer_error(
     pending: &mut VecDeque<PendingAppend>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
     error: TsfClientError,
@@ -1573,7 +1579,7 @@ fn fail_pending(pending: &mut VecDeque<PendingAppend>, message: impl Into<String
     while let Some(pending) = pending.pop_front() {
         let _ = pending
             .ack_tx
-            .send(Err(TsfClientError::AppendProducerFailed(message.clone())));
+            .send(Err(TsfClientError::AppendWriterFailed(message.clone())));
     }
 }
 
@@ -1594,7 +1600,7 @@ struct SseConnection {
     buffer: Vec<u8>,
     queued_events: VecDeque<ParsedSseEvent>,
     stream_info: Option<ReadStreamInfo>,
-    snapshot_boundary: Option<ReadSnapshotBoundary>,
+    snapshot_boundary: Option<SnapshotBoundary>,
     resume_event_id: Option<String>,
 }
 
@@ -1608,8 +1614,8 @@ pub struct TsfSseReadSession {
     queued_events: VecDeque<ParsedSseEvent>,
     queued_records: VecDeque<ReadRecord>,
     stream_info: ReadStreamInfo,
-    last_caught_up: Option<ReadCaughtUp>,
-    snapshot_boundary: Option<ReadSnapshotBoundary>,
+    last_caught_up: Option<CaughtUpPosition>,
+    snapshot_boundary: Option<SnapshotBoundary>,
     reconnect_attempts: usize,
     last_event_id: Option<String>,
     finished: bool,
@@ -1622,12 +1628,12 @@ impl TsfSseReadSession {
     }
 
     /// Returns the fixed boundary captured for a snapshot read.
-    pub fn snapshot_boundary(&self) -> Option<ReadSnapshotBoundary> {
+    pub fn snapshot_boundary(&self) -> Option<SnapshotBoundary> {
         self.snapshot_boundary
     }
 
     /// Returns the most recent reconnect-safe caught-up position.
-    pub fn last_caught_up(&self) -> Option<ReadCaughtUp> {
+    pub fn last_caught_up(&self) -> Option<CaughtUpPosition> {
         self.last_caught_up
     }
 
@@ -1714,7 +1720,7 @@ impl TsfSseReadSession {
                 "caught_up" => {
                     let value: SseCaughtUpEvent = serde_json::from_str(&event.data)
                         .map_err(|_| TsfClientError::InvalidSse("invalid caught_up event"))?;
-                    let caught_up = ReadCaughtUp {
+                    let caught_up = CaughtUpPosition {
                         next_seq_num: value.next_seq_num,
                         last_timestamp_ms: value.last_timestamp_ms,
                     };
@@ -1741,8 +1747,8 @@ pub struct TsfReadSession {
     socket: ReadSocket,
     stream_info: ReadStreamInfo,
     finished: bool,
-    last_caught_up: Option<ReadCaughtUp>,
-    snapshot_boundary: Option<ReadSnapshotBoundary>,
+    last_caught_up: Option<CaughtUpPosition>,
+    snapshot_boundary: Option<SnapshotBoundary>,
     no_progress_reconnects: usize,
     reconnect_backoff: Duration,
     pending_reconnect_backoff: Duration,
@@ -1755,8 +1761,8 @@ impl TsfReadSession {
         options: ReadStreamOptions,
         socket: ReadSocket,
         stream_info: ReadStreamInfo,
-        last_caught_up: Option<ReadCaughtUp>,
-        snapshot_boundary: Option<ReadSnapshotBoundary>,
+        last_caught_up: Option<CaughtUpPosition>,
+        snapshot_boundary: Option<SnapshotBoundary>,
     ) -> Self {
         let reconnect_backoff = client.config.retry_policy.initial_backoff;
         Self {
@@ -1775,12 +1781,12 @@ impl TsfReadSession {
     }
 
     /// Returns the latest reconnect-safe position reported after preceding records were delivered.
-    pub const fn last_caught_up(&self) -> Option<ReadCaughtUp> {
+    pub const fn last_caught_up(&self) -> Option<CaughtUpPosition> {
         self.last_caught_up
     }
 
     /// Returns the fixed exclusive end captured for a snapshot read.
-    pub const fn snapshot_boundary(&self) -> Option<ReadSnapshotBoundary> {
+    pub const fn snapshot_boundary(&self) -> Option<SnapshotBoundary> {
         self.snapshot_boundary
     }
 
@@ -1922,13 +1928,10 @@ struct ReadSocket {
 struct ConnectedReadSocket {
     socket: ReadSocket,
     stream_info: ReadStreamInfo,
-    snapshot_boundary: Option<ReadSnapshotBoundary>,
+    snapshot_boundary: Option<SnapshotBoundary>,
 }
 
-fn apply_snapshot_boundary(
-    options: &mut ReadStreamOptions,
-    boundary: Option<ReadSnapshotBoundary>,
-) {
+fn apply_snapshot_boundary(options: &mut ReadStreamOptions, boundary: Option<SnapshotBoundary>) {
     let Some(boundary) = boundary else {
         return;
     };
@@ -1964,7 +1967,7 @@ impl ReadSocket {
 enum ReadSocketOutcome {
     Record(ReadRecord),
     Records(Vec<ReadRecord>),
-    CaughtUp(ReadCaughtUp),
+    CaughtUp(CaughtUpPosition),
     Closed,
 }
 
@@ -1980,7 +1983,7 @@ async fn connect_websocket(
     let mut request = url.as_str().into_client_request()?;
     request.headers_mut().insert(
         SEC_WEBSOCKET_PROTOCOL,
-        HeaderValue::from_static(TSF_WS_PROTOCOL),
+        HeaderValue::from_static(TSF_WEBSOCKET_PROTOCOL),
     );
 
     let (mut ws, response) = timeout(
@@ -1998,7 +2001,7 @@ async fn connect_websocket(
         .transpose()
         .map_err(|_| TsfClientError::InvalidWebSocketProtocolHeader)?;
 
-    if selected_protocol.as_deref() != Some(TSF_WS_PROTOCOL) {
+    if selected_protocol.as_deref() != Some(TSF_WEBSOCKET_PROTOCOL) {
         return Err(TsfClientError::UnexpectedWebSocketProtocol(
             selected_protocol,
         ));
@@ -2216,18 +2219,13 @@ fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> 
     let writer: [u8; WriterId::BYTE_LEN] = writer
         .try_into()
         .map_err(|_| TsfClientError::InvalidSse("invalid writer_id length"))?;
-    let (format, data) = match record.data {
-        AppendRecordData::Text { text } => (RecordFormat::Transcript, Bytes::from(text)),
-        AppendRecordData::Bytes { base64, format } => {
+    let data = match record.data {
+        RecordData::Utf8(value) => Bytes::from(value),
+        RecordData::Base64url(value) => {
             let data = URL_SAFE_NO_PAD
-                .decode(base64)
-                .map_err(|_| TsfClientError::InvalidSse("invalid record base64"))?;
-            let format = match format.as_str() {
-                "bytes" => RecordFormat::Bytes,
-                "transcript" => RecordFormat::Transcript,
-                _ => return Err(TsfClientError::InvalidSse("invalid record format")),
-            };
-            (format, Bytes::from(data))
+                .decode(value)
+                .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?;
+            Bytes::from(data)
         }
     };
     let part = PartHeader::new(record.part.index, record.part.is_final)?;
@@ -2237,7 +2235,7 @@ fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> 
         writer_id: WriterId::from_bytes(writer),
         writer_seq_num: record.writer_seq_num,
         part,
-        format,
+        format: record.format,
         data,
     })
 }
@@ -2362,7 +2360,7 @@ async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
 
 struct ReadHandshake {
     stream_info: ReadStreamInfo,
-    snapshot_boundary: Option<ReadSnapshotBoundary>,
+    snapshot_boundary: Option<SnapshotBoundary>,
 }
 
 async fn expect_read_handshake(
@@ -2410,9 +2408,26 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
     }
 }
 
-/// Error surfaced by REST operations, socket setup, reads, and durable producers.
+fn validate_api_origin(origin: &Url) -> Result<(), TsfClientError> {
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(TsfClientError::InvalidApiOrigin(origin.clone()));
+    }
+    Ok(())
+}
+
+/// Error surfaced by REST operations, socket setup, reads, and durable writers.
 #[derive(Debug, thiserror::Error)]
 pub enum TsfClientError {
+    /// The configured API origin is not a bare HTTP or HTTPS origin.
+    #[error("API origin must be HTTP(S) without credentials, path, query, or fragment: {0}")]
+    InvalidApiOrigin(Url),
     /// HTTP transport or response-decoding failure.
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
@@ -2484,15 +2499,15 @@ pub enum TsfClientError {
         /// Invalid ack that advanced past the pending record.
         ack: AppendAck,
     },
-    /// Producer bounds are zero or not representable by the semaphore implementation.
-    #[error("invalid append producer config: {0}")]
-    InvalidProducerConfig(String),
-    /// A requested reservation is larger than the entire producer byte window.
-    #[error("append record reserves {bytes} bytes, above producer window {max_unacked_bytes}")]
-    AppendRecordExceedsProducerWindow {
+    /// Writer bounds are zero or not representable by the semaphore implementation.
+    #[error("invalid append writer config: {0}")]
+    InvalidWriterConfig(String),
+    /// A requested reservation is larger than the entire writer byte window.
+    #[error("append record reserves {bytes} bytes, above writer window {max_unacked_bytes}")]
+    AppendRecordExceedsWriterWindow {
         /// Requested reservation size.
         bytes: usize,
-        /// Configured producer byte window.
+        /// Configured writer byte window.
         max_unacked_bytes: usize,
     },
     /// A record is larger than its previously acquired reservation.
@@ -2503,15 +2518,15 @@ pub enum TsfClientError {
         /// Capacity owned by the permit.
         reserved_bytes: usize,
     },
-    /// The producer command channel is closed.
-    #[error("append producer is closed")]
-    AppendProducerClosed,
-    /// The producer task ended before resolving a pending ticket.
-    #[error("append producer dropped with unacknowledged records")]
-    AppendProducerDropped,
-    /// The producer background task failed or could not be joined.
-    #[error("append producer failed: {0}")]
-    AppendProducerFailed(String),
+    /// The writer command channel is closed.
+    #[error("append writer is closed")]
+    AppendWriterClosed,
+    /// The writer task ended before resolving a pending ticket.
+    #[error("append writer dropped with unacknowledged records")]
+    AppendWriterDropped,
+    /// The writer background task failed or could not be joined.
+    #[error("append writer failed: {0}")]
+    AppendWriterFailed(String),
     /// Consecutive read connections ended or requested reconnect without delivering a record.
     #[error(
         "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"
@@ -2723,7 +2738,7 @@ mod tests {
             }
             server
                 .send(Message::Binary(
-                    ServerFrame::CaughtUp(ReadCaughtUp {
+                    ServerFrame::CaughtUp(CaughtUpPosition {
                         next_seq_num: 42,
                         last_timestamp_ms: 1_786_377_600_000,
                     })
@@ -2743,7 +2758,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            ReadSocketOutcome::CaughtUp(ReadCaughtUp {
+            ReadSocketOutcome::CaughtUp(CaughtUpPosition {
                 next_seq_num: 42,
                 last_timestamp_ms: 1_786_377_600_000,
             })
@@ -2823,37 +2838,34 @@ mod tests {
     }
 
     #[test]
-    fn producer_window_cannot_exceed_server_queue_contract() {
-        let default = TsfProducerConfig::default();
-        assert_eq!(
-            default.max_unacked_bytes,
-            MAX_PRODUCER_UNACKED_PAYLOAD_BYTES
-        );
-        assert_eq!(default.max_unacked_records, MAX_PRODUCER_UNACKED_RECORDS);
+    fn writer_window_cannot_exceed_server_queue_contract() {
+        let default = TsfWriterConfig::default();
+        assert_eq!(default.max_unacked_bytes, MAX_WRITER_UNACKED_PAYLOAD_BYTES);
+        assert_eq!(default.max_unacked_records, MAX_WRITER_UNACKED_RECORDS);
         assert!(default.validate().is_ok());
 
         for config in [
-            TsfProducerConfig {
-                max_unacked_bytes: MAX_PRODUCER_UNACKED_PAYLOAD_BYTES + 1,
-                ..TsfProducerConfig::default()
+            TsfWriterConfig {
+                max_unacked_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES + 1,
+                ..TsfWriterConfig::default()
             },
-            TsfProducerConfig {
-                max_unacked_records: MAX_PRODUCER_UNACKED_RECORDS + 1,
-                ..TsfProducerConfig::default()
+            TsfWriterConfig {
+                max_unacked_records: MAX_WRITER_UNACKED_RECORDS + 1,
+                ..TsfWriterConfig::default()
             },
         ] {
             assert!(matches!(
                 config.validate(),
-                Err(TsfClientError::InvalidProducerConfig(_))
+                Err(TsfClientError::InvalidWriterConfig(_))
             ));
         }
     }
 
     #[test]
     fn builds_versioned_rest_urls_from_api_origin() {
-        let client = TsfClient::with_api_base_url(
-            Url::parse("http://localhost:8787/ignored?query=yes#fragment").expect("API origin"),
-        );
+        let client =
+            TsfClient::with_api_origin(Url::parse("http://localhost:8787").expect("API origin"))
+                .expect("valid API origin");
 
         assert_eq!(
             client.rest_url("/streams").as_str(),
@@ -2862,9 +2874,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_origin_api_urls() {
+        for value in [
+            "https://user@example.com",
+            "https://example.com/api",
+            "https://example.com?region=west",
+            "https://example.com#api",
+            "wss://example.com",
+        ] {
+            assert!(matches!(
+                TsfClient::with_api_origin(Url::parse(value).expect("URL")),
+                Err(TsfClientError::InvalidApiOrigin(_))
+            ));
+        }
+    }
+
+    #[test]
     fn builds_path_only_versioned_websocket_urls() {
         let client =
-            TsfClient::with_api_base_url(Url::parse("https://example.com").expect("API origin"));
+            TsfClient::with_api_origin(Url::parse("https://example.com").expect("API origin"))
+                .expect("valid API origin");
 
         assert_eq!(
             client
@@ -2940,7 +2969,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_read_selectors_outside_the_adapter_range() {
         let client =
-            TsfClient::with_api_base_url(Url::parse("http://localhost").expect("API origin"));
+            TsfClient::with_api_origin(Url::parse("http://localhost").expect("API origin"))
+                .expect("valid API origin");
         let mut options = ReadStreamOptions::new(
             "0123456789abcdefghjkmnpqrstvwxyz"
                 .parse()

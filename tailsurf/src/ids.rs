@@ -13,7 +13,7 @@ pub type StreamId = ubid::Ubid160;
 /// Maximum length of a stream-scoped Link ID.
 pub const MAX_LINK_ID_LEN: usize = 64;
 
-/// Client-chosen immutable identifier for an issued stream link.
+/// Client-chosen immutable identifier for a stream link.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LinkId(String);
 

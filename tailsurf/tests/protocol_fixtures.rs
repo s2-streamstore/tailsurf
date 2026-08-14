@@ -9,9 +9,10 @@ use tailsurf::{
         ws::{
             ReadStart,
             frame::{
-                AppendRecord, ClientFrame, MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES,
-                MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, ReadCaughtUp, ReadRecord,
-                ReadSnapshotBoundary, ReadStreamInfo, RecordFormat, ServerFrame, TSF_WS_PROTOCOL,
+                AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_BATCH_RECORDS,
+                MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader,
+                ReadRecord, ReadStreamInfo, RecordFormat, ServerFrame, SnapshotBoundary,
+                TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -103,7 +104,7 @@ enum ServerFixture {
 fn protocol_constants_match_v1_fixtures() {
     let fixtures = fixtures();
 
-    assert_eq!(fixtures.websocket_protocol, TSF_WS_PROTOCOL);
+    assert_eq!(fixtures.websocket_protocol, TSF_WEBSOCKET_PROTOCOL);
     assert_eq!(fixtures.max_record_bytes, MAX_RECORD_BYTES);
     assert_eq!(fixtures.max_append_batch_records, MAX_APPEND_BATCH_RECORDS);
     assert_eq!(fixtures.max_read_batch_records, MAX_READ_BATCH_RECORDS);
@@ -235,14 +236,14 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
         ServerFixture::CaughtUp {
             next_seq_num,
             last_timestamp_ms,
-        } => ServerFrame::CaughtUp(ReadCaughtUp {
+        } => ServerFrame::CaughtUp(CaughtUpPosition {
             next_seq_num: parse_u64(&next_seq_num),
             last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
         ServerFixture::SnapshotBoundary {
             end_seq_num,
             last_timestamp_ms,
-        } => ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+        } => ServerFrame::SnapshotBoundary(SnapshotBoundary {
             end_seq_num: parse_u64(&end_seq_num),
             last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
