@@ -24,6 +24,11 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     let records: SseRecordsEvent = fixture(&fixtures, "sse_records");
     assert_eq!(records.records.len(), 1);
     assert_eq!(fixtures["sse_resume_cursor"].as_str(), Some("v1,2,2,2"));
+    let snapshot: SseCaughtUpEvent = fixture(&fixtures, "sse_snapshot_boundary");
+    assert_eq!(
+        (snapshot.next_seq_num, snapshot.last_timestamp_ms),
+        (2, None)
+    );
     let caught_up: SseCaughtUpEvent = fixture(&fixtures, "sse_caught_up");
     assert_eq!(caught_up.next_seq_num, 8);
 }

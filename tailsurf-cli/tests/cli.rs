@@ -1038,6 +1038,32 @@ async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
 }
 
 #[tokio::test]
+async fn sse_snapshot_receives_an_explicit_nullable_boundary() {
+    let server = FakeSseServer::start().await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut options = ReadStreamOptions::new(stream_id);
+    options.start = Some(ReadStart::SeqNum(0));
+    options.snapshot = true;
+    options.link_secret = Some(TEST_STREAM_LINK.into());
+
+    let session = TsfClient::with_api_base_url(server.api_url.clone())
+        .connect_sse_reader(options)
+        .await
+        .expect("snapshot SSE session");
+
+    assert_eq!(
+        session.snapshot_boundary(),
+        Some(ReadSnapshotBoundary {
+            next_seq_num: 0,
+            last_timestamp_ms: None,
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn tail_selector_flags_are_sent_in_open_read() {
     let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
@@ -3104,6 +3130,10 @@ async fn fake_sse_read(
     Path(stream_id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
+    let snapshot = request
+        .uri()
+        .query()
+        .is_some_and(|query| query.split('&').any(|pair| pair == "snapshot=true"));
     let attempt_count = {
         let mut attempts = state.attempts.lock().expect("SSE attempts lock");
         attempts.push(SseAttempt {
@@ -3124,8 +3154,13 @@ async fn fake_sse_read(
     if attempt_count > 1 {
         return StatusCode::NO_CONTENT.into_response();
     }
+    let snapshot_boundary = if snapshot {
+        "event: snapshot_boundary\ndata: {\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}\n\n"
+    } else {
+        ""
+    };
     let body = format!(
-        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\nid: v1,0,0\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}}\n\n"
+        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{snapshot_boundary}id: v1,0,0\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}}\n\n"
     );
     (
         StatusCode::OK,

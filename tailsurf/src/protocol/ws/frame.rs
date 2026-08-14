@@ -1221,6 +1221,31 @@ mod tests {
             ServerFrame::decode(&[ServerOp::Ready.byte(), 0]),
             Err(FrameCodecError::TrailingBytes { op, count: 1 }) if op == ServerOp::Ready.byte()
         ));
+        let mut malformed_open_write = vec![ClientOp::OpenWrite.byte()];
+        malformed_open_write.extend_from_slice(&[0; WriterId::BYTE_LEN]);
+        malformed_open_write.extend_from_slice("B".repeat(LINK_SECRET_ENCODED_LENGTH).as_bytes());
+        assert!(matches!(
+            ClientFrame::decode(&malformed_open_write),
+            Err(FrameCodecError::InvalidLinkSecret)
+        ));
+        let mut unknown_position_flags = vec![ServerOp::CaughtUp.byte(), 0x02];
+        unknown_position_flags.extend_from_slice(&[0; 8]);
+        assert!(matches!(
+            ServerFrame::decode(&unknown_position_flags),
+            Err(FrameCodecError::UnknownPositionFlags(0x02))
+        ));
+        let mut missing_timestamp = vec![ServerOp::CaughtUp.byte(), POSITION_LAST_TIMESTAMP];
+        missing_timestamp.extend_from_slice(&[0; 8]);
+        assert!(matches!(
+            ServerFrame::decode(&missing_timestamp),
+            Err(FrameCodecError::TruncatedFrame { .. })
+        ));
+        let mut trailing_position = vec![ServerOp::CaughtUp.byte(), 0];
+        trailing_position.extend_from_slice(&[0; 9]);
+        assert!(matches!(
+            ServerFrame::decode(&trailing_position),
+            Err(FrameCodecError::TrailingBytes { count: 1, .. })
+        ));
     }
 
     #[test]
