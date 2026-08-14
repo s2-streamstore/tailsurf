@@ -69,21 +69,24 @@ impl LinkPermissions {
     pub const fn allows_write(self) -> bool {
         self.allows_owner() || self.0 & Self::WRITE != 0
     }
+
+    /// Returns the canonical string representation.
+    pub const fn as_str(self) -> &'static str {
+        const READ_WRITE: u8 = LinkPermissions::READ | LinkPermissions::WRITE;
+        match self.0 {
+            Self::OWNER => "o",
+            Self::READ => "r",
+            Self::WRITE => "w",
+            READ_WRITE => "rw",
+            // Every constructor validates bits into {o, r, w, rw}; no other value is representable.
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl fmt::Display for LinkPermissions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.allows_owner() {
-            f.write_str("o")?;
-            return Ok(());
-        }
-        if self.0 & LinkPermissions::READ != 0 {
-            f.write_str("r")?;
-        }
-        if self.0 & LinkPermissions::WRITE != 0 {
-            f.write_str("w")?;
-        }
-        Ok(())
+        f.write_str(self.as_str())
     }
 }
 
@@ -119,7 +122,7 @@ impl Serialize for LinkPermissions {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -128,8 +131,24 @@ impl<'de> Deserialize<'de> for LinkPermissions {
     where
         D: Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(de::Error::custom)
+        struct PermissionsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PermissionsVisitor {
+            type Value = LinkPermissions;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a valid permissions string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                value.parse().map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(PermissionsVisitor)
     }
 }
 
@@ -153,6 +172,21 @@ pub enum PermissionsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_every_permission_canonically() {
+        let cases = [
+            (LinkPermissions::owner(), "o"),
+            (LinkPermissions::read(), "r"),
+            (LinkPermissions::write(), "w"),
+            (LinkPermissions::read_write(), "rw"),
+        ];
+
+        for (permissions, canonical) in cases {
+            assert_eq!(permissions.as_str(), canonical);
+            assert_eq!(permissions.to_string(), canonical);
+        }
+    }
 
     #[test]
     fn parses_data_permissions_in_any_order_and_formats_canonically() {

@@ -72,7 +72,7 @@ pub fn stream_link(
     url.set_query(None);
 
     let fragment = form_urlencoded::Serializer::new(String::new())
-        .append_pair(&permissions.to_string(), secret.expose_secret())
+        .append_pair(permissions.as_str(), secret.expose_secret())
         .finish();
     url.set_fragment(Some(&fragment));
 
@@ -102,11 +102,11 @@ fn parse_fragment(fragment: &str) -> Result<Option<StreamLinkParam>, StreamLinkE
         return Ok(None);
     };
     let permissions = permissions.parse()?;
-    let link = link.into_owned();
     validate_link_secret(&link)?;
     if pairs.next().is_some() {
         return Err(StreamLinkError::MultipleLinks);
     }
+    let link = link.into_owned();
 
     Ok(Some(StreamLinkParam {
         declared_permissions: permissions,

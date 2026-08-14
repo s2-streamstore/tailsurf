@@ -2099,12 +2099,13 @@ fn bare_stream_url(base_url: &Url, stream_id: &StreamId) -> Url {
 }
 
 fn permission_label(permissions: LinkPermissions) -> &'static str {
-    match permissions.to_string().as_str() {
+    match permissions.as_str() {
         "o" => "owner",
         "r" => "read",
         "w" => "write",
         "rw" => "read-write",
-        _ => "link",
+        // as_str is total over the four validated bit patterns; no other value is representable.
+        _ => unreachable!(),
     }
 }
 
