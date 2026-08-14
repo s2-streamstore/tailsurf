@@ -17,7 +17,10 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     let append: AppendRecordsRequest = fixture(&fixtures, "append_request");
     assert_eq!(append.records.len(), 2);
     let acknowledgement: AppendRecordsResponse = fixture(&fixtures, "append_response");
-    assert_eq!((acknowledgement.seq_start, acknowledgement.seq_end), (7, 8));
+    assert_eq!(
+        (acknowledgement.seq_start, acknowledgement.next_seq_num),
+        (7, 9)
+    );
     let records: SseRecordsEvent = fixture(&fixtures, "sse_records");
     assert_eq!(records.records.len(), 1);
     assert_eq!(fixtures["sse_resume_cursor"].as_str(), Some("v1,2,2,2"));

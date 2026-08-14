@@ -21,11 +21,11 @@
         "start_type": "timestamp_ms",
         "start_value": "1000",
         "count": "20",
-        "until": "2000",
+        "end_seq_num": "2001",
         "playback_rate_permille": "2000",
-        "link_secret": "read-link"
+        "link_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
       },
-      "hex": "010f0200000000000003e8000000000000001400000000000007d000000000000007d00009726561642d6c696e6b"
+      "hex": "010f0200000000000003e8000000000000001400000000000007d100000000000007d041414141414141414141414141414141414141414141414141414141414141414141414141414141414141"
     },
     {
       "name": "open fixed snapshot read",
@@ -42,9 +42,9 @@
       "frame": {
         "type": "open_write",
         "writer_id_hex": "000102030405060708090a0b0c0d0e0f",
-        "link_secret": "write-link"
+        "link_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
       },
-      "hex": "02000102030405060708090a0b0c0d0e0f77726974652d6c696e6b"
+      "hex": "02000102030405060708090a0b0c0d0e0f41414141414141414141414141414141414141414141414141414141414141414141414141414141414141"
     },
     {
       "name": "append transcript batch",
@@ -71,9 +71,9 @@
       "frame": {
         "type": "ack",
         "writer_seq_start": "42",
-        "writer_seq_end": "43",
+        "writer_next_seq_num": "43",
         "seq_start": "100",
-        "seq_end": "101"
+        "next_seq_num": "101"
       },
       "hex": "81000000000000002a000000000000002b00000000000000640000000000000065"
     },
@@ -105,7 +105,16 @@
         "next_seq_num": "102",
         "last_timestamp_ms": "1786000000456"
       },
-      "hex": "8400000000000000660000019fd5e545c8"
+      "hex": "840100000000000000660000019fd5e545c8"
+    },
+    {
+      "name": "caught up on empty stream",
+      "frame": {
+        "type": "caught_up",
+        "next_seq_num": "0",
+        "last_timestamp_ms": null
+      },
+      "hex": "84000000000000000000"
     },
     {
       "name": "stream info",
@@ -126,7 +135,7 @@
         "next_seq_num": "102",
         "last_timestamp_ms": "1786000000456"
       },
-      "hex": "8600000000000000660000019fd5e545c8"
+      "hex": "860100000000000000660000019fd5e545c8"
     }
   ]
 }

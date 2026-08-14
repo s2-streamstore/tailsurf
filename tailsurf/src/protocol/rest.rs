@@ -106,8 +106,6 @@ pub struct CreateStreamResponse {
 /// Options for issuing a stream link.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IssueLinkRequest {
-    /// Client-generated stable link identifier.
-    pub link_id: LinkId,
     /// Client-generated secret. The same request can be retried safely.
     #[serde(serialize_with = "crate::ids::serialize_link_secret")]
     pub secret: LinkSecret,
@@ -124,7 +122,6 @@ impl IssueLinkRequest {
     /// Creates retry-safe link issuance material.
     pub fn new(label: LinkLabel, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
         Self {
-            link_id: LinkId::generate(),
             secret: random_link_secret(),
             label,
             permissions,
@@ -280,15 +277,15 @@ pub struct AppendRecordsRequest {
     pub match_seq_num: Option<u64>,
 }
 
-/// Durable inclusive physical sequence range for an atomic append.
+/// Durable half-open physical sequence range for an atomic append.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppendRecordsResponse {
     /// First durable physical sequence number.
     #[serde(with = "decimal_u64")]
     pub seq_start: u64,
-    /// Last durable physical sequence number.
+    /// Exclusive sequence number after the appended records.
     #[serde(with = "decimal_u64")]
-    pub seq_end: u64,
+    pub next_seq_num: u64,
 }
 
 /// One record in a batched SSE `records` event.
@@ -479,7 +476,7 @@ mod tests {
         let link = serde_json::to_value(link).expect("serialize link request");
         assert_eq!(link["label"], "Reader");
         assert_eq!(link["permissions"], "r");
-        assert!(link["link_id"].is_string());
+        assert!(link.get("link_id").is_none());
         assert!(link["secret"].is_string());
         assert_eq!(
             serde_json::to_value(RenameLinkRequest {

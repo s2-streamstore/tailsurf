@@ -283,10 +283,11 @@ impl TsfClient {
         request: &IssueLinkRequest,
         owner_link_secret: &LinkSecret,
     ) -> Result<IssueLinkResponse, TsfClientError> {
+        let link_id = LinkId::generate();
         self.retry_transient(|| {
             self.send_json_with_bearer(
                 self.http
-                    .post(self.rest_url(&format!("/streams/{stream_id}/links")))
+                    .put(self.rest_url(&format!("/streams/{stream_id}/links/{link_id}")))
                     .json(request),
                 "issue link",
                 Some(owner_link_secret),
@@ -574,13 +575,12 @@ impl TsfClient {
             if !response.status().is_success() {
                 return Err(http_status_error(response, "read SSE").await);
             }
-            let snapshot_boundary = snapshot_boundary_headers(response.headers())?;
             let mut connection = SseConnection {
                 body: Box::pin(response.bytes_stream()),
                 buffer: Vec::new(),
                 queued_events: VecDeque::new(),
                 stream_info: None,
-                snapshot_boundary,
+                snapshot_boundary: None,
             };
             let event = next_sse_event(
                 &mut connection.body,
@@ -598,6 +598,28 @@ impl TsfClient {
                 serde_json::from_str(&event.data)
                     .map_err(|_| TsfClientError::InvalidSse("invalid stream_info event"))?,
             );
+            if options.snapshot {
+                let event = next_sse_event(
+                    &mut connection.body,
+                    &mut connection.buffer,
+                    &mut connection.queued_events,
+                )
+                .await?
+                .ok_or(TsfClientError::InvalidSse(
+                    "response ended before snapshot_boundary",
+                ))?;
+                if event.event != "snapshot_boundary" {
+                    return Err(TsfClientError::InvalidSse(
+                        "snapshot_boundary must follow stream_info",
+                    ));
+                }
+                let boundary: SseCaughtUpEvent = serde_json::from_str(&event.data)
+                    .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
+                connection.snapshot_boundary = Some(ReadSnapshotBoundary {
+                    next_seq_num: boundary.next_seq_num,
+                    last_timestamp_ms: boundary.last_timestamp_ms,
+                });
+            }
             Ok(Some(connection))
         })
         .await
@@ -628,12 +650,12 @@ impl TsfClient {
                     maximum: MAX_PLAYBACK_RATE_PERMILLE,
                 });
             }
-            if options.until.is_none() && !options.snapshot {
-                return Err(TsfClientError::PlaybackRequiresUntil);
+            if options.end_seq_num.is_none() && !options.snapshot {
+                return Err(TsfClientError::PlaybackRequiresEnd);
             }
         }
-        if options.snapshot && options.until.is_some() {
-            return Err(TsfClientError::SnapshotWithUntil);
+        if options.snapshot && options.end_seq_num.is_some() {
+            return Err(TsfClientError::SnapshotWithEnd);
         }
         let opening_frame = ClientFrame::OpenRead {
             link_secret: options.link_secret.clone(),
@@ -641,7 +663,7 @@ impl TsfClient {
                 .start
                 .unwrap_or(ReadStart::TailOffset(DEFAULT_READ_TAIL_OFFSET)),
             count: options.count,
-            until: options.until,
+            end_seq_num: options.end_seq_num,
             playback_rate_permille: options.playback_rate_permille,
             snapshot: options.snapshot,
         }
@@ -961,26 +983,33 @@ impl WriteRecord {
 pub struct AppendAck {
     /// First acknowledged writer-local sequence number.
     pub writer_seq_start: u64,
-    /// Last acknowledged writer-local sequence number, inclusive.
-    pub writer_seq_end: u64,
+    /// Exclusive writer-local sequence after the acknowledged range.
+    pub writer_next_seq_num: u64,
     /// Durable sequence number assigned to the first acknowledged record.
     pub seq_start: u64,
-    /// Durable sequence number assigned to the last acknowledged record, inclusive.
-    pub seq_end: u64,
+    /// Exclusive durable sequence after the acknowledged range.
+    pub next_seq_num: u64,
 }
 
 impl AppendAck {
-    /// Returns whether the inclusive writer range contains a sequence number.
+    /// Returns whether the half-open writer range contains a sequence number.
     pub const fn contains_writer_seq(self, writer_seq_num: u64) -> bool {
-        self.writer_seq_start <= writer_seq_num && writer_seq_num <= self.writer_seq_end
+        self.writer_seq_start <= writer_seq_num && writer_seq_num < self.writer_next_seq_num
     }
 
     /// Returns the number of records when writer and durable ranges are valid and equal in length.
     pub fn record_count(self) -> Result<u64, TsfClientError> {
-        let writer_count = inclusive_range_len(self.writer_seq_start, self.writer_seq_end)
+        let writer_count = self
+            .writer_next_seq_num
+            .checked_sub(self.writer_seq_start)
             .ok_or(TsfClientError::InvalidAppendAck(self))?;
-        let durable_count = inclusive_range_len(self.seq_start, self.seq_end)
+        let durable_count = self
+            .next_seq_num
+            .checked_sub(self.seq_start)
             .ok_or(TsfClientError::InvalidAppendAck(self))?;
+        if writer_count == 0 {
+            return Err(TsfClientError::InvalidAppendAck(self));
+        }
         if writer_count != durable_count {
             return Err(TsfClientError::InvalidAppendAck(self));
         }
@@ -1268,14 +1297,14 @@ impl TsfAppendSession {
         {
             Some(ServerFrame::Ack {
                 writer_seq_start,
-                writer_seq_end,
+                writer_next_seq_num,
                 seq_start,
-                seq_end,
+                next_seq_num,
             }) => AppendAck {
                 writer_seq_start,
-                writer_seq_end,
+                writer_next_seq_num,
                 seq_start,
-                seq_end,
+                next_seq_num,
             }
             .validate()
             .map(Some),
@@ -1515,7 +1544,7 @@ fn dispatch_ack(
     for (item, writer_seq_num) in pending
         .iter()
         .take(record_count)
-        .zip(ack.writer_seq_start..=ack.writer_seq_end)
+        .zip(ack.writer_seq_start..ack.writer_next_seq_num)
     {
         if item.record.writer_seq_num < writer_seq_num {
             return Err(TsfClientError::AppendNotAcknowledged {
@@ -1530,8 +1559,8 @@ fn dispatch_ack(
 
     for ((item, writer_seq_num), seq_num) in pending
         .drain(..record_count)
-        .zip(ack.writer_seq_start..=ack.writer_seq_end)
-        .zip(ack.seq_start..=ack.seq_end)
+        .zip(ack.writer_seq_start..ack.writer_next_seq_num)
+        .zip(ack.seq_start..ack.next_seq_num)
     {
         let _ = item.ack_tx.send(Ok(AppendReceipt {
             writer_seq_num,
@@ -1561,10 +1590,6 @@ fn fail_pending(pending: &mut VecDeque<PendingAppend>, message: impl Into<String
             .ack_tx
             .send(Err(TsfClientError::AppendProducerFailed(message.clone())));
     }
-}
-
-fn inclusive_range_len(start: u64, end: u64) -> Option<u64> {
-    end.checked_sub(start)?.checked_add(1)
 }
 
 /// Resumable reader that advances its sequence position after every delivered record.
@@ -1634,7 +1659,7 @@ impl TsfSseReadSession {
                 return Ok(Some(record));
             }
             if self.options.count == Some(0)
-                || matches!((self.options.start, self.options.until), (Some(ReadStart::SeqNum(next)), Some(until)) if next > until)
+                || matches!((self.options.start, self.options.end_seq_num), (Some(ReadStart::SeqNum(next)), Some(end_seq_num)) if next >= end_seq_num)
             {
                 return Ok(None);
             }
@@ -1667,10 +1692,18 @@ impl TsfSseReadSession {
                     self.finished = true;
                     return Ok(None);
                 };
-                if connection.snapshot_boundary != self.snapshot_boundary {
-                    return Err(TsfClientError::InvalidSse(
-                        "snapshot boundary changed during resume",
-                    ));
+                if let Some(boundary) = connection.snapshot_boundary {
+                    if self
+                        .snapshot_boundary
+                        .is_some_and(|previous| previous.next_seq_num != boundary.next_seq_num)
+                    {
+                        return Err(TsfClientError::InvalidSse(
+                            "snapshot boundary changed during resume",
+                        ));
+                    }
+                    if self.snapshot_boundary.is_none() || boundary.last_timestamp_ms.is_some() {
+                        self.snapshot_boundary = Some(boundary);
+                    }
                 }
                 self.body = connection.body;
                 self.buffer = connection.buffer;
@@ -1696,7 +1729,7 @@ impl TsfSseReadSession {
                         .map_err(|_| TsfClientError::InvalidSse("invalid caught_up event"))?;
                     let caught_up = ReadCaughtUp {
                         next_seq_num: value.next_seq_num,
-                        last_timestamp_ms: value.last_timestamp_ms.unwrap_or(0),
+                        last_timestamp_ms: value.last_timestamp_ms,
                     };
                     self.last_event_id = Some(sse_resume_event_id(&event)?.to_owned());
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
@@ -1876,7 +1909,10 @@ impl TsfReadSession {
             }
         }
 
-        if self.options.until.is_some_and(|until| seq_num >= until) {
+        if matches!(
+            (self.options.start, self.options.end_seq_num),
+            (Some(ReadStart::SeqNum(next)), Some(end_seq_num)) if next >= end_seq_num
+        ) {
             self.finished = true;
         }
     }
@@ -1885,8 +1921,8 @@ impl TsfReadSession {
 fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
     options.count == Some(0)
         || matches!(
-            (options.start, options.until),
-            (Some(ReadStart::SeqNum(start)), Some(until)) if start > until
+            (options.start, options.end_seq_num),
+            (Some(ReadStart::SeqNum(start)), Some(end_seq_num)) if start >= end_seq_num
         )
 }
 
@@ -1910,11 +1946,7 @@ fn apply_snapshot_boundary(
         return;
     };
     options.snapshot = false;
-    if boundary.next_seq_num == 0 {
-        options.count = Some(0);
-    } else {
-        options.until = Some(boundary.next_seq_num - 1);
-    }
+    options.end_seq_num = Some(boundary.next_seq_num);
 }
 
 impl ReadSocket {
@@ -2026,12 +2058,12 @@ fn validate_read_options(options: &ReadStreamOptions) -> Result<(), TsfClientErr
                 maximum: MAX_PLAYBACK_RATE_PERMILLE,
             });
         }
-        if options.until.is_none() && !options.snapshot {
-            return Err(TsfClientError::PlaybackRequiresUntil);
+        if options.end_seq_num.is_none() && !options.snapshot {
+            return Err(TsfClientError::PlaybackRequiresEnd);
         }
     }
-    if options.snapshot && options.until.is_some() {
-        return Err(TsfClientError::SnapshotWithUntil);
+    if options.snapshot && options.end_seq_num.is_some() {
+        return Err(TsfClientError::SnapshotWithEnd);
     }
     Ok(())
 }
@@ -2053,8 +2085,8 @@ fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
     if let Some(value) = options.count {
         query.append_pair("count", &value.to_string());
     }
-    if let Some(value) = options.until {
-        query.append_pair("until", &value.to_string());
+    if let Some(value) = options.end_seq_num {
+        query.append_pair("end_seq_num", &value.to_string());
     }
     if let Some(value) = options.playback_rate_permille {
         query.append_pair("playback_rate_permille", &value.to_string());
@@ -2062,28 +2094,6 @@ fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
     if options.snapshot {
         query.append_pair("snapshot", "true");
     }
-}
-
-fn snapshot_boundary_headers(
-    headers: &reqwest::header::HeaderMap,
-) -> Result<Option<ReadSnapshotBoundary>, TsfClientError> {
-    let Some(next) = headers.get("x-tsf-snapshot-next-seq-num") else {
-        return Ok(None);
-    };
-    let next_seq_num = next
-        .to_str()
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .ok_or(TsfClientError::InvalidSse("invalid snapshot cursor header"))?;
-    let last_timestamp_ms = headers
-        .get("x-tsf-snapshot-last-timestamp-ms")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    Ok(Some(ReadSnapshotBoundary {
-        next_seq_num,
-        last_timestamp_ms,
-    }))
 }
 
 async fn next_sse_event(
@@ -2534,12 +2544,12 @@ pub enum TsfClientError {
         /// Fastest accepted playback rate.
         maximum: u64,
     },
-    /// Timestamp playback needs a stable inclusive ending sequence.
-    #[error("playback rate requires an inclusive until sequence")]
-    PlaybackRequiresUntil,
+    /// Timestamp playback needs a stable exclusive ending sequence.
+    #[error("playback rate requires an exclusive end_seq_num sequence")]
+    PlaybackRequiresEnd,
     /// A snapshot request also supplied an explicit ending sequence.
-    #[error("snapshot and until are mutually exclusive")]
-    SnapshotWithUntil,
+    #[error("snapshot and end_seq_num are mutually exclusive")]
+    SnapshotWithEnd,
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
@@ -2721,7 +2731,7 @@ mod tests {
                 .send(Message::Binary(
                     ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 42,
-                        last_timestamp_ms: 1_786_377_600_000,
+                        last_timestamp_ms: Some(1_786_377_600_000),
                     })
                     .encode()
                     .expect("encode caught up"),
@@ -2741,7 +2751,7 @@ mod tests {
             outcome,
             ReadSocketOutcome::CaughtUp(ReadCaughtUp {
                 next_seq_num: 42,
-                last_timestamp_ms: 1_786_377_600_000,
+                last_timestamp_ms: Some(1_786_377_600_000),
             })
         ));
         sender.await.expect("join heartbeat sender");
@@ -2940,12 +2950,12 @@ mod tests {
     }
 
     #[test]
-    fn append_ack_counts_inclusive_matching_ranges() {
+    fn append_ack_counts_half_open_matching_ranges() {
         let ack = AppendAck {
             writer_seq_start: 7,
-            writer_seq_end: 9,
+            writer_next_seq_num: 10,
             seq_start: 42,
-            seq_end: 44,
+            next_seq_num: 45,
         };
 
         assert_eq!(ack.record_count().expect("record count"), 3);
@@ -2956,9 +2966,9 @@ mod tests {
     fn append_ack_rejects_mismatched_range_lengths() {
         let ack = AppendAck {
             writer_seq_start: 7,
-            writer_seq_end: 9,
+            writer_next_seq_num: 9,
             seq_start: 42,
-            seq_end: 43,
+            next_seq_num: 43,
         };
 
         assert!(matches!(
@@ -2980,9 +2990,9 @@ mod tests {
         }]);
         let ack = AppendAck {
             writer_seq_start: 7,
-            writer_seq_end: 8,
+            writer_next_seq_num: 9,
             seq_start: 42,
-            seq_end: 43,
+            next_seq_num: 44,
         };
 
         assert!(matches!(
@@ -3012,9 +3022,9 @@ mod tests {
         }
         let ack = AppendAck {
             writer_seq_start: 7,
-            writer_seq_end: 8,
+            writer_next_seq_num: 9,
             seq_start: 42,
-            seq_end: 43,
+            next_seq_num: 44,
         };
 
         assert!(matches!(

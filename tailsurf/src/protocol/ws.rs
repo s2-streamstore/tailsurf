@@ -23,8 +23,8 @@ pub struct ReadStreamOptions {
     pub start: Option<ReadStart>,
     /// Optional maximum number of physical records to deliver.
     pub count: Option<u64>,
-    /// Optional inclusive ending sequence number.
-    pub until: Option<u64>,
+    /// Optional exclusive ending sequence number.
+    pub end_seq_num: Option<u64>,
     /// Optional timestamp playback rate in thousandths. `1000` is recorded speed.
     pub playback_rate_permille: Option<u64>,
     /// Captures a fixed ending position when the socket opens.
@@ -40,7 +40,7 @@ impl ReadStreamOptions {
             stream_id,
             start: None,
             count: None,
-            until: None,
+            end_seq_num: None,
             playback_rate_permille: None,
             snapshot: false,
             link_secret: None,

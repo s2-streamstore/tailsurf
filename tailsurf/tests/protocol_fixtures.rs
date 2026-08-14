@@ -44,7 +44,7 @@ enum ClientFixture {
         start_type: String,
         start_value: String,
         count: Option<String>,
-        until: Option<String>,
+        end_seq_num: Option<String>,
         playback_rate_permille: Option<String>,
         #[serde(default)]
         snapshot: bool,
@@ -68,9 +68,9 @@ enum ServerFixture {
     Ready,
     Ack {
         writer_seq_start: String,
-        writer_seq_end: String,
+        writer_next_seq_num: String,
         seq_start: String,
-        seq_end: String,
+        next_seq_num: String,
     },
     ReadBatch {
         seq_num: String,
@@ -84,11 +84,11 @@ enum ServerFixture {
     Heartbeat,
     CaughtUp {
         next_seq_num: String,
-        last_timestamp_ms: String,
+        last_timestamp_ms: Option<String>,
     },
     SnapshotBoundary {
         next_seq_num: String,
-        last_timestamp_ms: String,
+        last_timestamp_ms: Option<String>,
     },
     StreamInfo {
         stream_id: String,
@@ -158,7 +158,7 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             start_type,
             start_value,
             count,
-            until,
+            end_seq_num,
             playback_rate_permille,
             snapshot,
             link_secret,
@@ -166,7 +166,7 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             link_secret: link_secret.map(LinkSecret::from),
             start: read_start(&start_type, parse_u64(&start_value)),
             count: count.as_deref().map(parse_u64),
-            until: until.as_deref().map(parse_u64),
+            end_seq_num: end_seq_num.as_deref().map(parse_u64),
             playback_rate_permille: playback_rate_permille.as_deref().map(parse_u64),
             snapshot,
         },
@@ -205,14 +205,14 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
         ServerFixture::Ready => ServerFrame::Ready,
         ServerFixture::Ack {
             writer_seq_start,
-            writer_seq_end,
+            writer_next_seq_num,
             seq_start,
-            seq_end,
+            next_seq_num,
         } => ServerFrame::Ack {
             writer_seq_start: parse_u64(&writer_seq_start),
-            writer_seq_end: parse_u64(&writer_seq_end),
+            writer_next_seq_num: parse_u64(&writer_next_seq_num),
             seq_start: parse_u64(&seq_start),
-            seq_end: parse_u64(&seq_end),
+            next_seq_num: parse_u64(&next_seq_num),
         },
         ServerFixture::ReadBatch {
             seq_num,
@@ -237,14 +237,14 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             last_timestamp_ms,
         } => ServerFrame::CaughtUp(ReadCaughtUp {
             next_seq_num: parse_u64(&next_seq_num),
-            last_timestamp_ms: parse_u64(&last_timestamp_ms),
+            last_timestamp_ms: last_timestamp_ms.as_deref().map(parse_u64),
         }),
         ServerFixture::SnapshotBoundary {
             next_seq_num,
             last_timestamp_ms,
         } => ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
             next_seq_num: parse_u64(&next_seq_num),
-            last_timestamp_ms: parse_u64(&last_timestamp_ms),
+            last_timestamp_ms: last_timestamp_ms.as_deref().map(parse_u64),
         }),
         ServerFixture::StreamInfo {
             stream_id,

@@ -2,7 +2,7 @@
   "create_request": { "title": "Deploy log", "visibility": "private", "issue_links": [{ "label": "Owner", "permissions": "o", "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, { "label": "Writer", "permissions": "w", "secret": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE" }] },
   "stream_resource": { "stream_id": "00000000000000000000000000000000", "title": "Deploy log", "visibility": "private", "created_at": "2026-08-13T00:00:00Z", "expires_at": "2026-08-23T00:00:00Z", "future_field": true },
   "append_request": { "writer_id": "AAECAwQFBgcICQoLDA0ODw", "first_writer_seq_num": "41", "records": [{ "type": "text", "text": "hello\n", "part": { "index": 0, "is_final": true } }, { "type": "bytes", "base64": "AP8", "format": "bytes" }], "match_seq_num": "7" },
-  "append_response": { "seq_start": "7", "seq_end": "8", "future_field": true },
+  "append_response": { "seq_start": "7", "next_seq_num": "9", "future_field": true },
   "sse_records": { "records": [{ "seq_num": "7", "timestamp_ms": "1786579200000", "writer_id": "AAECAwQFBgcICQoLDA0ODw", "writer_seq_num": "41", "part": { "index": 0, "is_final": true }, "data": { "type": "text", "text": "hello\n" } }], "future_field": true },
   "sse_resume_cursor": "v1,2,2,2",
   "sse_caught_up": { "next_seq_num": "8", "last_timestamp_ms": "1786579200000", "future_field": true }

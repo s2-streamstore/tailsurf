@@ -865,7 +865,7 @@ async fn producer_close_is_not_blocked_by_an_unused_reservation() {
             tailsurf::protocol::ws::WriteStreamOptions::new(
                 stream_id,
                 WriterId::new_random(),
-                "write-secret",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
             TsfProducerConfig {
                 max_unacked_bytes: 1,
@@ -1429,7 +1429,7 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let attempts = last_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
-    assert_eq!(attempts[0].until, None);
+    assert_eq!(attempts[0].end_seq_num, None);
     assert_eq!(attempts[0].count, None);
     assert!(attempts[0].snapshot);
     last_server.abort();
@@ -1446,7 +1446,7 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let attempts = seq_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::SeqNum(2));
-    assert_eq!(attempts[0].until, None);
+    assert_eq!(attempts[0].end_seq_num, None);
     assert_eq!(attempts[0].count, None);
     assert!(attempts[0].snapshot);
     seq_server.abort();
@@ -1472,7 +1472,7 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let attempts = timestamp_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
-    assert_eq!(attempts[0].until, None);
+    assert_eq!(attempts[0].end_seq_num, None);
     assert_eq!(attempts[0].count, None);
     assert!(attempts[0].snapshot);
     timestamp_server.abort();
@@ -1492,7 +1492,7 @@ async fn replay_selector_flags_are_sent_in_bounded_open_read() {
     let attempts = count_server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::SeqNum(0));
-    assert_eq!(attempts[0].until, None);
+    assert_eq!(attempts[0].end_seq_num, None);
     assert_eq!(attempts[0].count, Some(1));
     assert!(attempts[0].snapshot);
     count_server.abort();
@@ -1517,7 +1517,7 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     assert_eq!(output.stderr, Vec::<u8>::new());
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].until, None);
+    assert_eq!(attempts[0].end_seq_num, None);
     assert!(attempts[0].snapshot);
 
     server.abort();
@@ -1707,13 +1707,12 @@ impl TestServer {
                     .patch(test_update_stream)
                     .delete(test_delete_stream),
             )
-            .route(
-                "/api/v1/streams/{stream_id}/links",
-                get(test_list_links).post(test_issue_link),
-            )
+            .route("/api/v1/streams/{stream_id}/links", get(test_list_links))
             .route(
                 "/api/v1/streams/{stream_id}/links/{link_id}",
-                axum::routing::patch(test_rename_link).delete(test_revoke_link),
+                axum::routing::put(test_issue_link)
+                    .patch(test_rename_link)
+                    .delete(test_revoke_link),
             )
             .route("/api/v1/streams/{stream_id}/write", get(test_write_socket))
             .route("/api/v1/streams/{stream_id}/read", get(test_read_socket))
@@ -2045,7 +2044,7 @@ async fn test_delete_stream(
 
 async fn test_issue_link(
     State(state): State<Arc<TestApiState>>,
-    Path(stream_id): Path<String>,
+    Path((stream_id, link_id)): Path<(String, LinkId)>,
     headers: HeaderMap,
     Json(request): Json<IssueLinkRequest>,
 ) -> Response {
@@ -2061,7 +2060,7 @@ async fn test_issue_link(
     }
     let link = test_store_stream_link(
         &state,
-        Some(request.link_id),
+        Some(link_id),
         request.secret,
         request.label,
         request.permissions,
@@ -2228,7 +2227,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
         let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
             return;
         };
-        let (writer_seq_start, writer_seq_end, seq_start, seq_end) = {
+        let (writer_seq_start, writer_next_seq_num, seq_start, next_seq_num) = {
             let mut streams = state.streams.lock().expect("streams lock");
             let Some(stream) = streams.get_mut(&stream_id) else {
                 return;
@@ -2237,7 +2236,10 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
             let Some(writer_seq_start) = records.first().map(|record| record.writer_seq_num) else {
                 return;
             };
-            let Some(writer_seq_end) = records.last().map(|record| record.writer_seq_num) else {
+            let Some(writer_next_seq_num) = records
+                .last()
+                .and_then(|record| record.writer_seq_num.checked_add(1))
+            else {
                 return;
             };
             for record in records {
@@ -2254,18 +2256,18 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
             }
             (
                 writer_seq_start,
-                writer_seq_end,
+                writer_next_seq_num,
                 seq_start,
-                stream.records.len() as u64 - 1,
+                stream.records.len() as u64,
             )
         };
         send_server_frame(
             &mut socket,
             ServerFrame::Ack {
                 writer_seq_start,
-                writer_seq_end,
+                writer_next_seq_num,
                 seq_start,
-                seq_end,
+                next_seq_num,
             },
         )
         .await
@@ -2290,7 +2292,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         link_secret: Some(link_secret),
         start,
         count,
-        until,
+        end_seq_num,
         snapshot,
         ..
     }) = ClientFrame::decode_bytes(opening)
@@ -2313,15 +2315,12 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         }
         let caught_up = ReadCaughtUp {
             next_seq_num: stream.records.len() as u64,
-            last_timestamp_ms: stream
-                .records
-                .last()
-                .map_or(0, |record| record.timestamp_ms),
+            last_timestamp_ms: stream.records.last().map(|record| record.timestamp_ms),
         };
         (
             test_read_stream_info(stream),
             caught_up,
-            test_select_records(stream, start, count, until),
+            test_select_records(stream, start, count, end_seq_num),
         )
     };
     send_server_frame(&mut socket, ServerFrame::Ready)
@@ -2452,7 +2451,7 @@ fn test_select_records(
     stream: &TestStream,
     start: ReadStart,
     count: Option<u64>,
-    until: Option<u64>,
+    end_seq_num: Option<u64>,
 ) -> Vec<TestRecord> {
     let mut records = stream.records.clone();
     match start {
@@ -2466,8 +2465,8 @@ fn test_select_records(
             records = records[start..].to_vec();
         }
     }
-    if let Some(until) = until {
-        records.retain(|record| record.seq_num <= until);
+    if let Some(end_seq_num) = end_seq_num {
+        records.retain(|record| record.seq_num < end_seq_num);
     }
     if let Some(count) = count {
         records.truncate(usize::try_from(count).unwrap_or(usize::MAX));
@@ -2723,7 +2722,7 @@ async fn connect_default_producer(api_url: &Url) -> tailsurf::TsfProducer {
         .connect_producer(WriteStreamOptions::new(
             stream_id,
             WriterId::new_random(),
-            "write-secret",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ))
         .await
         .expect("producer")
@@ -2913,9 +2912,9 @@ async fn send_test_ack(socket: &mut WebSocket, start: u64, end: u64) -> Result<(
         socket,
         ServerFrame::Ack {
             writer_seq_start: start,
-            writer_seq_end: end,
+            writer_next_seq_num: end + 1,
             seq_start: start,
-            seq_end: end,
+            next_seq_num: end + 1,
         },
     )
     .await
@@ -3040,9 +3039,9 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
         &mut socket,
         ServerFrame::Ack {
             writer_seq_start: record.writer_seq_num,
-            writer_seq_end: record.writer_seq_num,
+            writer_next_seq_num: record.writer_seq_num + 1,
             seq_start: 0,
-            seq_end: 0,
+            next_seq_num: 1,
         },
     )
     .await
@@ -3141,7 +3140,7 @@ struct ReadAttempt {
     link_secret: String,
     start: ReadStart,
     count: Option<u64>,
-    until: Option<u64>,
+    end_seq_num: Option<u64>,
     playback_rate_permille: Option<u64>,
     snapshot: bool,
 }
@@ -3245,7 +3244,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
         link_secret: Some(link_secret),
         start,
         count,
-        until,
+        end_seq_num,
         playback_rate_permille,
         snapshot,
     } = ClientFrame::decode_bytes(opening).expect("open read")
@@ -3258,7 +3257,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
             link_secret: link_secret.expose_secret().to_owned(),
             start,
             count,
-            until,
+            end_seq_num,
             playback_rate_permille,
             snapshot,
         });
@@ -3278,7 +3277,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
             &mut socket,
             ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
                 next_seq_num: fake_read_next_seq_num(state.mode),
-                last_timestamp_ms: 1_781_717_406_000,
+                last_timestamp_ms: Some(1_781_717_406_000),
             }),
         )
         .await
@@ -3299,7 +3298,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
                     &mut socket,
                     ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 5,
-                        last_timestamp_ms: 1_781_717_406_010,
+                        last_timestamp_ms: Some(1_781_717_406_010),
                     }),
                 )
                 .await

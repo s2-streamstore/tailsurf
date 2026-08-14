@@ -1626,7 +1626,6 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
         .issue_link(
             &locator.stream_id,
             &IssueLinkRequest {
-                link_id: LinkId::generate(),
                 secret,
                 label,
                 permissions,

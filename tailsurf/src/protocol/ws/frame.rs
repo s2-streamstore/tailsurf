@@ -4,8 +4,10 @@ use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
+use crate::stream_url::LINK_SECRET_ENCODED_LENGTH;
 use crate::{
     LinkSecret, StreamId, StreamTitle, WriterId,
+    ids::is_canonical_base64url_32,
     protocol::{
         rest::Visibility,
         ws::{
@@ -54,18 +56,20 @@ impl TryFrom<u8> for ClientOp {
 
 const OPEN_READ_LINK_SECRET: u8 = 0x01;
 const OPEN_READ_COUNT: u8 = 0x02;
-const OPEN_READ_UNTIL: u8 = 0x04;
+const OPEN_READ_END_SEQ_NUM: u8 = 0x04;
 const OPEN_READ_PLAYBACK_RATE: u8 = 0x08;
 const OPEN_READ_SNAPSHOT: u8 = 0x10;
 const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET
     | OPEN_READ_COUNT
-    | OPEN_READ_UNTIL
+    | OPEN_READ_END_SEQ_NUM
     | OPEN_READ_PLAYBACK_RATE
     | OPEN_READ_SNAPSHOT;
 
 const READ_START_SEQ_NUM: u8 = 0x01;
 const READ_START_TIMESTAMP_MS: u8 = 0x02;
 const READ_START_TAIL_OFFSET: u8 = 0x03;
+const POSITION_LAST_TIMESTAMP: u8 = 0x01;
+const POSITION_FLAGS: u8 = POSITION_LAST_TIMESTAMP;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,8 +222,8 @@ pub struct AppendRecord {
 pub struct ReadCaughtUp {
     /// Sequence number assigned to the next appended record.
     pub next_seq_num: u64,
-    /// Timestamp of the last record, or zero for an empty stream.
-    pub last_timestamp_ms: u64,
+    /// Timestamp of the last record, or `None` for an empty stream.
+    pub last_timestamp_ms: Option<u64>,
 }
 
 /// Fixed exclusive ending position captured when a snapshot read opens.
@@ -227,8 +231,8 @@ pub struct ReadCaughtUp {
 pub struct ReadSnapshotBoundary {
     /// Sequence number assigned to the next appended record.
     pub next_seq_num: u64,
-    /// Timestamp of the last record, or zero for an empty stream.
-    pub last_timestamp_ms: u64,
+    /// Timestamp of the last record, or `None` for an empty stream.
+    pub last_timestamp_ms: Option<u64>,
 }
 
 /// Stream metadata supplied by an authorized read handshake.
@@ -257,8 +261,8 @@ pub enum ClientFrame {
         start: ReadStart,
         /// Maximum number of physical records to deliver.
         count: Option<u64>,
-        /// Inclusive ending sequence number.
-        until: Option<u64>,
+        /// Exclusive ending sequence number.
+        end_seq_num: Option<u64>,
         /// Timestamp playback rate in thousandths.
         playback_rate_permille: Option<u64>,
         /// Whether the server captures a fixed ending position.
@@ -284,12 +288,12 @@ pub enum ServerFrame {
     Ack {
         /// First acknowledged writer-local sequence number.
         writer_seq_start: u64,
-        /// Last acknowledged writer-local sequence number, inclusive.
-        writer_seq_end: u64,
+        /// Exclusive writer-local sequence after the acknowledged range.
+        writer_next_seq_num: u64,
         /// Durable sequence number assigned to the first acknowledged record.
         seq_start: u64,
-        /// Durable sequence number assigned to the last acknowledged record, inclusive.
-        seq_end: u64,
+        /// Exclusive durable sequence after the acknowledged range.
+        next_seq_num: u64,
     },
     /// Delivers a bounded batch of physical stream records.
     ReadBatch(Vec<ReadRecord>),
@@ -314,35 +318,36 @@ impl ClientFrame {
                 link_secret,
                 start,
                 count,
-                until,
+                end_seq_num,
                 playback_rate_permille,
                 snapshot,
             } => {
-                validate_open_read(*start, *until, *playback_rate_permille, *snapshot)?;
-                let secret_len = link_secret
-                    .as_ref()
-                    .map(|secret| secret.expose_secret().len())
-                    .unwrap_or_default();
-                if link_secret.is_some() && secret_len == 0 {
-                    return Err(FrameCodecError::EmptyLinkSecret);
-                }
-                if secret_len > u16::MAX as usize {
-                    return Err(FrameCodecError::LinkSecretTooLarge(secret_len));
+                validate_open_read(*start, *end_seq_num, *playback_rate_permille, *snapshot)?;
+                if let Some(secret) = link_secret {
+                    validate_link_secret(secret)?;
                 }
                 Ok(Self::OPEN_READ_FIXED_LEN
                     + count.map_or(0, |_| 8)
-                    + until.map_or(0, |_| 8)
+                    + end_seq_num.map_or(0, |_| 8)
                     + playback_rate_permille.map_or(0, |_| 8)
-                    + link_secret.as_ref().map_or(0, |_| 2 + secret_len))
+                    + link_secret
+                        .as_ref()
+                        .map_or(0, |_| LINK_SECRET_ENCODED_LENGTH))
             }
             Self::OpenWrite { link_secret, .. } => {
-                Ok(1 + WriterId::BYTE_LEN + link_secret.expose_secret().len())
+                validate_link_secret(link_secret)?;
+                Ok(1 + WriterId::BYTE_LEN + LINK_SECRET_ENCODED_LENGTH)
             }
-            Self::AppendBatch(records) => batch_encoded_len(
-                records.iter().map(|record| &record.data),
-                Self::APPEND_BODY_HEADER_LEN,
-                MAX_APPEND_BATCH_RECORDS,
-            ),
+            Self::AppendBatch(records) => {
+                for record in records {
+                    validate_writer_seq_num(record.writer_seq_num)?;
+                }
+                batch_encoded_len(
+                    records.iter().map(|record| &record.data),
+                    Self::APPEND_BODY_HEADER_LEN,
+                    MAX_APPEND_BATCH_RECORDS,
+                )
+            }
         }
     }
 
@@ -353,14 +358,14 @@ impl ClientFrame {
                 link_secret,
                 start,
                 count,
-                until,
+                end_seq_num,
                 playback_rate_permille,
                 snapshot,
             } => {
                 output.put_u8(ClientOp::OpenRead.byte());
                 let flags = link_secret.as_ref().map_or(0, |_| OPEN_READ_LINK_SECRET)
                     | count.map_or(0, |_| OPEN_READ_COUNT)
-                    | until.map_or(0, |_| OPEN_READ_UNTIL)
+                    | end_seq_num.map_or(0, |_| OPEN_READ_END_SEQ_NUM)
                     | playback_rate_permille.map_or(0, |_| OPEN_READ_PLAYBACK_RATE)
                     | if *snapshot { OPEN_READ_SNAPSHOT } else { 0 };
                 output.put_u8(flags);
@@ -370,14 +375,13 @@ impl ClientFrame {
                 if let Some(value) = count {
                     output.put_u64(*value);
                 }
-                if let Some(value) = until {
+                if let Some(value) = end_seq_num {
                     output.put_u64(*value);
                 }
                 if let Some(value) = playback_rate_permille {
                     output.put_u64(*value);
                 }
                 if let Some(secret) = link_secret {
-                    output.put_u16(secret.expose_secret().len() as u16);
                     output.put_slice(secret.expose_secret().as_bytes());
                 }
             }
@@ -444,15 +448,15 @@ impl ServerFrame {
             Self::Ready => output.put_u8(ServerOp::Ready.byte()),
             Self::Ack {
                 writer_seq_start,
-                writer_seq_end,
+                writer_next_seq_num,
                 seq_start,
-                seq_end,
+                next_seq_num,
             } => {
                 output.put_u8(ServerOp::Ack.byte());
                 output.put_u64(*writer_seq_start);
-                output.put_u64(*writer_seq_end);
+                output.put_u64(*writer_next_seq_num);
                 output.put_u64(*seq_start);
-                output.put_u64(*seq_end);
+                output.put_u64(*next_seq_num);
             }
             Self::ReadBatch(records) => {
                 output.put_u8(ServerOp::ReadBatch.byte());
@@ -470,8 +474,15 @@ impl ServerFrame {
             Self::Heartbeat => output.put_u8(ServerOp::Heartbeat.byte()),
             Self::CaughtUp(caught_up) => {
                 output.put_u8(ServerOp::CaughtUp.byte());
+                output.put_u8(
+                    caught_up
+                        .last_timestamp_ms
+                        .map_or(0, |_| POSITION_LAST_TIMESTAMP),
+                );
                 output.put_u64(caught_up.next_seq_num);
-                output.put_u64(caught_up.last_timestamp_ms);
+                if let Some(last_timestamp_ms) = caught_up.last_timestamp_ms {
+                    output.put_u64(last_timestamp_ms);
+                }
             }
             Self::StreamInfo(stream) => {
                 let payload =
@@ -481,8 +492,15 @@ impl ServerFrame {
             }
             Self::SnapshotBoundary(boundary) => {
                 output.put_u8(ServerOp::SnapshotBoundary.byte());
+                output.put_u8(
+                    boundary
+                        .last_timestamp_ms
+                        .map_or(0, |_| POSITION_LAST_TIMESTAMP),
+                );
                 output.put_u64(boundary.next_seq_num);
-                output.put_u64(boundary.last_timestamp_ms);
+                if let Some(last_timestamp_ms) = boundary.last_timestamp_ms {
+                    output.put_u64(last_timestamp_ms);
+                }
             }
         }
         Ok(())
@@ -533,9 +551,14 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
         ClientOp::OpenRead => decode_open_read(op_byte, body),
         ClientOp::OpenWrite => {
             let (writer_id, secret_bytes) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            if secret_bytes.len() != LINK_SECRET_ENCODED_LENGTH {
+                return Err(FrameCodecError::InvalidLinkSecret);
+            }
+            let link_secret = LinkSecret::from(utf8_tail(secret_bytes)?);
+            validate_link_secret(&link_secret)?;
             Ok(ClientFrame::OpenWrite {
                 writer_id: WriterId::from_bytes(writer_id),
-                link_secret: LinkSecret::from(utf8_tail(secret_bytes)?),
+                link_secret,
             })
         }
         ClientOp::AppendBatch => {
@@ -544,6 +567,7 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
             for (start, end) in record_body_ranges(bytes, MAX_APPEND_BATCH_RECORDS)? {
                 let record_body = &bytes[start..end];
                 let (writer_seq_num, body) = read_u64(record_body)?;
+                validate_writer_seq_num(writer_seq_num)?;
                 let (part_raw, body) = read_u32(body)?;
                 let (format, data) = read_record_format(body)?;
                 validate_record_len(data.len())?;
@@ -583,7 +607,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         body = tail;
         Some(value)
     };
-    let until = if flags & OPEN_READ_UNTIL == 0 {
+    let end_seq_num = if flags & OPEN_READ_END_SEQ_NUM == 0 {
         None
     } else {
         let (value, tail) = read_u64(body)?;
@@ -602,26 +626,23 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         ensure_empty(op, body)?;
         None
     } else {
-        let (length, tail) = read_u16(body)?;
-        let length = usize::from(length);
-        let Some((secret, trailing)) = tail.split_at_checked(length) else {
+        let Some((secret, trailing)) = body.split_at_checked(LINK_SECRET_ENCODED_LENGTH) else {
             return Err(FrameCodecError::TruncatedFrame {
                 op,
-                needed: length.saturating_sub(tail.len()),
+                needed: LINK_SECRET_ENCODED_LENGTH.saturating_sub(body.len()),
             });
         };
         ensure_empty(op, trailing)?;
-        if secret.is_empty() {
-            return Err(FrameCodecError::EmptyLinkSecret);
-        }
-        Some(LinkSecret::from(utf8_tail(secret)?))
+        let secret = LinkSecret::from(utf8_tail(secret)?);
+        validate_link_secret(&secret)?;
+        Some(secret)
     };
-    validate_open_read(start, until, playback_rate_permille, snapshot)?;
+    validate_open_read(start, end_seq_num, playback_rate_permille, snapshot)?;
     Ok(ClientFrame::OpenRead {
         link_secret,
         start,
         count,
-        until,
+        end_seq_num,
         playback_rate_permille,
         snapshot,
     })
@@ -629,7 +650,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
 
 fn validate_open_read(
     start: ReadStart,
-    until: Option<u64>,
+    end_seq_num: Option<u64>,
     playback_rate_permille: Option<u64>,
     snapshot: bool,
 ) -> Result<(), FrameCodecError> {
@@ -637,15 +658,15 @@ fn validate_open_read(
     if selector > MAX_READ_SELECTOR_VALUE {
         return Err(FrameCodecError::ReadSelectorOutOfRange(selector));
     }
-    if snapshot && until.is_some() {
-        return Err(FrameCodecError::SnapshotWithUntil);
+    if snapshot && end_seq_num.is_some() {
+        return Err(FrameCodecError::SnapshotWithEnd);
     }
     if let Some(rate) = playback_rate_permille {
         if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
             return Err(FrameCodecError::PlaybackRateOutOfRange(rate));
         }
-        if until.is_none() && !snapshot {
-            return Err(FrameCodecError::PlaybackRequiresUntil);
+        if end_seq_num.is_none() && !snapshot {
+            return Err(FrameCodecError::PlaybackRequiresEnd);
         }
     }
     Ok(())
@@ -686,15 +707,15 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
         }
         ServerOp::Ack => {
             let (writer_seq_start, body) = read_u64(body)?;
-            let (writer_seq_end, body) = read_u64(body)?;
+            let (writer_next_seq_num, body) = read_u64(body)?;
             let (seq_start, body) = read_u64(body)?;
-            let (seq_end, body) = read_u64(body)?;
+            let (next_seq_num, body) = read_u64(body)?;
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::Ack {
                 writer_seq_start,
-                writer_seq_end,
+                writer_next_seq_num,
                 seq_start,
-                seq_end,
+                next_seq_num,
             })
         }
         ServerOp::ReadBatch => {
@@ -728,28 +749,54 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::Heartbeat)
         }
-        ServerOp::CaughtUp => {
-            let (next_seq_num, body) = read_u64(body)?;
-            let (last_timestamp_ms, body) = read_u64(body)?;
-            ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::CaughtUp(ReadCaughtUp {
+        ServerOp::CaughtUp => decode_position(op_byte, body, |next_seq_num, last_timestamp_ms| {
+            ServerFrame::CaughtUp(ReadCaughtUp {
                 next_seq_num,
                 last_timestamp_ms,
-            }))
-        }
+            })
+        }),
         ServerOp::StreamInfo => serde_json::from_slice(body)
             .map(ServerFrame::StreamInfo)
             .map_err(FrameCodecError::InvalidStreamInfo),
         ServerOp::SnapshotBoundary => {
-            let (next_seq_num, body) = read_u64(body)?;
-            let (last_timestamp_ms, body) = read_u64(body)?;
-            ensure_empty(op_byte, body)?;
-            Ok(ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
-                next_seq_num,
-                last_timestamp_ms,
-            }))
+            decode_position(op_byte, body, |next_seq_num, last_timestamp_ms| {
+                ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
+                    next_seq_num,
+                    last_timestamp_ms,
+                })
+            })
         }
     }
+}
+
+fn decode_position(
+    op: u8,
+    body: &[u8],
+    frame: impl FnOnce(u64, Option<u64>) -> ServerFrame,
+) -> Result<ServerFrame, FrameCodecError> {
+    let (&flags, body) = body
+        .split_first()
+        .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
+    if flags & !POSITION_FLAGS != 0 {
+        return Err(FrameCodecError::UnknownPositionFlags(
+            flags & !POSITION_FLAGS,
+        ));
+    }
+    let (next_seq_num, body) = read_u64(body)?;
+    let (last_timestamp_ms, body) = if flags & POSITION_LAST_TIMESTAMP == 0 {
+        (None, body)
+    } else {
+        let (value, body) = read_u64(body)?;
+        (Some(value), body)
+    };
+    ensure_empty(op, body)?;
+    Ok(frame(next_seq_num, last_timestamp_ms))
+}
+
+fn validate_link_secret(secret: &LinkSecret) -> Result<(), FrameCodecError> {
+    is_canonical_base64url_32(secret.expose_secret())
+        .then_some(())
+        .ok_or(FrameCodecError::InvalidLinkSecret)
 }
 
 fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
@@ -760,6 +807,14 @@ fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
         });
     }
     Ok(())
+}
+
+fn validate_writer_seq_num(value: u64) -> Result<(), FrameCodecError> {
+    if value == u64::MAX {
+        Err(FrameCodecError::WriterSequenceExhausted)
+    } else {
+        Ok(())
+    }
 }
 
 fn batch_encoded_len<'a>(
@@ -846,11 +901,6 @@ fn read_u32(input: &[u8]) -> Result<(u32, &[u8]), FrameCodecError> {
     Ok((u32::from_be_bytes(bytes), tail))
 }
 
-fn read_u16(input: &[u8]) -> Result<(u16, &[u8]), FrameCodecError> {
-    let (bytes, tail) = take::<2>(input)?;
-    Ok((u16::from_be_bytes(bytes), tail))
-}
-
 fn read_u64(input: &[u8]) -> Result<(u64, &[u8]), FrameCodecError> {
     let (bytes, tail) = take::<8>(input)?;
     Ok((u64::from_be_bytes(bytes), tail))
@@ -890,6 +940,9 @@ pub enum FrameCodecError {
     /// An `OpenRead` flag bit is not defined by TSF v1.
     #[error("OpenRead has unknown flags 0x{0:02x}")]
     UnknownOpenReadFlags(u8),
+    /// A position frame used an undefined presence bit.
+    #[error("position frame has unknown flags 0x{0:02x}")]
+    UnknownPositionFlags(u8),
     /// An `OpenRead` selector tag is not defined by TSF v1.
     #[error("OpenRead has unknown start tag 0x{0:02x}")]
     UnknownReadStartTag(u8),
@@ -902,17 +955,17 @@ pub enum FrameCodecError {
     )]
     PlaybackRateOutOfRange(u64),
     /// A snapshot request also supplied an explicit ending sequence.
-    #[error("snapshot and until are mutually exclusive")]
-    SnapshotWithUntil,
+    #[error("snapshot and end_seq_num are mutually exclusive")]
+    SnapshotWithEnd,
     /// Timestamp playback did not include a fixed ending sequence.
-    #[error("playback rate requires an inclusive until sequence or snapshot")]
-    PlaybackRequiresUntil,
-    /// A present read link secret was empty.
-    #[error("OpenRead link secret cannot be empty")]
-    EmptyLinkSecret,
-    /// A read link secret cannot fit in its length prefix.
-    #[error("OpenRead link secret is {0} bytes; maximum is 65535")]
-    LinkSecretTooLarge(usize),
+    #[error("playback rate requires an exclusive end_seq_num sequence or snapshot")]
+    PlaybackRequiresEnd,
+    /// An opening credential is not canonical 256-bit unpadded base64url.
+    #[error("opening link secret must be canonical 43-character unpadded base64url")]
+    InvalidLinkSecret,
+    /// A writer sequence left no representable exclusive acknowledgement boundary.
+    #[error("writer sequence must leave room for an exclusive acknowledgement boundary")]
+    WriterSequenceExhausted,
     /// A record used an undefined presentation format byte.
     #[error("unknown record format 0x{0:02x}")]
     UnknownRecordFormat(u8),
@@ -1145,7 +1198,7 @@ mod tests {
 
     #[test]
     fn frame_decoders_reject_invalid_utf8_and_trailing_bytes() {
-        let invalid_utf8 = [
+        let mut invalid_utf8 = vec![
             ClientOp::OpenRead.byte(),
             OPEN_READ_LINK_SECRET,
             READ_START_SEQ_NUM,
@@ -1157,10 +1210,9 @@ mod tests {
             0,
             0,
             0,
-            0,
-            1,
-            0xff,
         ];
+        invalid_utf8.extend_from_slice(&[b'A'; LINK_SECRET_ENCODED_LENGTH]);
+        *invalid_utf8.last_mut().expect("secret byte") = 0xff;
         assert!(matches!(
             ClientFrame::decode(&invalid_utf8),
             Err(FrameCodecError::InvalidUtf8(_))
@@ -1177,7 +1229,7 @@ mod tests {
             link_secret: None,
             start: ReadStart::TailOffset(80),
             count: None,
-            until: None,
+            end_seq_num: None,
             playback_rate_permille: None,
             snapshot: false,
         }
@@ -1224,7 +1276,14 @@ mod tests {
         ];
         assert!(matches!(
             ClientFrame::decode(&empty_secret),
-            Err(FrameCodecError::EmptyLinkSecret)
+            Err(FrameCodecError::TruncatedFrame { .. })
+        ));
+        let mut malformed_secret = valid.to_vec();
+        malformed_secret[1] = OPEN_READ_LINK_SECRET;
+        malformed_secret.extend_from_slice("B".repeat(43).as_bytes());
+        assert!(matches!(
+            ClientFrame::decode(&malformed_secret),
+            Err(FrameCodecError::InvalidLinkSecret)
         ));
         assert!(matches!(
             ClientFrame::decode(&valid[..valid.len() - 1]),
@@ -1241,19 +1300,19 @@ mod tests {
                 link_secret: None,
                 start: ReadStart::SeqNum(0),
                 count: None,
-                until: None,
+                end_seq_num: None,
                 playback_rate_permille: Some(1_000),
                 snapshot: false,
             }
             .encode(),
-            Err(FrameCodecError::PlaybackRequiresUntil)
+            Err(FrameCodecError::PlaybackRequiresEnd)
         ));
         assert!(matches!(
             ClientFrame::OpenRead {
                 link_secret: None,
                 start: ReadStart::SeqNum(0),
                 count: None,
-                until: Some(1),
+                end_seq_num: Some(1),
                 playback_rate_permille: Some(MAX_PLAYBACK_RATE_PERMILLE + 1),
                 snapshot: false,
             }
