@@ -1438,19 +1438,28 @@ impl WriterSession<'_> {
     }
 }
 
+fn read_options(
+    locator: &StreamLocator,
+    read: &ReadArgs,
+    default_start: ReadStart,
+) -> ReadStreamOptions {
+    let mut options = ReadStreamOptions::new(locator.stream_id);
+    options.start = Some(selected_read_start(
+        read.last,
+        read.seq,
+        read.since,
+        default_start,
+    ));
+    options.limit = read.limit;
+    if let Some(link) = locator.link_declaring(LinkPermissions::allows_read) {
+        options = options.with_link_secret(link.clone());
+    }
+    options
+}
+
 async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
-    let mut request = ReadStreamOptions::new(locator.stream_id);
-    request.start = Some(selected_read_start(
-        args.read.last,
-        args.read.seq,
-        args.read.since,
-        ReadStart::TailOffset(0),
-    ));
-    request.limit = args.read.limit;
-    if let Some(link) = locator.link_declaring(LinkPermissions::allows_read) {
-        request = request.with_link_secret(link.clone());
-    }
+    let request = read_options(&locator, &args.read, ReadStart::TailOffset(0));
 
     read_transcript(
         api_url,
@@ -1466,19 +1475,8 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     if args.read.limit == Some(0) {
         return Ok(());
     }
-    let mut request = ReadStreamOptions::new(locator.stream_id);
-    request.start = Some(selected_read_start(
-        args.read.last,
-        args.read.seq,
-        args.read.since,
-        ReadStart::SeqNum(0),
-    ));
+    let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
     request.snapshot = true;
-    request.limit = args.read.limit;
-    let read_link = locator.link_declaring(LinkPermissions::allows_read);
-    if let Some(link) = read_link {
-        request = request.with_link_secret(link.clone());
-    }
 
     read_transcript(
         api_url,
@@ -1524,23 +1522,35 @@ async fn delete_stream(api_url: Url, args: DeleteArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<()> {
+async fn update_and_print(
+    api_url: Url,
+    owner_link: &LinkInput,
+    request: &UpdateStreamRequest,
+    json: bool,
+    context: &'static str,
+) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
+        owner_client_from_link(api_url, owner_link.as_str())?;
     let stream = client
-        .update_stream(
-            &locator.stream_id,
-            &UpdateStreamRequest {
-                title: StreamTitleUpdate::Unchanged,
-                visibility: Some(args.visibility.into()),
-                expires_at: None,
-            },
-            &owner_link_secret,
-        )
+        .update_stream(&locator.stream_id, request, &owner_link_secret)
         .await
-        .context("failed to update stream visibility")?;
-    print_stream_metadata(&stream, args.json)?;
-    Ok(())
+        .context(context)?;
+    print_stream_metadata(&stream, json)
+}
+
+async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<()> {
+    update_and_print(
+        api_url,
+        &args.owner_link,
+        &UpdateStreamRequest {
+            title: StreamTitleUpdate::Unchanged,
+            visibility: Some(args.visibility.into()),
+            expires_at: None,
+        },
+        args.json,
+        "failed to update stream visibility",
+    )
+    .await
 }
 
 async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
@@ -1552,41 +1562,33 @@ async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
         ),
         TitleCommand::Clear(args) => (args.owner_link, StreamTitleUpdate::Clear, args.json),
     };
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, owner_link.as_str())?;
-    let stream = client
-        .update_stream(
-            &locator.stream_id,
-            &UpdateStreamRequest {
-                title,
-                visibility: None,
-                expires_at: None,
-            },
-            &owner_link_secret,
-        )
-        .await
-        .context("failed to update stream title")?;
-    print_stream_metadata(&stream, json)?;
-    Ok(())
+    update_and_print(
+        api_url,
+        &owner_link,
+        &UpdateStreamRequest {
+            title,
+            visibility: None,
+            expires_at: None,
+        },
+        json,
+        "failed to update stream title",
+    )
+    .await
 }
 
 async fn renew_stream(api_url: Url, args: RenewArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
-    let stream = client
-        .update_stream(
-            &locator.stream_id,
-            &UpdateStreamRequest {
-                title: StreamTitleUpdate::Unchanged,
-                visibility: None,
-                expires_at: Some(args.expires.rfc3339()?),
-            },
-            &owner_link_secret,
-        )
-        .await
-        .context("failed to renew stream")?;
-    print_stream_metadata(&stream, args.json)?;
-    Ok(())
+    update_and_print(
+        api_url,
+        &args.owner_link,
+        &UpdateStreamRequest {
+            title: StreamTitleUpdate::Unchanged,
+            visibility: None,
+            expires_at: Some(args.expires.rfc3339()?),
+        },
+        args.json,
+        "failed to renew stream",
+    )
+    .await
 }
 
 async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Result<()> {
