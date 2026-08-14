@@ -24,24 +24,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let created = client
         .create_stream(&CreateStreamRequest {
-            recovery_secret: None,
             title: Some("SDK lifecycle".parse()?),
             visibility: Visibility::Private,
             expires_in_secs: None,
-            issue_links: Some(vec![
-                InitialStreamLink {
-                    label: "Owner".parse()?,
-                    permissions: LinkPermissions::owner(),
-                },
-                InitialStreamLink {
-                    label: "Example writer".parse()?,
-                    permissions: LinkPermissions::write(),
-                },
-                InitialStreamLink {
-                    label: "Example reader".parse()?,
-                    permissions: LinkPermissions::read(),
-                },
-            ]),
+            issue_links: vec![
+                InitialStreamLink::new("Owner".parse()?, LinkPermissions::owner()),
+                InitialStreamLink::new("Example writer".parse()?, LinkPermissions::write()),
+                InitialStreamLink::new("Example reader".parse()?, LinkPermissions::read()),
+            ],
         })
         .await?;
     let owner_link_secret = created

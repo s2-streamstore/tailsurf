@@ -28,10 +28,10 @@ use tailsurf::{
     WriteRecord, WriterId,
     protocol::{
         rest::{
-            CreateStreamRequest, CreateStreamResponse, InitialStreamLink, IssueLinkRequest,
-            IssueLinkResponse, IssuedStreamLink, ListLinksResponse, RenameLinkRequest,
-            StreamInfoResponse, StreamLinkStatus, StreamLinkSummary, StreamTitleUpdate,
-            UpdateStreamRequest, Visibility,
+            CreateStreamRequest, CreateStreamResponse, IssueLinkRequest, IssueLinkResponse,
+            IssuedStreamLink, ListLinksResponse, RenameLinkRequest, StreamInfoResponse,
+            StreamLinkStatus, StreamLinkSummary, StreamTitleUpdate, UpdateStreamRequest,
+            Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -179,7 +179,7 @@ async fn new_outputs_json_and_link_files() {
 }
 
 #[tokio::test]
-async fn new_prints_recovery_links_before_a_link_file_error() {
+async fn new_prints_created_links_before_a_link_file_error() {
     let server = TestServer::start().await;
     let unwritable_path = std::env::temp_dir().join(format!(
         "tsf-cli-unwritable-link-{}-{}",
@@ -204,7 +204,7 @@ async fn new_prints_recovery_links_before_a_link_file_error() {
     .await;
 
     assert!(!output.status.success());
-    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("recovery JSON");
+    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("creation JSON");
     let owner_link = created_link_url(&json, "Owner");
     let locator = StreamLocator::parse(owner_link).expect("owner link parses");
     assert!(
@@ -248,13 +248,19 @@ async fn create_stream_recovers_a_committed_truncated_response() {
     server.fail_next_create_body();
     let key = CreateStreamIdempotencyKey::new_random();
     let exposed_key = key.expose_secret().to_owned();
+    let request = CreateStreamRequest::default();
+    let expected_owner_secret = request.issue_links[0].secret.expose_secret().to_owned();
 
     let created = TsfClient::with_api_base_url(server.api_url.clone())
-        .create_stream_with_idempotency_key(&CreateStreamRequest::default(), &key)
+        .create_stream_with_idempotency_key(&request, &key)
         .await
         .expect("recover committed create");
 
     assert_eq!(created.links.len(), 1);
+    assert_eq!(
+        created.links[0].secret.expose_secret(),
+        expected_owner_secret
+    );
     let observed_keys = server.create_idempotency_keys();
     assert_eq!(observed_keys.len(), 2);
     assert!(
@@ -1877,12 +1883,10 @@ async fn test_create_stream(
         *next_stream += 1;
         stream_id
     };
-    let requested_links = request
-        .issue_links
-        .unwrap_or_else(|| vec![test_initial_link("Owner", LinkPermissions::owner())]);
+    let requested_links = request.issue_links;
     let links = requested_links
         .into_iter()
-        .map(|link| test_issue_stream_link(&state, link.label, link.permissions))
+        .map(|link| test_store_stream_link(&state, None, link.secret, link.label, link.permissions))
         .collect::<Vec<_>>();
     let response_links = links
         .iter()
@@ -2020,7 +2024,13 @@ async fn test_issue_link(
     if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
-    let link = test_issue_stream_link(&state, request.label, request.permissions);
+    let link = test_store_stream_link(
+        &state,
+        Some(request.link_id),
+        request.secret,
+        request.label,
+        request.permissions,
+    );
     let response = IssueLinkResponse {
         link_id: link.link_id,
         label: link.label.clone(),
@@ -2326,23 +2336,19 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         .expect("close read socket");
 }
 
-fn test_initial_link(label: &str, permissions: LinkPermissions) -> InitialStreamLink {
-    InitialStreamLink {
-        label: label.parse().expect("test link label"),
-        permissions,
-    }
-}
-
-fn test_issue_stream_link(
+fn test_store_stream_link(
     state: &TestApiState,
+    link_id: Option<LinkId>,
+    secret: LinkSecret,
     label: LinkLabel,
     permissions: LinkPermissions,
 ) -> TestLink {
     let mut next_link = state.next_link.lock().expect("next link lock");
-    let link_id = format!("{:x}{:023x}", *next_link, *next_link)
-        .parse::<LinkId>()
-        .expect("link id");
-    let secret = LinkSecret::from(format!("{:042}A", *next_link));
+    let link_id = link_id.unwrap_or_else(|| {
+        format!("{:x}{:023x}", *next_link, *next_link)
+            .parse::<LinkId>()
+            .expect("link id")
+    });
     *next_link += 1;
     TestLink {
         link_id,

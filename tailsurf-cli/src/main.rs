@@ -551,12 +551,12 @@ impl FromStr for InitialLinkArg {
         let (permission, label) = value
             .split_once('=')
             .ok_or_else(|| "link must use PERMISSION=LABEL".to_owned())?;
-        Ok(Self(InitialStreamLink {
-            label: label
+        Ok(Self(InitialStreamLink::new(
+            label
                 .parse()
                 .map_err(|error| format!("invalid link label: {error}"))?,
-            permissions: permission.parse::<PermissionArg>()?.0,
-        }))
+            permission.parse::<PermissionArg>()?.0,
+        )))
     }
 }
 
@@ -922,8 +922,7 @@ async fn create_stream(
             title,
             visibility,
             expires_in_secs,
-            issue_links: Some(issue_links),
-            recovery_secret: None,
+            issue_links,
         })
         .await;
     match result {
@@ -1618,11 +1617,21 @@ fn link_status_label(status: StreamLinkStatus) -> &'static str {
 async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
         owner_client_from_link(api_url, args.owner_link.as_str())?;
-    let InitialStreamLink { label, permissions } = args.link.0;
+    let InitialStreamLink {
+        label,
+        permissions,
+        secret,
+    } = args.link.0;
     let issued = client
         .issue_link(
             &locator.stream_id,
-            &IssueLinkRequest::new(label, permissions, args.expires.rfc3339()),
+            &IssueLinkRequest {
+                link_id: LinkId::generate(),
+                secret,
+                label,
+                permissions,
+                expires_at: args.expires.rfc3339(),
+            },
             &owner_link_secret,
         )
         .await
@@ -2165,12 +2174,12 @@ fn write_private_file(path: &Path, value: &str) -> std::io::Result<()> {
 }
 
 fn initial_link(label: &str, permissions: LinkPermissions) -> eyre::Result<InitialStreamLink> {
-    Ok(InitialStreamLink {
-        label: label
+    Ok(InitialStreamLink::new(
+        label
             .parse()
             .map_err(|error| eyre!("invalid link label: {error}"))?,
         permissions,
-    })
+    ))
 }
 
 fn visibility_from_flags(public: bool) -> Visibility {

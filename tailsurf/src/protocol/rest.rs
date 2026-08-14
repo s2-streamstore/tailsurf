@@ -19,15 +19,8 @@ pub enum Visibility {
 }
 
 /// Options for creating a stream.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
-    /// Secret recovery material retained with one pending create request.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_link_secret"
-    )]
-    pub recovery_secret: Option<LinkSecret>,
     /// Optional human-facing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<StreamTitle>,
@@ -37,32 +30,45 @@ pub struct CreateStreamRequest {
     /// Requested lifetime in seconds, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in_secs: Option<u64>,
-    /// Requested initial link permissions. The service adds an owner link when absent. At most
-    /// three effective links are allowed, including the owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issue_links: Option<Vec<InitialStreamLink>>,
+    /// Prepared initial links. At least one must be an owner. At most three are allowed.
+    pub issue_links: Vec<InitialStreamLink>,
 }
 
-fn serialize_optional_link_secret<S>(
-    secret: &Option<LinkSecret>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match secret {
-        Some(secret) => crate::ids::serialize_link_secret(secret, serializer),
-        None => serializer.serialize_none(),
+impl Default for CreateStreamRequest {
+    fn default() -> Self {
+        Self {
+            title: None,
+            visibility: Visibility::Private,
+            expires_in_secs: None,
+            issue_links: vec![InitialStreamLink::new(
+                "Owner".parse().expect("default owner label is valid"),
+                LinkPermissions::owner(),
+            )],
+        }
     }
 }
 
 /// One link requested atomically with stream creation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitialStreamLink {
     /// Owner-visible label for the link.
     pub label: LinkLabel,
     /// Permissions carried by the link.
     pub permissions: LinkPermissions,
+    /// Client-generated secret retained with this prepared request.
+    #[serde(serialize_with = "crate::ids::serialize_link_secret")]
+    pub secret: LinkSecret,
+}
+
+impl InitialStreamLink {
+    /// Creates one initial link with an independent random secret.
+    pub fn new(label: LinkLabel, permissions: LinkPermissions) -> Self {
+        Self {
+            label,
+            permissions,
+            secret: random_link_secret(),
+        }
+    }
 }
 
 /// A stream link issued during stream creation.
@@ -117,16 +123,20 @@ pub struct IssueLinkRequest {
 impl IssueLinkRequest {
     /// Creates retry-safe link issuance material.
     pub fn new(label: LinkLabel, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
-        let mut secret = [0_u8; 32];
-        rand::rng().fill_bytes(&mut secret);
         Self {
             link_id: LinkId::generate(),
-            secret: encode_base64url_32(&secret).into(),
+            secret: random_link_secret(),
             label,
             permissions,
             expires_at,
         }
     }
+}
+
+fn random_link_secret() -> LinkSecret {
+    let mut secret = [0_u8; 32];
+    rand::rng().fill_bytes(&mut secret);
+    encode_base64url_32(&secret).into()
 }
 
 /// A newly issued stream link.
@@ -433,13 +443,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn omits_absent_create_stream_options() {
+    fn prepares_a_default_owner_for_stream_creation() {
         let request = CreateStreamRequest::default();
+        let value = serde_json::to_value(request).expect("serialize create request");
 
-        assert_eq!(
-            serde_json::to_value(request).expect("serialize create request"),
-            json!({ "visibility": "private" })
-        );
+        assert_eq!(value["visibility"], "private");
+        assert_eq!(value["issue_links"][0]["label"], "Owner");
+        assert_eq!(value["issue_links"][0]["permissions"], "o");
+        assert!(value["issue_links"][0]["secret"].is_string());
     }
 
     #[test]
