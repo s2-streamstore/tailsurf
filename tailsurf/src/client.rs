@@ -63,8 +63,12 @@ use crate::{
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const API_PREFIX: &str = "/api/v1";
+const MAX_CLIENT_DELAY: Duration = Duration::from_millis(2_147_483_647);
 
 /// Timeouts, retry behavior, and API origin for [`TsfClient`].
+///
+/// Configured durations cannot exceed 2,147,483,647 milliseconds. Required timeouts must be
+/// greater than zero.
 #[derive(Clone, Debug)]
 pub struct TsfClientConfig {
     /// Service origin without the `/api/v1` namespace.
@@ -116,9 +120,9 @@ impl Default for TsfClientConfig {
 pub struct RetryPolicy {
     /// Total attempts including the initial request.
     pub max_attempts: usize,
-    /// Delay before the first retry.
+    /// Base delay before the first retry. Client-controlled delays are jittered.
     pub initial_backoff: Duration,
-    /// Maximum delay between attempts.
+    /// Maximum base delay and server retry hint honored by the client.
     pub max_backoff: Duration,
 }
 
@@ -151,6 +155,16 @@ impl Default for RetryPolicy {
             initial_backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(2),
         }
+    }
+}
+
+fn jittered_backoff(backoff: Duration) -> Duration {
+    if backoff.is_zero() {
+        Duration::ZERO
+    } else {
+        backoff
+            .mul_f64(rand::rng().random_range(0.5_f64..=1.5_f64))
+            .min(MAX_CLIENT_DELAY)
     }
 }
 
@@ -556,6 +570,14 @@ impl TsfClient {
         &self,
         options: WriteStreamOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
+        self.retry_transient(|| self.connect_write_session_once(options.clone()))
+            .await
+    }
+
+    async fn connect_write_session_once(
+        &self,
+        options: WriteStreamOptions,
+    ) -> Result<TsfWriteSession, TsfClientError> {
         let url = self.websocket_url(&format!("/streams/{}/write", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
@@ -566,23 +588,14 @@ impl TsfClient {
         }
         .encode()?;
 
-        self.retry_transient(|| {
-            let url = url.clone();
-            let opening_frame = opening_frame.clone();
+        let mut ws =
+            connect_websocket(url, connect_timeout, operation_timeout, opening_frame).await?;
+        with_timeout(operation_timeout, "writer ready", expect_ready(&mut ws)).await?;
 
-            async move {
-                let mut ws =
-                    connect_websocket(url, connect_timeout, operation_timeout, opening_frame)
-                        .await?;
-                with_timeout(operation_timeout, "writer ready", expect_ready(&mut ws)).await?;
-
-                Ok(TsfWriteSession {
-                    ws,
-                    operation_timeout,
-                })
-            }
+        Ok(TsfWriteSession {
+            ws,
+            operation_timeout,
         })
-        .await
     }
 
     /// Connects a resumable read session at the requested position and bounds.
@@ -919,10 +932,7 @@ impl TsfClient {
                     let delay = error
                         .retry_after()
                         .map(|delay| delay.min(retry_policy.max_backoff))
-                        .unwrap_or_else(|| {
-                            let jitter = rand::rng().random_range(0.5_f64..=1.5_f64);
-                            backoff.mul_f64(jitter)
-                        });
+                        .unwrap_or_else(|| jittered_backoff(backoff));
                     if !delay.is_zero() {
                         sleep(delay).await;
                     }
@@ -998,7 +1008,7 @@ pub const MAX_WRITER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 /// This matches the TSF writer socket's hard queued-message bound.
 pub const MAX_WRITER_UNACKED_RECORDS: usize = 128;
 
-/// Memory, concurrency, and reconnect bounds for [`TsfWriter`].
+/// Memory and concurrency bounds for [`TsfWriter`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TsfWriterConfig {
     /// Maximum total payload bytes retained until durability acknowledgement. Must not exceed
@@ -1007,8 +1017,6 @@ pub struct TsfWriterConfig {
     /// Maximum number of records retained until durability acknowledgement. Must not exceed
     /// [`MAX_WRITER_UNACKED_RECORDS`].
     pub max_unacked_records: usize,
-    /// Maximum consecutive writer reconnect attempts before failing pending records.
-    pub max_reconnect_attempts: usize,
 }
 
 impl TsfWriterConfig {
@@ -1044,7 +1052,6 @@ impl Default for TsfWriterConfig {
         Self {
             max_unacked_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES,
             max_unacked_records: MAX_WRITER_UNACKED_RECORDS,
-            max_reconnect_attempts: 3,
         }
     }
 }
@@ -1188,7 +1195,7 @@ impl TsfWriter {
         let config = config.validate()?;
         let command_capacity = config.max_unacked_records + 1;
         let (cmd_tx, cmd_rx) = mpsc::channel(command_capacity);
-        let task = tokio::spawn(run_writer(client, options, session, cmd_rx, config));
+        let task = tokio::spawn(run_writer(client, options, session, cmd_rx));
 
         Ok(Self {
             cmd_tx,
@@ -1451,7 +1458,6 @@ async fn run_writer(
     options: WriteStreamOptions,
     mut session: TsfWriteSession,
     mut cmd_rx: mpsc::Receiver<WriterCommand>,
-    config: TsfWriterConfig,
 ) {
     let mut pending = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
@@ -1471,7 +1477,6 @@ async fn run_writer(
                                 &client,
                                 &options,
                                 &pending,
-                                config.max_reconnect_attempts,
                                 &mut reconnect_attempts,
                                 error,
                             )
@@ -1503,7 +1508,6 @@ async fn run_writer(
                             &client,
                             &options,
                             &pending,
-                            config.max_reconnect_attempts,
                             &mut reconnect_attempts,
                             TsfClientError::WebSocketClosed,
                         )
@@ -1519,7 +1523,6 @@ async fn run_writer(
                             &client,
                             &options,
                             &pending,
-                            config.max_reconnect_attempts,
                             &mut reconnect_attempts,
                             error,
                         )
@@ -1615,7 +1618,6 @@ async fn recover_pending_appends(
     client: &TsfClient,
     options: &WriteStreamOptions,
     pending: &VecDeque<PendingAppend>,
-    max_reconnect_attempts: usize,
     reconnect_attempts: &mut usize,
     mut error: TsfClientError,
 ) -> Result<(), TsfClientError> {
@@ -1623,9 +1625,20 @@ async fn recover_pending_appends(
         return Err(error);
     }
 
-    while *reconnect_attempts < max_reconnect_attempts {
+    let retry_policy = client.config.retry_policy;
+    let max_reconnects = retry_policy.attempt_count().saturating_sub(1);
+    while *reconnect_attempts < max_reconnects {
+        let backoff = retry_policy
+            .initial_backoff
+            .checked_mul(1_u32 << (*reconnect_attempts).min(30))
+            .unwrap_or(retry_policy.max_backoff)
+            .min(retry_policy.max_backoff);
+        let delay = jittered_backoff(backoff);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
         *reconnect_attempts += 1;
-        match client.connect_write_session(options.clone()).await {
+        match client.connect_write_session_once(options.clone()).await {
             Ok(mut connected) => match send_retained(&mut connected, pending, 0).await {
                 Ok(()) => {
                     *session = connected;
@@ -1803,6 +1816,7 @@ impl TsfSseReadSession {
                     .checked_mul(1_u32 << self.reconnect_attempts.min(30))
                     .unwrap_or(self.client.config.retry_policy.max_backoff)
                     .min(self.client.config.retry_policy.max_backoff);
+                let delay = jittered_backoff(delay);
                 if !delay.is_zero() {
                     sleep(delay).await;
                 }
@@ -2008,8 +2022,9 @@ impl TsfReadSession {
 
     async fn reconnect(&mut self) -> Result<(), TsfClientError> {
         debug_assert!(self.reconnect_needed);
-        if !self.pending_reconnect_backoff.is_zero() {
-            sleep(self.pending_reconnect_backoff).await;
+        let delay = jittered_backoff(self.pending_reconnect_backoff);
+        if !delay.is_zero() {
+            sleep(delay).await;
         }
         let ConnectedReadSocket {
             socket,
@@ -2983,19 +2998,21 @@ fn validate_client_config(config: &TsfClientConfig) -> Result<(), TsfClientError
             config.websocket_operation_timeout,
         ),
     ] {
-        if value.is_zero() {
+        if value.is_zero() || value > MAX_CLIENT_DELAY {
             return Err(TsfClientError::InvalidClientConfig(format!(
-                "{name} must be greater than zero"
+                "{name} must be greater than zero and at most {} milliseconds",
+                MAX_CLIENT_DELAY.as_millis()
             )));
         }
     }
     if config
         .websocket_read_idle_timeout
-        .is_some_and(|timeout| timeout.is_zero())
+        .is_some_and(|timeout| timeout.is_zero() || timeout > MAX_CLIENT_DELAY)
     {
-        return Err(TsfClientError::InvalidClientConfig(
-            "websocket_read_idle_timeout must be greater than zero when set".to_owned(),
-        ));
+        return Err(TsfClientError::InvalidClientConfig(format!(
+            "websocket_read_idle_timeout must be greater than zero and at most {} milliseconds when set",
+            MAX_CLIENT_DELAY.as_millis()
+        )));
     }
     if config.retry_policy.max_attempts == 0 {
         return Err(TsfClientError::InvalidClientConfig(
@@ -3006,6 +3023,12 @@ fn validate_client_config(config: &TsfClientConfig) -> Result<(), TsfClientError
         return Err(TsfClientError::InvalidClientConfig(
             "retry_policy.initial_backoff must not exceed retry_policy.max_backoff".to_owned(),
         ));
+    }
+    if config.retry_policy.max_backoff > MAX_CLIENT_DELAY {
+        return Err(TsfClientError::InvalidClientConfig(format!(
+            "retry_policy delays must not exceed {} milliseconds",
+            MAX_CLIENT_DELAY.as_millis()
+        )));
     }
     Ok(())
 }
@@ -3601,6 +3624,22 @@ mod tests {
             rest_request_timeout: Duration::ZERO,
             ..TsfClientConfig::default()
         };
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
+
+        let config = TsfClientConfig {
+            websocket_connect_timeout: MAX_CLIENT_DELAY + Duration::from_millis(1),
+            ..TsfClientConfig::default()
+        };
+        assert!(matches!(
+            TsfClient::with_config(config),
+            Err(TsfClientError::InvalidClientConfig(_))
+        ));
+
+        let mut config = TsfClientConfig::default();
+        config.retry_policy.max_backoff = MAX_CLIENT_DELAY + Duration::from_millis(1);
         assert!(matches!(
             TsfClient::with_config(config),
             Err(TsfClientError::InvalidClientConfig(_))

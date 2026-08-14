@@ -878,7 +878,6 @@ async fn writer_close_is_not_blocked_by_an_unused_reservation() {
             TsfWriterConfig {
                 max_unacked_bytes: 1,
                 max_unacked_records: 1,
-                max_reconnect_attempts: 0,
             },
         )
         .await
