@@ -1543,7 +1543,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     assert_eq!(info_json["stream_id"], created_json["stream_id"]);
     assert_eq!(info_json["title"], "Deploy log");
     assert_eq!(info_json["visibility"], "private");
-    assert_eq!(info_json["state"], "active");
+    assert!(info_json.get("state").is_none());
     assert_eq!(info_json["expires_at"], created_json["expires_at"]);
 
     let renewed = run_tsf(&server, ["renew", owner_link, "2d", "--json"], None).await;
@@ -1951,6 +1951,7 @@ async fn test_create_stream(
         stream_id,
         title: request.title,
         visibility: request.visibility,
+        created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at,
         links: response_links,
     };
@@ -2123,6 +2124,7 @@ async fn test_list_links(
                 is_current: link.active && link.permissions.allows_owner(),
             })
             .collect(),
+        next_cursor: None,
     })
     .into_response()
 }
@@ -2395,12 +2397,9 @@ fn test_get_stream_response(stream: &TestStream) -> StreamInfoResponse {
     StreamInfoResponse {
         stream_id: stream.stream_id,
         title: stream.title.clone(),
-        basin: "test-basin".to_owned(),
         visibility: stream.visibility,
-        state: if stream.deleted { "deleted" } else { "active" }.to_owned(),
         created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at: stream.expires_at.clone(),
-        active_link_count: stream.links.iter().filter(|link| link.active).count(),
     }
 }
 

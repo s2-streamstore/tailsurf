@@ -25,8 +25,8 @@ pub use client::{
     AppendAck, AppendReceipt, AppendTicket, CreateStreamIdempotencyKey, IntoRecordData,
     InvalidCreateStreamIdempotencyKey, MAX_PRODUCER_UNACKED_PAYLOAD_BYTES,
     MAX_PRODUCER_UNACKED_RECORDS, RetryPolicy, TsfAppendSession, TsfClient, TsfClientConfig,
-    TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession, WritePermit, WriteRecord,
-    default_api_base_url,
+    TsfClientError, TsfProducer, TsfProducerConfig, TsfReadSession, TsfSseReadSession, WritePermit,
+    WriteRecord, default_api_base_url,
 };
 pub use ids::{LinkId, LinkSecret, StreamId, WriterId};
 pub use link_label::{LinkLabel, LinkLabelError, MAX_LINK_LABEL_CODE_POINTS};

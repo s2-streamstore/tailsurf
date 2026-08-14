@@ -21,7 +21,8 @@ use secrecy::ExposeSecret;
 use serde::Serialize;
 use tailsurf::{
     AppendTicket, CreateStreamIdempotencyKey, LinkId, LinkLabel, LinkPermissions, LinkSecret,
-    StreamId, StreamTitle, TsfClient, TsfProducer, TsfReadSession, WriteRecord, WriterId,
+    StreamId, StreamTitle, TsfClient, TsfProducer, TsfReadSession, TsfSseReadSession, WriteRecord,
+    WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, InitialStreamLink, IssueLinkRequest,
@@ -226,6 +227,9 @@ struct TailArgs {
 
 #[derive(Debug, Args)]
 struct ReadArgs {
+    /// Use resumable HTTP event streaming instead of the binary WebSocket transport.
+    #[arg(long)]
+    sse: bool,
     /// Start this many records before the current tail.
     #[arg(short = 'n', long, conflicts_with_all = ["seq", "since"])]
     last: Option<u64>,
@@ -1461,7 +1465,11 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
         request = request.with_stream_link(link);
     }
 
-    read_transcript(api_url, request, args.read.max_logical_record_bytes).await
+    if args.read.sse {
+        read_transcript_sse(api_url, request, args.read.max_logical_record_bytes).await
+    } else {
+        read_transcript(api_url, request, args.read.max_logical_record_bytes).await
+    }
 }
 
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
@@ -1483,7 +1491,11 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
         request = request.with_stream_link(link);
     }
 
-    read_transcript(api_url, request, args.read.max_logical_record_bytes).await
+    if args.read.sse {
+        read_transcript_sse(api_url, request, args.read.max_logical_record_bytes).await
+    } else {
+        read_transcript(api_url, request, args.read.max_logical_record_bytes).await
+    }
 }
 
 async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
@@ -1638,11 +1650,7 @@ async fn issue_link(api_url: Url, web_url: Url, args: IssueLinkArgs) -> eyre::Re
     let issued = client
         .issue_link(
             &locator.stream_id,
-            &IssueLinkRequest {
-                label,
-                permissions,
-                expires_at: args.expires.rfc3339(),
-            },
+            &IssueLinkRequest::new(label, permissions, args.expires.rfc3339()),
             &owner_link_secret,
         )
         .await
@@ -1731,6 +1739,34 @@ async fn read_transcript(
     reader_task.await.context("transcript reader task panicked")
 }
 
+async fn read_transcript_sse(
+    api_url: Url,
+    options: ReadStreamOptions,
+    max_logical_record_bytes: usize,
+) -> eyre::Result<()> {
+    if options.count == Some(0) {
+        return Ok(());
+    }
+    let client = TsfClient::with_api_base_url(api_url);
+    let reader = client
+        .connect_sse_reader(options)
+        .await
+        .context("failed to connect SSE reader")?;
+    let (record_tx, mut record_rx) = mpsc::channel(TRANSCRIPT_RECORD_QUEUE);
+    let reader_task = tokio::spawn(assemble_sse_transcript_records(
+        reader,
+        max_logical_record_bytes,
+        record_tx,
+    ));
+    let mut stdout = BufWriter::with_capacity(TRANSCRIPT_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
+    let result = write_transcript_records(&mut record_rx, &mut stdout).await;
+    stdout.flush().await.context("failed to flush stdout")?;
+    result?;
+    reader_task
+        .await
+        .context("SSE transcript reader task panicked")
+}
+
 /// Writes decoded records until the reader finishes, flushing whenever none is already waiting.
 async fn write_transcript_records(
     record_rx: &mut mpsc::Receiver<eyre::Result<TranscriptRecord>>,
@@ -1767,6 +1803,36 @@ async fn assemble_transcript_records(
     if let Err(error) =
         forward_transcript_records(&mut reader, max_logical_record_bytes, &record_tx).await
     {
+        let _ = record_tx.send(Err(error)).await;
+    }
+}
+
+async fn assemble_sse_transcript_records(
+    mut reader: TsfSseReadSession,
+    max_logical_record_bytes: usize,
+    record_tx: mpsc::Sender<eyre::Result<TranscriptRecord>>,
+) {
+    let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
+    let result = async {
+        while let Some(record) = reader
+            .next_record()
+            .await
+            .context("failed to read SSE stream")?
+        {
+            let Some(record) = transcript
+                .push_record(record)
+                .context("failed to assemble transcript record")?
+            else {
+                continue;
+            };
+            if record_tx.send(Ok(record)).await.is_err() {
+                return eyre::Result::<()>::Ok(());
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
         let _ = record_tx.send(Err(error)).await;
     }
 }
@@ -2026,10 +2092,8 @@ fn print_stream_info(stream: &StreamInfoResponse, json: bool) -> eyre::Result<()
                 .map_or("Untitled stream", StreamTitle::as_str)
         );
         println!("Visibility: {}", visibility_label(stream.visibility));
-        println!("State: {}", stream.state);
         println!("Created: {}", stream.created_at);
         println!("Expires: {}", stream.expires_at);
-        println!("Active links: {}", stream.active_link_count);
     } else {
         println!("{}", serde_json::to_string_pretty(stream)?);
     }

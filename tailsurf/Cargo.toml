@@ -17,7 +17,7 @@ base64.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true, features = ["sink", "std"] }
 rand.workspace = true
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
