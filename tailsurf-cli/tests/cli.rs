@@ -1038,7 +1038,7 @@ async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
 }
 
 #[tokio::test]
-async fn sse_snapshot_receives_an_explicit_nullable_boundary() {
+async fn sse_snapshot_receives_an_explicit_empty_boundary() {
     let server = FakeSseServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1057,7 +1057,7 @@ async fn sse_snapshot_receives_an_explicit_nullable_boundary() {
         session.snapshot_boundary(),
         Some(ReadSnapshotBoundary {
             next_seq_num: 0,
-            last_timestamp_ms: None,
+            last_timestamp_ms: 0,
         })
     );
     server.abort();
@@ -2279,7 +2279,10 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         }
         let caught_up = ReadCaughtUp {
             next_seq_num: stream.records.len() as u64,
-            last_timestamp_ms: stream.records.last().map(|record| record.timestamp_ms),
+            last_timestamp_ms: stream
+                .records
+                .last()
+                .map_or(0, |record| record.timestamp_ms),
         };
         (
             test_read_stream_info(stream),
@@ -3083,12 +3086,13 @@ async fn fake_sse_read(
         return StatusCode::NO_CONTENT.into_response();
     }
     let snapshot_boundary = if snapshot {
-        "event: snapshot_boundary\ndata: {\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}\n\n"
+        "event: snapshot_boundary\ndata: {\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}\n\n"
     } else {
         ""
     };
+    let cursor = if snapshot { "v1,0,0,0,0" } else { "v1,0,0" };
     let body = format!(
-        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{snapshot_boundary}id: v1,0,0\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":null}}\n\n"
+        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{snapshot_boundary}id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
     );
     (
         StatusCode::OK,
@@ -3240,7 +3244,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
             &mut socket,
             ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
                 next_seq_num: fake_read_next_seq_num(state.mode),
-                last_timestamp_ms: Some(1_781_717_406_000),
+                last_timestamp_ms: 1_781_717_406_000,
             }),
         )
         .await
@@ -3261,7 +3265,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
                     &mut socket,
                     ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 5,
-                        last_timestamp_ms: Some(1_781_717_406_010),
+                        last_timestamp_ms: 1_781_717_406_010,
                     }),
                 )
                 .await

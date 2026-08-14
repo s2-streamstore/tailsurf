@@ -105,16 +105,25 @@
         "next_seq_num": "102",
         "last_timestamp_ms": "1786000000456"
       },
-      "hex": "840100000000000000660000019fd5e545c8"
+      "hex": "8400000000000000660000019fd5e545c8"
     },
     {
       "name": "caught up on empty stream",
       "frame": {
         "type": "caught_up",
         "next_seq_num": "0",
-        "last_timestamp_ms": null
+        "last_timestamp_ms": "0"
       },
-      "hex": "84000000000000000000"
+      "hex": "8400000000000000000000000000000000"
+    },
+    {
+      "name": "caught up after epoch timestamp",
+      "frame": {
+        "type": "caught_up",
+        "next_seq_num": "1",
+        "last_timestamp_ms": "0"
+      },
+      "hex": "8400000000000000010000000000000000"
     },
     {
       "name": "stream info",
@@ -135,7 +144,7 @@
         "next_seq_num": "102",
         "last_timestamp_ms": "1786000000456"
       },
-      "hex": "860100000000000000660000019fd5e545c8"
+      "hex": "8600000000000000660000019fd5e545c8"
     }
   ]
 }

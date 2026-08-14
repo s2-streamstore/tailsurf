@@ -84,11 +84,11 @@ enum ServerFixture {
     Heartbeat,
     CaughtUp {
         next_seq_num: String,
-        last_timestamp_ms: Option<String>,
+        last_timestamp_ms: String,
     },
     SnapshotBoundary {
         next_seq_num: String,
-        last_timestamp_ms: Option<String>,
+        last_timestamp_ms: String,
     },
     StreamInfo {
         stream_id: String,
@@ -237,14 +237,14 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             last_timestamp_ms,
         } => ServerFrame::CaughtUp(ReadCaughtUp {
             next_seq_num: parse_u64(&next_seq_num),
-            last_timestamp_ms: last_timestamp_ms.as_deref().map(parse_u64),
+            last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
         ServerFixture::SnapshotBoundary {
             next_seq_num,
             last_timestamp_ms,
         } => ServerFrame::SnapshotBoundary(ReadSnapshotBoundary {
             next_seq_num: parse_u64(&next_seq_num),
-            last_timestamp_ms: last_timestamp_ms.as_deref().map(parse_u64),
+            last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
         ServerFixture::StreamInfo {
             stream_id,

@@ -68,8 +68,6 @@ const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET
 const READ_START_SEQ_NUM: u8 = 0x01;
 const READ_START_TIMESTAMP_MS: u8 = 0x02;
 const READ_START_TAIL_OFFSET: u8 = 0x03;
-const POSITION_LAST_TIMESTAMP: u8 = 0x01;
-const POSITION_FLAGS: u8 = POSITION_LAST_TIMESTAMP;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,8 +220,8 @@ pub struct AppendRecord {
 pub struct ReadCaughtUp {
     /// Sequence number assigned to the next appended record.
     pub next_seq_num: u64,
-    /// Timestamp of the last record, or `None` for an empty stream.
-    pub last_timestamp_ms: Option<u64>,
+    /// Timestamp of the last record. This is zero when `next_seq_num` is zero.
+    pub last_timestamp_ms: u64,
 }
 
 /// Fixed exclusive ending position captured when a snapshot read opens.
@@ -231,8 +229,8 @@ pub struct ReadCaughtUp {
 pub struct ReadSnapshotBoundary {
     /// Sequence number assigned to the next appended record.
     pub next_seq_num: u64,
-    /// Timestamp of the last record, or `None` for an empty stream.
-    pub last_timestamp_ms: Option<u64>,
+    /// Timestamp of the last record. This is zero when `next_seq_num` is zero.
+    pub last_timestamp_ms: u64,
 }
 
 /// Stream metadata supplied by an authorized read handshake.
@@ -474,15 +472,8 @@ impl ServerFrame {
             Self::Heartbeat => output.put_u8(ServerOp::Heartbeat.byte()),
             Self::CaughtUp(caught_up) => {
                 output.put_u8(ServerOp::CaughtUp.byte());
-                output.put_u8(
-                    caught_up
-                        .last_timestamp_ms
-                        .map_or(0, |_| POSITION_LAST_TIMESTAMP),
-                );
                 output.put_u64(caught_up.next_seq_num);
-                if let Some(last_timestamp_ms) = caught_up.last_timestamp_ms {
-                    output.put_u64(last_timestamp_ms);
-                }
+                output.put_u64(caught_up.last_timestamp_ms);
             }
             Self::StreamInfo(stream) => {
                 let payload =
@@ -492,15 +483,8 @@ impl ServerFrame {
             }
             Self::SnapshotBoundary(boundary) => {
                 output.put_u8(ServerOp::SnapshotBoundary.byte());
-                output.put_u8(
-                    boundary
-                        .last_timestamp_ms
-                        .map_or(0, |_| POSITION_LAST_TIMESTAMP),
-                );
                 output.put_u64(boundary.next_seq_num);
-                if let Some(last_timestamp_ms) = boundary.last_timestamp_ms {
-                    output.put_u64(last_timestamp_ms);
-                }
+                output.put_u64(boundary.last_timestamp_ms);
             }
         }
         Ok(())
@@ -772,23 +756,10 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
 fn decode_position(
     op: u8,
     body: &[u8],
-    frame: impl FnOnce(u64, Option<u64>) -> ServerFrame,
+    frame: impl FnOnce(u64, u64) -> ServerFrame,
 ) -> Result<ServerFrame, FrameCodecError> {
-    let (&flags, body) = body
-        .split_first()
-        .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
-    if flags & !POSITION_FLAGS != 0 {
-        return Err(FrameCodecError::UnknownPositionFlags(
-            flags & !POSITION_FLAGS,
-        ));
-    }
     let (next_seq_num, body) = read_u64(body)?;
-    let (last_timestamp_ms, body) = if flags & POSITION_LAST_TIMESTAMP == 0 {
-        (None, body)
-    } else {
-        let (value, body) = read_u64(body)?;
-        (Some(value), body)
-    };
+    let (last_timestamp_ms, body) = read_u64(body)?;
     ensure_empty(op, body)?;
     Ok(frame(next_seq_num, last_timestamp_ms))
 }
@@ -940,9 +911,6 @@ pub enum FrameCodecError {
     /// An `OpenRead` flag bit is not defined by TSF v1.
     #[error("OpenRead has unknown flags 0x{0:02x}")]
     UnknownOpenReadFlags(u8),
-    /// A position frame used an undefined presence bit.
-    #[error("position frame has unknown flags 0x{0:02x}")]
-    UnknownPositionFlags(u8),
     /// An `OpenRead` selector tag is not defined by TSF v1.
     #[error("OpenRead has unknown start tag 0x{0:02x}")]
     UnknownReadStartTag(u8),
@@ -1228,20 +1196,14 @@ mod tests {
             ClientFrame::decode(&malformed_open_write),
             Err(FrameCodecError::InvalidLinkSecret)
         ));
-        let mut unknown_position_flags = vec![ServerOp::CaughtUp.byte(), 0x02];
-        unknown_position_flags.extend_from_slice(&[0; 8]);
-        assert!(matches!(
-            ServerFrame::decode(&unknown_position_flags),
-            Err(FrameCodecError::UnknownPositionFlags(0x02))
-        ));
-        let mut missing_timestamp = vec![ServerOp::CaughtUp.byte(), POSITION_LAST_TIMESTAMP];
+        let mut missing_timestamp = vec![ServerOp::CaughtUp.byte()];
         missing_timestamp.extend_from_slice(&[0; 8]);
         assert!(matches!(
             ServerFrame::decode(&missing_timestamp),
             Err(FrameCodecError::TruncatedFrame { .. })
         ));
-        let mut trailing_position = vec![ServerOp::CaughtUp.byte(), 0];
-        trailing_position.extend_from_slice(&[0; 9]);
+        let mut trailing_position = vec![ServerOp::CaughtUp.byte()];
+        trailing_position.extend_from_slice(&[0; 17]);
         assert!(matches!(
             ServerFrame::decode(&trailing_position),
             Err(FrameCodecError::TrailingBytes { count: 1, .. })

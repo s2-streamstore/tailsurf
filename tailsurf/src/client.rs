@@ -1681,9 +1681,7 @@ impl TsfSseReadSession {
                             "snapshot boundary changed during resume",
                         ));
                     }
-                    if self.snapshot_boundary.is_none() || boundary.last_timestamp_ms.is_some() {
-                        self.snapshot_boundary = Some(boundary);
-                    }
+                    self.snapshot_boundary = Some(boundary);
                 }
                 self.body = connection.body;
                 self.buffer = connection.buffer;
@@ -2165,16 +2163,23 @@ fn sse_resume_event_id(event: &ParsedSseEvent) -> Result<&str, TsfClientError> {
     let Some(consumed_count) = fields.next().and_then(parse_sse_cursor_u64) else {
         return Err(invalid_sse_resume_cursor());
     };
-    let snapshot_next_seq_num = if let Some(value) = fields.next() {
-        Some(parse_sse_cursor_u64(value).ok_or_else(invalid_sse_resume_cursor)?)
-    } else {
-        None
+    let snapshot = match (fields.next(), fields.next()) {
+        (None, None) => None,
+        (Some(next), Some(timestamp)) => Some((
+            parse_sse_cursor_u64(next).ok_or_else(invalid_sse_resume_cursor)?,
+            parse_sse_cursor_u64(timestamp).ok_or_else(invalid_sse_resume_cursor)?,
+        )),
+        _ => return Err(invalid_sse_resume_cursor()),
     };
     if fields.next().is_some()
         || next_seq_num > MAX_READ_SELECTOR_VALUE
         || consumed_count > next_seq_num
-        || snapshot_next_seq_num
-            .is_some_and(|snapshot| snapshot > MAX_READ_SELECTOR_VALUE || next_seq_num > snapshot)
+        || snapshot.is_some_and(|(snapshot_next_seq_num, snapshot_last_timestamp_ms)| {
+            snapshot_next_seq_num > MAX_READ_SELECTOR_VALUE
+                || next_seq_num > snapshot_next_seq_num
+                || snapshot_last_timestamp_ms > MAX_READ_SELECTOR_VALUE
+                || (snapshot_next_seq_num == 0 && snapshot_last_timestamp_ms != 0)
+        })
     {
         return Err(invalid_sse_resume_cursor());
     }
@@ -2711,7 +2716,7 @@ mod tests {
                 .send(Message::Binary(
                     ServerFrame::CaughtUp(ReadCaughtUp {
                         next_seq_num: 42,
-                        last_timestamp_ms: Some(1_786_377_600_000),
+                        last_timestamp_ms: 1_786_377_600_000,
                     })
                     .encode()
                     .expect("encode caught up"),
@@ -2731,7 +2736,7 @@ mod tests {
             outcome,
             ReadSocketOutcome::CaughtUp(ReadCaughtUp {
                 next_seq_num: 42,
-                last_timestamp_ms: Some(1_786_377_600_000),
+                last_timestamp_ms: 1_786_377_600_000,
             })
         ));
         sender.await.expect("join heartbeat sender");
@@ -2881,7 +2886,7 @@ mod tests {
     fn sse_parser_retains_only_strict_versioned_resume_ids() {
         let cursor = "v1,4,0";
         let block = format!(
-            "id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"4\",\"last_timestamp_ms\":null}}"
+            "id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"4\",\"last_timestamp_ms\":\"0\"}}"
         );
         let event = parse_sse_block(block.as_bytes())
             .expect("parse SSE event")
@@ -2889,12 +2894,26 @@ mod tests {
 
         assert_eq!(sse_resume_event_id(&event).expect("resume cursor"), cursor);
 
+        let snapshot_cursor = "v1,4,0,5,0";
+        let snapshot_event = ParsedSseEvent {
+            event: "records".to_owned(),
+            data: "{}".to_owned(),
+            id: Some(snapshot_cursor.to_owned()),
+        };
+        assert_eq!(
+            sse_resume_event_id(&snapshot_event).expect("snapshot resume cursor"),
+            snapshot_cursor
+        );
+
         for invalid in [
             "v2,4,0",
             "v1,04,0",
             "v1,4,5",
-            "v1,4,0,3",
-            "v1,4,0,5,6",
+            "v1,4,0,5",
+            "v1,4,0,3,6",
+            "v1,4,0,5,6,7",
+            "v1,0,0,0,1",
+            "v1,1,0,1,9007199254740992",
             "v1,4, 0",
         ] {
             let event = ParsedSseEvent {

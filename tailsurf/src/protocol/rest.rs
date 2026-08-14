@@ -308,8 +308,8 @@ pub struct SseCaughtUpEvent {
     #[serde(with = "decimal_u64")]
     pub next_seq_num: u64,
     /// Last record timestamp at the captured boundary.
-    #[serde(default, with = "optional_decimal_u64")]
-    pub last_timestamp_ms: Option<u64>,
+    #[serde(with = "decimal_u64")]
+    pub last_timestamp_ms: u64,
 }
 
 mod decimal_u64 {
