@@ -9,6 +9,11 @@ use crate::{
     protocol::ws::frame::RecordFormat,
 };
 
+/// Maximum records in one stateless atomic append.
+pub const MAX_STATELESS_APPEND_RECORDS: usize = 128;
+/// Maximum aggregate decoded record payload in one stateless atomic append.
+pub const MAX_STATELESS_APPEND_PAYLOAD_BYTES: usize = 900 * 1024;
+
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

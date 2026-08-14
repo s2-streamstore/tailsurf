@@ -40,7 +40,8 @@ use crate::{
     protocol::{
         rest::{
             AppendJsonRecord, AppendRecordsRequest, AppendRecordsResponse, CreateLinkRequest,
-            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, RecordData,
+            CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
+            MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, RecordData,
             RestRecordPart, SseCaughtUpEvent, SseReadRecord, SseRecordsEvent,
             SseSnapshotBoundaryEvent, StreamLinkCredential, StreamLinkSummary, StreamMetadata,
             UpdateStreamRequest,
@@ -228,6 +229,13 @@ impl TsfClient {
         request: &CreateStreamRequest,
         idempotency_key: &CreateStreamIdempotencyKey,
     ) -> Result<CreateStreamResponse, TsfClientError> {
+        if request
+            .links
+            .iter()
+            .any(|link| !is_canonical_base64url_32(link.secret.expose_secret()))
+        {
+            return Err(TsfClientError::InvalidLinkSecret);
+        }
         self.retry_when(
             || {
                 self.send_json_with_bearer(
@@ -305,6 +313,9 @@ impl TsfClient {
         request: &CreateLinkRequest,
         owner_link_secret: &LinkSecret,
     ) -> Result<StreamLinkCredential, TsfClientError> {
+        if !is_canonical_base64url_32(request.secret.expose_secret()) {
+            return Err(TsfClientError::InvalidLinkSecret);
+        }
         let link_id = request.link_id.clone();
         self.retry_transient(|| {
             self.send_json_with_bearer(
@@ -413,7 +424,7 @@ impl TsfClient {
         expected_next_seq_num: Option<u64>,
         write_link_secret: &LinkSecret,
     ) -> Result<AppendRecordsResponse, TsfClientError> {
-        if records.is_empty() || records.len() > 128 {
+        if records.is_empty() || records.len() > MAX_STATELESS_APPEND_RECORDS {
             return Err(TsfClientError::InvalidStatelessAppend(
                 "record count must be between 1 and 128",
             ));
@@ -462,7 +473,7 @@ impl TsfClient {
                 }),
             });
         }
-        if payload_bytes > 900 * 1024 {
+        if payload_bytes > MAX_STATELESS_APPEND_PAYLOAD_BYTES {
             return Err(TsfClientError::InvalidStatelessAppend(
                 "append payload must not exceed 900 KiB",
             ));
