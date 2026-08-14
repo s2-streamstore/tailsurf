@@ -1440,11 +1440,13 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
         request = request.with_link_secret(link.clone());
     }
 
-    if args.read.sse {
-        read_transcript_sse(api_url, request, args.read.max_logical_record_bytes).await
-    } else {
-        read_transcript(api_url, request, args.read.max_logical_record_bytes).await
-    }
+    read_transcript(
+        api_url,
+        request,
+        args.read.max_logical_record_bytes,
+        args.read.sse,
+    )
+    .await
 }
 
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
@@ -1466,11 +1468,13 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
         request = request.with_link_secret(link.clone());
     }
 
-    if args.read.sse {
-        read_transcript_sse(api_url, request, args.read.max_logical_record_bytes).await
-    } else {
-        read_transcript(api_url, request, args.read.max_logical_record_bytes).await
-    }
+    read_transcript(
+        api_url,
+        request,
+        args.read.max_logical_record_bytes,
+        args.read.sse,
+    )
+    .await
 }
 
 async fn stream_metadata(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
@@ -1669,16 +1673,28 @@ async fn read_transcript(
     api_url: Url,
     options: ReadStreamOptions,
     max_logical_record_bytes: usize,
+    sse: bool,
 ) -> eyre::Result<()> {
     if options.limit == Some(0) {
         return Ok(());
     }
 
     let client = TsfClient::with_api_origin(api_url)?;
-    let reader = client
-        .connect_reader(options)
-        .await
-        .context("failed to connect reader")?;
+    let reader = if sse {
+        TranscriptReader::Sse(
+            client
+                .connect_sse_reader(options)
+                .await
+                .context("failed to connect SSE reader")?,
+        )
+    } else {
+        TranscriptReader::WebSocket(
+            client
+                .connect_reader(options)
+                .await
+                .context("failed to connect reader")?,
+        )
+    };
     let (record_tx, mut record_rx) = mpsc::channel(TRANSCRIPT_RECORD_QUEUE);
     let reader_task = tokio::spawn(assemble_transcript_records(
         reader,
@@ -1692,34 +1708,6 @@ async fn read_transcript(
     result?;
 
     reader_task.await.context("transcript reader task panicked")
-}
-
-async fn read_transcript_sse(
-    api_url: Url,
-    options: ReadStreamOptions,
-    max_logical_record_bytes: usize,
-) -> eyre::Result<()> {
-    if options.limit == Some(0) {
-        return Ok(());
-    }
-    let client = TsfClient::with_api_origin(api_url)?;
-    let reader = client
-        .connect_sse_reader(options)
-        .await
-        .context("failed to connect SSE reader")?;
-    let (record_tx, mut record_rx) = mpsc::channel(TRANSCRIPT_RECORD_QUEUE);
-    let reader_task = tokio::spawn(assemble_sse_transcript_records(
-        reader,
-        max_logical_record_bytes,
-        record_tx,
-    ));
-    let mut stdout = BufWriter::with_capacity(TRANSCRIPT_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
-    let result = write_transcript_records(&mut record_rx, &mut stdout).await;
-    stdout.flush().await.context("failed to flush stdout")?;
-    result?;
-    reader_task
-        .await
-        .context("SSE transcript reader task panicked")
 }
 
 /// Writes decoded records until the reader finishes, flushing whenever none is already waiting.
@@ -1748,32 +1736,32 @@ async fn write_transcript_records(
     }
 }
 
-/// Reassembles logical records off the output path so socket reads overlap stdout writes.
-async fn assemble_transcript_records(
-    mut reader: TsfReadSession,
-    max_logical_record_bytes: usize,
-    record_tx: mpsc::Sender<eyre::Result<TranscriptRecord>>,
-) {
-    // Failures belong in stream order behind the records already sent, not in the join result.
-    if let Err(error) =
-        forward_transcript_records(&mut reader, max_logical_record_bytes, &record_tx).await
-    {
-        let _ = record_tx.send(Err(error)).await;
+enum TranscriptReader {
+    WebSocket(TsfReadSession),
+    Sse(TsfSseReadSession),
+}
+
+impl TranscriptReader {
+    async fn next_record(&mut self) -> eyre::Result<Option<tailsurf::ReadRecord>> {
+        match self {
+            Self::WebSocket(reader) => reader.next_record().await.context("failed to read stream"),
+            Self::Sse(reader) => reader
+                .next_record()
+                .await
+                .context("failed to read SSE stream"),
+        }
     }
 }
 
-async fn assemble_sse_transcript_records(
-    mut reader: TsfSseReadSession,
+/// Reassembles logical records off the output path so reads overlap stdout writes.
+async fn assemble_transcript_records(
+    mut reader: TranscriptReader,
     max_logical_record_bytes: usize,
     record_tx: mpsc::Sender<eyre::Result<TranscriptRecord>>,
 ) {
     let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
     let result = async {
-        while let Some(record) = reader
-            .next_record()
-            .await
-            .context("failed to read SSE stream")?
-        {
+        while let Some(record) = reader.next_record().await? {
             let Some(record) = transcript
                 .push_record(record)
                 .context("failed to assemble transcript record")?
@@ -1788,34 +1776,9 @@ async fn assemble_sse_transcript_records(
     }
     .await;
     if let Err(error) = result {
+        // Failures belong in stream order behind records already sent, not in the join result.
         let _ = record_tx.send(Err(error)).await;
     }
-}
-
-async fn forward_transcript_records(
-    reader: &mut TsfReadSession,
-    max_logical_record_bytes: usize,
-    record_tx: &mpsc::Sender<eyre::Result<TranscriptRecord>>,
-) -> eyre::Result<()> {
-    let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
-
-    while let Some(record) = reader
-        .next_record()
-        .await
-        .context("failed to read stream")?
-    {
-        let Some(record) = transcript
-            .push_record(record)
-            .context("failed to assemble transcript record")?
-        else {
-            continue;
-        };
-        if record_tx.send(Ok(record)).await.is_err() {
-            return Ok(());
-        }
-    }
-
-    Ok(())
 }
 async fn write_transcript_data(
     stdout: &mut (impl AsyncWrite + Unpin),
