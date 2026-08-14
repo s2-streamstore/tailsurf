@@ -115,7 +115,6 @@ pub struct CreateStreamResponse {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Human-facing title when one has been set.
-    #[serde(deserialize_with = "deserialize_nullable_stream_title")]
     pub title: Option<StreamTitle>,
     /// Initial visibility.
     pub visibility: Visibility,
@@ -213,7 +212,6 @@ pub struct StreamMetadata {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Human-facing title when one has been set.
-    #[serde(deserialize_with = "deserialize_nullable_stream_title")]
     pub title: Option<StreamTitle>,
     /// Current visibility.
     pub visibility: Visibility,
@@ -470,7 +468,8 @@ where
     match update {
         StreamTitleUpdate::Set(title) => serializer.serialize_some(title),
         StreamTitleUpdate::Clear => serializer.serialize_none(),
-        StreamTitleUpdate::Unchanged => serializer.serialize_unit(),
+        // skip_serializing_if keeps this arm off the wire; serializing `null` would mean Clear.
+        StreamTitleUpdate::Unchanged => unreachable!("Unchanged is skipped by is_unchanged"),
     }
 }
 
@@ -483,16 +482,6 @@ where
         None => StreamTitleUpdate::Clear,
     })
 }
-
-pub(crate) fn deserialize_nullable_stream_title<'de, D>(
-    deserializer: D,
-) -> Result<Option<StreamTitle>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<StreamTitle>::deserialize(deserializer)
-}
-
 fn deserialize_link_secret<'de, D>(deserializer: D) -> Result<LinkSecret, D::Error>
 where
     D: Deserializer<'de>,
@@ -663,6 +652,14 @@ mod tests {
             json!({ "title": null })
         );
         assert_eq!(
+            serde_json::to_value(UpdateStreamRequest {
+                title: StreamTitleUpdate::Set("Deploy log".parse().expect("title")),
+                ..UpdateStreamRequest::default()
+            })
+            .expect("serialize title set request"),
+            json!({ "title": "Deploy log" })
+        );
+        assert_eq!(
             serde_json::from_value::<UpdateStreamRequest>(json!({ "title": "Deploy log" }))
                 .expect("deserialize title update")
                 .title,
@@ -674,17 +671,42 @@ mod tests {
                 .title,
             StreamTitleUpdate::Clear
         );
+        assert_eq!(
+            serde_json::from_value::<UpdateStreamRequest>(json!({}))
+                .expect("deserialize absent title update")
+                .title,
+            StreamTitleUpdate::Unchanged
+        );
     }
 
     #[test]
-    fn response_models_require_nullable_fields_and_rfc3339_timestamps() {
+    fn response_models_tolerate_absent_titles_and_validate_rfc3339_timestamps() {
         let stream = json!({
             "stream_id": "00000000000000000000000000000000",
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z"
         });
-        assert!(serde_json::from_value::<StreamMetadata>(stream).is_err());
+        assert_eq!(
+            serde_json::from_value::<StreamMetadata>(stream)
+                .expect("deserialize absent stream title")
+                .title,
+            None
+        );
+
+        let created = json!({
+            "stream_id": "00000000000000000000000000000000",
+            "visibility": "private",
+            "created_at": "2026-08-13T00:00:00Z",
+            "expires_at": "2026-08-23T00:00:00Z",
+            "links": []
+        });
+        assert!(
+            serde_json::from_value::<CreateStreamResponse>(created)
+                .expect("deserialize absent created stream title")
+                .title
+                .is_none()
+        );
 
         let invalid_time = json!({
             "stream_id": "00000000000000000000000000000000",

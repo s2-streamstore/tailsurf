@@ -1185,18 +1185,23 @@ mod tests {
     }
 
     #[test]
-    fn stream_metadata_requires_nullable_title_and_valid_timestamps() {
-        for json in [
-            br#"{"stream_id":"00000000000000000000000000000000","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#.as_slice(),
-            br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"not-a-time","expires_at":"2026-08-23T00:00:00Z"}"#.as_slice(),
-        ] {
-            let mut encoded = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-            encoded.extend_from_slice(json);
-            assert!(matches!(
-                ServerFrame::decode(&encoded),
-                Err(FrameCodecError::InvalidStreamMetadata(_))
-            ));
-        }
+    fn stream_metadata_tolerates_absent_title_and_requires_valid_timestamps() {
+        let mut missing_title = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
+        missing_title.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#);
+        assert!(matches!(
+            ServerFrame::decode(&missing_title),
+            Ok(ServerFrame::StreamMetadata(StreamMetadata {
+                title: None,
+                ..
+            }))
+        ));
+
+        let mut invalid_time = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
+        invalid_time.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"not-a-time","expires_at":"2026-08-23T00:00:00Z"}"#);
+        assert!(matches!(
+            ServerFrame::decode(&invalid_time),
+            Err(FrameCodecError::InvalidStreamMetadata(_))
+        ));
     }
 
     #[test]
