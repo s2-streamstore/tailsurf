@@ -3,7 +3,7 @@
 use std::env;
 
 use tailsurf::{
-    LinkPermissions, TsfClient, WriterId,
+    ClientWriterId, LinkPermissions, TsfClient,
     protocol::{
         rest::{CreateStreamRequest, InitialStreamLink, Visibility},
         ws::{
@@ -58,8 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let writer = client
         .connect_writer(
-            WriteStreamOptions::new(created.stream_id, WriterId::new_random(), write_link_secret)
-                .with_expected_next_seq_num(0),
+            WriteStreamOptions::new(
+                created.stream_id,
+                ClientWriterId::new_random(),
+                write_link_secret,
+            )
+            .with_expected_next_seq_num(0),
         )
         .await?;
     let ticket = writer

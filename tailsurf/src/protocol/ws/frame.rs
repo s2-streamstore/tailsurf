@@ -5,10 +5,10 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    LinkSecret, StreamId, StreamTitle, WriterId,
+    ClientWriterId, LinkSecret, WriterId,
     ids::is_canonical_base64url_32,
     protocol::{
-        rest::Visibility,
+        rest::StreamMetadata,
         ws::{
             MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE, MIN_PLAYBACK_RATE_PERMILLE,
             ReadStart,
@@ -80,7 +80,7 @@ enum ServerOp {
     ReadBatch = 0x82,
     Heartbeat = 0x83,
     CaughtUp = 0x84,
-    StreamInfo = 0x85,
+    StreamMetadata = 0x85,
     SnapshotBoundary = 0x86,
 }
 
@@ -100,7 +100,7 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::ReadBatch.byte() => Ok(Self::ReadBatch),
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
-            value if value == Self::StreamInfo.byte() => Ok(Self::StreamInfo),
+            value if value == Self::StreamMetadata.byte() => Ok(Self::StreamMetadata),
             value if value == Self::SnapshotBoundary.byte() => Ok(Self::SnapshotBoundary),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
@@ -237,35 +237,6 @@ pub struct SnapshotBoundary {
     pub last_timestamp_ms: u64,
 }
 
-/// Stream metadata supplied by an authorized read handshake.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamInfo {
-    /// Stable stream identifier.
-    pub stream_id: StreamId,
-    /// Human-facing title when one has been set.
-    #[serde(deserialize_with = "crate::protocol::rest::deserialize_nullable_stream_title")]
-    pub title: Option<StreamTitle>,
-    /// Current visibility.
-    pub visibility: Visibility,
-    /// Absolute RFC 3339 stream creation timestamp.
-    #[serde(deserialize_with = "deserialize_rfc3339_string")]
-    pub created_at: String,
-    /// Absolute RFC 3339 stream expiration timestamp.
-    #[serde(deserialize_with = "deserialize_rfc3339_string")]
-    pub expires_at: String,
-}
-
-fn deserialize_rfc3339_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    if !crate::protocol::rest::is_rfc3339_timestamp(&value) {
-        return Err(serde::de::Error::custom("invalid RFC 3339 timestamp"));
-    }
-    Ok(value)
-}
-
 /// Frame sent from a reader or writer to the service.
 #[derive(Clone, Debug)]
 pub enum ClientFrame {
@@ -287,7 +258,7 @@ pub enum ClientFrame {
     /// Opens a write connection and establishes authorization and client writer identity.
     OpenWrite {
         /// Stable identity reused across reconnects.
-        client_writer_id: WriterId,
+        client_writer_id: ClientWriterId,
         /// Secret from a write-capable stream link.
         link_secret: LinkSecret,
         /// Initial stream sequence precondition for this writer session.
@@ -320,7 +291,7 @@ pub enum ServerFrame {
     /// Confirms that every record preceding the captured position was delivered.
     CaughtUp(CaughtUpPosition),
     /// Supplies stream metadata from the read authorization result.
-    StreamInfo(StreamInfo),
+    StreamMetadata(StreamMetadata),
     /// Supplies the fixed exclusive end for a snapshot read.
     SnapshotBoundary(SnapshotBoundary),
 }
@@ -361,7 +332,7 @@ impl ClientFrame {
                 if let Some(value) = expected_next_seq_num {
                     validate_expected_next_seq_num(*value)?;
                 }
-                Ok(2 + WriterId::BYTE_LEN
+                Ok(2 + ClientWriterId::BYTE_LEN
                     + expected_next_seq_num.map_or(0, |_| 8)
                     + LINK_SECRET_ENCODED_LENGTH)
             }
@@ -470,7 +441,7 @@ impl ServerFrame {
                 Self::READ_BODY_HEADER_LEN,
                 MAX_READ_BATCH_RECORDS,
             ),
-            Self::StreamInfo(_) => Ok(1),
+            Self::StreamMetadata(_) => Ok(1),
             _ => Ok(Self::MAX_FIXED_FRAME_LEN),
         }
     }
@@ -510,10 +481,10 @@ impl ServerFrame {
                 output.put_u64(caught_up.next_seq_num);
                 output.put_u64(caught_up.last_timestamp_ms);
             }
-            Self::StreamInfo(stream) => {
+            Self::StreamMetadata(stream) => {
                 let payload =
-                    serde_json::to_vec(stream).map_err(FrameCodecError::InvalidStreamInfo)?;
-                output.put_u8(ServerOp::StreamInfo.byte());
+                    serde_json::to_vec(stream).map_err(FrameCodecError::InvalidStreamMetadata)?;
+                output.put_u8(ServerOp::StreamMetadata.byte());
                 output.put_slice(&payload);
             }
             Self::SnapshotBoundary(boundary) => {
@@ -578,7 +549,7 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
                     flags & !OPEN_WRITE_FLAGS,
                 ));
             }
-            let (client_writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
+            let (client_writer_id, body) = take::<{ ClientWriterId::BYTE_LEN }>(body)?;
             let (expected_next_seq_num, secret_bytes) =
                 if flags & OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM == 0 {
                     (None, body)
@@ -593,7 +564,7 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
             let link_secret = LinkSecret::from(utf8_tail(secret_bytes)?);
             validate_link_secret(&link_secret)?;
             Ok(ClientFrame::OpenWrite {
-                client_writer_id: WriterId::from_bytes(client_writer_id),
+                client_writer_id: ClientWriterId::from_bytes(client_writer_id),
                 link_secret,
                 expected_next_seq_num,
             })
@@ -792,9 +763,9 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
                 last_timestamp_ms,
             })
         }),
-        ServerOp::StreamInfo => serde_json::from_slice(body)
-            .map(ServerFrame::StreamInfo)
-            .map_err(FrameCodecError::InvalidStreamInfo),
+        ServerOp::StreamMetadata => serde_json::from_slice(body)
+            .map(ServerFrame::StreamMetadata)
+            .map_err(FrameCodecError::InvalidStreamMetadata),
         ServerOp::SnapshotBoundary => {
             decode_position(op_byte, body, |end_seq_num, last_timestamp_ms| {
                 ServerFrame::SnapshotBoundary(SnapshotBoundary {
@@ -1043,8 +1014,8 @@ pub enum FrameCodecError {
     #[error("link secret is not valid UTF-8: {0}")]
     InvalidUtf8(#[source] std::str::Utf8Error),
     /// A stream metadata frame did not contain the expected JSON object.
-    #[error("stream info frame is invalid: {0}")]
-    InvalidStreamInfo(#[source] serde_json::Error),
+    #[error("stream metadata frame is invalid: {0}")]
+    InvalidStreamMetadata(#[source] serde_json::Error),
     /// A physical record payload exceeded [`MAX_RECORD_BYTES`].
     #[error("record is {actual} bytes; maximum is {max}")]
     RecordTooLarge {
@@ -1061,6 +1032,7 @@ pub enum FrameCodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::rest::Visibility;
 
     #[test]
     fn part_header_packs_final_bit_and_index() {
@@ -1177,13 +1149,13 @@ mod tests {
     }
 
     #[test]
-    fn stream_info_ignores_unknown_json_fields() {
-        let mut encoded = BytesMut::from(&[ServerOp::StreamInfo.byte()][..]);
+    fn stream_metadata_ignores_unknown_json_fields() {
+        let mut encoded = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
         encoded.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z","future_field":{"enabled":true}}"#);
 
         assert_eq!(
-            ServerFrame::decode(&encoded).expect("decode stream info"),
-            ServerFrame::StreamInfo(StreamInfo {
+            ServerFrame::decode(&encoded).expect("decode stream metadata"),
+            ServerFrame::StreamMetadata(StreamMetadata {
                 stream_id: "00000000000000000000000000000000"
                     .parse()
                     .expect("stream ID"),
@@ -1196,16 +1168,16 @@ mod tests {
     }
 
     #[test]
-    fn stream_info_requires_nullable_title_and_valid_timestamps() {
+    fn stream_metadata_requires_nullable_title_and_valid_timestamps() {
         for json in [
             br#"{"stream_id":"00000000000000000000000000000000","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#.as_slice(),
             br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"not-a-time","expires_at":"2026-08-23T00:00:00Z"}"#.as_slice(),
         ] {
-            let mut encoded = BytesMut::from(&[ServerOp::StreamInfo.byte()][..]);
+            let mut encoded = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
             encoded.extend_from_slice(json);
             assert!(matches!(
                 ServerFrame::decode(&encoded),
-                Err(FrameCodecError::InvalidStreamInfo(_))
+                Err(FrameCodecError::InvalidStreamMetadata(_))
             ));
         }
     }
@@ -1272,7 +1244,7 @@ mod tests {
             Err(FrameCodecError::TrailingBytes { op, count: 1 }) if op == ServerOp::Ready.byte()
         ));
         let mut malformed_open_write = vec![ClientOp::OpenWrite.byte()];
-        malformed_open_write.extend_from_slice(&[0; WriterId::BYTE_LEN]);
+        malformed_open_write.extend_from_slice(&[0; ClientWriterId::BYTE_LEN]);
         malformed_open_write.extend_from_slice("B".repeat(LINK_SECRET_ENCODED_LENGTH).as_bytes());
         assert!(matches!(
             ClientFrame::decode(&malformed_open_write),
@@ -1393,7 +1365,7 @@ mod tests {
     #[test]
     fn open_write_strictly_validates_flags_preconditions_and_lengths() {
         let valid = ClientFrame::OpenWrite {
-            client_writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
+            client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
             link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
             expected_next_seq_num: Some(7),
         }
@@ -1409,7 +1381,7 @@ mod tests {
         assert!(ClientFrame::decode(&valid[..valid.len() - 1]).is_err());
         assert!(matches!(
             ClientFrame::OpenWrite {
-                client_writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
+                client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
                 link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
                 expected_next_seq_num: Some(MAX_READ_SELECTOR_VALUE + 1),
             }

@@ -19,13 +19,13 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
-    AppendRecord, AppendTicket, LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
-    TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter, WriterId,
+    AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, StreamId,
+    StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter,
     protocol::{
         rest::{
-            CreateLinkRequest, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
-            ListLinksResponse, StreamLinkCredential, StreamLinkStatus, StreamMetadata,
-            StreamTitleUpdate, UpdateStreamRequest, Visibility,
+            CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
+            StreamLinkCredential, StreamLinkStatus, StreamMetadata, StreamTitleUpdate,
+            UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -587,14 +587,14 @@ enum WriteBuffering {
 
 #[derive(Debug)]
 struct WriterState {
-    client_writer_id: WriterId,
+    client_writer_id: ClientWriterId,
     next_writer_seq: u64,
 }
 
 impl WriterState {
     fn new_random() -> Self {
         Self {
-            client_writer_id: WriterId::new_random(),
+            client_writer_id: ClientWriterId::new_random(),
             next_writer_seq: 0,
         }
     }
@@ -652,7 +652,7 @@ async fn run(api_url: Url, web_url: Url, command: Command) -> eyre::Result<()> {
         Command::Write(args) => write_stream(api_url, args).await,
         Command::Tail(args) => tail_stream(api_url, args).await,
         Command::Replay(args) => replay_stream(api_url, args).await,
-        Command::Info(args) => stream_info(api_url, args).await,
+        Command::Info(args) => stream_metadata(api_url, args).await,
         Command::Delete(args) => delete_stream(api_url, args).await,
         Command::Visibility(args) => update_visibility(api_url, args).await,
         Command::Title(args) => update_title(api_url, args).await,
@@ -1473,7 +1473,7 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     }
 }
 
-async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
+async fn stream_metadata(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     let client = TsfClient::with_api_origin(api_url)?;
     let stream = client
@@ -1483,7 +1483,7 @@ async fn stream_info(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
         )
         .await
         .context("failed to get stream")?;
-    print_stream_info(&stream, args.json)
+    print_stream_metadata(&stream, args.json)
 }
 
 async fn delete_stream(api_url: Url, args: DeleteArgs) -> eyre::Result<()> {
@@ -1526,7 +1526,7 @@ async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<(
         )
         .await
         .context("failed to update stream visibility")?;
-    print_stream_info(&stream, args.json)?;
+    print_stream_metadata(&stream, args.json)?;
     Ok(())
 }
 
@@ -1553,7 +1553,7 @@ async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
         )
         .await
         .context("failed to update stream title")?;
-    print_stream_info(&stream, json)?;
+    print_stream_metadata(&stream, json)?;
     Ok(())
 }
 
@@ -1572,7 +1572,7 @@ async fn renew_stream(api_url: Url, args: RenewArgs) -> eyre::Result<()> {
         )
         .await
         .context("failed to renew stream")?;
-    print_stream_info(&stream, args.json)?;
+    print_stream_metadata(&stream, args.json)?;
     Ok(())
 }
 
@@ -1587,27 +1587,25 @@ async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Resul
 async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
         owner_client_from_link(api_url, args.owner_link.as_str())?;
-    let links = client
+    let inventory = client
         .list_all_links(&locator.stream_id, &owner_link_secret)
         .await
         .context("failed to list links")?;
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&ListLinksResponse {
-                links,
-                next_cursor: None,
-            })?
-        );
+        println!("{}", serde_json::to_string_pretty(&inventory)?);
     } else {
-        for link in links {
+        for link in &inventory.links {
             println!(
                 "{:<24}  {:<10}  {:<7}  expires {}{}",
                 link.link_id,
                 permission_label(link.permissions),
                 link_status_label(link.status),
                 link.expires_at.as_deref().unwrap_or("never"),
-                if link.is_current { "  (current)" } else { "" }
+                if link.link_id == inventory.authorizing_link_id {
+                    "  (current)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -1633,7 +1631,7 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
     let credential = client
         .create_link(
             &locator.stream_id,
-            &CreateLinkRequest {
+            &CreateLinkInput {
                 link_id,
                 secret,
                 permissions,
@@ -1991,7 +1989,7 @@ fn print_created_stream(
     Ok(())
 }
 
-fn print_stream_info(stream: &StreamMetadata, json: bool) -> eyre::Result<()> {
+fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()> {
     if !json {
         println!("Stream {}", stream.stream_id);
         println!(

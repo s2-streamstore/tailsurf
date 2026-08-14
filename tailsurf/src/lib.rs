@@ -26,10 +26,12 @@ pub use client::{
     TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, TsfWriterConfig, WritePermit,
     default_api_origin,
 };
-pub use ids::{LinkId, LinkIdError, LinkSecret, MAX_LINK_ID_LEN, StreamId, WriterId};
+pub use ids::{
+    ClientWriterId, LinkId, LinkIdError, LinkSecret, MAX_LINK_ID_LEN, StreamId, WriterId,
+};
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     rest::StreamMetadata,
-    ws::frame::{AppendRecord, CaughtUpPosition, ReadRecord, SnapshotBoundary, StreamInfo},
+    ws::frame::{AppendRecord, CaughtUpPosition, ReadRecord, SnapshotBoundary},
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

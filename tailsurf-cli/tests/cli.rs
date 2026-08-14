@@ -23,8 +23,9 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    AppendRecord, CreateStreamIdempotencyKey, LinkId, LinkPermissions, LinkSecret, RetryPolicy,
-    StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
+    AppendRecord, ClientWriterId, CreateStreamIdempotencyKey, LinkId, LinkPermissions, LinkSecret,
+    RetryPolicy, StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError,
+    TsfWriterConfig, WriterId,
     protocol::{
         rest::{
             CreateStreamRequest, CreateStreamResponse, ListLinksResponse, StreamLinkCredential,
@@ -35,7 +36,7 @@ use tailsurf::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
                 CaughtUpPosition, ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord,
-                RecordFormat, ServerFrame, SnapshotBoundary, StreamInfo, TSF_WEBSOCKET_PROTOCOL,
+                RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -871,7 +872,7 @@ async fn writer_close_is_not_blocked_by_an_unused_reservation() {
         .connect_writer_with_config(
             tailsurf::protocol::ws::WriteStreamOptions::new(
                 stream_id,
-                WriterId::new_random(),
+                ClientWriterId::new_random(),
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
             TsfWriterConfig {
@@ -1574,7 +1575,7 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
     let info = run_tsf(&server, ["info", owner_link, "--json"], None).await;
     assert!(info.status.success(), "stderr={}", info.stderr);
     let info_json: serde_json::Value =
-        serde_json::from_str(&info.stdout).expect("stream info output");
+        serde_json::from_str(&info.stdout).expect("stream metadata output");
     assert_eq!(info_json["stream_id"], created_json["stream_id"]);
     assert_eq!(info_json["title"], "Deploy log");
     assert_eq!(info_json["visibility"], "private");
@@ -1845,7 +1846,7 @@ struct TestLink {
 }
 
 #[derive(serde::Deserialize)]
-struct TestCreateLinkRequest {
+struct TestCreateLinkInput {
     secret: String,
     permissions: LinkPermissions,
 }
@@ -2057,7 +2058,7 @@ async fn test_create_link(
     State(state): State<Arc<TestApiState>>,
     Path((stream_id, link_id)): Path<(String, LinkId)>,
     headers: HeaderMap,
-    Json(request): Json<TestCreateLinkRequest>,
+    Json(request): Json<TestCreateLinkInput>,
 ) -> Response {
     let mut streams = state.streams.lock().expect("streams lock");
     let Some(stream) = streams.get_mut(&stream_id) else {
@@ -2120,7 +2121,15 @@ async fn test_list_links(
         .unwrap_or(0)
         .min(stream.links.len());
     let end = start.saturating_add(2).min(stream.links.len());
+    let authorizing_link_id = stream
+        .links
+        .iter()
+        .find(|link| link.active && link.permissions.allows_owner())
+        .expect("authorized stream has an active owner link")
+        .link_id
+        .clone();
     Json(ListLinksResponse {
+        authorizing_link_id,
         links: stream
             .links
             .get(start..end)
@@ -2137,7 +2146,6 @@ async fn test_list_links(
                 created_at: "2026-08-07T12:00:00.000Z".to_owned(),
                 expires_at: None,
                 revoked_at: (!link.active).then(|| "2026-08-07T12:01:00.000Z".to_owned()),
-                is_current: link.active && link.permissions.allows_owner(),
             })
             .collect(),
         next_cursor: (end < stream.links.len()).then(|| end.to_string()),
@@ -2238,7 +2246,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
                 stream.records.push(TestRecord {
                     seq_num,
                     timestamp_ms: 1_781_717_406_000 + seq_num,
-                    writer_id: client_writer_id,
+                    writer_id: WriterId::from_bytes(*client_writer_id.as_bytes()),
                     writer_seq_num: record.writer_seq_num,
                     part: record.part,
                     format: record.format,
@@ -2290,7 +2298,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
     else {
         return;
     };
-    let (stream_info, caught_up, records) = {
+    let (stream_metadata, caught_up, records) = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
             return;
@@ -2312,7 +2320,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
                 .map_or(0, |record| record.timestamp_ms),
         };
         (
-            test_read_stream_info(stream),
+            test_read_stream_metadata(stream),
             caught_up,
             test_select_records(stream, start, limit, end_seq_num),
         )
@@ -2320,9 +2328,9 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
     send_server_frame(&mut socket, ServerFrame::Ready)
         .await
         .expect("send ready");
-    send_server_frame(&mut socket, ServerFrame::StreamInfo(stream_info))
+    send_server_frame(&mut socket, ServerFrame::StreamMetadata(stream_metadata))
         .await
-        .expect("send stream info");
+        .expect("send stream metadata");
     if snapshot {
         send_server_frame(
             &mut socket,
@@ -2387,8 +2395,8 @@ fn test_get_stream_response(stream: &TestStream) -> StreamMetadata {
     }
 }
 
-fn test_read_stream_info(stream: &TestStream) -> StreamInfo {
-    StreamInfo {
+fn test_read_stream_metadata(stream: &TestStream) -> StreamMetadata {
+    StreamMetadata {
         stream_id: stream.stream_id,
         title: stream.title.clone(),
         visibility: stream.visibility,
@@ -2706,7 +2714,7 @@ async fn connect_default_writer(api_url: &Url) -> tailsurf::TsfWriter {
         .expect("valid API origin")
         .connect_writer(WriteStreamOptions::new(
             stream_id,
-            WriterId::new_random(),
+            ClientWriterId::new_random(),
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ))
         .await
@@ -2732,7 +2740,7 @@ struct HoldingWriteState {
 
 #[derive(Clone)]
 struct HoldingWriteAttempt {
-    client_writer_id: WriterId,
+    client_writer_id: ClientWriterId,
     writer_seq_num: u64,
     data: Bytes,
 }
@@ -2918,7 +2926,7 @@ async fn send_server_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AppendAttempt {
-    client_writer_id: WriterId,
+    client_writer_id: ClientWriterId,
     link_secret: String,
     expected_next_seq_num: Option<u64>,
     writer_seq_num: u64,
@@ -3126,7 +3134,7 @@ async fn fake_sse_read(
     };
     let cursor = if snapshot { "v1,0,0,0,0" } else { "v1,0,0" };
     let body = format!(
-        "event: stream_info\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{snapshot_boundary}id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
+        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{snapshot_boundary}id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
     );
     (
         StatusCode::OK,
@@ -3218,8 +3226,8 @@ const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
     }
 }
 
-fn fake_stream_info(stream_id: &str) -> StreamInfo {
-    StreamInfo {
+fn fake_stream_metadata(stream_id: &str) -> StreamMetadata {
+    StreamMetadata {
         stream_id: stream_id.parse().expect("fake stream ID"),
         title: None,
         visibility: Visibility::Private,
@@ -3269,10 +3277,10 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
         .expect("send ready");
     send_server_frame(
         &mut socket,
-        ServerFrame::StreamInfo(fake_stream_info(&stream_id)),
+        ServerFrame::StreamMetadata(fake_stream_metadata(&stream_id)),
     )
     .await
-    .expect("send stream info");
+    .expect("send stream metadata");
     if snapshot {
         send_server_frame(
             &mut socket,

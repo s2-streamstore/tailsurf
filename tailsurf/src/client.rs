@@ -35,16 +35,15 @@ use tokio_tungstenite::{
 use url::Url;
 
 use crate::{
-    LinkId, LinkSecret, StreamId, WriterId,
+    ClientWriterId, LinkId, LinkSecret, StreamId, WriterId,
     ids::{encode_base64url_32, is_canonical_base64url_32},
     protocol::{
         rest::{
-            AppendJsonRecord, AppendRecordsRequest, AppendRecordsResponse, CreateLinkRequest,
+            AppendJsonRecord, AppendRange, AppendRecordsRequest, CreateLinkInput,
             CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
             MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, RecordData,
-            RestRecordPart, SseCaughtUpEvent, SseReadRecord, SseRecordsEvent,
-            SseSnapshotBoundaryEvent, StreamLinkCredential, StreamLinkSummary, StreamMetadata,
-            UpdateStreamRequest,
+            RestRecordPart, SseCaughtUpEvent, SseReadBatchEvent, SseReadRecord,
+            SseSnapshotBoundaryEvent, StreamLinkCredential, StreamMetadata, UpdateStreamRequest,
         },
         ws::{
             DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
@@ -52,8 +51,7 @@ use crate::{
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
                 MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader,
-                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, StreamInfo,
-                TSF_WEBSOCKET_PROTOCOL,
+                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -310,7 +308,7 @@ impl TsfClient {
     pub async fn create_link(
         &self,
         stream_id: &StreamId,
-        request: &CreateLinkRequest,
+        request: &CreateLinkInput,
         owner_link_secret: &LinkSecret,
     ) -> Result<StreamLinkCredential, TsfClientError> {
         if !is_canonical_base64url_32(request.secret.expose_secret()) {
@@ -369,9 +367,10 @@ impl TsfClient {
         &self,
         stream_id: &StreamId,
         owner_link_secret: &LinkSecret,
-    ) -> Result<Vec<StreamLinkSummary>, TsfClientError> {
+    ) -> Result<ListLinksResponse, TsfClientError> {
         let mut links = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut authorizing_link_id = None;
         loop {
             let page = self
                 .list_links(
@@ -383,13 +382,19 @@ impl TsfClient {
                     owner_link_secret,
                 )
                 .await?;
+            authorizing_link_id.get_or_insert(page.authorizing_link_id);
             links.extend(page.links);
             match page.next_cursor {
                 Some(next) => cursor = Some(next),
                 None => break,
             }
         }
-        Ok(links)
+        Ok(ListLinksResponse {
+            authorizing_link_id: authorizing_link_id
+                .expect("link inventory always contains an authorizing link ID"),
+            links,
+            next_cursor: None,
+        })
     }
 
     /// Revokes a stream link by its non-secret identifier.
@@ -419,11 +424,11 @@ impl TsfClient {
     pub async fn append_records(
         &self,
         stream_id: &StreamId,
-        client_writer_id: WriterId,
+        client_writer_id: ClientWriterId,
         records: &[AppendRecord],
         expected_next_seq_num: Option<u64>,
         write_link_secret: &LinkSecret,
-    ) -> Result<AppendRecordsResponse, TsfClientError> {
+    ) -> Result<AppendRange, TsfClientError> {
         if records.is_empty() || records.len() > MAX_STATELESS_APPEND_RECORDS {
             return Err(TsfClientError::InvalidStatelessAppend(
                 "record count must be between 1 and 128",
@@ -559,7 +564,7 @@ impl TsfClient {
     ) -> Result<TsfReadSession, TsfClientError> {
         let ConnectedReadSocket {
             socket,
-            stream_info,
+            stream_metadata,
             snapshot_boundary,
         } = self.connect_read_socket(options.clone()).await?;
         apply_snapshot_boundary(&mut options, snapshot_boundary);
@@ -567,7 +572,7 @@ impl TsfClient {
             self.clone(),
             options,
             socket,
-            stream_info,
+            stream_metadata,
             None,
             snapshot_boundary,
         ))
@@ -587,7 +592,7 @@ impl TsfClient {
             .open_sse_connection(&request_options, None)
             .await?
             .ok_or(TsfClientError::InvalidSse(
-                "initial read completed without stream_info",
+                "initial read completed without stream_metadata",
             ))?;
         if let Some(boundary) = connection.snapshot_boundary {
             apply_snapshot_boundary(&mut options, Some(boundary));
@@ -600,7 +605,9 @@ impl TsfClient {
             buffer: connection.buffer,
             queued_events: connection.queued_events,
             queued_records: VecDeque::new(),
-            stream_info: connection.stream_info.expect("validated stream_info event"),
+            stream_metadata: connection
+                .stream_metadata
+                .expect("validated stream_metadata event"),
             last_caught_up: None,
             snapshot_boundary: connection.snapshot_boundary,
             reconnect_attempts: 0,
@@ -638,7 +645,7 @@ impl TsfClient {
                 body: Box::pin(response.bytes_stream()),
                 buffer: Vec::new(),
                 queued_events: VecDeque::new(),
-                stream_info: None,
+                stream_metadata: None,
                 snapshot_boundary: None,
                 resume_event_id: None,
             };
@@ -649,14 +656,16 @@ impl TsfClient {
             )
             .await?
             .ok_or(TsfClientError::InvalidSse(
-                "response ended before stream_info",
+                "response ended before stream_metadata",
             ))?;
-            if event.event != "stream_info" {
-                return Err(TsfClientError::InvalidSse("first event is not stream_info"));
+            if event.event != "stream_metadata" {
+                return Err(TsfClientError::InvalidSse(
+                    "first event is not stream_metadata",
+                ));
             }
-            connection.stream_info = Some(
+            connection.stream_metadata = Some(
                 serde_json::from_str(&event.data)
-                    .map_err(|_| TsfClientError::InvalidSse("invalid stream_info event"))?,
+                    .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?,
             );
             if event.id.is_some() {
                 connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
@@ -673,7 +682,7 @@ impl TsfClient {
                 ))?;
                 if event.event != "snapshot_boundary" {
                     return Err(TsfClientError::InvalidSse(
-                        "snapshot_boundary must follow stream_info",
+                        "snapshot_boundary must follow stream_metadata",
                     ));
                 }
                 connection.resume_event_id = Some(sse_resume_event_id(&event)?.to_owned());
@@ -759,7 +768,7 @@ impl TsfClient {
                         read_idle_timeout,
                         pending_records: VecDeque::new(),
                     },
-                    stream_info: handshake.stream_info,
+                    stream_metadata: handshake.stream_metadata,
                     snapshot_boundary: handshake.snapshot_boundary,
                 })
             }
@@ -1670,7 +1679,7 @@ struct SseConnection {
     body: SseBody,
     buffer: Vec<u8>,
     queued_events: VecDeque<ParsedSseEvent>,
-    stream_info: Option<StreamInfo>,
+    stream_metadata: Option<StreamMetadata>,
     snapshot_boundary: Option<SnapshotBoundary>,
     resume_event_id: Option<String>,
 }
@@ -1684,7 +1693,7 @@ pub struct TsfSseReadSession {
     buffer: Vec<u8>,
     queued_events: VecDeque<ParsedSseEvent>,
     queued_records: VecDeque<ReadRecord>,
-    stream_info: StreamInfo,
+    stream_metadata: StreamMetadata,
     last_caught_up: Option<CaughtUpPosition>,
     snapshot_boundary: Option<SnapshotBoundary>,
     reconnect_attempts: usize,
@@ -1694,8 +1703,8 @@ pub struct TsfSseReadSession {
 
 impl TsfSseReadSession {
     /// Returns authorized stream metadata from the opening event.
-    pub fn stream_info(&self) -> &StreamInfo {
-        &self.stream_info
+    pub fn stream_metadata(&self) -> &StreamMetadata {
+        &self.stream_metadata
     }
 
     /// Returns the fixed boundary captured for a snapshot read.
@@ -1778,13 +1787,15 @@ impl TsfSseReadSession {
                 self.body = connection.body;
                 self.buffer = connection.buffer;
                 self.queued_events = connection.queued_events;
-                self.stream_info = connection.stream_info.expect("validated stream_info event");
+                self.stream_metadata = connection
+                    .stream_metadata
+                    .expect("validated stream_metadata event");
                 continue;
             };
             match event.event.as_str() {
-                "records" => {
-                    let batch: SseRecordsEvent = serde_json::from_str(&event.data)
-                        .map_err(|_| TsfClientError::InvalidSse("invalid records event"))?;
+                "read_batch" => {
+                    let batch: SseReadBatchEvent = serde_json::from_str(&event.data)
+                        .map_err(|_| TsfClientError::InvalidSse("invalid read_batch event"))?;
                     let records = batch
                         .records
                         .into_iter()
@@ -1807,9 +1818,9 @@ impl TsfSseReadSession {
                     self.reconnect_attempts = 0;
                 }
                 "error" => return Err(TsfClientError::SseTerminal(event.data)),
-                "stream_info" => {
-                    self.stream_info = serde_json::from_str(&event.data)
-                        .map_err(|_| TsfClientError::InvalidSse("invalid stream_info event"))?
+                "stream_metadata" => {
+                    self.stream_metadata = serde_json::from_str(&event.data)
+                        .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?
                 }
                 _ => {}
             }
@@ -1822,7 +1833,7 @@ pub struct TsfReadSession {
     client: TsfClient,
     options: ReadStreamOptions,
     socket: ReadSocket,
-    stream_info: StreamInfo,
+    stream_metadata: StreamMetadata,
     finished: bool,
     last_caught_up: Option<CaughtUpPosition>,
     snapshot_boundary: Option<SnapshotBoundary>,
@@ -1837,7 +1848,7 @@ impl TsfReadSession {
         client: TsfClient,
         options: ReadStreamOptions,
         socket: ReadSocket,
-        stream_info: StreamInfo,
+        stream_metadata: StreamMetadata,
         last_caught_up: Option<CaughtUpPosition>,
         snapshot_boundary: Option<SnapshotBoundary>,
     ) -> Self {
@@ -1846,7 +1857,7 @@ impl TsfReadSession {
             client,
             options,
             socket,
-            stream_info,
+            stream_metadata,
             finished: false,
             last_caught_up,
             snapshot_boundary,
@@ -1868,8 +1879,8 @@ impl TsfReadSession {
     }
 
     /// Returns metadata supplied by the latest successful read handshake.
-    pub const fn stream_info(&self) -> &StreamInfo {
-        &self.stream_info
+    pub const fn stream_metadata(&self) -> &StreamMetadata {
+        &self.stream_metadata
     }
 
     /// Waits for the next physical record using the configured idle timeout.
@@ -1927,14 +1938,14 @@ impl TsfReadSession {
         }
         let ConnectedReadSocket {
             socket,
-            stream_info,
+            stream_metadata,
             snapshot_boundary,
         } = self
             .client
             .connect_read_socket(self.options.clone())
             .await?;
         self.socket = socket;
-        self.stream_info = stream_info;
+        self.stream_metadata = stream_metadata;
         apply_snapshot_boundary(&mut self.options, snapshot_boundary);
         if snapshot_boundary.is_some() {
             self.snapshot_boundary = snapshot_boundary;
@@ -2004,7 +2015,7 @@ struct ReadSocket {
 
 struct ConnectedReadSocket {
     socket: ReadSocket,
-    stream_info: StreamInfo,
+    stream_metadata: StreamMetadata,
     snapshot_boundary: Option<SnapshotBoundary>,
 }
 
@@ -2436,7 +2447,7 @@ async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
 }
 
 struct ReadHandshake {
-    stream_info: StreamInfo,
+    stream_metadata: StreamMetadata,
     snapshot_boundary: Option<SnapshotBoundary>,
 }
 
@@ -2445,8 +2456,8 @@ async fn expect_read_handshake(
     snapshot: bool,
 ) -> Result<ReadHandshake, TsfClientError> {
     expect_ready(ws).await?;
-    let stream_info = match next_server_frame(ws).await? {
-        Some(ServerFrame::StreamInfo(stream_info)) => stream_info,
+    let stream_metadata = match next_server_frame(ws).await? {
+        Some(ServerFrame::StreamMetadata(stream_metadata)) => stream_metadata,
         Some(frame) => {
             return Err(TsfClientError::UnexpectedServerFrame(server_frame_name(
                 &frame,
@@ -2468,7 +2479,7 @@ async fn expect_read_handshake(
         None
     };
     Ok(ReadHandshake {
-        stream_info,
+        stream_metadata,
         snapshot_boundary,
     })
 }
@@ -2480,7 +2491,7 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::ReadBatch(_) => "read batch",
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::CaughtUp(_) => "caught up",
-        ServerFrame::StreamInfo(_) => "stream info",
+        ServerFrame::StreamMetadata(_) => "stream metadata",
         ServerFrame::SnapshotBoundary(_) => "snapshot boundary",
     }
 }
@@ -2790,7 +2801,7 @@ mod tests {
     #[tokio::test]
     async fn read_handshake_returns_metadata() {
         let (mut client, mut server) = connected_websockets().await;
-        let stream_info = StreamInfo {
+        let stream_metadata = StreamMetadata {
             stream_id: "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
@@ -2799,9 +2810,12 @@ mod tests {
             created_at: "2026-08-13T00:00:00Z".to_owned(),
             expires_at: "2026-08-23T00:00:00Z".to_owned(),
         };
-        let expected_stream_info = stream_info.clone();
+        let expected_stream_metadata = stream_metadata.clone();
         let sender = tokio::spawn(async move {
-            for frame in [ServerFrame::Ready, ServerFrame::StreamInfo(stream_info)] {
+            for frame in [
+                ServerFrame::Ready,
+                ServerFrame::StreamMetadata(stream_metadata),
+            ] {
                 server
                     .send(Message::Binary(
                         frame.encode().expect("encode handshake frame"),
@@ -2815,7 +2829,7 @@ mod tests {
             .await
             .expect("read handshake");
 
-        assert_eq!(handshake.stream_info, expected_stream_info);
+        assert_eq!(handshake.stream_metadata, expected_stream_metadata);
         assert_eq!(handshake.snapshot_boundary, None);
         sender.await.expect("join handshake sender");
     }
@@ -3031,7 +3045,7 @@ mod tests {
 
         let snapshot_cursor = "v1,4,0,5,0";
         let snapshot_event = ParsedSseEvent {
-            event: "records".to_owned(),
+            event: "read_batch".to_owned(),
             data: "{}".to_owned(),
             id: Some(snapshot_cursor.to_owned()),
         };
@@ -3247,7 +3261,7 @@ mod tests {
             client
                 .append_records(
                     &stream_id,
-                    WriterId::from_bytes([0; 16]),
+                    ClientWriterId::from_bytes([0; 16]),
                     &large,
                     None,
                     &secret
@@ -3268,7 +3282,7 @@ mod tests {
             client
                 .append_records(
                     &stream_id,
-                    WriterId::from_bytes([0; 16]),
+                    ClientWriterId::from_bytes([0; 16]),
                     &endpoint,
                     None,
                     &secret,

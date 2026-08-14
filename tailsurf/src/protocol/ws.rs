@@ -3,7 +3,7 @@
 /// Binary TSF v1 frames and their codec.
 pub mod frame;
 
-use crate::{LinkSecret, StreamId, WriterId};
+use crate::{ClientWriterId, LinkSecret, StreamId};
 
 /// Largest read selector accepted by the current TypeScript data adapter.
 pub const MAX_READ_SELECTOR_VALUE: u64 = 9_007_199_254_740_991;
@@ -71,7 +71,7 @@ pub struct WriteStreamOptions {
     /// Stream to append to.
     pub stream_id: StreamId,
     /// Stable client writer identity reused with sequence numbers across reconnects.
-    pub client_writer_id: WriterId,
+    pub client_writer_id: ClientWriterId,
     /// Secret from a write-capable stream link.
     pub link_secret: LinkSecret,
     /// Initial stream sequence precondition for this writer session.
@@ -82,7 +82,7 @@ impl WriteStreamOptions {
     /// Creates write options from an owned stream link secret.
     pub fn new(
         stream_id: StreamId,
-        client_writer_id: WriterId,
+        client_writer_id: ClientWriterId,
         link_secret: impl Into<LinkSecret>,
     ) -> Self {
         Self {

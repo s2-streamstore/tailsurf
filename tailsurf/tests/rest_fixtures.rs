@@ -2,8 +2,8 @@
 
 use serde_json::Value;
 use tailsurf::protocol::rest::{
-    AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, SseCaughtUpEvent,
-    SseRecordsEvent, SseSnapshotBoundaryEvent, StreamMetadata,
+    AppendRange, AppendRecordsRequest, CreateStreamRequest, SseCaughtUpEvent, SseReadBatchEvent,
+    SseSnapshotBoundaryEvent, StreamMetadata,
 };
 
 #[test]
@@ -17,12 +17,12 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     let append: AppendRecordsRequest = fixture(&fixtures, "append_request");
     assert_eq!(append.client_writer_id, "AAECAwQFBgcICQoLDA0ODw");
     assert_eq!(append.records.len(), 2);
-    let acknowledgement: AppendRecordsResponse = fixture(&fixtures, "append_response");
+    let acknowledgement: AppendRange = fixture(&fixtures, "append_response");
     assert_eq!(
         (acknowledgement.start_seq_num, acknowledgement.end_seq_num),
         (7, 9)
     );
-    let records: SseRecordsEvent = fixture(&fixtures, "sse_records");
+    let records: SseReadBatchEvent = fixture(&fixtures, "sse_read_batch");
     assert_eq!(records.records.len(), 1);
     assert_eq!(
         fixtures["sse_resume_cursor"].as_str(),

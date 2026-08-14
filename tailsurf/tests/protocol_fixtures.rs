@@ -3,16 +3,15 @@
 use bytes::Bytes;
 use serde::Deserialize;
 use tailsurf::{
-    LinkSecret, WriterId,
+    ClientWriterId, LinkSecret, WriterId,
     protocol::{
-        rest::Visibility,
+        rest::{StreamMetadata, Visibility},
         ws::{
             ReadStart,
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_BATCH_RECORDS,
                 MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader,
-                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, StreamInfo,
-                TSF_WEBSOCKET_PROTOCOL,
+                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -92,7 +91,7 @@ enum ServerFixture {
         end_seq_num: String,
         last_timestamp_ms: String,
     },
-    StreamInfo {
+    StreamMetadata {
         stream_id: String,
         title: Option<String>,
         visibility: Visibility,
@@ -177,7 +176,7 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             link_secret,
             expected_next_seq_num,
         } => ClientFrame::OpenWrite {
-            client_writer_id: decode_writer_id(&client_writer_id_hex),
+            client_writer_id: decode_client_writer_id(&client_writer_id_hex),
             link_secret: LinkSecret::from(link_secret),
             expected_next_seq_num: expected_next_seq_num.as_deref().map(parse_u64),
         },
@@ -250,13 +249,13 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             end_seq_num: parse_u64(&end_seq_num),
             last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
-        ServerFixture::StreamInfo {
+        ServerFixture::StreamMetadata {
             stream_id,
             title,
             visibility,
             created_at,
             expires_at,
-        } => ServerFrame::StreamInfo(StreamInfo {
+        } => ServerFrame::StreamMetadata(StreamMetadata {
             stream_id: stream_id.parse().expect("fixture stream ID"),
             title: title.map(|title| title.parse().expect("fixture stream title")),
             visibility,
@@ -283,6 +282,13 @@ fn decode_writer_id(value: &str) -> WriterId {
         .try_into()
         .expect("fixture writer ID has the correct length");
     WriterId::from_bytes(bytes)
+}
+
+fn decode_client_writer_id(value: &str) -> ClientWriterId {
+    let bytes: [u8; ClientWriterId::BYTE_LEN] = decode_hex(value)
+        .try_into()
+        .expect("fixture client writer ID has the correct length");
+    ClientWriterId::from_bytes(bytes)
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {

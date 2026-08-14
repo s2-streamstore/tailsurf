@@ -115,7 +115,7 @@ pub struct CreateStreamResponse {
 
 /// Options for creating a stream link.
 #[derive(Clone, Debug, Serialize)]
-pub struct CreateLinkRequest {
+pub struct CreateLinkInput {
     /// Client-generated stable link identifier carried in the request path.
     #[serde(skip_serializing)]
     pub link_id: LinkId,
@@ -129,7 +129,7 @@ pub struct CreateLinkRequest {
     pub expires_at: Option<String>,
 }
 
-impl CreateLinkRequest {
+impl CreateLinkInput {
     /// Creates retry-safe link material.
     pub fn new(link_id: LinkId, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
         Self {
@@ -177,13 +177,13 @@ pub struct StreamLinkSummary {
     /// RFC 3339 revocation timestamp when inactive.
     #[serde(deserialize_with = "deserialize_nullable_rfc3339_string")]
     pub revoked_at: Option<String>,
-    /// Whether this link authenticated the inventory request.
-    pub is_current: bool,
 }
 
 /// Non-secret link inventory for a stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ListLinksResponse {
+    /// Link whose bearer credential authorized this request.
+    pub authorizing_link_id: LinkId,
     /// Retained link metadata ordered newest first.
     pub links: Vec<StreamLinkSummary>,
     /// Opaque cursor for the next page.
@@ -261,7 +261,7 @@ pub struct AppendRecordsRequest {
 
 /// Durable half-open physical sequence range for an atomic append.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AppendRecordsResponse {
+pub struct AppendRange {
     /// First durable physical sequence number.
     #[serde(with = "decimal_u64")]
     pub start_seq_num: u64,
@@ -270,7 +270,7 @@ pub struct AppendRecordsResponse {
     pub end_seq_num: u64,
 }
 
-/// One record in a batched SSE `records` event.
+/// One record in a batched SSE `read_batch` event.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct SseReadRecord {
     /// Absolute physical sequence number.
@@ -279,7 +279,7 @@ pub struct SseReadRecord {
     /// Record timestamp in Unix milliseconds.
     #[serde(with = "decimal_u64")]
     pub timestamp_ms: u64,
-    /// Canonical client writer ID.
+    /// Server-derived writer identity.
     pub writer_id: String,
     /// Writer-local sequence number.
     #[serde(with = "decimal_u64")]
@@ -292,9 +292,9 @@ pub struct SseReadRecord {
     pub data: RecordData,
 }
 
-/// Payload of a batched SSE `records` event.
+/// Payload of a batched SSE `read_batch` event.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct SseRecordsEvent {
+pub struct SseReadBatchEvent {
     /// Ordered records in this event.
     pub records: Vec<SseReadRecord>,
 }
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn serializes_link_mutations_and_omits_absent_stream_update() {
-        let link = CreateLinkRequest::new(
+        let link = CreateLinkInput::new(
             "reader".parse().expect("Link ID"),
             LinkPermissions::read(),
             None,
