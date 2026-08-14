@@ -565,7 +565,7 @@ impl TsfClient {
         mut options: WriteStreamOptions,
         config: TsfWriterConfig,
     ) -> Result<TsfWriter, TsfClientError> {
-        let session = self.connect_write_session(options.clone()).await?;
+        let session = self.open_write_session(&options).await?;
         options.expected_next_seq_num = None;
         TsfWriter::new(self.clone(), options, session, config)
     }
@@ -577,13 +577,20 @@ impl TsfClient {
         &self,
         options: WriteStreamOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        self.retry_transient(|| self.connect_write_session_once(options.clone()))
+        self.open_write_session(&options).await
+    }
+
+    async fn open_write_session(
+        &self,
+        options: &WriteStreamOptions,
+    ) -> Result<TsfWriteSession, TsfClientError> {
+        self.retry_transient(|| self.connect_write_session_once(options))
             .await
     }
 
     async fn connect_write_session_once(
         &self,
-        options: WriteStreamOptions,
+        options: &WriteStreamOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
         let url = self.websocket_url(format_args!("/streams/{}/write", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
@@ -614,7 +621,7 @@ impl TsfClient {
             socket,
             stream_metadata,
             snapshot_boundary,
-        } = self.connect_read_socket(options.clone()).await?;
+        } = self.connect_read_socket(&options).await?;
         apply_snapshot_boundary(&mut options, snapshot_boundary);
         Ok(TsfReadSession::new(
             self.clone(),
@@ -754,7 +761,7 @@ impl TsfClient {
 
     async fn connect_read_socket(
         &self,
-        options: ReadStreamOptions,
+        options: &ReadStreamOptions,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
         if let Some(start) = options.start {
             let value = match start {
@@ -1637,7 +1644,7 @@ async fn recover_pending_appends(
             sleep(delay).await;
         }
         *reconnect_attempts += 1;
-        match client.connect_write_session_once(options.clone()).await {
+        match client.connect_write_session_once(options).await {
             Ok(mut connected) => match send_retained(&mut connected, pending, 0).await {
                 Ok(()) => {
                     *session = connected;
@@ -2017,10 +2024,7 @@ impl TsfReadSession {
             socket,
             stream_metadata,
             snapshot_boundary,
-        } = self
-            .client
-            .connect_read_socket(self.options.clone())
-            .await?;
+        } = self.client.connect_read_socket(&self.options).await?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
         apply_snapshot_boundary(&mut self.options, snapshot_boundary);
@@ -2204,13 +2208,16 @@ async fn connect_websocket(
     let selected_protocol = response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
-        .map(|value| value.to_str().map(str::to_owned))
-        .transpose()
-        .map_err(|_| TsfClientError::InvalidWebSocketProtocolHeader)?;
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| TsfClientError::InvalidWebSocketProtocolHeader)
+        })
+        .transpose()?;
 
-    if selected_protocol.as_deref() != Some(TSF_WEBSOCKET_PROTOCOL) {
+    if selected_protocol != Some(TSF_WEBSOCKET_PROTOCOL) {
         return Err(TsfClientError::UnexpectedWebSocketProtocol(
-            selected_protocol,
+            selected_protocol.map(str::to_owned),
         ));
     }
 
