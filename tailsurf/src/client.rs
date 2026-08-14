@@ -136,15 +136,21 @@ impl RetryPolicy {
         }
     }
 
-    fn attempt_count(self) -> usize {
-        self.max_attempts
-    }
-
     fn next_backoff(self, current: Duration) -> Duration {
         current
             .checked_mul(2)
             .unwrap_or(self.max_backoff)
             .min(self.max_backoff)
+    }
+
+    fn reconnect_delay(self, retry: usize) -> Duration {
+        let multiplier = 1_u32 << retry.min(30);
+        let backoff = self
+            .initial_backoff
+            .checked_mul(multiplier)
+            .unwrap_or(self.max_backoff)
+            .min(self.max_backoff);
+        jittered_backoff(backoff)
     }
 }
 
@@ -922,7 +928,7 @@ impl TsfClient {
         Fut: Future<Output = Result<T, TsfClientError>>,
     {
         let retry_policy = self.config.retry_policy;
-        let attempts = retry_policy.attempt_count();
+        let attempts = retry_policy.max_attempts;
         let mut backoff = retry_policy.initial_backoff;
 
         for attempt in 1..=attempts {
@@ -1626,14 +1632,9 @@ async fn recover_pending_appends(
     }
 
     let retry_policy = client.config.retry_policy;
-    let max_reconnects = retry_policy.attempt_count().saturating_sub(1);
+    let max_reconnects = retry_policy.max_attempts.saturating_sub(1);
     while *reconnect_attempts < max_reconnects {
-        let backoff = retry_policy
-            .initial_backoff
-            .checked_mul(1_u32 << (*reconnect_attempts).min(30))
-            .unwrap_or(retry_policy.max_backoff)
-            .min(retry_policy.max_backoff);
-        let delay = jittered_backoff(backoff);
+        let delay = retry_policy.reconnect_delay(*reconnect_attempts);
         if !delay.is_zero() {
             sleep(delay).await;
         }
@@ -1802,21 +1803,14 @@ impl TsfSseReadSession {
                 Err(error) => return Err(error),
             };
             let Some(event) = event else {
-                let attempts = self.client.config.retry_policy.attempt_count();
+                let retry_policy = self.client.config.retry_policy;
+                let attempts = retry_policy.max_attempts;
                 if self.reconnect_attempts + 1 >= attempts {
                     return Err(TsfClientError::ReadReconnectLimitExceeded {
                         max_connection_attempts: attempts,
                     });
                 }
-                let delay = self
-                    .client
-                    .config
-                    .retry_policy
-                    .initial_backoff
-                    .checked_mul(1_u32 << self.reconnect_attempts.min(30))
-                    .unwrap_or(self.client.config.retry_policy.max_backoff)
-                    .min(self.client.config.retry_policy.max_backoff);
-                let delay = jittered_backoff(delay);
+                let delay = retry_policy.reconnect_delay(self.reconnect_attempts);
                 if !delay.is_zero() {
                     sleep(delay).await;
                 }
@@ -2052,10 +2046,10 @@ impl TsfReadSession {
             return Ok(());
         }
         let retry_policy = self.client.config.retry_policy;
-        let max_reconnects = retry_policy.attempt_count().saturating_sub(1);
+        let max_reconnects = retry_policy.max_attempts.saturating_sub(1);
         if self.no_progress_reconnects >= max_reconnects {
             return Err(TsfClientError::ReadReconnectLimitExceeded {
-                max_connection_attempts: retry_policy.attempt_count(),
+                max_connection_attempts: retry_policy.max_attempts,
             });
         }
         self.no_progress_reconnects += 1;
@@ -3339,6 +3333,7 @@ mod tests {
             );
             assert!(serde_json::from_str::<ApiErrorResponse>(&body).is_err());
         }
+        assert_eq!(api_error_message("plain failure"), None);
     }
 
     #[tokio::test]
@@ -3950,21 +3945,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [7, 9]
         );
-    }
-
-    #[test]
-    fn api_error_message_extracts_stable_code_and_message() {
-        let body = r#"{"error":{"code":"forbidden","message":"owner link required"}}"#;
-
-        assert_eq!(
-            api_error_message(body).as_deref(),
-            Some("forbidden: owner link required")
-        );
-    }
-
-    #[test]
-    fn api_error_message_leaves_non_standard_body_for_fallback() {
-        assert_eq!(api_error_message("plain failure"), None);
     }
 
     #[tokio::test]
