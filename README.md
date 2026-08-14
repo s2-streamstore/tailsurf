@@ -1,19 +1,18 @@
-# tail.surf (tsf)
+# tail.surf (`tsf`)
 
-tail.surf is a streaming gist for live work and agent conversations.
+[tail.surf](https://tail.surf) is a streaming gist for live work and agent conversations.
 
 Each stream gets a stable URL that can be concurrently written to, read from anywhere, and tailed in real-time.
 
 Free to start with no sign-up required.
 
-Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or agent-to-agent messages. For example,
+Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or agent-to-agent messages. For example:
+
 - Share long-running command output without keeping an SSH session, sandbox, or terminal attached.
 - Give agents a reliable async channel with durable catch-up.
 - Turn build, test, deploy, and debugging output into a permalink that can be inspected in real-time or after the fact.
 
-`tsf` has an API and two first-class clients:
-- Full-featured CLI
-- Gist-style scrubbable live transcript with web UI
+Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or install the `tsf` CLI below. Rust SDK documentation and examples live in [Rustdoc](https://docs.rs/tailsurf).
 
 ## Install
 
@@ -52,34 +51,6 @@ tsf update --check
 Installer-owned binaries may contact GitHub Releases and print an update hint after a successful interactive command against `https://tail.surf`. The check runs at most once per day, waits at most 500 milliseconds, and never installs an update. Set `TSF_NO_UPDATE_CHECK` or `DO_NOT_TRACK` to disable hints. CI and non-interactive commands do not check.
 
 Installations owned by a package manager do not check or print the hint. Cargo users rerun `cargo install tailsurf-cli --locked`. cargo-binstall users rerun `cargo binstall tailsurf-cli`.
-
-## SDK quickstart
-
-The [`create_write_read_delete`](https://github.com/s2-streamstore/tailsurf/blob/main/tailsurf/examples/create_write_read_delete.rs) example creates a private stream, writes one durable record through the reconnecting producer, reads it back, and deletes the stream with its owner link:
-
-```sh
-cargo run -p tailsurf --example create_write_read_delete
-```
-
-Set `TSF_API_URL` to use a non-default API origin. The SDK appends the versioned `/api/v1` namespace.
-
-Applications normally use `TsfProducer` and `TsfReadSession`; `TsfAppendSession` is the lower-level frame/ack API.
-
-SDK readers and producers retry bounded transient WebSocket interruptions while preserving read positions and unacknowledged writer sequence numbers. Protocol and policy closes fail immediately.
-
-Every reader sends a mandatory `OpenRead` frame immediately after WebSocket negotiation. It carries the start selector, count, inclusive end, optional `playback_rate_permille`, and optional link secret. Read and write WebSocket URLs contain only the stream path. Writers open with `OpenWrite`.
-
-An unbounded read receives `1013 upstream_unavailable` when its backing read ends or fails transiently. The SDK reconnects from the latest record or `CaughtUp` position with its configured retry policy. A bounded read closes normally at its fixed end.
-
-Every read handshake returns stream metadata. Records carry absolute sequence numbers. `CaughtUp` confirms that every preceding record through its position was delivered. `TsfReadSession::stream_info()` and `last_caught_up()` expose the latest values without a REST request.
-
-REST authorization is stream-scoped. Read methods accept an optional link secret because public streams need none. Management methods require an owner link secret on each call. The client never retains a link secret as implicit authorization for later REST requests.
-
-The permission in a link fragment selects the intended client mode. The server resolves authoritative permissions from the secret. Changing the fragment cannot elevate permission, and clients do not need a remote permission preflight before choosing their initial mode.
-
-The default producer window is capped at the service's hard writer-queue contract: 128 records and 5 MiB of payload. Applications may configure smaller windows.
-
-The producer packs retained records into protocol batches of at most 128 records and 1 MiB. Read batches carry up to 1,000 records or 1 MiB. Read sessions drain them one record at a time and advance their reconnect cursor only after delivery.
 
 ## CLI quickstart
 
