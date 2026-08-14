@@ -1782,19 +1782,11 @@ impl TsfSseReadSession {
     /// Returns the next record, reconnecting from the last safe absolute cursor when needed.
     pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
         loop {
-            if self.finished {
-                return Ok(None);
-            }
-            if self.options.limit == Some(0)
-                || matches!((self.options.start, self.options.end_seq_num), (Some(ReadStart::SeqNum(next)), Some(end_seq_num)) if next >= end_seq_num)
-            {
+            if self.finished || read_options_exhausted(&self.options) {
                 return Ok(None);
             }
             if let Some(record) = self.queued_records.pop_front() {
-                self.options.start = record.seq_num.checked_add(1).map(ReadStart::SeqNum);
-                if let Some(remaining) = self.options.limit.as_mut() {
-                    *remaining = remaining.saturating_sub(1);
-                }
+                self.finished = advance_read_options(&mut self.options, record.seq_num);
                 return Ok(Some(record));
             }
             let event = match next_sse_event(&mut self.body, &mut self.parser).await {
@@ -2064,25 +2056,19 @@ impl TsfReadSession {
         self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
-        match seq_num.checked_add(1) {
-            Some(next_seq_num) => self.options.start = Some(ReadStart::SeqNum(next_seq_num)),
-            None => self.finished = true,
-        }
-
-        if let Some(remaining) = self.options.limit.as_mut() {
-            *remaining = remaining.saturating_sub(1);
-            if *remaining == 0 {
-                self.finished = true;
-            }
-        }
-
-        if matches!(
-            (self.options.start, self.options.end_seq_num),
-            (Some(ReadStart::SeqNum(next)), Some(end_seq_num)) if next >= end_seq_num
-        ) {
-            self.finished = true;
-        }
+        self.finished = advance_read_options(&mut self.options, seq_num);
     }
+}
+
+fn advance_read_options(options: &mut ReadStreamOptions, seq_num: u64) -> bool {
+    let Some(next_seq_num) = seq_num.checked_add(1) else {
+        return true;
+    };
+    options.start = Some(ReadStart::SeqNum(next_seq_num));
+    if let Some(remaining) = options.limit.as_mut() {
+        *remaining = remaining.saturating_sub(1);
+    }
+    read_options_exhausted(options)
 }
 
 fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
@@ -3699,14 +3685,21 @@ mod tests {
     }
 
     #[test]
-    fn builds_versioned_rest_urls_from_api_origin() {
+    fn builds_versioned_rest_and_path_only_websocket_urls() {
         let client =
-            TsfClient::with_api_origin(Url::parse("http://localhost:8787").expect("API origin"))
+            TsfClient::with_api_origin(Url::parse("https://example.com").expect("API origin"))
                 .expect("valid API origin");
 
         assert_eq!(
             client.rest_url("/streams").as_str(),
-            "http://localhost:8787/api/v1/streams"
+            "https://example.com/api/v1/streams"
+        );
+        assert_eq!(
+            client
+                .websocket_url("/streams/0123456789abcdefghjkmnpqrstvwxyz/read")
+                .expect("WebSocket URL")
+                .as_str(),
+            "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read"
         );
     }
 
@@ -3724,21 +3717,6 @@ mod tests {
                 Err(TsfClientError::InvalidApiOrigin(_))
             ));
         }
-    }
-
-    #[test]
-    fn builds_path_only_versioned_websocket_urls() {
-        let client =
-            TsfClient::with_api_origin(Url::parse("https://example.com").expect("API origin"))
-                .expect("valid API origin");
-
-        assert_eq!(
-            client
-                .websocket_url("/streams/0123456789abcdefghjkmnpqrstvwxyz/read")
-                .expect("WebSocket URL")
-                .as_str(),
-            "wss://example.com/api/v1/streams/0123456789abcdefghjkmnpqrstvwxyz/read"
-        );
     }
 
     #[test]
