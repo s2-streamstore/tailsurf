@@ -1688,12 +1688,12 @@ async fn read_transcript(
                 .context("failed to connect SSE reader")?,
         )
     } else {
-        TranscriptReader::WebSocket(
+        TranscriptReader::WebSocket(Box::new(
             client
                 .connect_reader(options)
                 .await
                 .context("failed to connect reader")?,
-        )
+        ))
     };
     let (record_tx, mut record_rx) = mpsc::channel(TRANSCRIPT_RECORD_QUEUE);
     let reader_task = tokio::spawn(assemble_transcript_records(
@@ -1737,7 +1737,7 @@ async fn write_transcript_records(
 }
 
 enum TranscriptReader {
-    WebSocket(TsfReadSession),
+    WebSocket(Box<TsfReadSession>),
     Sse(TsfSseReadSession),
 }
 
