@@ -428,7 +428,8 @@ impl TsfClient {
                 ));
             }
             authorizing_link_id.get_or_insert(page.authorizing_link_id);
-            // validate_link_page dedups within a page; overlapping pages need a running set.
+            // validate_link_page rejects duplicates within a page. Keep that invariant across
+            // pages.
             for link in &page.links {
                 if !seen_link_ids.insert(link.link_id.clone()) {
                     return Err(TsfClientError::InvalidLinkPage(
@@ -1915,9 +1916,8 @@ impl TsfSseReadSession {
                 self.stream_metadata = connection
                     .stream_metadata
                     .expect("validated stream_metadata event");
-                // reconnect_attempts resets only on delivered read_batch/caught_up events, so a
-                // server that completes handshakes but never delivers records still hits the
-                // consecutive no-progress reconnect limit.
+                // A handshake alone is not progress. A read_batch or caught_up event resets the
+                // counter below.
                 continue;
             };
             match event.event.as_str() {
@@ -2605,11 +2605,13 @@ fn compact_record_data(bytes: &[u8]) -> RecordData {
 }
 
 fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
-    // decode_slice rejects wrong output lengths.
     let mut writer = [0u8; WriterId::BYTE_LEN];
-    URL_SAFE_NO_PAD
+    let decoded_len = URL_SAFE_NO_PAD
         .decode_slice(record.writer_id, &mut writer)
         .map_err(|_| TsfClientError::InvalidSse("invalid writer_id"))?;
+    if decoded_len != WriterId::BYTE_LEN {
+        return Err(TsfClientError::InvalidSse("invalid writer_id length"));
+    }
     let data = match record.data {
         RecordData::Utf8(value) => Bytes::from(value),
         RecordData::Base64url(value) => {
@@ -3258,9 +3260,9 @@ pub enum TsfClientError {
     /// The writer background task failed or could not be joined.
     #[error("append writer failed: {0}")]
     AppendWriterFailed(String),
-    /// Consecutive read connections ended or requested reconnect without delivering a record.
+    /// Consecutive read connections ended without delivering a record batch or caught-up event.
     #[error(
-        "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"
+        "read stream delivered no record batch or caught-up event across {max_connection_attempts} consecutive connection attempts"
     )]
     ReadReconnectLimitExceeded {
         /// Configured maximum consecutive connection attempts, including the initial connection.
@@ -4333,19 +4335,27 @@ mod tests {
         options.end_seq_num = None;
         assert!(validate_sse_read_batch(&non_contiguous, &options).is_err());
 
-        let oversized = SseReadRecord {
+        let mut wire_record = SseReadRecord {
             seq_num: 0,
             timestamp_ms: 0,
-            writer_id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
+            writer_id: URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN - 1]),
             writer_seq_num: 0,
             part: RestRecordPart {
                 index: 0,
                 is_final: true,
             },
             format: RecordFormat::Bytes,
-            data: RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_BYTES + 1])),
+            data: RecordData::Utf8(String::new()),
         };
-        assert!(sse_read_record(oversized).is_err());
+        assert!(matches!(
+            sse_read_record(wire_record.clone()),
+            Err(TsfClientError::InvalidSse("invalid writer_id length"))
+        ));
+
+        wire_record.writer_id = URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]);
+        wire_record.data =
+            RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_BYTES + 1]));
+        assert!(sse_read_record(wire_record).is_err());
     }
 
     #[test]

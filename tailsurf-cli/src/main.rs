@@ -859,7 +859,7 @@ fn new_stream_links(
     {
         if links.iter().any(|link| link.link_id.as_str() == "reader") {
             bail!(
-                "Link ID \"reader\" is reserved for the default read link on private streams; choose another ID or give that link read permission"
+                "Link ID \"reader\" is reserved for the default read link on private streams; choose another ID or give that link read-only permission"
             );
         }
         links.push(initial_link("reader", LinkPermissions::read())?);
@@ -2296,7 +2296,14 @@ mod tests {
         let error = new_stream_links(&args, Visibility::Private).expect_err("reserved reader ID");
         assert_eq!(
             error.to_string(),
-            "Link ID \"reader\" is reserved for the default read link on private streams; choose another ID or give that link read permission"
+            "Link ID \"reader\" is reserved for the default read link on private streams; choose another ID or give that link read-only permission"
+        );
+
+        let args = new_args(vec!["reader=rw".parse().expect("valid link")]);
+        let error = new_stream_links(&args, Visibility::Private).expect_err("reserved reader ID");
+        assert_eq!(
+            error.to_string(),
+            "Link ID \"reader\" is reserved for the default read link on private streams; choose another ID or give that link read-only permission"
         );
 
         // User-vs-user duplicates still hit the generic uniqueness error.
