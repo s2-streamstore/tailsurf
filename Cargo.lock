@@ -1829,6 +1829,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "memchr",
  "rand 0.10.2",
  "reqwest",
  "secrecy",

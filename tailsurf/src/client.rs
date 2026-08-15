@@ -2358,21 +2358,18 @@ fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
 struct SseParser {
     buffer: Vec<u8>,
     offset: usize,
-    validated: bool,
+    /// Start of the not-yet-terminated event; only newly pushed bytes are validated.
+    tail_start: usize,
 }
 
 impl SseParser {
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), TsfClientError> {
         self.compact();
         self.buffer.extend_from_slice(chunk);
-        self.validated = false;
+        self.validate_new_bytes(chunk.len())
     }
 
     fn next_event(&mut self) -> Result<Option<ParsedSseEvent>, TsfClientError> {
-        if !self.validated {
-            validate_sse_buffer(&self.buffer[self.offset..])?;
-            self.validated = true;
-        }
         loop {
             let Some((index, length)) = sse_boundary(&self.buffer[self.offset..]) else {
                 return Ok(None);
@@ -2385,9 +2382,31 @@ impl SseParser {
         }
     }
 
+    /// Validates only the bytes appended by the last push; earlier bytes were proven on arrival.
+    /// The 3-byte overlap catches an event terminator straddling the previous chunk boundary.
+    fn validate_new_bytes(&mut self, pushed: usize) -> Result<(), TsfClientError> {
+        let new_start = self.buffer.len() - pushed;
+        let mut pos = new_start.saturating_sub(3).max(self.tail_start);
+        while let Some((index, length)) = sse_boundary(&self.buffer[pos..]) {
+            let boundary_end = pos + index + length;
+            if boundary_end - self.tail_start > MAX_SSE_EVENT_BYTES {
+                return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
+            }
+            self.tail_start = boundary_end;
+            pos = boundary_end;
+        }
+        if self.buffer.len() - self.tail_start > MAX_SSE_UNTERMINATED_EVENT_BYTES {
+            return Err(TsfClientError::InvalidSse(
+                "unterminated event exceeds 2 MiB",
+            ));
+        }
+        Ok(())
+    }
+
     fn compact(&mut self) {
         if self.offset >= 64 * 1024 && self.offset >= self.buffer.len() / 2 {
             self.buffer.drain(..self.offset);
+            self.tail_start -= self.offset;
             self.offset = 0;
         }
     }
@@ -2403,7 +2422,7 @@ async fn next_sse_event(
         }
         match body.next().await {
             Some(Ok(chunk)) => {
-                parser.push(&chunk);
+                parser.push(&chunk)?;
             }
             Some(Err(error)) => return Err(error.into()),
             None => return Ok(None),
@@ -2411,30 +2430,17 @@ async fn next_sse_event(
     }
 }
 
-fn validate_sse_buffer(buffer: &[u8]) -> Result<(), TsfClientError> {
-    let mut offset = 0;
-    while let Some((index, length)) = sse_boundary(&buffer[offset..]) {
-        if index + length > MAX_SSE_EVENT_BYTES {
-            return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
-        }
-        offset += index + length;
-    }
-    if buffer.len() - offset > MAX_SSE_UNTERMINATED_EVENT_BYTES {
-        return Err(TsfClientError::InvalidSse(
-            "unterminated event exceeds 2 MiB",
-        ));
-    }
-    Ok(())
-}
-
 fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len().saturating_sub(1) {
-        if buffer[index..].starts_with(b"\r\n\r\n") {
-            return Some((index, 4));
+    let mut from = 0;
+    while let Some(index) = memchr::memchr(b'\n', &buffer[from..]) {
+        let at = from + index;
+        if at >= 3 && buffer[at - 3..=at] == *b"\r\n\r\n" {
+            return Some((at - 3, 4));
         }
-        if buffer[index..].starts_with(b"\n\n") {
-            return Some((index, 2));
+        if at >= 1 && buffer[at - 1] == b'\n' {
+            return Some((at - 1, 2));
         }
+        from = at + 1;
     }
     None
 }
@@ -4100,6 +4106,38 @@ mod tests {
                 "unterminated event exceeds 2 MiB"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn sse_parser_rejects_an_event_oversized_across_fragments() {
+        let first = format!("event: read_batch\ndata: {}", "a".repeat(1_500_000));
+        let second = format!("{}\n\n", "b".repeat(700_000));
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(vec![
+            Ok::<_, reqwest::Error>(Bytes::from(first)),
+            Ok::<_, reqwest::Error>(Bytes::from(second)),
+        ]));
+        let mut parser = SseParser::default();
+
+        assert!(matches!(
+            next_sse_event(&mut body, &mut parser).await,
+            Err(TsfClientError::InvalidSse("event exceeds 2 MiB"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_parser_accepts_a_terminator_split_across_chunks() {
+        let chunks = ["data: hi\r\n\r", "\n"]
+            .into_iter()
+            .map(|chunk| Ok::<_, reqwest::Error>(Bytes::copy_from_slice(chunk.as_bytes())))
+            .collect::<Vec<_>>();
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(chunks));
+        let mut parser = SseParser::default();
+
+        let event = next_sse_event(&mut body, &mut parser)
+            .await
+            .expect("straddled event")
+            .expect("straddled event value");
+        assert_eq!(event.data, "hi");
     }
 
     #[test]
