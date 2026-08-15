@@ -311,7 +311,13 @@ impl ClientFrame {
                 playback_rate_permille,
                 snapshot,
             } => {
-                validate_open_read(*start, *end_seq_num, *playback_rate_permille, *snapshot)?;
+                validate_open_read(
+                    *start,
+                    *limit,
+                    *end_seq_num,
+                    *playback_rate_permille,
+                    *snapshot,
+                )?;
                 if let Some(secret) = link_secret {
                     validate_link_secret(secret)?;
                 }
@@ -648,7 +654,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         validate_link_secret(&secret)?;
         Some(secret)
     };
-    validate_open_read(start, end_seq_num, playback_rate_permille, snapshot)?;
+    validate_open_read(start, limit, end_seq_num, playback_rate_permille, snapshot)?;
     Ok(ClientFrame::OpenRead {
         link_secret,
         start,
@@ -661,6 +667,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
 
 fn validate_open_read(
     start: ReadStart,
+    limit: Option<u64>,
     end_seq_num: Option<u64>,
     playback_rate_permille: Option<u64>,
     snapshot: bool,
@@ -668,6 +675,12 @@ fn validate_open_read(
     let (_, selector) = read_start_wire(start);
     if selector > MAX_READ_SELECTOR_VALUE {
         return Err(FrameCodecError::ReadSelectorOutOfRange(selector));
+    }
+    // Bounds and counts also flow through the data adapter; keep them exact-integer safe.
+    for value in [limit, end_seq_num].into_iter().flatten() {
+        if value > MAX_READ_SELECTOR_VALUE {
+            return Err(FrameCodecError::ReadSelectorOutOfRange(value));
+        }
     }
     if snapshot && end_seq_num.is_some() {
         return Err(FrameCodecError::SnapshotWithEnd);
@@ -1318,6 +1331,44 @@ mod tests {
         oversized_selector[3..11].copy_from_slice(&(MAX_READ_SELECTOR_VALUE + 1).to_be_bytes());
         assert!(matches!(
             ClientFrame::decode(&oversized_selector),
+            Err(FrameCodecError::ReadSelectorOutOfRange(value))
+                if value == MAX_READ_SELECTOR_VALUE + 1
+        ));
+
+        for (limit, end_seq_num) in [
+            (Some(MAX_READ_SELECTOR_VALUE + 1), None),
+            (None, Some(MAX_READ_SELECTOR_VALUE + 1)),
+        ] {
+            let out_of_range = ClientFrame::OpenRead {
+                link_secret: None,
+                start: ReadStart::SeqNum(0),
+                limit,
+                end_seq_num,
+                playback_rate_permille: None,
+                snapshot: false,
+            };
+            assert!(matches!(
+                out_of_range.encode(),
+                Err(FrameCodecError::ReadSelectorOutOfRange(value))
+                    if value == MAX_READ_SELECTOR_VALUE + 1
+            ));
+        }
+
+        // The decode path shares the bound: patch a valid end_seq_num past the adapter range.
+        let with_end = ClientFrame::OpenRead {
+            link_secret: None,
+            start: ReadStart::SeqNum(0),
+            limit: None,
+            end_seq_num: Some(9),
+            playback_rate_permille: None,
+            snapshot: false,
+        }
+        .encode()
+        .expect("OpenRead with end");
+        let mut patched_end = with_end.to_vec();
+        patched_end[11..19].copy_from_slice(&(MAX_READ_SELECTOR_VALUE + 1).to_be_bytes());
+        assert!(matches!(
+            ClientFrame::decode(&patched_end),
             Err(FrameCodecError::ReadSelectorOutOfRange(value))
                 if value == MAX_READ_SELECTOR_VALUE + 1
         ));
