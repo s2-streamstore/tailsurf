@@ -299,6 +299,8 @@ pub struct ApiError {
     /// Human-readable diagnostic message.
     pub message: String,
     /// Request identifier used for support and tracing.
+    // Tolerated absent: proxy-generated errors carry the other structured fields without one.
+    #[serde(default)]
     pub request_id: String,
     /// Retry delay in milliseconds when supplied.
     pub retry_after_ms: Option<u64>,
@@ -726,5 +728,21 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn api_error_tolerates_an_absent_request_id() {
+        let error: ApiErrorResponse = serde_json::from_value(json!({
+            "error": {
+                "code": "sequence_mismatch",
+                "message": "position changed",
+                "retry_after_ms": 250,
+                "actual_next_seq_num": "42"
+            }
+        }))
+        .expect("error without request id");
+        assert!(error.error.request_id.is_empty());
+        assert_eq!(error.error.retry_after_ms, Some(250));
+        assert_eq!(error.error.actual_next_seq_num, Some(42));
     }
 }
