@@ -2567,30 +2567,49 @@ fn invalid_sse_resume_cursor() -> TsfClientError {
     TsfClientError::InvalidSse("SSE event does not carry a valid resume cursor")
 }
 
+/// Per-byte JSON escaped length matching serde_json's ESCAPE table: '"', '\\', and the
+/// five short-form controls take two bytes, the rest of C0 takes six (\u00XX), and every
+/// other byte passes through unescaped.
+const JSON_ESCAPED_LEN: [u8; 256] = {
+    let mut table = [1u8; 256];
+    let mut control = 0;
+    while control < 0x20 {
+        table[control] = 6;
+        control += 1;
+    }
+    table[b'"' as usize] = 2;
+    table[b'\\' as usize] = 2;
+    table[b'\x08' as usize] = 2; // \b
+    table[b'\t' as usize] = 2;
+    table[b'\n' as usize] = 2;
+    table[b'\x0C' as usize] = 2; // \f
+    table[b'\r' as usize] = 2;
+    table
+};
+
 fn compact_record_data(bytes: &[u8]) -> RecordData {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes));
     };
-    let utf8 = RecordData::Utf8(text.to_owned());
-    let utf8_len = serde_json::to_vec(&utf8)
-        .expect("record data serialization is infallible")
-        .len();
+    let escaped_len = bytes.iter().fold(0usize, |total, byte| {
+        total + JSON_ESCAPED_LEN[*byte as usize] as usize
+    });
+    let utf8_len = br#"{"encoding":"utf8","value":""}"#.len() + escaped_len;
     let base64url_len =
         br#"{"encoding":"base64url","value":""}"#.len() + bytes.len().saturating_mul(4).div_ceil(3);
     if utf8_len <= base64url_len {
-        utf8
+        RecordData::Utf8(text.to_owned())
     } else {
         RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes))
     }
 }
 
 fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
-    let writer = URL_SAFE_NO_PAD
-        .decode(record.writer_id)
+    // decode_slice rejects wrong output lengths.
+    let mut writer = [0u8; WriterId::BYTE_LEN];
+    URL_SAFE_NO_PAD
+        .decode_slice(record.writer_id, &mut writer)
         .map_err(|_| TsfClientError::InvalidSse("invalid writer_id"))?;
-    let writer: [u8; WriterId::BYTE_LEN] = writer
-        .try_into()
-        .map_err(|_| TsfClientError::InvalidSse("invalid writer_id length"))?;
     let data = match record.data {
         RecordData::Utf8(value) => Bytes::from(value),
         RecordData::Base64url(value) => {
@@ -4252,6 +4271,41 @@ mod tests {
             ))
         ));
         server.await.expect("join REST server");
+    }
+
+    #[test]
+    fn compact_record_data_choice_matches_serialized_lengths() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"plain text".to_vec(),
+            "unicode 😀 text".as_bytes().to_vec(),
+            b"\"\\escape\theavy\n".to_vec(),
+            vec![0x00; 64],
+            vec![0x7f; 128],
+            "😀".repeat(1024).into_bytes(),
+            vec![0xff; 32],
+        ];
+        for bytes in cases {
+            let chosen = compact_record_data(&bytes);
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                let utf8_len = serde_json::to_vec(&RecordData::Utf8(text.to_owned()))
+                    .expect("measure utf8")
+                    .len();
+                let base64url_len = br#"{"encoding":"base64url","value":""}"#.len()
+                    + bytes.len().saturating_mul(4).div_ceil(3);
+                assert_eq!(
+                    matches!(chosen, RecordData::Utf8(_)),
+                    utf8_len <= base64url_len,
+                    "bytes={bytes:?}"
+                );
+            } else {
+                assert!(matches!(chosen, RecordData::Base64url(_)));
+            }
+            let round_tripped = match &chosen {
+                RecordData::Utf8(value) => value.as_bytes().to_vec(),
+                RecordData::Base64url(value) => URL_SAFE_NO_PAD.decode(value).expect("decode"),
+            };
+            assert_eq!(round_tripped, bytes);
+        }
     }
 
     #[test]
