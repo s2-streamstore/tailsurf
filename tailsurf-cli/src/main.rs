@@ -955,6 +955,23 @@ async fn create_stream(
     }
 }
 
+async fn connect_session_writer(
+    api_url: Url,
+    stream_id: StreamId,
+    link: LinkSecret,
+    expected_next_seq_num: Option<u64>,
+) -> eyre::Result<(TsfWriter, WriterState)> {
+    let client = TsfClient::with_api_origin(api_url)?;
+    let state = WriterState::new_random();
+    let mut options = WriteStreamOptions::new(stream_id, state.client_writer_id, link);
+    options.expected_next_seq_num = expected_next_seq_num;
+    let writer = client
+        .connect_writer(options)
+        .await
+        .context("failed to connect writer")?;
+    Ok((writer, state))
+}
+
 async fn stream_stdin_to_writer(
     api_url: Url,
     stream_id: StreamId,
@@ -963,14 +980,8 @@ async fn stream_stdin_to_writer(
     buffering: WriteBuffering,
     max_logical_record_bytes: usize,
 ) -> eyre::Result<()> {
-    let client = TsfClient::with_api_origin(api_url)?;
-    let mut state = WriterState::new_random();
-    let mut options = WriteStreamOptions::new(stream_id, state.client_writer_id, link);
-    options.expected_next_seq_num = expected_next_seq_num;
-    let writer = client
-        .connect_writer(options)
-        .await
-        .context("failed to connect writer")?;
+    let (writer, mut state) =
+        connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
 
     let interrupted = match buffering {
         WriteBuffering::Raw => stream_raw_stdin_to_writer(&writer, &mut state).await,
@@ -1084,14 +1095,8 @@ async fn stream_command_to_writer(
     max_logical_record_bytes: usize,
     command: Vec<String>,
 ) -> eyre::Result<()> {
-    let client = TsfClient::with_api_origin(api_url)?;
-    let mut state = WriterState::new_random();
-    let mut options = WriteStreamOptions::new(stream_id, state.client_writer_id, link);
-    options.expected_next_seq_num = expected_next_seq_num;
-    let writer = client
-        .connect_writer(options)
-        .await
-        .context("failed to connect writer")?;
+    let (writer, mut state) =
+        connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
     let outcome = {
         let mut session = WriterSession {
             writer: &writer,
