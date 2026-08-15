@@ -1416,27 +1416,15 @@ impl TsfWriteSession {
         let operation_timeout = self.operation_timeout;
 
         with_timeout(operation_timeout, "send append frame", async move {
-            self.buffer_batch(std::iter::once(&record)).await?;
+            self.buffer_batch(&[&record]).await?;
             self.flush().await
         })
         .await
     }
 
     /// Encodes one batch into the socket's write buffer, leaving the flush to the caller.
-    async fn buffer_batch<'a>(
-        &mut self,
-        records: impl IntoIterator<Item = &'a AppendRecord>,
-    ) -> Result<(), TsfClientError> {
-        let records = records
-            .into_iter()
-            .map(|record| AppendRecord {
-                writer_seq_num: record.writer_seq_num,
-                part: record.part,
-                format: record.format,
-                data: record.data.clone(),
-            })
-            .collect();
-        let frame = ClientFrame::AppendBatch(records).encode()?;
+    async fn buffer_batch(&mut self, records: &[&AppendRecord]) -> Result<(), TsfClientError> {
+        let frame = ClientFrame::encode_append_batch(records)?;
         self.ws.feed(Message::Binary(frame)).await?;
         Ok(())
     }
@@ -1681,7 +1669,7 @@ async fn send_retained(
                 payload_bytes += next.record.data.len();
                 batch.push(&next.record);
             }
-            session.buffer_batch(batch).await?;
+            session.buffer_batch(&batch).await?;
         }
         session.flush().await
     })

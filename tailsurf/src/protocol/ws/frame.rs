@@ -1,5 +1,7 @@
 //! Exact binary codec for `tsf.v1` WebSocket traffic.
 
+use std::borrow::Borrow;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -342,16 +344,32 @@ impl ClientFrame {
                     + expected_next_seq_num.map_or(0, |_| 8)
                     + LINK_SECRET_ENCODED_LENGTH)
             }
-            Self::AppendBatch(records) => {
-                for record in records {
-                    validate_writer_seq_num(record.writer_seq_num)?;
-                }
-                batch_encoded_len(
-                    records.iter().map(|record| &record.data),
-                    Self::APPEND_BODY_HEADER_LEN,
-                    MAX_APPEND_BATCH_RECORDS,
-                )
-            }
+            Self::AppendBatch(records) => Self::append_batch_encoded_len(records),
+        }
+    }
+
+    fn append_batch_encoded_len<R: Borrow<AppendRecord>>(
+        records: &[R],
+    ) -> Result<usize, FrameCodecError> {
+        for record in records {
+            validate_writer_seq_num(record.borrow().writer_seq_num)?;
+        }
+        batch_encoded_len(
+            records.iter().map(|record| &record.borrow().data),
+            Self::APPEND_BODY_HEADER_LEN,
+            MAX_APPEND_BATCH_RECORDS,
+        )
+    }
+
+    fn put_append_batch<R: Borrow<AppendRecord>>(output: &mut BytesMut, records: &[R]) {
+        output.put_u8(ClientOp::AppendBatch.byte());
+        for record in records {
+            let record = record.borrow();
+            output.put_u32((Self::APPEND_BODY_HEADER_LEN + record.data.len()) as u32);
+            output.put_u64(record.writer_seq_num);
+            output.put_u32(record.part.raw());
+            output.put_u8(record.format.byte());
+            output.put_slice(&record.data);
         }
     }
 
@@ -403,17 +421,20 @@ impl ClientFrame {
                 }
                 output.put_slice(link_secret.expose_secret().as_bytes());
             }
-            Self::AppendBatch(records) => {
-                output.put_u8(ClientOp::AppendBatch.byte());
-                for record in records {
-                    output.put_u32((Self::APPEND_BODY_HEADER_LEN + record.data.len()) as u32);
-                    output.put_u64(record.writer_seq_num);
-                    output.put_u32(record.part.raw());
-                    output.put_u8(record.format.byte());
-                    output.put_slice(&record.data);
-                }
-            }
+            Self::AppendBatch(records) => Self::put_append_batch(output, records),
         }
+    }
+
+    /// Encodes one append batch borrowed from retained records into a complete WebSocket message.
+    ///
+    /// Equivalent to [`ClientFrame::AppendBatch`]`::encode` without taking ownership of the
+    /// records.
+    pub fn encode_append_batch<R: Borrow<AppendRecord>>(
+        records: &[R],
+    ) -> Result<Bytes, FrameCodecError> {
+        let mut output = BytesMut::with_capacity(Self::append_batch_encoded_len(records)?);
+        Self::put_append_batch(&mut output, records);
+        Ok(output.freeze())
     }
 
     /// Encodes one client frame into a complete WebSocket binary message.
