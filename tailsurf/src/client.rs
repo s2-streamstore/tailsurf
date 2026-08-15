@@ -1838,6 +1838,19 @@ impl TsfSseReadSession {
         self.last_caught_up
     }
 
+    fn resume_cursors(
+        &self,
+        event: &ParsedSseEvent,
+    ) -> Result<(ParsedSseResumeCursor, Option<ParsedSseResumeCursor>), TsfClientError> {
+        Ok((
+            sse_resume_cursor(event)?.1,
+            self.last_event_id
+                .as_deref()
+                .map(parse_sse_resume_cursor)
+                .transpose()?,
+        ))
+    }
+
     /// Returns the next record, reconnecting from the last safe absolute cursor when needed.
     pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
         loop {
@@ -1893,7 +1906,9 @@ impl TsfSseReadSession {
                 self.stream_metadata = connection
                     .stream_metadata
                     .expect("validated stream_metadata event");
-                self.reconnect_attempts = 0;
+                // reconnect_attempts resets only on delivered read_batch/caught_up events, so a
+                // server that completes handshakes but never delivers records still hits the
+                // consecutive no-progress reconnect limit.
                 continue;
             };
             match event.event.as_str() {
@@ -1907,12 +1922,7 @@ impl TsfSseReadSession {
                         .map(sse_read_record)
                         .collect::<Result<Vec<_>, _>>()?;
                     validate_sse_read_batch(&records, &self.options)?;
-                    let (event_id, cursor) = sse_resume_cursor(&event)?;
-                    let previous = self
-                        .last_event_id
-                        .as_deref()
-                        .map(parse_sse_resume_cursor)
-                        .transpose()?;
+                    let (cursor, previous) = self.resume_cursors(&event)?;
                     validate_sse_read_batch_cursor(
                         &records,
                         cursor,
@@ -1920,7 +1930,7 @@ impl TsfSseReadSession {
                         &self.options,
                         self.snapshot_boundary,
                     )?;
-                    self.last_event_id = Some(event_id.to_owned());
+                    self.last_event_id = event.id;
                     self.queued_records.extend(records);
                     self.reconnect_attempts = 0;
                 }
@@ -1931,12 +1941,7 @@ impl TsfSseReadSession {
                         next_seq_num: value.next_seq_num,
                         last_timestamp_ms: value.last_timestamp_ms,
                     };
-                    let (event_id, cursor) = sse_resume_cursor(&event)?;
-                    let previous = self
-                        .last_event_id
-                        .as_deref()
-                        .map(parse_sse_resume_cursor)
-                        .transpose()?;
+                    let (cursor, previous) = self.resume_cursors(&event)?;
                     validate_sse_caught_up_cursor(
                         caught_up,
                         cursor,
@@ -1944,7 +1949,7 @@ impl TsfSseReadSession {
                         &self.options,
                         self.snapshot_boundary,
                     )?;
-                    self.last_event_id = Some(event_id.to_owned());
+                    self.last_event_id = event.id;
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
                     self.reconnect_attempts = 0;
@@ -4143,6 +4148,55 @@ mod tests {
             .expect("straddled event")
             .expect("straddled event value");
         assert_eq!(event.data, "hi");
+    }
+
+    #[tokio::test]
+    async fn sse_reader_bounds_consecutive_reconnects_without_delivered_records() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind SSE listener");
+        let address = listener.local_addr().expect("SSE listener address");
+        let server = tokio::spawn(async move {
+            // Every handshake completes with valid metadata; no body ever delivers a record.
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                    event: stream_metadata\n\
+                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let mut config =
+            TsfClientConfig::new(Url::parse(&format!("http://{address}")).expect("SSE API origin"))
+                .expect("valid client config");
+        config.retry_policy = RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        };
+        let client = TsfClient::with_config(config).expect("SSE client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let mut reader = client
+            .connect_sse_reader(ReadStreamOptions::new(stream_id))
+            .await
+            .expect("initial SSE connect");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), reader.next_record()).await;
+
+        assert!(matches!(
+            result,
+            Ok(Err(TsfClientError::ReadReconnectLimitExceeded {
+                max_connection_attempts: 3,
+            }))
+        ));
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
