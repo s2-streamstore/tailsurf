@@ -35,8 +35,8 @@ use tailsurf::{
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
             frame::{
-                CaughtUpPosition, ClientFrame, MAX_RECORD_BYTES, PartHeader, ReadRecord,
-                RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
+                CaughtUpPosition, ClientFrame, MAX_RECORD_BYTES, OwnedReadRecord, PartHeader,
+                ReadBatch, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -600,8 +600,8 @@ async fn write_defaults_to_lines_and_splits_large_records() {
 
     let mut records = Vec::new();
     while records.len() < 3 {
-        match reader.next_record().await.expect("event") {
-            Some(record) => records.push(record),
+        match reader.next_batch().await.expect("event") {
+            Some(batch) => records.extend(batch.iter().map(|record| record.into_owned())),
             None => panic!("reader closed before expected records"),
         }
     }
@@ -675,10 +675,12 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let mut records = Vec::new();
     let mut output = Vec::new();
     while output.len() < input.len() {
-        match reader.next_record().await.expect("event") {
-            Some(record) => {
-                output.extend_from_slice(&record.data);
-                records.push(record);
+        match reader.next_batch().await.expect("event") {
+            Some(batch) => {
+                for record in &batch {
+                    output.extend_from_slice(record.data);
+                    records.push(record.into_owned());
+                }
             }
             None => panic!("reader closed before expected records"),
         }
@@ -742,10 +744,12 @@ async fn write_raw_flushes_on_linger() {
 
     let mut data = Vec::new();
     while data.len() < 2 {
-        match reader.next_record().await.expect("event") {
-            Some(record) => {
-                assert_eq!(record.format, RecordFormat::Bytes);
-                data.push(record.data);
+        match reader.next_batch().await.expect("event") {
+            Some(batch) => {
+                for record in &batch {
+                    assert_eq!(record.format, RecordFormat::Bytes);
+                    data.push(Bytes::copy_from_slice(record.data));
+                }
             }
             None => panic!("reader closed before expected records"),
         }
@@ -1047,6 +1051,36 @@ async fn tail_reconnect_resumes_after_last_sequence() {
 }
 
 #[tokio::test]
+async fn tail_reconnect_after_multi_record_batch_advances_start_and_limit() {
+    let server = FakeReadServer::start(FakeReadMode::ReconnectAfterBatch).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+
+    let output = run_tsf_until_stdout_contains(
+        server.api_url.clone(),
+        ["tail", "--seq", "0", "--limit", "10", read_link.as_str()],
+        b"four\n",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(output.stdout, "one\ntwo\nthree\nfour\n");
+    assert_eq!(output.stderr, "");
+    let attempts = server.read_attempts();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].start, ReadStart::SeqNum(0));
+    assert_eq!(attempts[0].limit, Some(10));
+    // The three-record batch moves the resume position past its last sequence and decrements
+    // the remaining limit by the full batch length.
+    assert_eq!(attempts[1].start, ReadStart::SeqNum(3));
+    assert_eq!(attempts[1].limit, Some(7));
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
     let server = FakeSseServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -1078,6 +1112,40 @@ async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
     assert!(attempts.iter().all(|attempt| {
         attempt.authorization.as_deref() == Some(&format!("Bearer {TEST_STREAM_LINK}"))
     }));
+    server.abort();
+}
+
+#[tokio::test]
+async fn sse_tail_reconnects_after_multi_record_batch_with_advanced_cursor() {
+    let server = FakeSseServer::start_with_mode(FakeSseMode::BatchThenClose).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
+    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+
+    let output = run_tsf_with_api_url(
+        server.api_url.clone(),
+        ["tail", "--sse", "--limit", "10", read_link.as_str()],
+        None,
+    )
+    .await;
+
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    assert_eq!(output.stdout, "one\ntwo\nthree\n");
+    let attempts = server.attempts();
+    assert_eq!(attempts.len(), 2);
+    // The resume cursor carries the sequence past the batch's last record and its consumed
+    // count; the query (including the original limit) is unchanged.
+    assert_eq!(attempts[0].last_event_id, None);
+    assert_eq!(attempts[1].last_event_id.as_deref(), Some("v1,3,3"));
+    assert_eq!(attempts[0].query, attempts[1].query);
+    let query = attempts[1].query.as_deref().expect("SSE query");
+    let query = Url::parse(&format!("http://localhost/?{query}")).expect("parse captured query");
+    assert_eq!(
+        query.query_pairs().collect::<HashMap<_, _>>(),
+        HashMap::from([
+            ("tail_offset".into(), "0".into()),
+            ("limit".into(), "10".into()),
+        ])
+    );
     server.abort();
 }
 
@@ -1207,14 +1275,15 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     let request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
-    let record = reader
-        .next_record_with_timeout(Duration::from_secs(5))
+    let batch = reader
+        .next_batch_with_timeout(Duration::from_secs(5))
         .await
-        .expect("read record")
-        .expect("record");
+        .expect("read batch")
+        .expect("batch");
+    let record = batch.first().expect("record");
 
     assert_eq!(record.seq_num, 20);
-    assert_eq!(record.data.as_ref(), b"default\n");
+    assert_eq!(record.data, b"default\n");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(80));
@@ -1240,14 +1309,15 @@ async fn reader_restarts_retries_after_established_idle_connections() {
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
-    let record = timeout(Duration::from_secs(2), reader.next_record())
+    let batch = timeout(Duration::from_secs(2), reader.next_batch())
         .await
         .expect("bounded reconnects")
         .expect("recovered read")
-        .expect("record after reconnects");
+        .expect("batch after reconnects");
+    let record = batch.first().expect("record");
 
     assert_eq!(record.seq_num, 0);
-    assert_eq!(record.data.as_ref(), b"recovered\n");
+    assert_eq!(record.data, b"recovered\n");
     assert_eq!(server.read_attempts().len(), 3);
     server.abort();
 }
@@ -1271,7 +1341,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
 
     let error = timeout(
         Duration::from_secs(1),
-        reader.next_record_with_timeout(Duration::from_millis(100)),
+        reader.next_batch_with_timeout(Duration::from_millis(100)),
     )
     .await
     .expect("absolute read deadline")
@@ -1280,7 +1350,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
     assert!(matches!(
         error,
         TsfClientError::Timeout {
-            operation: "read stream record"
+            operation: "read stream batch"
         }
     ));
     assert!(server.read_attempts().len() >= 2);
@@ -1299,23 +1369,24 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let error = reader
-        .next_record_with_timeout(Duration::from_millis(50))
+        .next_batch_with_timeout(Duration::from_millis(50))
         .await
         .expect_err("caller timeout during reconnect backoff");
     assert!(matches!(
         error,
         TsfClientError::Timeout {
-            operation: "read stream record"
+            operation: "read stream batch"
         }
     ));
 
-    let record = timeout(Duration::from_secs(2), reader.next_record())
+    let batch = timeout(Duration::from_secs(2), reader.next_batch())
         .await
         .expect("resumed reconnect")
-        .expect("read record")
-        .expect("record");
+        .expect("read batch")
+        .expect("batch");
+    let record = batch.first().expect("record");
     assert_eq!(record.seq_num, 5);
-    assert_eq!(record.data.as_ref(), b"stable\n");
+    assert_eq!(record.data, b"stable\n");
     assert_eq!(server.read_attempts().len(), 2);
     server.abort();
 }
@@ -1338,14 +1409,15 @@ async fn reader_reconnects_after_configured_idle_timeout() {
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
-    let record = timeout(Duration::from_secs(2), reader.next_record())
+    let batch = timeout(Duration::from_secs(2), reader.next_batch())
         .await
         .expect("idle reconnect")
-        .expect("read record")
-        .expect("record");
+        .expect("read batch")
+        .expect("batch");
+    let record = batch.first().expect("record");
 
     assert_eq!(record.seq_num, 0);
-    assert_eq!(record.data.as_ref(), b"after idle\n");
+    assert_eq!(record.data, b"after idle\n");
     assert_eq!(server.read_attempts().len(), 2);
     server.abort();
 }
@@ -2393,18 +2465,21 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         send_server_frame(
             &mut socket,
             ServerFrame::ReadBatch(
-                records
-                    .into_iter()
-                    .map(|record| ReadRecord {
-                        seq_num: record.seq_num,
-                        timestamp_ms: record.timestamp_ms,
-                        writer_id: record.writer_id,
-                        writer_seq_num: record.writer_seq_num,
-                        part: record.part,
-                        format: record.format,
-                        data: record.data,
-                    })
-                    .collect(),
+                ReadBatch::try_from_records(
+                    records
+                        .into_iter()
+                        .map(|record| OwnedReadRecord {
+                            seq_num: record.seq_num,
+                            timestamp_ms: record.timestamp_ms,
+                            writer_id: record.writer_id,
+                            writer_seq_num: record.writer_seq_num,
+                            part: record.part,
+                            format: record.format,
+                            data: record.data,
+                        })
+                        .collect(),
+                )
+                .expect("test records within batch bounds"),
             ),
         )
         .await
@@ -3129,9 +3204,19 @@ struct SseAttempt {
     authorization: Option<String>,
 }
 
+#[derive(Default, Clone, Copy)]
+enum FakeSseMode {
+    /// Metadata and an empty caught_up, then end of stream.
+    #[default]
+    CaughtUpThenClose,
+    /// Metadata and one three-record read_batch, then end of stream mid-read.
+    BatchThenClose,
+}
+
 #[derive(Default)]
 struct FakeSseState {
     attempts: Mutex<Vec<SseAttempt>>,
+    mode: FakeSseMode,
 }
 
 struct FakeSseServer {
@@ -3142,9 +3227,16 @@ struct FakeSseServer {
 
 impl FakeSseServer {
     async fn start() -> Self {
+        Self::start_with_mode(FakeSseMode::default()).await
+    }
+
+    async fn start_with_mode(mode: FakeSseMode) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("address");
-        let state = Arc::new(FakeSseState::default());
+        let state = Arc::new(FakeSseState {
+            mode,
+            ..FakeSseState::default()
+        });
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/records", get(fake_sse_read))
             .with_state(state.clone());
@@ -3208,8 +3300,26 @@ async fn fake_sse_read(
         ""
     };
     let cursor = if snapshot { "v1,0,0,0,0" } else { "v1,0,0" };
+    let record = |seq_num: u64, value: &str| {
+        format!(
+            "{{\"seq_num\":\"{seq_num}\",\"timestamp_ms\":\"1781717406000\",\"writer_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"writer_seq_num\":\"{seq_num}\",\"part\":{{\"index\":0,\"is_final\":true}},\"format\":\"transcript\",\"data\":{{\"encoding\":\"utf8\",\"value\":\"{value}\"}}}}"
+        )
+    };
+    let events = match state.mode {
+        FakeSseMode::CaughtUpThenClose => format!(
+            "{snapshot_boundary}id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
+        ),
+        // A three-record batch with a resume cursor past its last sequence, then EOF: the
+        // client must reconnect with this cursor.
+        FakeSseMode::BatchThenClose => format!(
+            "id: v1,3,3\nevent: read_batch\ndata: {{\"records\":[{},{},{}]}}\n\n",
+            record(0, "one\\n"),
+            record(1, "two\\n"),
+            record(2, "three\\n"),
+        ),
+    };
     let body = format!(
-        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{snapshot_boundary}id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
+        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{events}"
     );
     (
         StatusCode::OK,
@@ -3237,6 +3347,7 @@ struct FakeReadState {
 #[derive(Clone, Copy)]
 enum FakeReadMode {
     Reconnect,
+    ReconnectAfterBatch,
     ReconnectAfterEmptyCaughtUp,
     ReconnectBeforeFirstDefault,
     ReconnectTwiceThenRecord,
@@ -3290,6 +3401,7 @@ impl FakeReadServer {
 const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
     match mode {
         FakeReadMode::Reconnect => 0,
+        FakeReadMode::ReconnectAfterBatch => 3,
         FakeReadMode::ReconnectAfterEmptyCaughtUp => 7,
         FakeReadMode::ReconnectBeforeFirstDefault => 100,
         FakeReadMode::ReconnectTwiceThenRecord
@@ -3378,6 +3490,41 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
                 close_retryable_read(&mut socket).await;
             } else {
                 send_read_record(&mut socket, first_seq_num, 1, b"second\n").await;
+            }
+        }
+        FakeReadMode::ReconnectAfterBatch => {
+            if attempt_count == 1 {
+                // One frame carrying three records, then a retryable drop: the client must
+                // resume after the batch's last sequence with the limit reduced by three.
+                send_server_frame(
+                    &mut socket,
+                    ServerFrame::ReadBatch(
+                        ReadBatch::try_from_records(
+                            [
+                                (0, 0, b"one\n".as_slice()),
+                                (1, 1, b"two\n".as_slice()),
+                                (2, 2, b"three\n".as_slice()),
+                            ]
+                            .into_iter()
+                            .map(|(seq_num, writer_seq_num, data)| OwnedReadRecord {
+                                seq_num,
+                                timestamp_ms: 1_781_717_406_000 + seq_num,
+                                writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
+                                writer_seq_num,
+                                part: PartHeader::unsplit(),
+                                format: RecordFormat::Transcript,
+                                data: Bytes::copy_from_slice(data),
+                            })
+                            .collect(),
+                        )
+                        .expect("test records within batch bounds"),
+                    ),
+                )
+                .await
+                .expect("send batch");
+                close_retryable_read(&mut socket).await;
+            } else {
+                send_read_record(&mut socket, 3, 3, b"four\n").await;
             }
         }
         FakeReadMode::ReconnectAfterEmptyCaughtUp => {
@@ -3524,15 +3671,18 @@ async fn send_read_record_with_format(
 ) {
     send_server_frame(
         socket,
-        ServerFrame::ReadBatch(vec![ReadRecord {
-            seq_num,
-            timestamp_ms: 1_781_717_406_000 + seq_num,
-            writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
-            writer_seq_num,
-            part,
-            format,
-            data: Bytes::copy_from_slice(data),
-        }]),
+        ServerFrame::ReadBatch(
+            ReadBatch::try_from_records(vec![OwnedReadRecord {
+                seq_num,
+                timestamp_ms: 1_781_717_406_000 + seq_num,
+                writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
+                writer_seq_num,
+                part,
+                format,
+                data: Bytes::copy_from_slice(data),
+            }])
+            .expect("test record within batch bounds"),
+        ),
     )
     .await
     .expect("send read record");

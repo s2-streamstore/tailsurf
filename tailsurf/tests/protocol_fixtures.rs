@@ -10,8 +10,9 @@ use tailsurf::{
             ReadStart,
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_BATCH_RECORDS,
-                MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader,
-                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
+                MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, OwnedReadRecord,
+                PartHeader, ReadBatch, RecordFormat, ServerFrame, SnapshotBoundary,
+                TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -225,15 +226,18 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             part_raw,
             format,
             data_hex,
-        } => ServerFrame::ReadBatch(vec![ReadRecord {
-            seq_num: parse_u64(&seq_num),
-            timestamp_ms: parse_u64(&timestamp_ms),
-            writer_id: decode_writer_id(&writer_id_hex),
-            writer_seq_num: parse_u64(&writer_seq_num),
-            part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
-            format: parse_format(format),
-            data: Bytes::from(decode_hex(&data_hex)),
-        }]),
+        } => ServerFrame::ReadBatch(
+            ReadBatch::try_from_records(vec![OwnedReadRecord {
+                seq_num: parse_u64(&seq_num),
+                timestamp_ms: parse_u64(&timestamp_ms),
+                writer_id: decode_writer_id(&writer_id_hex),
+                writer_seq_num: parse_u64(&writer_seq_num),
+                part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
+                format: parse_format(format),
+                data: Bytes::from(decode_hex(&data_hex)),
+            }])
+            .expect("fixture record within batch bounds"),
+        ),
         ServerFixture::Heartbeat => ServerFrame::Heartbeat,
         ServerFixture::CaughtUp {
             next_seq_num,

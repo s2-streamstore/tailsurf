@@ -128,7 +128,7 @@ impl LogicalTranscript {
             check_logical_record_len(record.data.len(), limits.max_logical_record_bytes)?;
             return Ok(Some(TranscriptRecord {
                 format: record.format,
-                data: TranscriptData::from(record.data),
+                data: TranscriptData::from(Bytes::copy_from_slice(record.data)),
             }));
         }
 
@@ -160,7 +160,7 @@ impl LogicalTranscript {
                 chunks: Vec::new(),
             };
             if !record.data.is_empty() {
-                pending.chunks.push(record.data);
+                pending.chunks.push(Bytes::copy_from_slice(record.data));
             }
             writer.pending = Some(pending);
             self.pending_bytes = pending_bytes;
@@ -191,7 +191,7 @@ impl LogicalTranscript {
         pending.len = logical_record_len;
         pending.part_count = part_count;
         if !record.data.is_empty() {
-            pending.chunks.push(record.data);
+            pending.chunks.push(Bytes::copy_from_slice(record.data));
         }
         if record.part.is_final() {
             return Ok(Some(TranscriptRecord {
@@ -481,7 +481,7 @@ fn clear_pending(writer: &mut WriterState, pending_bytes: &mut usize, pending_pa
 mod tests {
     use super::*;
 
-    fn record(seq: u64, part: PartHeader, data: &[u8]) -> ReadRecord {
+    fn record(seq: u64, part: PartHeader, data: &[u8]) -> ReadRecord<'_> {
         record_with_writer(
             WriterId::from_bytes([1; WriterId::BYTE_LEN]),
             seq,
@@ -495,7 +495,7 @@ mod tests {
         seq: u64,
         part: PartHeader,
         data: &[u8],
-    ) -> ReadRecord {
+    ) -> ReadRecord<'_> {
         ReadRecord {
             seq_num: seq,
             timestamp_ms: seq,
@@ -503,7 +503,7 @@ mod tests {
             writer_seq_num: seq,
             part,
             format: RecordFormat::Transcript,
-            data: Bytes::copy_from_slice(data),
+            data,
         }
     }
 

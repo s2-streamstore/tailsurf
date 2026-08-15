@@ -189,9 +189,56 @@ impl TryFrom<u8> for RecordFormat {
     }
 }
 
-/// One physical stream record delivered by the read data plane.
+/// One physical stream record borrowed from a [`ReadBatch`].
+///
+/// The payload borrows from the batch's shared backing buffer; use [`ReadRecord::into_owned`] to
+/// retain a record beyond the batch's lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadRecord<'a> {
+    /// Durable absolute sequence number.
+    pub seq_num: u64,
+    /// Record timestamp as Unix epoch milliseconds.
+    pub timestamp_ms: u64,
+    /// Stable identity of the writer that wrote this record.
+    pub writer_id: WriterId,
+    /// Writer-local sequence number reused if this record is retransmitted.
+    pub writer_seq_num: u64,
+    /// Logical split-part metadata.
+    pub part: PartHeader,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record payload bytes.
+    pub data: &'a [u8],
+}
+
+impl ReadRecord<'_> {
+    /// Copies this record into an independently owned value.
+    ///
+    /// Named `into_owned` because `ReadRecord` is `Clone`: an inherent `to_owned` would collide
+    /// with the blanket [`ToOwned`] impl, whose `Owned = Self` would silently hand generic code
+    /// a borrowed view instead of an owned copy.
+    pub fn into_owned(self) -> OwnedReadRecord {
+        self.into()
+    }
+}
+
+impl From<ReadRecord<'_>> for OwnedReadRecord {
+    fn from(record: ReadRecord<'_>) -> Self {
+        Self {
+            seq_num: record.seq_num,
+            timestamp_ms: record.timestamp_ms,
+            writer_id: record.writer_id,
+            writer_seq_num: record.writer_seq_num,
+            part: record.part,
+            format: record.format,
+            data: Bytes::copy_from_slice(record.data),
+        }
+    }
+}
+
+/// One physical stream record with independently owned payload bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadRecord {
+pub struct OwnedReadRecord {
     /// Durable absolute sequence number.
     pub seq_num: u64,
     /// Record timestamp as Unix epoch milliseconds.
@@ -207,6 +254,189 @@ pub struct ReadRecord {
     /// Exact record payload bytes.
     pub data: Bytes,
 }
+
+impl OwnedReadRecord {
+    /// Borrows this record as a [`ReadRecord`] view.
+    pub fn as_record(&self) -> ReadRecord<'_> {
+        ReadRecord {
+            seq_num: self.seq_num,
+            timestamp_ms: self.timestamp_ms,
+            writer_id: self.writer_id,
+            writer_seq_num: self.writer_seq_num,
+            part: self.part,
+            format: self.format,
+            data: &self.data,
+        }
+    }
+}
+
+/// Fixed record metadata with the payload location inside the batch backing buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecordMeta {
+    pub(crate) seq_num: u64,
+    pub(crate) timestamp_ms: u64,
+    pub(crate) writer_id: WriterId,
+    pub(crate) writer_seq_num: u64,
+    pub(crate) part: PartHeader,
+    pub(crate) format: RecordFormat,
+    pub(crate) data_start: u32,
+    pub(crate) data_len: u32,
+}
+
+/// A bounded batch of physical stream records sharing one backing payload buffer.
+///
+/// Decoding keeps the received frame as one buffer instead of refcounting one [`Bytes`] handle
+/// per record; iterating borrows payloads directly from that buffer.
+#[derive(Clone, Debug)]
+pub struct ReadBatch {
+    payload: Bytes,
+    records: Vec<RecordMeta>,
+}
+
+impl ReadBatch {
+    /// Builds a batch from owned records, validating the same bounds the wire codec enforces
+    /// and concatenating payloads into one buffer.
+    ///
+    /// Rejects empty or over-count batches, oversized records or aggregate payloads, and
+    /// non-contiguous sequences; construction is the parse step that upholds the bounded-batch
+    /// invariant.
+    pub fn try_from_records(records: Vec<OwnedReadRecord>) -> Result<Self, FrameCodecError> {
+        // Count first: an over-count input could otherwise wrap the payload sum on 32-bit
+        // targets before the aggregate bound rejects it.
+        validate_batch_count(records.len(), MAX_READ_BATCH_RECORDS)?;
+        validate_sequence_contiguous(records.iter().map(|record| record.seq_num))?;
+        let mut payload_bytes = 0_usize;
+        for record in &records {
+            validate_record_len(record.data.len())?;
+            // MAX_READ_BATCH_RECORDS records of MAX_RECORD_BYTES each cannot overflow.
+            payload_bytes = payload_bytes
+                .checked_add(record.data.len())
+                .expect("bounded batch payload sum");
+        }
+        if payload_bytes > MAX_BATCH_PAYLOAD_BYTES {
+            return Err(FrameCodecError::BatchPayloadTooLarge {
+                actual: payload_bytes,
+                max: MAX_BATCH_PAYLOAD_BYTES,
+            });
+        }
+
+        let mut payload = BytesMut::with_capacity(payload_bytes);
+        let mut metas = Vec::with_capacity(records.len());
+        for record in records {
+            // payload_bytes is capped at MAX_BATCH_PAYLOAD_BYTES, so these narrows cannot
+            // truncate.
+            let data_start = payload.len() as u32;
+            payload.extend_from_slice(&record.data);
+            metas.push(RecordMeta {
+                seq_num: record.seq_num,
+                timestamp_ms: record.timestamp_ms,
+                writer_id: record.writer_id,
+                writer_seq_num: record.writer_seq_num,
+                part: record.part,
+                format: record.format,
+                data_start,
+                data_len: record.data.len() as u32,
+            });
+        }
+        Ok(Self::from_parts(payload.freeze(), metas))
+    }
+
+    pub(crate) fn from_parts(payload: Bytes, records: Vec<RecordMeta>) -> Self {
+        Self { payload, records }
+    }
+
+    /// Returns the number of records in this batch.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Returns whether this batch contains no records.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Returns the first record, or `None` for an empty batch.
+    pub fn first(&self) -> Option<ReadRecord<'_>> {
+        self.records.first().map(|meta| self.record(meta))
+    }
+
+    /// Returns the last record, or `None` for an empty batch.
+    pub fn last(&self) -> Option<ReadRecord<'_>> {
+        self.records.last().map(|meta| self.record(meta))
+    }
+
+    /// Iterates the records, borrowing payloads from the shared buffer.
+    pub fn iter(&self) -> Iter<'_> {
+        Iter {
+            batch: self,
+            records: self.records.iter(),
+        }
+    }
+
+    fn record(&self, meta: &RecordMeta) -> ReadRecord<'_> {
+        let data_start = meta.data_start as usize;
+        ReadRecord {
+            seq_num: meta.seq_num,
+            timestamp_ms: meta.timestamp_ms,
+            writer_id: meta.writer_id,
+            writer_seq_num: meta.writer_seq_num,
+            part: meta.part,
+            format: meta.format,
+            data: &self.payload[data_start..data_start + meta.data_len as usize],
+        }
+    }
+}
+
+/// Iterates the records of a [`ReadBatch`], borrowing payloads from the shared buffer.
+///
+/// Returned by [`ReadBatch::iter`]; `&ReadBatch` also iterates directly via its
+/// [`IntoIterator`] impl.
+#[derive(Clone, Debug)]
+pub struct Iter<'a> {
+    batch: &'a ReadBatch,
+    records: std::slice::Iter<'a, RecordMeta>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = ReadRecord<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.records.next().map(|meta| self.batch.record(meta))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.records.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for Iter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.records.next_back().map(|meta| self.batch.record(meta))
+    }
+}
+
+impl ExactSizeIterator for Iter<'_> {}
+
+impl std::iter::FusedIterator for Iter<'_> {}
+
+impl<'a> IntoIterator for &'a ReadBatch {
+    type Item = ReadRecord<'a>;
+    type IntoIter = Iter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl PartialEq for ReadBatch {
+    // Decode backs the batch with the whole frame while try_from_records stores concatenated
+    // payloads, so equality compares records rather than backing buffers.
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ReadBatch {}
 
 /// One physical record submitted by a writer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,7 +517,7 @@ pub enum ServerFrame {
         end_seq_num: u64,
     },
     /// Delivers a bounded batch of physical stream records.
-    ReadBatch(Vec<ReadRecord>),
+    ReadBatch(ReadBatch),
     /// Keeps an otherwise idle unbounded read connection active.
     Heartbeat,
     /// Confirms that every record preceding the captured position was delivered.
@@ -349,7 +579,7 @@ impl ClientFrame {
             validate_writer_seq_num(record.borrow().writer_seq_num)?;
         }
         batch_encoded_len(
-            records.iter().map(|record| &record.borrow().data),
+            records.iter().map(|record| record.borrow().data.len()),
             Self::APPEND_BODY_HEADER_LEN,
             MAX_APPEND_BATCH_RECORDS,
         )
@@ -456,17 +686,18 @@ impl ServerFrame {
     /// Returns the exact wire length of this frame, validating the payload size for records.
     ///
     /// Covers only fixed-size and batch frames; [`ServerFrame::StreamMetadata`] carries
-    /// variable-length JSON and is serialized directly by [`ServerFrame::encode`].
+    /// variable-length JSON and is serialized directly by [`ServerFrame::encode`]. ReadBatch
+    /// validity is a construction invariant ([`ReadBatch::try_from_records`], decode), so only
+    /// the length is computed here.
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
-            Self::ReadBatch(records) => {
-                validate_read_batch_sequence(records)?;
-                batch_encoded_len(
-                    records.iter().map(|record| &record.data),
-                    Self::READ_BODY_HEADER_LEN,
-                    MAX_READ_BATCH_RECORDS,
-                )
-            }
+            Self::ReadBatch(batch) => Ok(1
+                + batch.records.len() * (4 + Self::READ_BODY_HEADER_LEN)
+                + batch
+                    .records
+                    .iter()
+                    .map(|record| record.data_len as usize)
+                    .sum::<usize>()),
             Self::StreamMetadata(_) => {
                 unreachable!("StreamMetadata is serialized directly by encode()")
             }
@@ -490,17 +721,19 @@ impl ServerFrame {
                 output.put_u64(*start_seq_num);
                 output.put_u64(*end_seq_num);
             }
-            Self::ReadBatch(records) => {
+            Self::ReadBatch(batch) => {
                 output.put_u8(ServerOp::ReadBatch.byte());
-                for record in records {
-                    output.put_u32((Self::READ_BODY_HEADER_LEN + record.data.len()) as u32);
+                for record in &batch.records {
+                    let data_start = record.data_start as usize;
+                    let data_len = record.data_len as usize;
+                    output.put_u32((Self::READ_BODY_HEADER_LEN + data_len) as u32);
                     output.put_u64(record.seq_num);
                     output.put_u64(record.timestamp_ms);
                     output.put_slice(record.writer_id.as_bytes());
                     output.put_u64(record.writer_seq_num);
                     output.put_u32(record.part.raw());
                     output.put_u8(record.format.byte());
-                    output.put_slice(&record.data);
+                    output.put_slice(&batch.payload[data_start..data_start + data_len]);
                 }
             }
             Self::Heartbeat => output.put_u8(ServerOp::Heartbeat.byte()),
@@ -760,7 +993,11 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
             })
         }
         ServerOp::ReadBatch => {
-            let mut records = Vec::new();
+            // Every record costs a 4-byte length prefix plus the fixed header on the wire, so
+            // the frame length bounds the record count.
+            let max_records =
+                (body.len() / (4 + ServerFrame::READ_BODY_HEADER_LEN)).min(MAX_READ_BATCH_RECORDS);
+            let mut records = Vec::with_capacity(max_records);
             let mut payload_bytes = 0;
             for range in record_body_ranges(bytes, MAX_READ_BATCH_RECORDS) {
                 let (start, end) = range?;
@@ -773,20 +1010,21 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
                 let (format, data) = read_record_format(body)?;
                 validate_record_len(data.len())?;
                 payload_bytes += data.len();
-                let data_start = end - data.len();
-                records.push(ReadRecord {
+                records.push(RecordMeta {
                     seq_num,
                     timestamp_ms,
                     writer_id: WriterId::from_bytes(writer_id),
                     writer_seq_num,
                     part: PartHeader::from_raw(part_raw),
                     format,
-                    data: input.slice(data_start..end),
+                    data_start: (end - data.len()) as u32,
+                    data_len: data.len() as u32,
                 });
             }
-            validate_batch(records.len(), payload_bytes, MAX_READ_BATCH_RECORDS)?;
-            validate_read_batch_sequence(&records)?;
-            Ok(ServerFrame::ReadBatch(records))
+            let batch = ReadBatch::from_parts(input, records);
+            validate_batch(batch.len(), payload_bytes, MAX_READ_BATCH_RECORDS)?;
+            validate_read_batch_sequence(&batch)?;
+            Ok(ServerFrame::ReadBatch(batch))
         }
         ServerOp::Heartbeat => {
             ensure_empty(op_byte, body)?;
@@ -855,24 +1093,23 @@ fn validate_expected_next_seq_num(value: u64) -> Result<(), FrameCodecError> {
     }
 }
 
-fn batch_encoded_len<'a>(
-    records: impl ExactSizeIterator<Item = &'a Bytes>,
+fn batch_encoded_len(
+    record_lens: impl ExactSizeIterator<Item = usize>,
     record_header_len: usize,
     maximum_records: usize,
 ) -> Result<usize, FrameCodecError> {
-    let record_count = records.len();
+    let record_count = record_lens.len();
     let mut payload_bytes = 0;
-    for data in records {
-        validate_record_len(data.len())?;
-        payload_bytes += data.len();
+    for len in record_lens {
+        validate_record_len(len)?;
+        payload_bytes += len;
     }
     validate_batch(record_count, payload_bytes, maximum_records)?;
     Ok(1 + record_count * (4 + record_header_len) + payload_bytes)
 }
 
-fn validate_batch(
+fn validate_batch_count(
     record_count: usize,
-    payload_bytes: usize,
     maximum_records: usize,
 ) -> Result<(), FrameCodecError> {
     if record_count == 0 || record_count > maximum_records {
@@ -881,6 +1118,15 @@ fn validate_batch(
             max: maximum_records,
         });
     }
+    Ok(())
+}
+
+fn validate_batch(
+    record_count: usize,
+    payload_bytes: usize,
+    maximum_records: usize,
+) -> Result<(), FrameCodecError> {
+    validate_batch_count(record_count, maximum_records)?;
     if payload_bytes > MAX_BATCH_PAYLOAD_BYTES {
         return Err(FrameCodecError::BatchPayloadTooLarge {
             actual: payload_bytes,
@@ -890,14 +1136,21 @@ fn validate_batch(
     Ok(())
 }
 
-fn validate_read_batch_sequence(records: &[ReadRecord]) -> Result<(), FrameCodecError> {
-    if records
-        .windows(2)
-        .any(|pair| pair[0].seq_num.checked_add(1) != Some(pair[1].seq_num))
-    {
-        return Err(FrameCodecError::NonContiguousReadBatch);
+fn validate_sequence_contiguous(
+    seq_nums: impl IntoIterator<Item = u64>,
+) -> Result<(), FrameCodecError> {
+    let mut previous = None;
+    for seq_num in seq_nums {
+        if previous.is_some_and(|previous: u64| previous.checked_add(1) != Some(seq_num)) {
+            return Err(FrameCodecError::NonContiguousReadBatch);
+        }
+        previous = Some(seq_num);
     }
     Ok(())
+}
+
+fn validate_read_batch_sequence(batch: &ReadBatch) -> Result<(), FrameCodecError> {
+    validate_sequence_contiguous(batch.records.iter().map(|record| record.seq_num))
 }
 
 /// Lazily walks length-prefixed record bodies so decoding parses each record in one pass.
@@ -1109,6 +1362,18 @@ mod tests {
     use super::*;
     use crate::protocol::rest::Visibility;
 
+    fn owned_read_record(seq_num: u64, data: Bytes) -> OwnedReadRecord {
+        OwnedReadRecord {
+            seq_num,
+            timestamp_ms: 0,
+            writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
+            writer_seq_num: 0,
+            part: PartHeader::unsplit(),
+            format: RecordFormat::Bytes,
+            data,
+        }
+    }
+
     #[test]
     fn part_header_packs_final_bit_and_index() {
         let part = PartHeader::new(42, true).expect("part header");
@@ -1145,33 +1410,12 @@ mod tests {
             }) if actual == MAX_RECORD_BYTES + 1
         ));
 
-        ServerFrame::ReadBatch(vec![ReadRecord {
-            seq_num: 0,
-            timestamp_ms: 0,
-            writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
-            writer_seq_num: 0,
-            part: PartHeader::unsplit(),
-            format: RecordFormat::Bytes,
-            data: max_data,
-        }])
+        ServerFrame::ReadBatch(
+            ReadBatch::try_from_records(vec![owned_read_record(0, max_data)])
+                .expect("max record batch"),
+        )
         .encode()
         .expect("server max record encodes");
-        assert!(matches!(
-            ServerFrame::ReadBatch(vec![ReadRecord {
-                seq_num: 0,
-                timestamp_ms: 0,
-                writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
-                writer_seq_num: 0,
-                part: PartHeader::unsplit(),
-                format: RecordFormat::Bytes,
-                data: oversized_data,
-            }])
-            .encode(),
-            Err(FrameCodecError::RecordTooLarge {
-                actual,
-                max: MAX_RECORD_BYTES
-            }) if actual == MAX_RECORD_BYTES + 1
-        ));
 
         let oversized_client_frame = encoded_append_data_with_len(MAX_RECORD_BYTES + 1);
         assert!(matches!(
@@ -1271,16 +1515,10 @@ mod tests {
             Err(FrameCodecError::UnknownRecordFormat(0x7f))
         ));
 
-        let writer_id = WriterId::from_bytes([1; WriterId::BYTE_LEN]);
-        let mut server = ServerFrame::ReadBatch(vec![ReadRecord {
-            seq_num: 0,
-            timestamp_ms: 0,
-            writer_id,
-            writer_seq_num: 0,
-            part: PartHeader::unsplit(),
-            format: RecordFormat::Bytes,
-            data: Bytes::new(),
-        }])
+        let mut server = ServerFrame::ReadBatch(
+            ReadBatch::try_from_records(vec![owned_read_record(0, Bytes::new())])
+                .expect("valid batch"),
+        )
         .encode()
         .expect("server record")
         .to_vec();
@@ -1526,19 +1764,13 @@ mod tests {
             Err(FrameCodecError::InvalidRecordLength)
         ));
 
-        let read_record = |seq_num| ReadRecord {
-            seq_num,
-            timestamp_ms: 0,
-            writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
-            writer_seq_num: 0,
-            part: PartHeader::unsplit(),
-            format: RecordFormat::Bytes,
-            data: Bytes::new(),
-        };
         let maximum_read = ServerFrame::ReadBatch(
-            (0..MAX_READ_BATCH_RECORDS as u64)
-                .map(read_record)
-                .collect(),
+            ReadBatch::try_from_records(
+                (0..MAX_READ_BATCH_RECORDS as u64)
+                    .map(|seq_num| owned_read_record(seq_num, Bytes::new()))
+                    .collect(),
+            )
+            .expect("maximum read batch"),
         );
         let encoded = maximum_read.encode().expect("encode maximum read batch");
         assert_eq!(
@@ -1564,22 +1796,111 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn try_from_records_enforces_wire_batch_bounds() {
         assert!(matches!(
-            ServerFrame::ReadBatch(
+            ReadBatch::try_from_records(vec![]),
+            Err(FrameCodecError::InvalidBatchRecordCount { actual: 0, .. })
+        ));
+        assert!(matches!(
+            ReadBatch::try_from_records(
                 (0..=MAX_READ_BATCH_RECORDS as u64)
-                    .map(read_record)
+                    .map(|seq_num| owned_read_record(seq_num, Bytes::new()))
                     .collect()
-            )
-            .encode(),
+            ),
             Err(FrameCodecError::InvalidBatchRecordCount {
                 max: MAX_READ_BATCH_RECORDS,
                 ..
             })
         ));
         assert!(matches!(
-            ServerFrame::ReadBatch(vec![read_record(0), read_record(0)]).encode(),
+            ReadBatch::try_from_records(vec![owned_read_record(
+                0,
+                Bytes::from(vec![0; MAX_RECORD_BYTES + 1])
+            )]),
+            Err(FrameCodecError::RecordTooLarge {
+                max: MAX_RECORD_BYTES,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ReadBatch::try_from_records(
+                [0, 1, 2]
+                    .map(|seq_num| owned_read_record(seq_num, Bytes::from(vec![0; 400 * 1024])))
+                    .to_vec()
+            ),
+            Err(FrameCodecError::BatchPayloadTooLarge {
+                max: MAX_BATCH_PAYLOAD_BYTES,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ReadBatch::try_from_records(vec![
+                owned_read_record(0, Bytes::new()),
+                owned_read_record(2, Bytes::new())
+            ]),
             Err(FrameCodecError::NonContiguousReadBatch)
         ));
+        assert!(ReadBatch::try_from_records(vec![owned_read_record(0, Bytes::new())]).is_ok());
+    }
+
+    #[test]
+    fn read_batch_views_preserve_payload_boundaries() {
+        let alpha = OwnedReadRecord {
+            seq_num: 7,
+            timestamp_ms: 100,
+            writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
+            writer_seq_num: 3,
+            part: PartHeader::unsplit(),
+            format: RecordFormat::Bytes,
+            data: Bytes::from_static(b"alpha"),
+        };
+        let beta = OwnedReadRecord {
+            seq_num: 8,
+            timestamp_ms: 101,
+            writer_id: WriterId::from_bytes([2; WriterId::BYTE_LEN]),
+            writer_seq_num: 4,
+            part: PartHeader::unsplit(),
+            format: RecordFormat::Transcript,
+            data: Bytes::from_static(b"beta-longer"),
+        };
+        let batch =
+            ReadBatch::try_from_records(vec![alpha.clone(), beta.clone()]).expect("valid batch");
+
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.first().expect("first"), alpha.as_record());
+        assert_eq!(batch.last().expect("last"), beta.as_record());
+
+        let viewed: Vec<ReadRecord<'_>> = batch.iter().collect();
+        assert_eq!(viewed, [alpha.as_record(), beta.as_record()]);
+        assert_eq!(viewed[0].data, b"alpha");
+        assert_eq!(viewed[1].data, b"beta-longer");
+        assert_eq!(batch.iter().len(), 2);
+
+        // Owned conversion copies payload bytes out of the shared buffer.
+        let owned = viewed[1].into_owned();
+        assert_eq!(owned, beta);
+        assert_eq!(owned.data.as_ref(), b"beta-longer");
+
+        // `&batch` iterates directly, and the iterator is double-ended and fused.
+        let mut total = 0_usize;
+        for record in &batch {
+            total += record.data.len();
+        }
+        assert_eq!(total, b"alpha".len() + b"beta-longer".len());
+        let mut reversed = batch.iter().rev().map(|record| record.seq_num);
+        assert_eq!(reversed.next(), Some(8));
+        assert_eq!(reversed.next(), Some(7));
+        assert_eq!(reversed.next(), None);
+        assert_eq!(reversed.next(), None);
+
+        // A wire round trip preserves the same record views and payload boundaries.
+        let frame = ServerFrame::ReadBatch(batch);
+        let decoded = ServerFrame::decode_bytes(frame.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded, frame);
     }
 
     fn encoded_append_data_with_len(data_len: usize) -> Bytes {

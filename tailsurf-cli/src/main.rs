@@ -1766,11 +1766,11 @@ enum TranscriptReader {
 }
 
 impl TranscriptReader {
-    async fn next_record(&mut self) -> eyre::Result<Option<tailsurf::ReadRecord>> {
+    async fn next_batch(&mut self) -> eyre::Result<Option<tailsurf::ReadBatch>> {
         match self {
-            Self::WebSocket(reader) => reader.next_record().await.context("failed to read stream"),
+            Self::WebSocket(reader) => reader.next_batch().await.context("failed to read stream"),
             Self::Sse(reader) => reader
-                .next_record()
+                .next_batch()
                 .await
                 .context("failed to read SSE stream"),
         }
@@ -1785,15 +1785,17 @@ async fn assemble_transcript_records(
 ) {
     let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
     let result = async {
-        while let Some(record) = reader.next_record().await? {
-            let Some(record) = transcript
-                .push_record(record)
-                .context("failed to assemble transcript record")?
-            else {
-                continue;
-            };
-            if record_tx.send(Ok(record)).await.is_err() {
-                return eyre::Result::<()>::Ok(());
+        while let Some(batch) = reader.next_batch().await? {
+            for record in batch.iter() {
+                let Some(record) = transcript
+                    .push_record(record)
+                    .context("failed to assemble transcript record")?
+                else {
+                    continue;
+                };
+                if record_tx.send(Ok(record)).await.is_err() {
+                    return eyre::Result::<()>::Ok(());
+                }
             }
         }
         Ok(())

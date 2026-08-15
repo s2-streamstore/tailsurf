@@ -12,7 +12,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use rand::{Rng, RngExt};
 use reqwest::StatusCode;
@@ -46,8 +46,8 @@ use crate::{
             MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS,
             MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
             MAX_STATELESS_APPEND_RECORDS, RecordData, RestRecordPart, SseCaughtUpData,
-            SseReadBatchData, SseReadRecord, SseSnapshotBoundaryData, StreamLinkCredential,
-            StreamMetadata, UpdateStreamRequest,
+            SseReadBatchData, SseSnapshotBoundaryData, StreamLinkCredential, StreamMetadata,
+            UpdateStreamRequest,
         },
         ws::{
             DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
@@ -55,7 +55,8 @@ use crate::{
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
                 MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES, PartHeader,
-                ReadRecord, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
+                ReadBatch, RecordFormat, RecordMeta, ServerFrame, SnapshotBoundary,
+                TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -669,7 +670,6 @@ impl TsfClient {
             request_options,
             body: connection.body,
             parser: connection.parser,
-            queued_records: VecDeque::new(),
             stream_metadata: connection
                 .stream_metadata
                 .expect("validated stream_metadata event"),
@@ -837,7 +837,6 @@ impl TsfClient {
                     socket: ReadSocket {
                         ws,
                         read_idle_timeout,
-                        pending_records: VecDeque::new(),
                     },
                     stream_metadata: handshake.stream_metadata,
                     snapshot_boundary: handshake.snapshot_boundary,
@@ -1823,7 +1822,6 @@ pub struct TsfSseReadSession {
     request_options: ReadStreamOptions,
     body: SseBody,
     parser: SseParser,
-    queued_records: VecDeque<ReadRecord>,
     stream_metadata: StreamMetadata,
     last_caught_up: Option<CaughtUpPosition>,
     snapshot_boundary: Option<SnapshotBoundary>,
@@ -1861,15 +1859,15 @@ impl TsfSseReadSession {
         ))
     }
 
-    /// Returns the next record, reconnecting from the last safe absolute cursor when needed.
-    pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
+    /// Returns the next record batch, reconnecting from the last safe absolute cursor when needed.
+    ///
+    /// The session advances past the whole batch on return: records the caller does not consume
+    /// are not redelivered, including after a reconnect. Process or retain every needed record
+    /// from each batch.
+    pub async fn next_batch(&mut self) -> Result<Option<ReadBatch>, TsfClientError> {
         loop {
             if self.finished || read_options_exhausted(&self.options) {
                 return Ok(None);
-            }
-            if let Some(record) = self.queued_records.pop_front() {
-                self.finished = advance_read_options(&mut self.options, record.seq_num);
-                return Ok(Some(record));
             }
             let event = match next_sse_event(&mut self.body, &mut self.parser).await {
                 Ok(event) => event,
@@ -1925,23 +1923,20 @@ impl TsfSseReadSession {
                     let batch: SseReadBatchData = serde_json::from_str(&event.data)
                         .map_err(|_| TsfClientError::InvalidSse("invalid read_batch event"))?;
                     validate_sse_read_batch_count(batch.records.len())?;
-                    let records = batch
-                        .records
-                        .into_iter()
-                        .map(sse_read_record)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    validate_sse_read_batch(&records, &self.options)?;
+                    let batch = sse_read_batch(batch)?;
+                    validate_sse_read_batch(&batch, &self.options)?;
                     let (cursor, previous) = self.resume_cursors(&event)?;
                     validate_sse_read_batch_cursor(
-                        &records,
+                        &batch,
                         cursor,
                         previous,
                         &self.options,
                         self.snapshot_boundary,
                     )?;
                     self.last_event_id = event.id;
-                    self.queued_records.extend(records);
                     self.reconnect_attempts = 0;
+                    self.finished = advance_read_options_for_batch(&mut self.options, &batch);
+                    return Ok(Some(batch));
                 }
                 "caught_up" => {
                     let value: SseCaughtUpData = serde_json::from_str(&event.data)
@@ -2032,20 +2027,24 @@ impl TsfReadSession {
         &self.stream_metadata
     }
 
-    /// Waits for the next physical record using the configured idle timeout.
-    pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
-        self.next_record_inner().await
+    /// Waits for the next record batch using the configured idle timeout.
+    ///
+    /// The session advances past the whole batch on return: records the caller does not consume
+    /// are not redelivered, including after a reconnect. Process or retain every needed record
+    /// from each batch.
+    pub async fn next_batch(&mut self) -> Result<Option<ReadBatch>, TsfClientError> {
+        self.next_batch_inner().await
     }
 
-    /// Waits for the next physical record with a caller-supplied timeout for this operation.
-    pub async fn next_record_with_timeout(
+    /// Waits for the next record batch with a caller-supplied timeout for this operation.
+    pub async fn next_batch_with_timeout(
         &mut self,
         timeout: Duration,
-    ) -> Result<Option<ReadRecord>, TsfClientError> {
-        with_timeout(timeout, "read stream record", self.next_record_inner()).await
+    ) -> Result<Option<ReadBatch>, TsfClientError> {
+        with_timeout(timeout, "read stream batch", self.next_batch_inner()).await
     }
 
-    async fn next_record_inner(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
+    async fn next_batch_inner(&mut self) -> Result<Option<ReadBatch>, TsfClientError> {
         loop {
             if self.finished || read_options_exhausted(&self.options) {
                 self.finished = true;
@@ -2056,13 +2055,10 @@ impl TsfReadSession {
             }
 
             match self.socket.next_outcome().await {
-                Ok(ReadSocketOutcome::Record(record)) => {
-                    self.record_delivered(record.seq_num);
-                    return Ok(Some(record));
-                }
-                Ok(ReadSocketOutcome::Records(records)) => {
-                    validate_read_batch_for_request(&records, &self.options)?;
-                    self.socket.pending_records.extend(records);
+                Ok(ReadSocketOutcome::Records(batch)) => {
+                    validate_read_batch_for_request(&batch, &self.options)?;
+                    self.batch_delivered(&batch);
+                    return Ok(Some(batch));
                 }
                 Ok(ReadSocketOutcome::CaughtUp(caught_up)) => {
                     validate_caught_up_for_request(caught_up, &self.options)?;
@@ -2124,22 +2120,31 @@ impl TsfReadSession {
         Ok(())
     }
 
-    fn record_delivered(&mut self, seq_num: u64) {
+    fn batch_delivered(&mut self, batch: &ReadBatch) {
         self.no_progress_reconnects = 0;
         self.reconnect_backoff = self.client.config.retry_policy.initial_backoff;
         self.pending_reconnect_backoff = Duration::ZERO;
         self.reconnect_needed = false;
-        self.finished = advance_read_options(&mut self.options, seq_num);
+        self.finished = advance_read_options_for_batch(&mut self.options, batch);
     }
 }
 
-fn advance_read_options(options: &mut ReadStreamOptions, seq_num: u64) -> bool {
-    let Some(next_seq_num) = seq_num.checked_add(1) else {
+fn advance_read_options_for_batch(options: &mut ReadStreamOptions, batch: &ReadBatch) -> bool {
+    let last = batch.last().expect("validated non-empty batch");
+    advance_read_options(options, last.seq_num, batch.len())
+}
+
+fn advance_read_options(
+    options: &mut ReadStreamOptions,
+    last_seq_num: u64,
+    record_count: usize,
+) -> bool {
+    let Some(next_seq_num) = last_seq_num.checked_add(1) else {
         return true;
     };
     options.start = Some(ReadStart::SeqNum(next_seq_num));
     if let Some(remaining) = options.limit.as_mut() {
-        *remaining = remaining.saturating_sub(1);
+        *remaining = remaining.saturating_sub(record_count as u64);
     }
     read_options_exhausted(options)
 }
@@ -2153,10 +2158,10 @@ fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
 }
 
 fn validate_read_batch_for_request(
-    records: &[ReadRecord],
+    batch: &ReadBatch,
     options: &ReadStreamOptions,
 ) -> Result<(), TsfClientError> {
-    let Some(first) = records.first() else {
+    let Some(first) = batch.first() else {
         return Err(TsfClientError::InvalidReadResponse("ReadBatch is empty"));
     };
     let wrong_start = match options.start {
@@ -2171,15 +2176,16 @@ fn validate_read_batch_for_request(
     }
     if options
         .limit
-        .is_some_and(|remaining| records.len() as u64 > remaining)
+        .is_some_and(|remaining| batch.len() as u64 > remaining)
     {
         return Err(TsfClientError::InvalidReadResponse(
             "ReadBatch exceeds the remaining record limit",
         ));
     }
+    // Decode enforces strictly increasing sequences, so only the last record can cross.
     if options
         .end_seq_num
-        .is_some_and(|end_seq_num| records.iter().any(|record| record.seq_num >= end_seq_num))
+        .is_some_and(|end_seq_num| batch.last().is_some_and(|last| last.seq_num >= end_seq_num))
     {
         return Err(TsfClientError::InvalidReadResponse(
             "ReadBatch crosses the requested end sequence",
@@ -2203,7 +2209,6 @@ fn validate_caught_up_for_request(
 struct ReadSocket {
     ws: ClientWebSocket,
     read_idle_timeout: Option<Duration>,
-    pending_records: VecDeque<ReadRecord>,
 }
 
 struct ConnectedReadSocket {
@@ -2223,9 +2228,6 @@ fn apply_snapshot_boundary(options: &mut ReadStreamOptions, boundary: Option<Sna
 impl ReadSocket {
     async fn next_outcome(&mut self) -> Result<ReadSocketOutcome, TsfClientError> {
         loop {
-            if let Some(record) = self.pending_records.pop_front() {
-                return Ok(ReadSocketOutcome::Record(record));
-            }
             let outcome = if let Some(read_idle_timeout) = self.read_idle_timeout {
                 with_timeout(
                     read_idle_timeout,
@@ -2244,8 +2246,7 @@ impl ReadSocket {
 }
 
 enum ReadSocketOutcome {
-    Record(ReadRecord),
-    Records(Vec<ReadRecord>),
+    Records(ReadBatch),
     CaughtUp(CaughtUpPosition),
     Closed,
 }
@@ -2604,47 +2605,61 @@ fn compact_record_data(bytes: &[u8]) -> RecordData {
     }
 }
 
-fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
-    let mut writer = [0u8; WriterId::BYTE_LEN];
-    let decoded_len = URL_SAFE_NO_PAD
-        .decode_slice(record.writer_id, &mut writer)
-        .map_err(|_| TsfClientError::InvalidSse("invalid writer_id"))?;
-    if decoded_len != WriterId::BYTE_LEN {
-        return Err(TsfClientError::InvalidSse("invalid writer_id length"));
-    }
-    let data = match record.data {
-        RecordData::Utf8(value) => Bytes::from(value),
-        RecordData::Base64url(value) => {
-            let data = URL_SAFE_NO_PAD
-                .decode(value)
-                .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?;
-            Bytes::from(data)
+fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> {
+    // Unpadded base64url packs 3 bytes into 4 chars, so decoded payload sizes are exact here.
+    let payload_len: usize = batch
+        .records
+        .iter()
+        .map(|record| match &record.data {
+            RecordData::Utf8(value) => value.len(),
+            RecordData::Base64url(value) => value.len() * 3 / 4,
+        })
+        .sum();
+    let mut payload = BytesMut::with_capacity(payload_len);
+    let mut records = Vec::with_capacity(batch.records.len());
+    for record in batch.records {
+        let mut writer = [0u8; WriterId::BYTE_LEN];
+        let decoded_len = URL_SAFE_NO_PAD
+            .decode_slice(record.writer_id, &mut writer)
+            .map_err(|_| TsfClientError::InvalidSse("invalid writer_id"))?;
+        if decoded_len != WriterId::BYTE_LEN {
+            return Err(TsfClientError::InvalidSse("invalid writer_id length"));
         }
-    };
-    if data.len() > MAX_RECORD_BYTES {
-        return Err(TsfClientError::InvalidSse(
-            "read_batch contains an oversized record",
-        ));
+        let data = match record.data {
+            RecordData::Utf8(value) => value.into_bytes(),
+            RecordData::Base64url(value) => URL_SAFE_NO_PAD
+                .decode(value)
+                .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?,
+        };
+        if data.len() > MAX_RECORD_BYTES {
+            return Err(TsfClientError::InvalidSse(
+                "read_batch contains an oversized record",
+            ));
+        }
+        let part = PartHeader::new(record.part.index, record.part.is_final)?;
+        let data_start = payload.len() as u32;
+        payload.extend_from_slice(&data);
+        records.push(RecordMeta {
+            seq_num: record.seq_num,
+            timestamp_ms: record.timestamp_ms,
+            writer_id: WriterId::from_bytes(writer),
+            writer_seq_num: record.writer_seq_num,
+            part,
+            format: record.format,
+            data_start,
+            data_len: data.len() as u32,
+        });
     }
-    let part = PartHeader::new(record.part.index, record.part.is_final)?;
-    Ok(ReadRecord {
-        seq_num: record.seq_num,
-        timestamp_ms: record.timestamp_ms,
-        writer_id: WriterId::from_bytes(writer),
-        writer_seq_num: record.writer_seq_num,
-        part,
-        format: record.format,
-        data,
-    })
+    Ok(ReadBatch::from_parts(payload.freeze(), records))
 }
 
 fn validate_sse_read_batch(
-    records: &[ReadRecord],
+    batch: &ReadBatch,
     options: &ReadStreamOptions,
 ) -> Result<(), TsfClientError> {
     let mut payload_bytes = 0_usize;
     let mut previous_seq_num = None;
-    for record in records {
+    for record in batch {
         payload_bytes = payload_bytes.saturating_add(record.data.len());
         if payload_bytes > MAX_SSE_READ_BATCH_PAYLOAD_BYTES {
             return Err(TsfClientError::InvalidSse(
@@ -2670,7 +2685,7 @@ fn validate_sse_read_batch(
     }
     if options
         .limit
-        .is_some_and(|remaining| records.len() as u64 > remaining)
+        .is_some_and(|remaining| batch.len() as u64 > remaining)
     {
         return Err(TsfClientError::InvalidSse(
             "read_batch exceeds the remaining record limit",
@@ -2689,16 +2704,16 @@ fn validate_sse_read_batch_count(record_count: usize) -> Result<(), TsfClientErr
 }
 
 fn validate_sse_read_batch_cursor(
-    records: &[ReadRecord],
+    batch: &ReadBatch,
     cursor: ParsedSseResumeCursor,
     previous: Option<ParsedSseResumeCursor>,
     options: &ReadStreamOptions,
     snapshot_boundary: Option<SnapshotBoundary>,
 ) -> Result<(), TsfClientError> {
-    let Some(first) = records.first() else {
+    let Some(first) = batch.first() else {
         return Err(TsfClientError::InvalidSse("read_batch is empty"));
     };
-    let Some(expected_next_seq_num) = records
+    let Some(expected_next_seq_num) = batch
         .last()
         .and_then(|record| record.seq_num.checked_add(1))
     else {
@@ -2732,7 +2747,7 @@ fn validate_sse_read_batch_cursor(
     }
     let expected_consumed = previous
         .map_or(0, |value| value.consumed_records)
-        .checked_add(records.len() as u64)
+        .checked_add(batch.len() as u64)
         .ok_or(TsfClientError::InvalidSse(
             "read_batch consumed count overflowed",
         ))?;
@@ -3407,6 +3422,7 @@ mod tests {
     use tokio_tungstenite::connect_async;
 
     use super::*;
+    use crate::protocol::{rest::SseReadRecord, ws::frame::OwnedReadRecord};
 
     #[test]
     fn parses_structured_http_error_details() {
@@ -3616,7 +3632,6 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_millis(100)),
-            pending_records: VecDeque::new(),
         };
 
         let outcome = socket.next_outcome().await.expect("caught-up outcome");
@@ -3648,7 +3663,6 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_secs(1)),
-            pending_records: VecDeque::new(),
         };
 
         let result = with_timeout(
@@ -3677,7 +3691,6 @@ mod tests {
         let mut socket = ReadSocket {
             ws: client,
             read_idle_timeout: Some(Duration::from_millis(50)),
-            pending_records: VecDeque::new(),
         };
 
         let result = socket.next_outcome().await;
@@ -3984,7 +3997,13 @@ mod tests {
                 .expect("stream ID"),
         );
         options.start = Some(ReadStart::SeqNum(2));
-        assert!(validate_read_batch_for_request(&[sse_test_record(1, 0)], &options).is_err());
+        assert!(
+            validate_read_batch_for_request(
+                &ReadBatch::try_from_records(vec![sse_test_record(1, 0)]).expect("valid batch"),
+                &options
+            )
+            .is_err()
+        );
         assert!(
             validate_caught_up_for_request(
                 CaughtUpPosition {
@@ -4217,7 +4236,7 @@ mod tests {
             .await
             .expect("initial SSE connect");
 
-        let result = tokio::time::timeout(Duration::from_secs(5), reader.next_record()).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), reader.next_batch()).await;
 
         assert!(matches!(
             result,
@@ -4320,18 +4339,29 @@ mod tests {
                 .parse()
                 .expect("stream ID"),
         );
-        let aggregate = [0, 1, 2].map(|seq_num| sse_test_record(seq_num, 400 * 1024));
+        // Build through sse_read_batch so batch validation, not batch construction, is what
+        // rejects these.
+        let aggregate = sse_read_batch(SseReadBatchData {
+            records: [0, 1, 2]
+                .map(|seq_num| sse_wire_record(seq_num, 400 * 1024))
+                .to_vec(),
+        })
+        .expect("sse_read_batch leaves aggregate bounds to validation");
         assert!(validate_sse_read_batch(&aggregate, &options).is_err());
 
         options.limit = Some(1);
-        let two = [sse_test_record(0, 0), sse_test_record(1, 0)];
+        let two = ReadBatch::try_from_records(vec![sse_test_record(0, 0), sse_test_record(1, 0)])
+            .expect("valid batch");
         assert!(validate_sse_read_batch(&two, &options).is_err());
 
         options.limit = None;
         options.end_seq_num = Some(1);
         assert!(validate_sse_read_batch(&two, &options).is_err());
 
-        let non_contiguous = [sse_test_record(0, 0), sse_test_record(2, 0)];
+        let non_contiguous = sse_read_batch(SseReadBatchData {
+            records: vec![sse_wire_record(0, 0), sse_wire_record(2, 0)],
+        })
+        .expect("sse_read_batch leaves continuity to validation");
         options.end_seq_num = None;
         assert!(validate_sse_read_batch(&non_contiguous, &options).is_err());
 
@@ -4348,14 +4378,21 @@ mod tests {
             data: RecordData::Utf8(String::new()),
         };
         assert!(matches!(
-            sse_read_record(wire_record.clone()),
+            sse_read_batch(SseReadBatchData {
+                records: vec![wire_record.clone()],
+            }),
             Err(TsfClientError::InvalidSse("invalid writer_id length"))
         ));
 
         wire_record.writer_id = URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]);
         wire_record.data =
             RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_BYTES + 1]));
-        assert!(sse_read_record(wire_record).is_err());
+        assert!(
+            sse_read_batch(SseReadBatchData {
+                records: vec![wire_record],
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -4366,7 +4403,8 @@ mod tests {
                 .expect("stream ID"),
         );
         options.start = Some(ReadStart::SeqNum(0));
-        let records = [sse_test_record(0, 0)];
+        let records =
+            ReadBatch::try_from_records(vec![sse_test_record(0, 0)]).expect("valid batch");
         assert!(
             validate_sse_read_batch_cursor(
                 &records,
@@ -4422,8 +4460,8 @@ mod tests {
         );
     }
 
-    fn sse_test_record(seq_num: u64, payload_bytes: usize) -> ReadRecord {
-        ReadRecord {
+    fn sse_test_record(seq_num: u64, payload_bytes: usize) -> OwnedReadRecord {
+        OwnedReadRecord {
             seq_num,
             timestamp_ms: seq_num,
             writer_id: WriterId::from_bytes([0_u8; 16]),
@@ -4432,6 +4470,70 @@ mod tests {
             format: RecordFormat::Bytes,
             data: Bytes::from(vec![0_u8; payload_bytes]),
         }
+    }
+
+    fn sse_wire_record(seq_num: u64, payload_bytes: usize) -> SseReadRecord {
+        SseReadRecord {
+            seq_num,
+            timestamp_ms: seq_num,
+            writer_id: URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]),
+            writer_seq_num: seq_num,
+            part: RestRecordPart {
+                index: 0,
+                is_final: true,
+            },
+            format: RecordFormat::Bytes,
+            data: RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; payload_bytes])),
+        }
+    }
+
+    #[test]
+    fn sse_read_batch_decodes_mixed_utf8_and_base64url_payloads() {
+        let text = SseReadRecord {
+            seq_num: 3,
+            timestamp_ms: 300,
+            writer_id: URL_SAFE_NO_PAD.encode([7_u8; WriterId::BYTE_LEN]),
+            writer_seq_num: 30,
+            part: RestRecordPart {
+                index: 0,
+                is_final: true,
+            },
+            format: RecordFormat::Transcript,
+            data: RecordData::Utf8("héllo".to_owned()),
+        };
+        let binary = SseReadRecord {
+            seq_num: 4,
+            timestamp_ms: 301,
+            writer_id: URL_SAFE_NO_PAD.encode([8_u8; WriterId::BYTE_LEN]),
+            writer_seq_num: 40,
+            part: RestRecordPart {
+                index: 0,
+                is_final: true,
+            },
+            format: RecordFormat::Bytes,
+            data: RecordData::Base64url(URL_SAFE_NO_PAD.encode([0_u8, 159, 146, 150])),
+        };
+        let batch = sse_read_batch(SseReadBatchData {
+            records: vec![text, binary],
+        })
+        .expect("valid read_batch event");
+
+        assert_eq!(batch.len(), 2);
+        let first = batch.first().expect("first");
+        assert_eq!(first.data, "héllo".as_bytes());
+        assert_eq!(first.format, RecordFormat::Transcript);
+        assert_eq!(first.writer_id, WriterId::from_bytes([7_u8; 16]));
+        assert_eq!(first.writer_seq_num, 30);
+        let last = batch.last().expect("last");
+        assert_eq!(last.data, &[0_u8, 159, 146, 150]);
+        assert_eq!(last.seq_num, 4);
+
+        let options = ReadStreamOptions::new(
+            "00000000000000000000000000000000"
+                .parse()
+                .expect("stream ID"),
+        );
+        assert!(validate_sse_read_batch(&batch, &options).is_ok());
     }
 
     #[test]
