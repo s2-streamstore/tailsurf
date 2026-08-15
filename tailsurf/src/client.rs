@@ -6,7 +6,7 @@ use std::{
     future::Future,
     pin::Pin,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -1157,6 +1157,7 @@ pub struct AppendReceipt {
 /// Future that resolves when one submitted record is durable or permanently fails.
 pub struct AppendTicket {
     rx: oneshot::Receiver<Result<AppendReceipt, TsfClientError>>,
+    terminal_error: Arc<OnceLock<String>>,
 }
 
 impl AppendTicket {
@@ -1166,10 +1167,13 @@ impl AppendTicket {
     pub fn try_recv(&mut self) -> Option<Result<AppendReceipt, TsfClientError>> {
         match self.rx.try_recv() {
             Ok(result) => Some(result),
-            Err(oneshot::error::TryRecvError::Empty) => None,
-            Err(oneshot::error::TryRecvError::Closed) => {
-                Some(Err(TsfClientError::AppendWriterDropped))
+            Err(oneshot::error::TryRecvError::Empty) => {
+                retained_terminal_error(&self.terminal_error).map(Err)
             }
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(terminal_writer_error(
+                &self.terminal_error,
+                TsfClientError::AppendWriterDropped,
+            ))),
         }
     }
 }
@@ -1180,8 +1184,12 @@ impl Future for AppendTicket {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.rx).poll(cx) {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(TsfClientError::AppendWriterDropped)),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(terminal_writer_error(
+                &self.terminal_error,
+                TsfClientError::AppendWriterDropped,
+            ))),
+            Poll::Pending => retained_terminal_error(&self.terminal_error)
+                .map_or(Poll::Pending, |error| Poll::Ready(Err(error))),
         }
     }
 }
@@ -1192,6 +1200,7 @@ pub struct TsfWriter {
     cmd_tx: mpsc::Sender<WriterCommand>,
     byte_permits: Arc<Semaphore>,
     record_permits: Arc<Semaphore>,
+    terminal_error: Arc<OnceLock<String>>,
     max_unacked_bytes: usize,
     task: Option<JoinHandle<()>>,
 }
@@ -1206,12 +1215,20 @@ impl TsfWriter {
         let config = config.validate()?;
         let command_capacity = config.max_unacked_records + 1;
         let (cmd_tx, cmd_rx) = mpsc::channel(command_capacity);
-        let task = tokio::spawn(run_writer(client, options, session, cmd_rx));
+        let terminal_error = Arc::new(OnceLock::new());
+        let task = tokio::spawn(run_writer(
+            client,
+            options,
+            session,
+            cmd_rx,
+            Arc::clone(&terminal_error),
+        ));
 
         Ok(Self {
             cmd_tx,
             byte_permits: Arc::new(Semaphore::new(config.max_unacked_bytes)),
             record_permits: Arc::new(Semaphore::new(config.max_unacked_records)),
+            terminal_error,
             max_unacked_bytes: config.max_unacked_bytes,
             task: Some(task),
         })
@@ -1240,24 +1257,25 @@ impl TsfWriter {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| TsfClientError::AppendWriterClosed)?;
+            .map_err(|_| self.closed_error())?;
         let byte_permit = self
             .byte_permits
             .clone()
             .acquire_many_owned(bytes as u32)
             .await
-            .map_err(|_| TsfClientError::AppendWriterClosed)?;
+            .map_err(|_| self.closed_error())?;
         let cmd_tx_permit = self
             .cmd_tx
             .clone()
             .reserve_owned()
             .await
-            .map_err(|_| TsfClientError::AppendWriterClosed)?;
+            .map_err(|_| self.closed_error())?;
 
         Ok(WritePermit {
             cmd_tx_permit,
             byte_permit,
             record_permit,
+            terminal_error: Arc::clone(&self.terminal_error),
             reserved_bytes: bytes,
         })
     }
@@ -1265,23 +1283,40 @@ impl TsfWriter {
     /// Stops accepting records, waits for every pending durability acknowledgement, and joins the
     /// writer task.
     pub async fn close(mut self) -> Result<(), TsfClientError> {
-        let (done_tx, done_rx) = oneshot::channel();
+        let (done_tx, mut done_rx) = oneshot::channel();
         self.cmd_tx
             .send(WriterCommand::Close { done_tx })
             .await
-            .map_err(|_| TsfClientError::AppendWriterClosed)?;
-
-        let result = done_rx
-            .await
-            .map_err(|_| TsfClientError::AppendWriterDropped)?;
+            .map_err(|_| self.closed_error())?;
 
         if let Some(task) = self.task.take() {
             task.await
                 .map_err(|error| TsfClientError::AppendWriterFailed(error.to_string()))?;
         }
 
-        result
+        done_rx.try_recv().map_err(|_| self.dropped_error())?
     }
+
+    fn closed_error(&self) -> TsfClientError {
+        terminal_writer_error(&self.terminal_error, TsfClientError::AppendWriterClosed)
+    }
+
+    fn dropped_error(&self) -> TsfClientError {
+        terminal_writer_error(&self.terminal_error, TsfClientError::AppendWriterDropped)
+    }
+}
+
+fn terminal_writer_error(
+    terminal_error: &OnceLock<String>,
+    fallback: TsfClientError,
+) -> TsfClientError {
+    retained_terminal_error(terminal_error).unwrap_or(fallback)
+}
+
+fn retained_terminal_error(terminal_error: &OnceLock<String>) -> Option<TsfClientError> {
+    terminal_error
+        .get()
+        .map(|message| TsfClientError::AppendWriterFailed(message.clone()))
 }
 
 impl Drop for TsfWriter {
@@ -1299,12 +1334,16 @@ pub struct WritePermit {
     cmd_tx_permit: mpsc::OwnedPermit<WriterCommand>,
     byte_permit: OwnedSemaphorePermit,
     record_permit: OwnedSemaphorePermit,
+    terminal_error: Arc<OnceLock<String>>,
     reserved_bytes: usize,
 }
 
 impl WritePermit {
     /// Submits a record no larger than the reserved capacity without awaiting another window slot.
     pub fn submit(self, record: AppendRecord) -> Result<AppendTicket, TsfClientError> {
+        if let Some(error) = retained_terminal_error(&self.terminal_error) {
+            return Err(error);
+        }
         record.validate()?;
         let bytes = record.unacked_bytes();
         if bytes > self.reserved_bytes {
@@ -1322,7 +1361,10 @@ impl WritePermit {
             record_permit: self.record_permit,
         });
 
-        Ok(AppendTicket { rx: ack_rx })
+        Ok(AppendTicket {
+            rx: ack_rx,
+            terminal_error: self.terminal_error,
+        })
     }
 }
 
@@ -1469,6 +1511,7 @@ async fn run_writer(
     options: WriteStreamOptions,
     mut session: TsfWriteSession,
     mut cmd_rx: mpsc::Receiver<WriterCommand>,
+    terminal_error: Arc<OnceLock<String>>,
 ) {
     let mut pending = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
@@ -1493,7 +1536,12 @@ async fn run_writer(
                             )
                             .await
                         {
-                            finish_writer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(
+                                &mut pending,
+                                &mut close_tx,
+                                &terminal_error,
+                                error,
+                            );
                             return;
                         }
                     }
@@ -1508,7 +1556,12 @@ async fn run_writer(
                 match ack {
                     Ok(Some(ack)) => {
                         if let Err(error) = dispatch_ack(ack, &mut pending) {
-                            finish_writer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(
+                                &mut pending,
+                                &mut close_tx,
+                                &terminal_error,
+                                error,
+                            );
                             return;
                         }
                         reconnect_attempts = 0;
@@ -1524,7 +1577,12 @@ async fn run_writer(
                         )
                         .await
                         {
-                            finish_writer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(
+                                &mut pending,
+                                &mut close_tx,
+                                &terminal_error,
+                                error,
+                            );
                             return;
                         }
                     }
@@ -1539,7 +1597,12 @@ async fn run_writer(
                         )
                         .await
                         {
-                            finish_writer_error(&mut pending, &mut close_tx, error);
+                            finish_writer_error(
+                                &mut pending,
+                                &mut close_tx,
+                                &terminal_error,
+                                error,
+                            );
                             return;
                         }
                     }
@@ -1715,9 +1778,12 @@ fn validate_append_range(
 fn finish_writer_error(
     pending: &mut VecDeque<PendingAppend>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
+    terminal_error: &OnceLock<String>,
     error: TsfClientError,
 ) {
-    fail_pending(pending, error.to_string());
+    let message = error.to_string();
+    let _ = terminal_error.set(message.clone());
+    fail_pending(pending, message);
     if let Some(close_tx) = close_tx.take() {
         let _ = close_tx.send(Err(error));
     }
@@ -3835,6 +3901,34 @@ mod tests {
             ack.record_count(),
             Err(TsfClientError::InvalidAppendAck(error_ack)) if error_ack == ack
         ));
+    }
+
+    #[tokio::test]
+    async fn close_preserves_terminal_error_when_its_command_is_dropped() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCommand>(1);
+        let terminal_error = Arc::new(OnceLock::new());
+        let task_terminal_error = Arc::clone(&terminal_error);
+        let task = tokio::spawn(async move {
+            let command = cmd_rx.recv().await.expect("close command");
+            task_terminal_error
+                .set("stream next sequence did not match".to_owned())
+                .expect("set terminal error");
+            drop(command);
+        });
+        let writer = TsfWriter {
+            cmd_tx,
+            byte_permits: Arc::new(Semaphore::new(1)),
+            record_permits: Arc::new(Semaphore::new(1)),
+            terminal_error,
+            max_unacked_bytes: 1,
+            task: Some(task),
+        };
+
+        let error = writer.close().await.expect_err("close must fail");
+        assert!(
+            matches!(&error, TsfClientError::AppendWriterFailed(message) if message.contains("stream next sequence did not match")),
+            "error={error}"
+        );
     }
 
     #[test]

@@ -516,6 +516,7 @@ async fn capture_then_replay_round_trips_piped_input() {
         .expose_secret()
         .to_owned();
     assert_eq!(server.write_link_secrets(), [owner_secret]);
+    assert_eq!(server.write_expected_next_seq_nums(), [None]);
     let read_link = output
         .stdout
         .lines()
@@ -858,6 +859,42 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
     assert_eq!(attempts[0].format, RecordFormat::Transcript);
     assert_eq!(attempts[1].format, RecordFormat::Transcript);
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn writer_preserves_its_terminal_failure_for_later_submissions() {
+    let server = FakeWriteServer::start_terminal().await;
+    let writer = connect_default_writer(&server.api_url).await;
+    let pre_admitted = writer.reserve(1).await.expect("reserve before failure");
+    let first = writer
+        .submit(test_write_record(0, Bytes::from_static(b"first")))
+        .await
+        .expect("submit first record");
+    let first_error = first.await.expect_err("first record must fail");
+    assert_sequence_mismatch(&first_error);
+
+    let pre_admitted_error =
+        match pre_admitted.submit(test_write_record(1, Bytes::from_static(b"x"))) {
+            Ok(_) => panic!("terminal writer accepted a pre-admitted record"),
+            Err(error) => error,
+        };
+    assert_sequence_mismatch(&pre_admitted_error);
+
+    let later_error = match writer
+        .submit(test_write_record(1, Bytes::from_static(b"later")))
+        .await
+    {
+        Ok(_) => panic!("terminal writer accepted a later record"),
+        Err(error) => error,
+    };
+    assert_sequence_mismatch(&later_error);
+
+    let close_error = writer
+        .close()
+        .await
+        .expect_err("terminal writer close must fail");
+    assert_sequence_mismatch(&close_error);
     server.abort();
 }
 
@@ -1771,6 +1808,14 @@ impl TestServer {
             .clone()
     }
 
+    fn write_expected_next_seq_nums(&self) -> Vec<Option<u64>> {
+        self.state
+            .write_expected_next_seq_nums
+            .lock()
+            .expect("write preconditions lock")
+            .clone()
+    }
+
     fn stream_count(&self) -> usize {
         self.state.streams.lock().expect("streams lock").len()
     }
@@ -1819,6 +1864,7 @@ struct TestApiState {
     create_idempotency_keys: Mutex<Vec<Option<String>>>,
     create_authorizations: Mutex<Vec<Option<String>>>,
     write_link_secrets: Mutex<Vec<String>>,
+    write_expected_next_seq_nums: Mutex<Vec<Option<u64>>>,
     link_list_failures_remaining: Mutex<usize>,
     streams: Mutex<HashMap<String, TestStream>>,
 }
@@ -2188,7 +2234,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
     let Ok(ClientFrame::OpenWrite {
         client_writer_id,
         link_secret,
-        ..
+        expected_next_seq_num,
     }) = ClientFrame::decode_bytes(auth)
     else {
         return;
@@ -2198,6 +2244,11 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
         .lock()
         .expect("write link secrets lock")
         .push(link_secret.expose_secret().to_owned());
+    state
+        .write_expected_next_seq_nums
+        .lock()
+        .expect("write preconditions lock")
+        .push(expected_next_seq_num);
     {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
@@ -2726,6 +2777,13 @@ fn test_write_record(writer_seq_num: u64, data: Bytes) -> AppendRecord {
     )
 }
 
+fn assert_sequence_mismatch(error: &TsfClientError) {
+    assert!(
+        matches!(error, TsfClientError::AppendWriterFailed(message) if message.contains("stream next sequence did not match")),
+        "error={error}"
+    );
+}
+
 struct HoldingWriteState {
     expected_before_ack: usize,
     attempts: Mutex<Vec<HoldingWriteAttempt>>,
@@ -2931,9 +2989,9 @@ struct AppendAttempt {
     data: Bytes,
 }
 
-#[derive(Default)]
 struct FakeWriteState {
     append_attempts: Mutex<Vec<AppendAttempt>>,
+    terminal: bool,
 }
 
 struct FakeWriteServer {
@@ -2944,9 +3002,20 @@ struct FakeWriteServer {
 
 impl FakeWriteServer {
     async fn start() -> Self {
+        Self::start_with_mode(false).await
+    }
+
+    async fn start_terminal() -> Self {
+        Self::start_with_mode(true).await
+    }
+
+    async fn start_with_mode(terminal: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let state = Arc::new(FakeWriteState::default());
+        let state = Arc::new(FakeWriteState {
+            append_attempts: Mutex::new(Vec::new()),
+            terminal,
+        });
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/write", get(fake_write_socket))
             .with_state(state.clone());
@@ -3023,6 +3092,16 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     };
 
     if attempt_count == 1 {
+        if state.terminal {
+            socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 1008,
+                    reason: "sequence_mismatch".into(),
+                })))
+                .await
+                .expect("close terminal writer");
+            return;
+        }
         socket
             .send(Message::Close(None))
             .await
