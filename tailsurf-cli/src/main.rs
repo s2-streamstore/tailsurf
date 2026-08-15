@@ -813,7 +813,7 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
         api_url,
         created.stream_id,
         owner_link_secret,
-        Some(0),
+        None,
         args.input,
     )
     .await

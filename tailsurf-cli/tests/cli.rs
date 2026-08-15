@@ -516,6 +516,7 @@ async fn capture_then_replay_round_trips_piped_input() {
         .expose_secret()
         .to_owned();
     assert_eq!(server.write_link_secrets(), [owner_secret]);
+    assert_eq!(server.write_expected_next_seq_nums(), [None]);
     let read_link = output
         .stdout
         .lines()
@@ -1815,6 +1816,14 @@ impl TestServer {
             .clone()
     }
 
+    fn write_expected_next_seq_nums(&self) -> Vec<Option<u64>> {
+        self.state
+            .write_expected_next_seq_nums
+            .lock()
+            .expect("write preconditions lock")
+            .clone()
+    }
+
     fn stream_count(&self) -> usize {
         self.state.streams.lock().expect("streams lock").len()
     }
@@ -1863,6 +1872,7 @@ struct TestApiState {
     create_idempotency_keys: Mutex<Vec<Option<String>>>,
     create_authorizations: Mutex<Vec<Option<String>>>,
     write_link_secrets: Mutex<Vec<String>>,
+    write_expected_next_seq_nums: Mutex<Vec<Option<u64>>>,
     link_list_failures_remaining: Mutex<usize>,
     streams: Mutex<HashMap<String, TestStream>>,
 }
@@ -2232,7 +2242,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
     let Ok(ClientFrame::OpenWrite {
         client_writer_id,
         link_secret,
-        ..
+        expected_next_seq_num,
     }) = ClientFrame::decode_bytes(auth)
     else {
         return;
@@ -2242,6 +2252,11 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
         .lock()
         .expect("write link secrets lock")
         .push(link_secret.expose_secret().to_owned());
+    state
+        .write_expected_next_seq_nums
+        .lock()
+        .expect("write preconditions lock")
+        .push(expected_next_seq_num);
     {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
