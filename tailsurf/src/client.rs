@@ -407,6 +407,7 @@ impl TsfClient {
         let mut cursor: Option<String> = None;
         let mut authorizing_link_id = None;
         let mut seen_cursors = HashSet::new();
+        let mut seen_link_ids = HashSet::new();
         loop {
             let page = self
                 .list_links(
@@ -427,6 +428,14 @@ impl TsfClient {
                 ));
             }
             authorizing_link_id.get_or_insert(page.authorizing_link_id);
+            // validate_link_page dedups within a page; overlapping pages need a running set.
+            for link in &page.links {
+                if !seen_link_ids.insert(link.link_id.clone()) {
+                    return Err(TsfClientError::InvalidLinkPage(
+                        "link ID appears on multiple pages",
+                    ));
+                }
+            }
             links.extend(page.links);
             match page.next_cursor {
                 Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
@@ -4197,6 +4206,52 @@ mod tests {
         ));
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn list_all_links_rejects_link_ids_repeated_across_pages() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind REST listener");
+        let address = listener.local_addr().expect("REST listener address");
+        let server = tokio::spawn(async move {
+            let link = r#"{"link_id":"reader","permissions":"r","status":"active","created_at":"2026-08-13T00:00:00Z","expires_at":null,"revoked_at":null}"#;
+            for page in [
+                format!(
+                    r#"{{"authorizing_link_id":"owner","links":[{link}],"next_cursor":"next"}}"#
+                ),
+                format!(r#"{{"authorizing_link_id":"owner","links":[{link}],"next_cursor":null}}"#),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept REST request");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let mut config = TsfClientConfig::new(
+            Url::parse(&format!("http://{address}")).expect("REST API origin"),
+        )
+        .expect("valid client config");
+        config.retry_policy = RetryPolicy::none();
+        let client = TsfClient::with_config(config).expect("REST client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let owner = LinkSecret::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+        let result = client.list_all_links(&stream_id, &owner).await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::InvalidLinkPage(
+                "link ID appears on multiple pages"
+            ))
+        ));
+        server.await.expect("join REST server");
     }
 
     #[test]
