@@ -3926,12 +3926,9 @@ mod tests {
 
         let error = writer.close().await.expect_err("close must fail");
         assert!(
-            error
-                .to_string()
-                .contains("stream next sequence did not match"),
+            matches!(&error, TsfClientError::AppendWriterFailed(message) if message.contains("stream next sequence did not match")),
             "error={error}"
         );
-        assert!(!error.to_string().contains("append writer dropped"));
     }
 
     #[test]

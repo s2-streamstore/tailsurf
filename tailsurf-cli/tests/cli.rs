@@ -871,33 +871,15 @@ async fn writer_preserves_its_terminal_failure_for_later_submissions() {
         .submit(test_write_record(0, Bytes::from_static(b"first")))
         .await
         .expect("submit first record");
-    let first_error = timeout(Duration::from_secs(1), first)
-        .await
-        .expect("first record failure")
-        .expect_err("first record must fail");
-    assert!(
-        first_error
-            .to_string()
-            .contains("stream next sequence did not match"),
-        "error={first_error}"
-    );
+    let first_error = first.await.expect_err("first record must fail");
+    assert_sequence_mismatch(&first_error);
 
     let pre_admitted_error =
         match pre_admitted.submit(test_write_record(1, Bytes::from_static(b"x"))) {
             Ok(_) => panic!("terminal writer accepted a pre-admitted record"),
             Err(error) => error,
         };
-    assert!(
-        pre_admitted_error
-            .to_string()
-            .contains("stream next sequence did not match"),
-        "error={pre_admitted_error}"
-    );
-    assert!(
-        !pre_admitted_error
-            .to_string()
-            .contains("append writer dropped")
-    );
+    assert_sequence_mismatch(&pre_admitted_error);
 
     let later_error = match writer
         .submit(test_write_record(1, Bytes::from_static(b"later")))
@@ -906,24 +888,13 @@ async fn writer_preserves_its_terminal_failure_for_later_submissions() {
         Ok(_) => panic!("terminal writer accepted a later record"),
         Err(error) => error,
     };
-    assert!(
-        later_error
-            .to_string()
-            .contains("stream next sequence did not match"),
-        "error={later_error}"
-    );
-    assert!(!later_error.to_string().contains("append writer is closed"));
+    assert_sequence_mismatch(&later_error);
 
     let close_error = writer
         .close()
         .await
         .expect_err("terminal writer close must fail");
-    assert!(
-        close_error
-            .to_string()
-            .contains("stream next sequence did not match"),
-        "error={close_error}"
-    );
+    assert_sequence_mismatch(&close_error);
     server.abort();
 }
 
@@ -2804,6 +2775,13 @@ fn test_write_record(writer_seq_num: u64, data: Bytes) -> AppendRecord {
         RecordFormat::Bytes,
         data,
     )
+}
+
+fn assert_sequence_mismatch(error: &TsfClientError) {
+    assert!(
+        matches!(error, TsfClientError::AppendWriterFailed(message) if message.contains("stream next sequence did not match")),
+        "error={error}"
+    );
 }
 
 struct HoldingWriteState {
