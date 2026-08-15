@@ -866,16 +866,37 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
 async fn writer_preserves_its_terminal_failure_for_later_submissions() {
     let server = FakeWriteServer::start_terminal().await;
     let writer = connect_default_writer(&server.api_url).await;
+    let pre_admitted = writer.reserve(1).await.expect("reserve before failure");
     let first = writer
         .submit(test_write_record(0, Bytes::from_static(b"first")))
         .await
         .expect("submit first record");
-    let first_error = first.await.expect_err("first record must fail");
+    let first_error = timeout(Duration::from_secs(1), first)
+        .await
+        .expect("first record failure")
+        .expect_err("first record must fail");
     assert!(
         first_error
             .to_string()
             .contains("stream next sequence did not match"),
         "error={first_error}"
+    );
+
+    let pre_admitted_error =
+        match pre_admitted.submit(test_write_record(1, Bytes::from_static(b"x"))) {
+            Ok(_) => panic!("terminal writer accepted a pre-admitted record"),
+            Err(error) => error,
+        };
+    assert!(
+        pre_admitted_error
+            .to_string()
+            .contains("stream next sequence did not match"),
+        "error={pre_admitted_error}"
+    );
+    assert!(
+        !pre_admitted_error
+            .to_string()
+            .contains("append writer dropped")
     );
 
     let later_error = match writer
