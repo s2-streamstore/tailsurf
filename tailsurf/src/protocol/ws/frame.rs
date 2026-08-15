@@ -461,6 +461,9 @@ impl ServerFrame {
     const MAX_FIXED_FRAME_LEN: usize = 1 + 4 * 8;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
+    ///
+    /// Covers only fixed-size and batch frames; [`ServerFrame::StreamMetadata`] carries
+    /// variable-length JSON and is serialized directly by [`ServerFrame::encode`].
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
             Self::ReadBatch(records) => {
@@ -471,13 +474,15 @@ impl ServerFrame {
                     MAX_READ_BATCH_RECORDS,
                 )
             }
-            Self::StreamMetadata(_) => Ok(1),
+            Self::StreamMetadata(_) => {
+                unreachable!("StreamMetadata is serialized directly by encode()")
+            }
             _ => Ok(Self::MAX_FIXED_FRAME_LEN),
         }
     }
 
     /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
-    fn encode_into(&self, output: &mut BytesMut) -> Result<(), FrameCodecError> {
+    fn encode_into(&self, output: &mut BytesMut) {
         match self {
             Self::Ready => output.put_u8(ServerOp::Ready.byte()),
             Self::AppendAck {
@@ -511,11 +516,8 @@ impl ServerFrame {
                 output.put_u64(caught_up.next_seq_num);
                 output.put_u64(caught_up.last_timestamp_ms);
             }
-            Self::StreamMetadata(stream) => {
-                let payload =
-                    serde_json::to_vec(stream).map_err(FrameCodecError::InvalidStreamMetadata)?;
-                output.put_u8(ServerOp::StreamMetadata.byte());
-                output.put_slice(&payload);
+            Self::StreamMetadata(_) => {
+                unreachable!("StreamMetadata is serialized directly by encode()")
             }
             Self::SnapshotBoundary(boundary) => {
                 output.put_u8(ServerOp::SnapshotBoundary.byte());
@@ -523,13 +525,20 @@ impl ServerFrame {
                 output.put_u64(boundary.last_timestamp_ms);
             }
         }
-        Ok(())
     }
 
     /// Encodes one server frame into a complete WebSocket binary message.
     pub fn encode(&self) -> Result<Bytes, FrameCodecError> {
+        // StreamMetadata carries variable-length JSON; serialize straight into the output.
+        if let Self::StreamMetadata(stream) = self {
+            let mut output = BytesMut::new();
+            output.put_u8(ServerOp::StreamMetadata.byte());
+            serde_json::to_writer((&mut output).writer(), stream)
+                .map_err(FrameCodecError::InvalidStreamMetadata)?;
+            return Ok(output.freeze());
+        }
         let mut output = BytesMut::with_capacity(self.encoded_len()?);
-        self.encode_into(&mut output)?;
+        self.encode_into(&mut output);
         Ok(output.freeze())
     }
 
