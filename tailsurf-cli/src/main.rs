@@ -1487,9 +1487,6 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
 
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
-    if args.read.limit == Some(0) {
-        return Ok(());
-    }
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
     request.snapshot = true;
 
