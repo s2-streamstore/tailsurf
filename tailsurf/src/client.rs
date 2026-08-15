@@ -2448,7 +2448,8 @@ fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientError> {
     let text =
         std::str::from_utf8(block).map_err(|_| TsfClientError::InvalidSse("event is not UTF-8"))?;
-    let mut event = "message".to_owned();
+    // Borrow during the scan; allocate only for blocks that actually carry data.
+    let mut event = None;
     let mut id = None;
     let mut data = Vec::new();
     for line in text.lines() {
@@ -2459,21 +2460,25 @@ fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientErro
             (name, value.strip_prefix(' ').unwrap_or(value))
         });
         match name {
-            "event" => event = value.to_owned(),
-            "id" => id = Some(value.to_owned()),
+            "event" => event = Some(value),
+            "id" => id = Some(value),
             "data" => data.push(value),
             _ => {}
         }
     }
     if data.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(ParsedSseEvent {
-            event,
-            data: data.join("\n"),
-            id,
-        }))
+        return Ok(None);
     }
+    // Single data lines dominate; join only multi-line payloads.
+    let data = match data.as_slice() {
+        [single] => (*single).to_owned(),
+        lines => lines.join("\n"),
+    };
+    Ok(Some(ParsedSseEvent {
+        event: event.unwrap_or("message").to_owned(),
+        data,
+        id: id.map(str::to_owned),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
