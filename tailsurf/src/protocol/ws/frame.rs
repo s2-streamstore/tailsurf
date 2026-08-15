@@ -611,7 +611,8 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
         ClientOp::AppendBatch => {
             let mut records = Vec::new();
             let mut payload_bytes = 0;
-            for (start, end) in record_body_ranges(bytes, MAX_APPEND_BATCH_RECORDS)? {
+            for range in record_body_ranges(bytes, MAX_APPEND_BATCH_RECORDS) {
+                let (start, end) = range?;
                 let record_body = &bytes[start..end];
                 let (writer_seq_num, body) = read_u64(record_body)?;
                 validate_writer_seq_num(writer_seq_num)?;
@@ -775,7 +776,8 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
         ServerOp::ReadBatch => {
             let mut records = Vec::new();
             let mut payload_bytes = 0;
-            for (start, end) in record_body_ranges(bytes, MAX_READ_BATCH_RECORDS)? {
+            for range in record_body_ranges(bytes, MAX_READ_BATCH_RECORDS) {
+                let (start, end) = range?;
                 let record_body = &bytes[start..end];
                 let (seq_num, body) = read_u64(record_body)?;
                 let (timestamp_ms, body) = read_u64(body)?;
@@ -912,38 +914,65 @@ fn validate_read_batch_sequence(records: &[ReadRecord]) -> Result<(), FrameCodec
     Ok(())
 }
 
-fn record_body_ranges(
-    input: &[u8],
+/// Lazily walks length-prefixed record bodies so decoding parses each record in one pass.
+fn record_body_ranges(input: &[u8], maximum_records: usize) -> RecordBodyRanges<'_> {
+    RecordBodyRanges {
+        input,
+        offset: 1,
+        count: 0,
+        maximum_records,
+    }
+}
+
+struct RecordBodyRanges<'a> {
+    input: &'a [u8],
+    offset: usize,
+    count: usize,
     maximum_records: usize,
-) -> Result<Vec<(usize, usize)>, FrameCodecError> {
-    let mut ranges = Vec::new();
-    let mut offset = 1;
-    while offset < input.len() {
-        if ranges.len() == maximum_records {
+}
+
+impl Iterator for RecordBodyRanges<'_> {
+    type Item = Result<(usize, usize), FrameCodecError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.input.len() {
+            return None;
+        }
+        let result = self.advance();
+        if result.is_err() {
+            // Fuse: callers stop on the first error; never yield twice.
+            self.offset = self.input.len();
+        }
+        Some(result)
+    }
+}
+
+impl RecordBodyRanges<'_> {
+    fn advance(&mut self) -> Result<(usize, usize), FrameCodecError> {
+        if self.count == self.maximum_records {
             return Err(FrameCodecError::InvalidBatchRecordCount {
-                actual: maximum_records + 1,
-                max: maximum_records,
+                actual: self.maximum_records + 1,
+                max: self.maximum_records,
             });
         }
-        let (length, _) = read_u32(&input[offset..])?;
-        offset += 4;
+        let (length, _) = read_u32(&self.input[self.offset..])?;
+        self.offset += 4;
         let length = length as usize;
-        let Some(end) = offset.checked_add(length).filter(|end| *end <= input.len()) else {
+        let Some(end) = self
+            .offset
+            .checked_add(length)
+            .filter(|end| *end <= self.input.len())
+        else {
             return Err(FrameCodecError::InvalidRecordLength);
         };
         if length == 0 {
             return Err(FrameCodecError::InvalidRecordLength);
         }
-        ranges.push((offset, end));
-        offset = end;
+        let start = self.offset;
+        self.offset = end;
+        self.count += 1;
+        Ok((start, end))
     }
-    if ranges.is_empty() {
-        return Err(FrameCodecError::InvalidBatchRecordCount {
-            actual: 0,
-            max: maximum_records,
-        });
-    }
-    Ok(ranges)
 }
 
 fn take<const N: usize>(input: &[u8]) -> Result<([u8; N], &[u8]), FrameCodecError> {
