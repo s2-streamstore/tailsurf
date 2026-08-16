@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/s2-streamstore/tailsurf/compare/v0.8.0...v0.9.0) - 2026-08-16
+
+### Added
+
+- add split_logical_record as the write-side half of LogicalTranscript ([#37](https://github.com/s2-streamstore/tailsurf/pull/37))
+
+### Other
+
+- [**breaking**] validate link secrets at construction and keep errors typed end to end ([#36](https://github.com/s2-streamstore/tailsurf/pull/36))
+- consolidate duplicated validation, backoff, and CLI label logic ([#35](https://github.com/s2-streamstore/tailsurf/pull/35))
+- simplify core and test infrastructure ([#32](https://github.com/s2-streamstore/tailsurf/pull/32))
+
 ## [0.8.0](https://github.com/s2-streamstore/tailsurf/compare/v0.7.1...v0.8.0) - 2026-08-16
 
 ### Fixed
