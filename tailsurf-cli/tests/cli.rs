@@ -1959,6 +1959,18 @@ async fn test_create_link(
     headers: HeaderMap,
     Json(request): Json<TestCreateLinkInput>,
 ) -> Response {
+    if headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<IdempotencyKey>().ok())
+        .is_none()
+    {
+        return test_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "canonical idempotency key required from SDK",
+        );
+    }
     let mut streams = state.streams.lock().expect("streams lock");
     let Some(stream) = streams.get_mut(&stream_id) else {
         return test_error(StatusCode::NOT_FOUND, "not_found", "stream not found");
