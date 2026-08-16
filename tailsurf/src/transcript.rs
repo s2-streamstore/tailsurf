@@ -1,4 +1,5 @@
-//! Logical transcript reconstruction from physical TSF read records.
+//! Logical records over physical TSF records: [`split_logical_record`] produces the split-part
+//! layout on the write side that [`LogicalTranscript`] reassembles on the read side.
 
 use std::collections::{HashMap, hash_map::Entry};
 
@@ -6,7 +7,9 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
     WriterId,
-    protocol::ws::frame::{MAX_RECORD_BYTES, PartHeader, ReadRecord, RecordFormat},
+    protocol::ws::frame::{
+        AppendRecord, FrameCodecError, MAX_RECORD_BYTES, PartHeader, ReadRecord, RecordFormat,
+    },
 };
 
 /// Default maximum reassembled logical-record size: 16 MiB.
@@ -63,7 +66,8 @@ impl Default for TranscriptLimits {
 ///
 /// Records are processed in delivery order. Reused or decreasing writer sequence numbers are
 /// suppressed, malformed partial sequences are dropped, and a read beginning mid-split waits for
-/// the next complete logical record.
+/// the next complete logical record. [`split_logical_record`] is the write-side counterpart that
+/// produces the part layout reassembly expects.
 pub struct LogicalTranscript {
     limits: TranscriptLimits,
     writers: HashMap<WriterId, WriterState>,
@@ -224,6 +228,55 @@ impl Default for LogicalTranscript {
     fn default() -> Self {
         Self::with_limits(TranscriptLimits::default())
     }
+}
+
+/// Splits one logical record into the physical parts [`LogicalTranscript`] reassembles.
+///
+/// Reassembly requires split parts to occupy consecutive writer sequence numbers matching their
+/// part index; the returned records have both baked in, starting at `writer_start_seq_num`, so
+/// submitting them in order upholds the invariant. A record that fits in [`MAX_RECORD_BYTES`]
+/// is returned unsplit; larger payloads are sliced without copying. Readers drop logical
+/// records above their configured [`TranscriptLimits::max_logical_record_bytes`].
+pub fn split_logical_record(
+    writer_start_seq_num: u64,
+    format: RecordFormat,
+    data: Bytes,
+) -> Result<Vec<AppendRecord>, FrameCodecError> {
+    let part_count = data.len().div_ceil(MAX_RECORD_BYTES).max(1);
+    if part_count > PartHeader::MAX_INDEX as usize + 1 {
+        return Err(FrameCodecError::PartIndexTooLarge(
+            u32::try_from(part_count - 1).unwrap_or(u32::MAX),
+        ));
+    }
+    // Every part must carry a usable sequence number; u64::MAX is the exhaustion sentinel.
+    if writer_start_seq_num
+        .checked_add(part_count as u64 - 1)
+        .is_none_or(|last_seq_num| last_seq_num == u64::MAX)
+    {
+        return Err(FrameCodecError::WriterSequenceExhausted);
+    }
+
+    if part_count == 1 {
+        return Ok(vec![AppendRecord {
+            writer_seq_num: writer_start_seq_num,
+            part: PartHeader::unsplit(),
+            format,
+            data,
+        }]);
+    }
+
+    let mut records = Vec::with_capacity(part_count);
+    for index in 0..part_count {
+        let start = index * MAX_RECORD_BYTES;
+        let end = data.len().min(start + MAX_RECORD_BYTES);
+        records.push(AppendRecord {
+            writer_seq_num: writer_start_seq_num + index as u64,
+            part: PartHeader::new(index as u32, index == part_count - 1)?,
+            format,
+            data: data.slice(start..end),
+        });
+    }
+    Ok(records)
 }
 
 /// One complete logical transcript record after deduplication and reassembly.
@@ -622,6 +675,92 @@ mod tests {
             "retention must not coalesce chunks"
         );
         assert_eq!(retained.data.into_bytes(), Bytes::from_static(b"hello"));
+    }
+
+    #[test]
+    fn split_records_round_trip_through_reassembly() {
+        let len = MAX_RECORD_BYTES * 2 + MAX_RECORD_BYTES / 2;
+        let data = Bytes::from((0..len).map(|i| i as u8).collect::<Vec<u8>>());
+        let records =
+            split_logical_record(7, RecordFormat::Transcript, data.clone()).expect("split");
+
+        assert_eq!(records.len(), 3);
+        for (index, part) in records.iter().enumerate() {
+            assert_eq!(part.writer_seq_num, 7 + index as u64);
+            assert_eq!(part.part.index(), index as u32);
+            assert_eq!(part.part.is_final(), index == records.len() - 1);
+            assert_eq!(part.format, RecordFormat::Transcript);
+        }
+        assert!(
+            records[..records.len() - 1]
+                .iter()
+                .all(|part| part.data.len() == MAX_RECORD_BYTES)
+        );
+
+        let mut transcript = LogicalTranscript::new();
+        let mut reassembled = None;
+        for part in &records {
+            let read = ReadRecord {
+                seq_num: part.writer_seq_num,
+                timestamp_ms: 0,
+                writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
+                writer_seq_num: part.writer_seq_num,
+                part: part.part,
+                format: part.format,
+                data: &part.data,
+            };
+            reassembled = transcript.push_record(read).expect("push part");
+        }
+        let reassembled = reassembled.expect("final part completes the logical record");
+        assert_eq!(reassembled.data.into_bytes(), data);
+    }
+
+    #[test]
+    fn small_and_empty_logical_records_stay_unsplit_without_copying() {
+        let data = Bytes::from_static(b"fits");
+        let records = split_logical_record(3, RecordFormat::Bytes, data.clone()).expect("split");
+        let [record] = records.as_slice() else {
+            panic!("expected one unsplit record");
+        };
+        assert_eq!(record.writer_seq_num, 3);
+        assert_eq!(record.part, PartHeader::unsplit());
+        // Same backing storage, not a copy.
+        assert!(std::ptr::eq(record.data.as_ptr(), data.as_ptr()));
+
+        let empty = split_logical_record(0, RecordFormat::Bytes, Bytes::new()).expect("split");
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].data.is_empty());
+        assert_eq!(empty[0].part, PartHeader::unsplit());
+    }
+
+    #[test]
+    fn exact_multiples_split_into_full_parts() {
+        let data = Bytes::from(vec![0_u8; MAX_RECORD_BYTES * 2]);
+        let records = split_logical_record(0, RecordFormat::Bytes, data).expect("split");
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|part| part.data.len() == MAX_RECORD_BYTES)
+        );
+        assert!(!records[0].part.is_final());
+        assert!(records[1].part.is_final());
+    }
+
+    #[test]
+    fn split_rejects_writer_sequence_exhaustion() {
+        assert!(matches!(
+            split_logical_record(u64::MAX, RecordFormat::Bytes, Bytes::from_static(b"x")),
+            Err(FrameCodecError::WriterSequenceExhausted)
+        ));
+        assert!(matches!(
+            split_logical_record(
+                u64::MAX - 1,
+                RecordFormat::Bytes,
+                Bytes::from(vec![0_u8; MAX_RECORD_BYTES + 1]),
+            ),
+            Err(FrameCodecError::WriterSequenceExhausted)
+        ));
     }
 
     fn record(seq: u64, part: PartHeader, data: &[u8]) -> ReadRecord<'_> {
