@@ -20,11 +20,10 @@ pub mod stream_url;
 pub mod transcript;
 
 pub use client::{
-    AppendAck, AppendReceipt, AppendTicket, CreateStreamIdempotencyKey, IntoRecordData,
-    InvalidCreateStreamIdempotencyKey, ListLinksOptions, MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-    MAX_WRITER_UNACKED_RECORDS, RetryPolicy, TsfClient, TsfClientConfig, TsfClientError,
-    TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, TsfWriterConfig, WritePermit,
-    default_api_origin,
+    AppendAck, AppendReceipt, AppendTicket, IdempotencyKey, IntoRecordData, InvalidIdempotencyKey,
+    ListLinksOptions, MAX_WRITER_UNACKED_PAYLOAD_BYTES, MAX_WRITER_UNACKED_RECORDS, RetryPolicy,
+    TsfClient, TsfClientConfig, TsfClientError, TsfReadSession, TsfSseReadSession, TsfWriteSession,
+    TsfWriter, TsfWriterConfig, WritePermit, default_api_origin,
 };
 pub use ids::{
     ClientWriterId, LinkId, LinkIdError, LinkSecret, LinkSecretError, MAX_LINK_ID_LEN, StreamId,

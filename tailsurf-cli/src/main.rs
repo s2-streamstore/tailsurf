@@ -1557,7 +1557,6 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
     let InitialStreamLink {
         link_id,
         permissions,
-        secret,
     } = args.link.0;
     let expires_at = args.expires.rfc3339()?;
     let credential = client
@@ -1565,7 +1564,6 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
             &locator.stream_id,
             &CreateLinkInput {
                 link_id,
-                secret,
                 permissions,
                 expires_at,
             },

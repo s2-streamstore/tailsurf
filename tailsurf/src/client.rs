@@ -219,26 +219,24 @@ impl TsfClient {
 
     /// Creates a stream and returns its metadata and initial link credentials.
     ///
-    /// Construct the request once so its prepared link secrets remain stable. The client generates
-    /// one idempotency key for this logical call and reuses the complete request while retrying
-    /// transient failures according to policy.
+    /// The client generates one idempotency key for this logical call and reuses the complete
+    /// request while retrying transient failures according to policy.
     pub async fn create_stream(
         &self,
         request: &CreateStreamRequest,
     ) -> Result<CreateStreamResponse, TsfClientError> {
-        let idempotency_key = CreateStreamIdempotencyKey::new_random();
+        let idempotency_key = IdempotencyKey::new_random();
         self.create_stream_with_idempotency_key(request, &idempotency_key)
             .await
     }
 
     /// Creates a logical stream using a caller-owned idempotency key.
     ///
-    /// An exact retry requires the same prepared request. The idempotency key alone cannot return
-    /// the link credentials.
+    /// An exact retry requires the same request and returns the same server-minted credentials.
     pub async fn create_stream_with_idempotency_key(
         &self,
         request: &CreateStreamRequest,
-        idempotency_key: &CreateStreamIdempotencyKey,
+        idempotency_key: &IdempotencyKey,
     ) -> Result<CreateStreamResponse, TsfClientError> {
         self.retry_when(
             || {
@@ -314,11 +312,29 @@ impl TsfClient {
 
     /// Creates a stream link idempotently.
     ///
-    /// Transient failures are retried with the same client-generated Link ID and secret.
+    /// Transient failures are retried with one idempotency key.
     pub async fn create_link(
         &self,
         stream_id: &StreamId,
         request: &CreateLinkInput,
+        owner_link_secret: &LinkSecret,
+    ) -> Result<StreamLinkCredential, TsfClientError> {
+        let idempotency_key = IdempotencyKey::new_random();
+        self.create_link_with_idempotency_key(
+            stream_id,
+            request,
+            &idempotency_key,
+            owner_link_secret,
+        )
+        .await
+    }
+
+    /// Creates or retries one link with a caller-owned idempotency key.
+    pub async fn create_link_with_idempotency_key(
+        &self,
+        stream_id: &StreamId,
+        request: &CreateLinkInput,
+        idempotency_key: &IdempotencyKey,
         owner_link_secret: &LinkSecret,
     ) -> Result<StreamLinkCredential, TsfClientError> {
         self.retry_transient(|| {
@@ -328,6 +344,7 @@ impl TsfClient {
                         "/streams/{stream_id}/links/{}",
                         request.link_id
                     )))
+                    .header("Idempotency-Key", idempotency_key.expose_secret())
                     .json(request),
                 "create link",
                 Some(owner_link_secret),
@@ -927,39 +944,39 @@ pub fn default_api_origin() -> Url {
     Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
 }
 
-/// Non-authorizing idempotency key for one logical stream-creation request.
+/// Sensitive recovery key for one logical creation request.
 #[derive(Clone, Debug)]
-pub struct CreateStreamIdempotencyKey(secrecy::SecretString);
+pub struct IdempotencyKey(secrecy::SecretString);
 
-impl CreateStreamIdempotencyKey {
+impl IdempotencyKey {
     /// Generates a cryptographically random canonical 256-bit key.
     pub fn new_random() -> Self {
         Self(random_base64url_32().into())
     }
 }
 
-impl FromStr for CreateStreamIdempotencyKey {
-    type Err = InvalidCreateStreamIdempotencyKey;
+impl FromStr for IdempotencyKey {
+    type Err = InvalidIdempotencyKey;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if is_canonical_base64url_32(value) {
             Ok(Self(value.into()))
         } else {
-            Err(InvalidCreateStreamIdempotencyKey)
+            Err(InvalidIdempotencyKey)
         }
     }
 }
 
-impl ExposeSecret<str> for CreateStreamIdempotencyKey {
+impl ExposeSecret<str> for IdempotencyKey {
     fn expose_secret(&self) -> &str {
         self.0.expose_secret()
     }
 }
 
-/// Error returned for a malformed stream-creation idempotency key.
+/// Error returned for a malformed idempotency key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("create idempotency key must be canonical 43-character unpadded base64url")]
-pub struct InvalidCreateStreamIdempotencyKey;
+#[error("idempotency key must be canonical 43-character unpadded base64url")]
+pub struct InvalidIdempotencyKey;
 
 /// Low-level authenticated write socket without retained-record recovery.
 pub struct TsfWriteSession {
@@ -3439,21 +3456,21 @@ mod tests {
 
     #[test]
     fn create_idempotency_keys_validate_and_redact_debug_output() {
-        let key = CreateStreamIdempotencyKey::new_random();
+        let key = IdempotencyKey::new_random();
         let exposed = key.expose_secret().to_owned();
 
         assert!(is_canonical_base64url_32(&exposed));
         assert_eq!(
             exposed
-                .parse::<CreateStreamIdempotencyKey>()
+                .parse::<IdempotencyKey>()
                 .expect("canonical key")
                 .expose_secret(),
             exposed
         );
         assert!(!format!("{key:?}").contains(&exposed));
         assert!(matches!(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse::<CreateStreamIdempotencyKey>(),
-            Err(InvalidCreateStreamIdempotencyKey)
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse::<IdempotencyKey>(),
+            Err(InvalidIdempotencyKey)
         ));
     }
 
@@ -4182,7 +4199,7 @@ mod tests {
         let stream_id = "00000000000000000000000000000000"
             .parse()
             .expect("stream ID");
-        let owner: LinkSecret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        let owner: LinkSecret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             .parse()
             .expect("canonical secret");
 
@@ -4466,7 +4483,7 @@ mod tests {
         let stream_id = "00000000000000000000000000000000"
             .parse()
             .expect("stream ID");
-        let secret: LinkSecret = "A".repeat(43).parse().expect("canonical secret");
+        let secret: LinkSecret = "A".repeat(32).parse().expect("canonical secret");
         let large = vec![
             AppendRecord::new(
                 0,

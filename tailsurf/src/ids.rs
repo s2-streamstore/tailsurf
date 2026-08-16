@@ -75,20 +75,15 @@ impl<'de> Deserialize<'de> for LinkId {
 )]
 pub struct LinkIdError;
 
-/// Secret value carried by a stream link: the canonical unpadded base64url encoding of 256 bits.
+/// Server-minted 24-byte stream-link credential encoded as unpadded base64url.
 ///
 /// Canonicality is validated once at construction; every consumer can rely on it.
 #[derive(Clone)]
 pub struct LinkSecret(secrecy::SecretString);
 
 impl LinkSecret {
-    /// Length of the canonical unpadded base64url encoding of a 256-bit secret.
-    pub const ENCODED_LEN: usize = BASE64URL_32_ENCODED_LEN;
-
-    /// Generates a cryptographically random link secret.
-    pub fn new_random() -> Self {
-        Self(random_base64url_32().into())
-    }
+    /// Length of the canonical unpadded base64url encoding of a 24-byte secret.
+    pub const ENCODED_LEN: usize = BASE64URL_24_ENCODED_LEN;
 
     /// Returns the canonical secret text.
     pub fn expose_secret(&self) -> &str {
@@ -106,7 +101,7 @@ impl FromStr for LinkSecret {
     type Err = LinkSecretError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if !is_canonical_base64url_32(value) {
+        if !is_canonical_base64url_24(value) {
             return Err(LinkSecretError);
         }
         Ok(Self(value.to_owned().into()))
@@ -115,7 +110,7 @@ impl FromStr for LinkSecret {
 
 /// Error returned for a non-canonical link secret.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("link secret must be canonical 43-character unpadded base64url")]
+#[error("link secret must be canonical 32-character unpadded base64url")]
 pub struct LinkSecretError;
 
 /// Stable 128-bit client-chosen writer identity reused across reconnects.
@@ -197,6 +192,8 @@ where
 
 /// Length of the canonical unpadded base64url encoding of a 256-bit value.
 pub(crate) const BASE64URL_32_ENCODED_LEN: usize = 43;
+/// Length of the canonical unpadded base64url encoding of a 24-byte value.
+pub(crate) const BASE64URL_24_ENCODED_LEN: usize = 32;
 
 /// Encodes a 256-bit value as canonical unpadded base64url.
 pub(crate) fn encode_base64url_32(bytes: &[u8; 32]) -> String {
@@ -218,6 +215,15 @@ pub(crate) fn is_canonical_base64url_32(value: &str) -> bool {
     URL_SAFE_NO_PAD.decode_slice(value, &mut decoded).is_ok()
 }
 
+/// Returns whether `value` is the canonical unpadded base64url encoding of a 24-byte value.
+fn is_canonical_base64url_24(value: &str) -> bool {
+    if value.len() != BASE64URL_24_ENCODED_LEN {
+        return false;
+    }
+    let mut decoded = [0_u8; 24];
+    URL_SAFE_NO_PAD.decode_slice(value, &mut decoded).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,16 +238,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malleable_trailing_bits() {
-        let canonical = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert!(is_canonical_base64url_32(canonical));
-
-        let mut chars: Vec<char> = canonical.chars().collect();
-        for bad in ['B', 'C', 'D'] {
-            chars[42] = bad;
-            let link: String = chars.iter().collect();
-            assert!(!is_canonical_base64url_32(&link), "link={link}");
-        }
+    fn accepts_exact_24_byte_link_secrets() {
+        let canonical = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(is_canonical_base64url_24(canonical));
+        assert!(!is_canonical_base64url_24(&canonical[..31]));
+        assert!(!is_canonical_base64url_24(&format!("{canonical}A")));
     }
 
     #[test]

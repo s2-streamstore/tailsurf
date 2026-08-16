@@ -1236,8 +1236,8 @@ pub enum FrameCodecError {
     /// Timestamp playback did not include a fixed ending sequence.
     #[error("playback rate requires an exclusive end_seq_num sequence or snapshot")]
     PlaybackRequiresEnd,
-    /// An opening credential is not canonical 256-bit unpadded base64url.
-    #[error("opening link secret must be canonical 43-character unpadded base64url")]
+    /// An opening credential is not canonical 24-byte unpadded base64url.
+    #[error("opening link secret must be canonical 32-character unpadded base64url")]
     InvalidLinkSecret,
     /// A writer sequence left no representable exclusive acknowledgement boundary.
     #[error("writer sequence must leave room for an exclusive acknowledgement boundary")]
@@ -1606,7 +1606,7 @@ mod tests {
         ));
         let mut malformed_secret = valid.to_vec();
         malformed_secret[1] = OPEN_READ_LINK_SECRET;
-        malformed_secret.extend_from_slice("B".repeat(43).as_bytes());
+        malformed_secret.extend_from_slice(format!("{}!", "B".repeat(31)).as_bytes());
         assert!(matches!(
             ClientFrame::decode(&malformed_secret),
             Err(FrameCodecError::InvalidLinkSecret)

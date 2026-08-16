@@ -9,12 +9,56 @@
   "max_sse_read_batch_payload_bytes": 1048576,
   "max_sse_event_bytes": 2097152,
   "max_sse_unterminated_event_bytes": 2097152,
-  "create_request": { "title": "Deploy log", "visibility": "private", "links": [{ "link_id": "owner", "permissions": "o", "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, { "link_id": "deploy-bot", "permissions": "w", "secret": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE" }] },
-  "stream_resource": { "stream_id": "00000000000000000000000000000000", "title": "Deploy log", "visibility": "private", "created_at": "2026-08-13T00:00:00Z", "expires_at": "2026-08-23T00:00:00Z", "future_field": true },
-  "append_request": { "client_writer_id": "AAECAwQFBgcICQoLDA0ODw", "writer_start_seq_num": "41", "records": [{ "part": { "index": 0, "is_final": true }, "format": "transcript", "data": { "encoding": "utf8", "value": "hello\n" } }, { "format": "bytes", "data": { "encoding": "base64url", "value": "AP8" } }], "expected_next_seq_num": "7" },
+  "create_request": {
+    "title": "Deploy log",
+    "visibility": "private",
+    "links": [
+      { "link_id": "owner", "permissions": "o" },
+      { "link_id": "deploy-bot", "permissions": "w" }
+    ]
+  },
+  "stream_resource": {
+    "stream_id": "00000000000000000000000000000000",
+    "title": "Deploy log",
+    "visibility": "private",
+    "created_at": "2026-08-13T00:00:00Z",
+    "expires_at": "2026-08-23T00:00:00Z",
+    "future_field": true
+  },
+  "append_request": {
+    "client_writer_id": "AAECAwQFBgcICQoLDA0ODw",
+    "writer_start_seq_num": "41",
+    "records": [
+      { "part": { "index": 0, "is_final": true }, "format": "transcript", "data": { "encoding": "utf8", "value": "hello\n" } },
+      { "format": "bytes", "data": { "encoding": "base64url", "value": "AP8" } }
+    ],
+    "expected_next_seq_num": "7"
+  },
   "append_response": { "start_seq_num": "7", "end_seq_num": "9", "future_field": true },
-  "error_response": { "error": { "code": "sequence_mismatch", "message": "append sequence precondition failed", "request_id": "request-42", "actual_next_seq_num": "9", "future_field": true }, "future_field": true },
-  "sse_read_batch": { "records": [{ "seq_num": "7", "timestamp_ms": "1786579200000", "writer_id": "AAECAwQFBgcICQoLDA0ODw", "writer_seq_num": "41", "part": { "index": 0, "is_final": true, "future_field": true }, "format": "transcript", "data": { "encoding": "utf8", "value": "hello\n", "future_field": true } }], "future_field": true },
+  "error_response": {
+    "error": {
+      "code": "sequence_mismatch",
+      "message": "append sequence precondition failed",
+      "request_id": "request-42",
+      "actual_next_seq_num": "9",
+      "future_field": true
+    },
+    "future_field": true
+  },
+  "sse_read_batch": {
+    "records": [
+      {
+        "seq_num": "7",
+        "timestamp_ms": "1786579200000",
+        "writer_id": "AAECAwQFBgcICQoLDA0ODw",
+        "writer_seq_num": "41",
+        "part": { "index": 0, "is_final": true, "future_field": true },
+        "format": "transcript",
+        "data": { "encoding": "utf8", "value": "hello\n", "future_field": true }
+      }
+    ],
+    "future_field": true
+  },
   "sse_resume_cursor": "v1,2,2,2,1786579200000",
   "sse_snapshot_cursor": "v1,0,0,2,1786579200000",
   "sse_snapshot_boundary": { "end_seq_num": "2", "last_timestamp_ms": "1786579200000", "future_field": true },
