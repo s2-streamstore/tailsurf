@@ -62,6 +62,18 @@ pub fn stream_link(
     secret: &LinkSecret,
 ) -> Result<Url, StreamLinkError> {
     validate_link_secret(secret.expose_secret())?;
+    let mut url = public_stream_url(base_url, stream_id)?;
+
+    let fragment = form_urlencoded::Serializer::new(String::new())
+        .append_pair(permissions.as_str(), secret.expose_secret())
+        .finish();
+    url.set_fragment(Some(&fragment));
+
+    Ok(url)
+}
+
+/// Builds the fragment-less `/s/{stream_id}` URL, normalizing the base like [`stream_link`].
+pub fn public_stream_url(base_url: &Url, stream_id: &StreamId) -> Result<Url, StreamLinkError> {
     let mut url = base_url.clone();
     validate_web_scheme(&url)?;
     url.set_username("")
@@ -70,11 +82,7 @@ pub fn stream_link(
         .map_err(|()| StreamLinkError::InvalidBaseUrl)?;
     url.set_path(&format!("/s/{stream_id}"));
     url.set_query(None);
-
-    let fragment = form_urlencoded::Serializer::new(String::new())
-        .append_pair(permissions.as_str(), secret.expose_secret())
-        .finish();
-    url.set_fragment(Some(&fragment));
+    url.set_fragment(None);
 
     Ok(url)
 }

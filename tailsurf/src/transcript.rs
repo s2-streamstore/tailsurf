@@ -1,6 +1,6 @@
 //! Logical transcript reconstruction from physical TSF read records.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -106,16 +106,19 @@ impl LogicalTranscript {
         record: ReadRecord<'a>,
     ) -> Result<Option<TranscriptRecord<'a>>, TranscriptError> {
         let limits = self.limits;
-        if !self.writers.contains_key(&record.writer_id)
-            && self.writers.len() >= limits.max_writer_states
-        {
-            return Err(TranscriptError::WriterStateLimitExceeded {
-                actual: self.writers.len().saturating_add(1),
-                max: limits.max_writer_states,
-            });
-        }
-
-        let writer = self.writers.entry(record.writer_id).or_default();
+        let writer_count = self.writers.len();
+        let writer = match self.writers.entry(record.writer_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                if writer_count >= limits.max_writer_states {
+                    return Err(TranscriptError::WriterStateLimitExceeded {
+                        actual: writer_count.saturating_add(1),
+                        max: limits.max_writer_states,
+                    });
+                }
+                entry.insert(WriterState::default())
+            }
+        };
         if writer
             .highest_seq
             .is_some_and(|highest| record.writer_seq_num <= highest)
@@ -258,11 +261,6 @@ pub enum TranscriptData<'a> {
 }
 
 impl TranscriptData<'_> {
-    /// Creates contiguous transcript data from a static byte slice.
-    pub fn from_static(data: &'static [u8]) -> TranscriptData<'static> {
-        TranscriptData::Borrowed(data)
-    }
-
     /// Returns the number of bytes not consumed through the [`Buf`] implementation.
     pub fn len(&self) -> usize {
         self.remaining()
@@ -676,7 +674,7 @@ mod tests {
             push(&mut transcript, record(0, PartHeader::unsplit(), b"hello")),
             Some(TranscriptRecord {
                 format: RecordFormat::Transcript,
-                data: TranscriptData::from_static(b"hello")
+                data: TranscriptData::Borrowed(b"hello")
             })
         );
         assert_eq!(
@@ -769,7 +767,7 @@ mod tests {
             push(&mut transcript, record(9, PartHeader::unsplit(), b"next")),
             Some(TranscriptRecord {
                 format: RecordFormat::Transcript,
-                data: TranscriptData::from_static(b"next")
+                data: TranscriptData::Borrowed(b"next")
             })
         );
     }
@@ -796,7 +794,7 @@ mod tests {
             push(&mut transcript, record(10, PartHeader::unsplit(), b"next")),
             Some(TranscriptRecord {
                 format: RecordFormat::Transcript,
-                data: TranscriptData::from_static(b"next")
+                data: TranscriptData::Borrowed(b"next")
             })
         );
     }
@@ -814,7 +812,7 @@ mod tests {
             ),
             Some(TranscriptRecord {
                 format: RecordFormat::Transcript,
-                data: TranscriptData::from_static(b"first")
+                data: TranscriptData::Borrowed(b"first")
             })
         );
         assert_eq!(
@@ -824,7 +822,7 @@ mod tests {
             ),
             Some(TranscriptRecord {
                 format: RecordFormat::Transcript,
-                data: TranscriptData::from_static(b"second")
+                data: TranscriptData::Borrowed(b"second")
             })
         );
     }
@@ -864,7 +862,7 @@ mod tests {
             push(&mut transcript, record(9, PartHeader::unsplit(), b"next")),
             Some(TranscriptRecord {
                 format: RecordFormat::Transcript,
-                data: TranscriptData::from_static(b"next")
+                data: TranscriptData::Borrowed(b"next")
             })
         );
     }
@@ -1029,7 +1027,7 @@ mod tests {
             ),
             Some(TranscriptRecord {
                 format: RecordFormat::Transcript,
-                data: TranscriptData::from_static(b""),
+                data: TranscriptData::Borrowed(b""),
             })
         );
         assert_eq!(transcript.pending_parts, 0);

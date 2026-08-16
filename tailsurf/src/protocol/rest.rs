@@ -28,6 +28,8 @@ pub const MAX_SSE_READ_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum encoded bytes retained for an SSE event whose terminator has not arrived.
 pub const MAX_SSE_UNTERMINATED_EVENT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum links accepted atomically with stream creation.
+pub const MAX_INITIAL_STREAM_LINKS: usize = 3;
 
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -38,6 +40,22 @@ pub enum Visibility {
     Private,
     /// Reads are anonymous; writes and management still require authorization.
     Public,
+}
+
+impl Visibility {
+    /// Returns the canonical lowercase wire form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+}
+
+impl std::fmt::Display for Visibility {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Options for creating a stream.
@@ -52,7 +70,8 @@ pub struct CreateStreamRequest {
     /// Requested lifetime in seconds, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in_seconds: Option<u64>,
-    /// Prepared initial links. At least one must be an owner. At most three are allowed.
+    /// Prepared initial links. At least one must be an owner. At most
+    /// [`MAX_INITIAL_STREAM_LINKS`] are allowed.
     pub links: Vec<InitialStreamLink>,
 }
 
@@ -169,6 +188,23 @@ pub enum StreamLinkStatus {
     Expired,
     /// The link was explicitly revoked.
     Revoked,
+}
+
+impl StreamLinkStatus {
+    /// Returns the canonical lowercase wire form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamLinkStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Non-secret metadata for one stream link.
@@ -306,6 +342,18 @@ pub struct ApiError {
     pub actual_next_seq_num: Option<u64>,
 }
 
+/// Parses a canonical decimal u64 wire string: digits only, no sign or superfluous leading zeros.
+pub(crate) fn parse_canonical_decimal_u64(value: &str) -> Option<u64> {
+    // Integer FromStr accepts a leading '+'; canonical wire decimals are digits only.
+    if value.is_empty()
+        || (value != "0" && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
 /// Parses canonical decimal u64 wire strings. Borrowed strings stay borrowed; `visit_string`
 /// keeps owned-`Value` deserializers working.
 struct DecimalU64Visitor {
@@ -324,14 +372,8 @@ impl serde::de::Visitor<'_> for DecimalU64Visitor {
     where
         E: serde::de::Error,
     {
-        // Integer FromStr accepts a leading '+'; canonical wire decimals are digits only.
-        if value.is_empty()
-            || (value != "0" && value.starts_with('0'))
-            || !value.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(E::custom("non-canonical decimal u64"));
-        }
-        let parsed: u64 = value.parse().map_err(E::custom)?;
+        let parsed = parse_canonical_decimal_u64(value)
+            .ok_or_else(|| E::custom("non-canonical decimal u64"))?;
         if self.max.is_some_and(|max| parsed > max) {
             return Err(E::custom("sequence exceeds the data adapter range"));
         }

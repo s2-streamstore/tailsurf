@@ -2,7 +2,7 @@
 
 use std::{fmt, str::FromStr};
 
-use base64::{Engine as _, alphabet, engine};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -158,15 +158,9 @@ where
 /// Length of the canonical unpadded base64url encoding of a 256-bit value.
 pub(crate) const BASE64URL_32_ENCODED_LEN: usize = 43;
 
-/// Strict URL-safe no-pad base64 engine that rejects non-canonical trailing bits.
-const STRICT_URL_SAFE_NO_PAD: engine::GeneralPurpose = engine::GeneralPurpose::new(
-    &alphabet::URL_SAFE,
-    engine::general_purpose::NO_PAD.with_decode_allow_trailing_bits(false),
-);
-
 /// Encodes a 256-bit value as canonical unpadded base64url.
 pub(crate) fn encode_base64url_32(bytes: &[u8; 32]) -> String {
-    STRICT_URL_SAFE_NO_PAD.encode(bytes)
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 pub(crate) fn random_base64url_32() -> String {
@@ -181,9 +175,7 @@ pub(crate) fn is_canonical_base64url_32(value: &str) -> bool {
         return false;
     }
     let mut decoded = [0_u8; 32];
-    STRICT_URL_SAFE_NO_PAD
-        .decode_slice(value, &mut decoded)
-        .is_ok()
+    URL_SAFE_NO_PAD.decode_slice(value, &mut decoded).is_ok()
 }
 
 #[cfg(test)]

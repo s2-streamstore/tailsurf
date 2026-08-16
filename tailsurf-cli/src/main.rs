@@ -24,7 +24,7 @@ use tailsurf::{
     protocol::{
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
-            StreamLinkCredential, StreamLinkStatus, StreamMetadata, StreamTitleUpdate,
+            MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamMetadata, StreamTitleUpdate,
             UpdateStreamRequest, Visibility,
         },
         ws::{
@@ -32,7 +32,7 @@ use tailsurf::{
             frame::{MAX_RECORD_BYTES, PartHeader, RecordFormat},
         },
     },
-    stream_url::{StreamLocator, stream_link},
+    stream_url::{StreamLocator, public_stream_url, stream_link},
     transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript},
 };
 use tokio::{
@@ -53,7 +53,6 @@ const TRANSCRIPT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
 const TRANSCRIPT_BATCH_QUEUE: usize = 8;
 /// Stdin read block size for line-framed and raw writes.
 const STDIN_READ_BYTES: usize = 16 * 1024;
-const MAX_INITIAL_LINKS: usize = 3;
 const UPDATE_HINT_CACHE_FILE: &str = ".tailsurf-cli-update-check";
 const UPDATE_HINT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_HINT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -529,18 +528,17 @@ impl FromStr for PermissionArg {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let permissions = match value.to_ascii_lowercase().as_str() {
-            "read" | "r" => LinkPermissions::read(),
-            "write" | "w" => LinkPermissions::write(),
-            "read-write" | "rw" => LinkPermissions::read_write(),
-            "owner" | "o" => LinkPermissions::owner(),
-            other => {
-                return Err(format!(
-                    "unknown permission {other:?}; use read, write, read-write, or owner"
-                ));
-            }
+        let value = value.to_ascii_lowercase();
+        let short = match value.as_str() {
+            "read" => "r",
+            "write" => "w",
+            "read-write" => "rw",
+            "owner" => "o",
+            other => other,
         };
-        Ok(Self(permissions))
+        short.parse().map(Self).map_err(|_| {
+            format!("unknown permission {value:?}; use read, write, read-write, or owner")
+        })
     }
 }
 
@@ -871,9 +869,9 @@ fn new_stream_links(
         }
         links.push(initial_link("reader", LinkPermissions::read())?);
     }
-    if links.len() > MAX_INITIAL_LINKS {
+    if links.len() > MAX_INITIAL_STREAM_LINKS {
         bail!(
-            "at most {MAX_INITIAL_LINKS} initial links may be created, including the default owner and private reader links"
+            "at most {MAX_INITIAL_STREAM_LINKS} initial links may be created, including the default owner and private reader links"
         );
     }
     let mut link_ids = HashSet::with_capacity(links.len());
@@ -990,11 +988,7 @@ async fn stream_raw_stdin_to_writer(
     let mut stdin = tokio::io::stdin();
     let mut buffer = vec![0_u8; STDIN_READ_BYTES];
     let mut appender = RawRecordAppender::new(RAW_LINGER);
-    let mut session = WriterSession {
-        writer,
-        state,
-        pending_tickets: VecDeque::new(),
-    };
+    let mut session = WriterSession::new(writer, state);
     let interrupted = loop {
         if let Some(deadline) = appender.deadline() {
             tokio::select! {
@@ -1043,11 +1037,7 @@ async fn stream_lines_to_writer(
     let mut stdin = tokio::io::stdin();
     let mut read_buffer = BytesMut::with_capacity(STDIN_READ_BYTES);
     let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
-    let mut session = WriterSession {
-        writer,
-        state,
-        pending_tickets: VecDeque::new(),
-    };
+    let mut session = WriterSession::new(writer, state);
 
     let interrupted = loop {
         read_buffer.reserve(STDIN_READ_BYTES);
@@ -1084,11 +1074,7 @@ async fn stream_command_to_writer(
     let (writer, mut state) =
         connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
     let outcome = {
-        let mut session = WriterSession {
-            writer: &writer,
-            state: &mut state,
-            pending_tickets: VecDeque::new(),
-        };
+        let mut session = WriterSession::new(&writer, &mut state);
         let outcome =
             stream_child_command_output(&mut session, buffering, max_logical_record_bytes, command)
                 .await?;
@@ -1238,10 +1224,7 @@ impl RawRecordAppender {
             if self.pending.is_empty() {
                 self.deadline = Some(Instant::now() + self.linger);
             }
-            let available = MAX_RECORD_BYTES - self.pending.len();
-            let take = available.min(bytes.len());
-            self.pending.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
+            fill_pending_record(&mut self.pending, &mut bytes);
             if self.pending.len() == MAX_RECORD_BYTES {
                 self.flush(session).await?;
             }
@@ -1345,10 +1328,7 @@ impl LineRecordAppender {
 
     fn buffer(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() {
-            let available = MAX_RECORD_BYTES - self.pending.len();
-            let take = available.min(bytes.len());
-            self.pending.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
+            fill_pending_record(&mut self.pending, &mut bytes);
             if self.pending.len() == MAX_RECORD_BYTES {
                 self.pending_parts.push(self.pending.split().freeze());
             }
@@ -1375,10 +1355,27 @@ impl LineRecordAppender {
     }
 }
 
+/// Copies input into `pending` up to the MAX_RECORD_BYTES fill line.
+fn fill_pending_record(pending: &mut BytesMut, bytes: &mut &[u8]) {
+    let take = (MAX_RECORD_BYTES - pending.len()).min(bytes.len());
+    pending.extend_from_slice(&bytes[..take]);
+    *bytes = &bytes[take..];
+}
+
 struct WriterSession<'a> {
     writer: &'a TsfWriter,
     state: &'a mut WriterState,
     pending_tickets: VecDeque<AppendTicket>,
+}
+
+impl<'a> WriterSession<'a> {
+    fn new(writer: &'a TsfWriter, state: &'a mut WriterState) -> Self {
+        Self {
+            writer,
+            state,
+            pending_tickets: VecDeque::new(),
+        }
+    }
 }
 
 impl WriterSession<'_> {
@@ -1612,7 +1609,7 @@ async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
                 "{:<24}  {:<10}  {:<7}  expires {}{}",
                 link.link_id,
                 permission_label(link.permissions),
-                link_status_label(link.status),
+                link.status.as_str(),
                 link.expires_at.as_deref().unwrap_or("never"),
                 if link.link_id == inventory.authorizing_link_id {
                     "  (current)"
@@ -1623,14 +1620,6 @@ async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
         }
     }
     Ok(())
-}
-
-fn link_status_label(status: StreamLinkStatus) -> &'static str {
-    match status {
-        StreamLinkStatus::Active => "active",
-        StreamLinkStatus::Expired => "expired",
-        StreamLinkStatus::Revoked => "revoked",
-    }
 }
 
 async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::Result<()> {
@@ -1887,8 +1876,7 @@ fn print_created_stream(
     if !json {
         println!(
             "Created {} stream {}",
-            visibility_label(created.visibility),
-            created.stream_id
+            created.visibility, created.stream_id
         );
         println!(
             "Title: {}",
@@ -1904,7 +1892,7 @@ fn print_created_stream(
             .map(|credential| {
                 Ok((
                     credential.link_id.as_str(),
-                    permission_label(credential.permissions),
+                    credential.permissions,
                     stream_link(
                         web_url,
                         &created.stream_id,
@@ -1922,20 +1910,21 @@ fn print_created_stream(
         if matches!(created.visibility, Visibility::Public) {
             links.push((
                 "Public",
-                "read",
-                bare_stream_url(web_url, &created.stream_id),
+                LinkPermissions::read(),
+                public_stream_url(web_url, &created.stream_id)?,
                 "  (public)",
             ));
         }
         if !links.is_empty() {
             println!();
-            links.sort_by_key(|(_, permission, _, _)| permission_rank(permission));
+            links.sort_by_key(|(_, permissions, _, _)| permission_rank(*permissions));
             let width = links
                 .iter()
                 .map(|(label, _, _, _)| label.len())
                 .max()
                 .unwrap_or(0);
-            for (label, permission, url, suffix) in &links {
+            for (label, permissions, url, suffix) in &links {
+                let permission = permission_label(*permissions);
                 println!("  {label:<width$}  {permission:<10}  {url}{suffix}");
             }
             println!();
@@ -1948,7 +1937,7 @@ fn print_created_stream(
                 .title
                 .as_ref()
                 .map(|title| title.as_str().to_owned()),
-            visibility: visibility_label(created.visibility),
+            visibility: created.visibility.as_str(),
             expires_at: created.expires_at.clone(),
             links: created
                 .links
@@ -1967,8 +1956,12 @@ fn print_created_stream(
                     })
                 })
                 .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?,
-            public_url: matches!(created.visibility, Visibility::Public)
-                .then(|| bare_stream_url(web_url, &created.stream_id).to_string()),
+            public_url: match created.visibility {
+                Visibility::Public => {
+                    Some(public_stream_url(web_url, &created.stream_id)?.to_string())
+                }
+                Visibility::Private => None,
+            },
         };
         print_json(&output)?;
     }
@@ -1985,7 +1978,7 @@ fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()
                 .as_ref()
                 .map_or("Untitled stream", StreamTitle::as_str)
         );
-        println!("Visibility: {}", visibility_label(stream.visibility));
+        println!("Visibility: {}", stream.visibility);
         println!("Created: {}", stream.created_at);
         println!("Expires: {}", stream.expires_at);
     } else {
@@ -2098,39 +2091,22 @@ fn initial_link(link_id: &str, permissions: LinkPermissions) -> eyre::Result<Ini
     ))
 }
 
-fn visibility_label(visibility: Visibility) -> &'static str {
-    match visibility {
-        Visibility::Private => "private",
-        Visibility::Public => "public",
-    }
-}
-
-fn bare_stream_url(base_url: &Url, stream_id: &StreamId) -> Url {
-    let mut url = base_url.clone();
-    url.set_path(&format!("/s/{stream_id}"));
-    url.set_query(None);
-    url.set_fragment(None);
-    url
-}
-
 fn permission_label(permissions: LinkPermissions) -> &'static str {
-    match permissions.as_str() {
-        "o" => "owner",
-        "r" => "read",
-        "w" => "write",
-        "rw" => "read-write",
-        // as_str is total over the four validated bit patterns; no other value is representable.
-        _ => unreachable!(),
+    match permissions {
+        p if p == LinkPermissions::owner() => "owner",
+        p if p == LinkPermissions::read() => "read",
+        p if p == LinkPermissions::write() => "write",
+        // Constructors validate bits into {o, r, w, rw}; only read-write remains.
+        _ => "read-write",
     }
 }
 
-fn permission_rank(label: &str) -> usize {
-    match label {
-        "read" => 0,
-        "write" => 1,
-        "read-write" => 2,
-        "owner" => 3,
-        _ => 4,
+fn permission_rank(permissions: LinkPermissions) -> usize {
+    match permissions {
+        p if p == LinkPermissions::read() => 0,
+        p if p == LinkPermissions::write() => 1,
+        p if p == LinkPermissions::read_write() => 2,
+        _ => 3,
     }
 }
 
