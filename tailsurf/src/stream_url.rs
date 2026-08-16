@@ -7,7 +7,7 @@ use crate::{LinkPermissions, LinkSecret, StreamId};
 /// Default origin for Tailsurf stream links.
 pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";
 /// Encoded length of a 256-bit stream link.
-pub const LINK_SECRET_ENCODED_LENGTH: usize = crate::ids::BASE64URL_32_ENCODED_LEN;
+pub const LINK_SECRET_ENCODED_LENGTH: usize = LinkSecret::ENCODED_LEN;
 /// Declared permission and secret value decoded from a stream link fragment.
 #[derive(Clone, Debug)]
 pub struct StreamLinkParam {

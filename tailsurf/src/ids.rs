@@ -82,6 +82,9 @@ pub struct LinkIdError;
 pub struct LinkSecret(secrecy::SecretString);
 
 impl LinkSecret {
+    /// Length of the canonical unpadded base64url encoding of a 256-bit secret.
+    pub const ENCODED_LEN: usize = BASE64URL_32_ENCODED_LEN;
+
     /// Generates a cryptographically random link secret.
     pub fn new_random() -> Self {
         Self(random_base64url_32().into())
