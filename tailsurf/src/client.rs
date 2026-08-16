@@ -337,19 +337,22 @@ impl TsfClient {
         idempotency_key: &IdempotencyKey,
         owner_link_secret: &LinkSecret,
     ) -> Result<StreamLinkCredential, TsfClientError> {
-        self.retry_transient(|| {
-            self.send_json_with_bearer(
-                self.http
-                    .put(self.rest_url(format_args!(
-                        "/streams/{stream_id}/links/{}",
-                        request.link_id
-                    )))
-                    .header("Idempotency-Key", idempotency_key.expose_secret())
-                    .json(request),
-                "create link",
-                Some(owner_link_secret),
-            )
-        })
+        self.retry_when(
+            || {
+                self.send_json_with_bearer(
+                    self.http
+                        .put(self.rest_url(format_args!(
+                            "/streams/{stream_id}/links/{}",
+                            request.link_id
+                        )))
+                        .header("Idempotency-Key", idempotency_key.expose_secret())
+                        .json(request),
+                    "create link",
+                    Some(owner_link_secret),
+                )
+            },
+            TsfClientError::is_recoverable_create_failure,
+        )
         .await
     }
 
