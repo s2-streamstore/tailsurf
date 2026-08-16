@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/s2-streamstore/tailsurf/compare/v0.7.1...v0.8.0) - 2026-08-16
+
+### Fixed
+
+- [**breaking**] tighten wire parsing, bound no-progress SSE reconnects, trim hot-path work ([#29](https://github.com/s2-streamstore/tailsurf/pull/29))
+
+### Other
+
+- [**breaking**] deliver zero-copy read batches through transcript assembly ([#31](https://github.com/s2-streamstore/tailsurf/pull/31))
+
 ## [0.7.1](https://github.com/s2-streamstore/tailsurf/compare/v0.7.0...v0.7.1) - 2026-08-15
 
 ### Fixed
