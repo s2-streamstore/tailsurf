@@ -851,27 +851,9 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
     let (start_value, mut body) = read_u64(body)?;
     let start = read_start_from_wire(start_tag, start_value)?;
-    let limit = if flags & OPEN_READ_LIMIT == 0 {
-        None
-    } else {
-        let (value, tail) = read_u64(body)?;
-        body = tail;
-        Some(value)
-    };
-    let end_seq_num = if flags & OPEN_READ_END_SEQ_NUM == 0 {
-        None
-    } else {
-        let (value, tail) = read_u64(body)?;
-        body = tail;
-        Some(value)
-    };
-    let playback_rate_permille = if flags & OPEN_READ_PLAYBACK_RATE == 0 {
-        None
-    } else {
-        let (value, tail) = read_u64(body)?;
-        body = tail;
-        Some(value)
-    };
+    let limit = read_flagged_u64(flags, OPEN_READ_LIMIT, &mut body)?;
+    let end_seq_num = read_flagged_u64(flags, OPEN_READ_END_SEQ_NUM, &mut body)?;
+    let playback_rate_permille = read_flagged_u64(flags, OPEN_READ_PLAYBACK_RATE, &mut body)?;
     let snapshot = flags & OPEN_READ_SNAPSHOT != 0;
     let link_secret = if flags & OPEN_READ_LINK_SECRET == 0 {
         ensure_empty(op, body)?;
@@ -899,7 +881,16 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
     })
 }
 
-fn validate_open_read(
+fn read_flagged_u64(flags: u8, bit: u8, body: &mut &[u8]) -> Result<Option<u64>, FrameCodecError> {
+    if flags & bit == 0 {
+        return Ok(None);
+    }
+    let (value, tail) = read_u64(body)?;
+    *body = tail;
+    Ok(Some(value))
+}
+
+pub(crate) fn validate_open_read(
     start: ReadStart,
     end_seq_num: Option<u64>,
     playback_rate_permille: Option<u64>,
