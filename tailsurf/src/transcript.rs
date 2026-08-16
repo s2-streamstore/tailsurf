@@ -1,6 +1,7 @@
-//! Logical records over physical TSF records: [`split_logical_record`](crate::transcript::split_logical_record)
-//! produces the split-part layout on the write side that
-//! [`LogicalTranscript`](crate::transcript::LogicalTranscript) reassembles on the read side.
+//! Logical records over physical TSF records:
+//! [`split_logical_record`](crate::transcript::split_logical_record) produces the split-part layout
+//! on the write side that [`LogicalTranscript`](crate::transcript::LogicalTranscript) reassembles
+//! on the read side.
 
 use std::collections::{HashMap, hash_map::Entry};
 
