@@ -14,7 +14,6 @@ use crate::{
             ReadStart,
         },
     },
-    stream_url::LINK_SECRET_ENCODED_LENGTH,
 };
 /// WebSocket subprotocol offered and selected for TSF v1 connections.
 pub const TSF_WEBSOCKET_PROTOCOL: &str = "tsf.v1";
@@ -540,9 +539,7 @@ impl ClientFrame {
                     + limit.map_or(0, |_| 8)
                     + end_seq_num.map_or(0, |_| 8)
                     + playback_rate_permille.map_or(0, |_| 8)
-                    + link_secret
-                        .as_ref()
-                        .map_or(0, |_| LINK_SECRET_ENCODED_LENGTH))
+                    + link_secret.as_ref().map_or(0, |_| LinkSecret::ENCODED_LEN))
             }
             Self::OpenWrite {
                 expected_next_seq_num,
@@ -553,7 +550,7 @@ impl ClientFrame {
                 }
                 Ok(2 + ClientWriterId::BYTE_LEN
                     + expected_next_seq_num.map_or(0, |_| 8)
-                    + LINK_SECRET_ENCODED_LENGTH)
+                    + LinkSecret::ENCODED_LEN)
             }
             Self::AppendBatch(records) => Self::append_batch_encoded_len(records),
         }
@@ -793,7 +790,7 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
                     validate_expected_next_seq_num(value)?;
                     (Some(value), body)
                 };
-            if secret_bytes.len() != LINK_SECRET_ENCODED_LENGTH {
+            if secret_bytes.len() != LinkSecret::ENCODED_LEN {
                 return Err(FrameCodecError::InvalidLinkSecret);
             }
             let link_secret = parse_link_secret(utf8_tail(secret_bytes)?)?;
@@ -851,10 +848,10 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         ensure_empty(op, body)?;
         None
     } else {
-        let Some((secret, trailing)) = body.split_at_checked(LINK_SECRET_ENCODED_LENGTH) else {
+        let Some((secret, trailing)) = body.split_at_checked(LinkSecret::ENCODED_LEN) else {
             return Err(FrameCodecError::TruncatedFrame {
                 op,
-                needed: LINK_SECRET_ENCODED_LENGTH.saturating_sub(body.len()),
+                needed: LinkSecret::ENCODED_LEN.saturating_sub(body.len()),
             });
         };
         ensure_empty(op, trailing)?;
@@ -1019,7 +1016,7 @@ fn parse_link_secret(text: &str) -> Result<LinkSecret, FrameCodecError> {
     text.parse().map_err(|_| FrameCodecError::InvalidLinkSecret)
 }
 
-fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
+pub(crate) fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
     if len > MAX_RECORD_BYTES {
         return Err(FrameCodecError::RecordTooLarge {
             actual: len,
@@ -1499,7 +1496,7 @@ mod tests {
             0,
             0,
         ];
-        invalid_utf8.extend_from_slice(&[b'A'; LINK_SECRET_ENCODED_LENGTH]);
+        invalid_utf8.extend_from_slice(&[b'A'; LinkSecret::ENCODED_LEN]);
         *invalid_utf8.last_mut().expect("secret byte") = 0xff;
         assert!(matches!(
             ClientFrame::decode(&invalid_utf8),
@@ -1511,7 +1508,7 @@ mod tests {
         ));
         let mut malformed_open_write = vec![ClientOp::OpenWrite.byte()];
         malformed_open_write.extend_from_slice(&[0; ClientWriterId::BYTE_LEN]);
-        malformed_open_write.extend_from_slice("B".repeat(LINK_SECRET_ENCODED_LENGTH).as_bytes());
+        malformed_open_write.extend_from_slice("B".repeat(LinkSecret::ENCODED_LEN).as_bytes());
         assert!(matches!(
             ClientFrame::decode(&malformed_open_write),
             Err(FrameCodecError::InvalidLinkSecret)
@@ -1655,7 +1652,7 @@ mod tests {
         let valid = ClientFrame::OpenWrite {
             client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
             link_secret: "A"
-                .repeat(LINK_SECRET_ENCODED_LENGTH)
+                .repeat(LinkSecret::ENCODED_LEN)
                 .parse()
                 .expect("canonical secret"),
             expected_next_seq_num: Some(7),
@@ -1673,7 +1670,7 @@ mod tests {
         assert!(matches!(
             ClientFrame::OpenWrite {
                 client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
-                link_secret: "A".repeat(LINK_SECRET_ENCODED_LENGTH).parse().expect("canonical secret"),
+                link_secret: "A".repeat(LinkSecret::ENCODED_LEN).parse().expect("canonical secret"),
                 expected_next_seq_num: Some(MAX_READ_SELECTOR_VALUE + 1),
             }
             .encode(),

@@ -20,7 +20,7 @@ use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
     AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, StreamId,
-    StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter,
+    StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
     protocol::{
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
@@ -32,7 +32,7 @@ use tailsurf::{
             frame::{MAX_RECORD_BYTES, PartHeader, RecordFormat},
         },
     },
-    stream_url::{StreamLocator, public_stream_url, stream_link},
+    stream_url::{DEFAULT_WEB_BASE_URL, StreamLocator, public_stream_url, stream_link},
     transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript, split_logical_record},
 };
 use tokio::{
@@ -68,7 +68,7 @@ struct Cli {
     #[arg(
         long = "api-url",
         env = "TSF_API_URL",
-        default_value = "https://tail.surf",
+        default_value = DEFAULT_WEB_BASE_URL,
         global = true,
         help_heading = "Connection"
     )]
@@ -77,7 +77,7 @@ struct Cli {
     #[arg(
         long = "web-url",
         env = "TSF_WEB_URL",
-        default_value = "https://tail.surf",
+        default_value = DEFAULT_WEB_BASE_URL,
         global = true,
         help_heading = "Connection"
     )]
@@ -716,10 +716,7 @@ fn should_check_for_update_hint(
     stderr_is_terminal: bool,
     disabled: bool,
 ) -> bool {
-    stderr_is_terminal
-        && !disabled
-        && !is_update_command
-        && api_url.as_str() == "https://tail.surf/"
+    stderr_is_terminal && !disabled && !is_update_command && *api_url == default_api_origin()
 }
 
 fn automatic_update_checks_disabled() -> bool {
@@ -967,99 +964,38 @@ async fn stream_stdin_to_writer(
     let (writer, mut state) =
         connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
 
-    let interrupted = match buffering {
-        WriteBuffering::Raw => stream_raw_stdin_to_writer(&writer, &mut state).await,
-        WriteBuffering::Lines => {
-            stream_lines_to_writer(&writer, &mut state, max_logical_record_bytes).await
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<eyre::Result<Bytes>>(16);
+    // Ctrl-C drops the sender, so the consumer sees the channel close, flushes any
+    // pending data, and finishes the session cleanly before the interrupted exit.
+    let stdin_task = tokio::spawn(async move {
+        tokio::select! {
+            result = read_pipe_chunks(tokio::io::stdin(), chunk_tx, "failed to read stdin") => {
+                result.map(|()| false)
+            }
+            interrupt = tokio::signal::ctrl_c() => {
+                interrupt.context("failed to listen for interrupt signal")?;
+                Ok(true)
+            }
         }
-    }?;
+    });
+    {
+        let mut session = WriterSession::new(&writer, &mut state);
+        match buffering {
+            WriteBuffering::Raw => stream_raw_chunks_to_writer(&mut session, &mut chunk_rx).await?,
+            WriteBuffering::Lines => {
+                stream_line_chunks_to_writer(&mut session, &mut chunk_rx, max_logical_record_bytes)
+                    .await?
+            }
+        }
+        session.finish().await?;
+    }
+    let interrupted = stdin_task.await.context("stdin reader task panicked")??;
     writer.close().await.context("failed to close writer")?;
     print_write_summary(state.next_writer_seq);
     if interrupted {
         exit_interrupted();
     }
     Ok(())
-}
-
-async fn stream_raw_stdin_to_writer(
-    writer: &TsfWriter,
-    state: &mut WriterState,
-) -> eyre::Result<bool> {
-    let mut stdin = tokio::io::stdin();
-    let mut buffer = vec![0_u8; STDIN_READ_BYTES];
-    let mut appender = RawRecordAppender::new(RAW_LINGER);
-    let mut session = WriterSession::new(writer, state);
-    let interrupted = loop {
-        if let Some(deadline) = appender.deadline() {
-            tokio::select! {
-                byte_count = stdin.read(&mut buffer) => {
-                    let byte_count = byte_count.context("failed to read stdin")?;
-                    if byte_count == 0 {
-                        break false;
-                    }
-                    appender.push_bytes(&mut session, &buffer[..byte_count]).await?;
-                }
-                _ = sleep_until(deadline) => {
-                    appender.flush(&mut session).await?;
-                }
-                interrupt = tokio::signal::ctrl_c() => {
-                    interrupt.context("failed to listen for interrupt signal")?;
-                    break true;
-                }
-            }
-        } else {
-            let byte_count = tokio::select! {
-                byte_count = stdin.read(&mut buffer) => byte_count.context("failed to read stdin")?,
-                interrupt = tokio::signal::ctrl_c() => {
-                    interrupt.context("failed to listen for interrupt signal")?;
-                    break true;
-                }
-            };
-            if byte_count == 0 {
-                break false;
-            }
-            appender
-                .push_bytes(&mut session, &buffer[..byte_count])
-                .await?;
-        };
-    };
-    appender.flush(&mut session).await?;
-    session.finish().await?;
-
-    Ok(interrupted)
-}
-
-async fn stream_lines_to_writer(
-    writer: &TsfWriter,
-    state: &mut WriterState,
-    max_logical_record_bytes: usize,
-) -> eyre::Result<bool> {
-    let mut stdin = tokio::io::stdin();
-    let mut read_buffer = BytesMut::with_capacity(STDIN_READ_BYTES);
-    let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
-    let mut session = WriterSession::new(writer, state);
-
-    let interrupted = loop {
-        read_buffer.reserve(STDIN_READ_BYTES);
-        let byte_count = tokio::select! {
-            byte_count = stdin.read_buf(&mut read_buffer) => byte_count.context("failed to read stdin")?,
-            interrupt = tokio::signal::ctrl_c() => {
-                interrupt.context("failed to listen for interrupt signal")?;
-                break true;
-            }
-        };
-        if byte_count == 0 {
-            break false;
-        }
-
-        line_appender.push_bytes(&mut session, &read_buffer).await?;
-        read_buffer.clear();
-    };
-
-    line_appender.finish(&mut session).await?;
-    session.finish().await?;
-
-    Ok(interrupted)
 }
 
 async fn stream_command_to_writer(
@@ -1123,18 +1059,23 @@ async fn stream_child_command_output(
         .take()
         .context("failed to capture child stderr")?;
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<eyre::Result<Bytes>>(16);
-    let stdout_task = tokio::spawn(read_child_pipe(stdout, chunk_tx.clone()));
-    let stderr_task = tokio::spawn(read_child_pipe(stderr, chunk_tx));
+    let stdout_task = tokio::spawn(read_pipe_chunks(
+        stdout,
+        chunk_tx.clone(),
+        "failed to read command output",
+    ));
+    let stderr_task = tokio::spawn(read_pipe_chunks(
+        stderr,
+        chunk_tx,
+        "failed to read command output",
+    ));
 
     let stream_output = async {
         match buffering {
             WriteBuffering::Raw => stream_raw_chunks_to_writer(session, &mut chunk_rx).await?,
             WriteBuffering::Lines => {
-                let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
-                while let Some(chunk) = chunk_rx.recv().await {
-                    line_appender.push_bytes(session, &chunk?).await?;
-                }
-                line_appender.finish(session).await?;
+                stream_line_chunks_to_writer(session, &mut chunk_rx, max_logical_record_bytes)
+                    .await?
             }
         }
         eyre::Result::<()>::Ok(())
@@ -1168,9 +1109,10 @@ async fn stream_child_command_output(
     })
 }
 
-async fn read_child_pipe<R>(
+async fn read_pipe_chunks<R>(
     mut pipe: R,
     chunk_tx: mpsc::Sender<eyre::Result<Bytes>>,
+    read_error_context: &'static str,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1181,7 +1123,7 @@ where
         let byte_count = pipe
             .read_buf(&mut buffer)
             .await
-            .context("failed to read command output")?;
+            .context(read_error_context)?;
         if byte_count == 0 {
             return Ok(());
         }
@@ -1274,6 +1216,18 @@ async fn stream_raw_chunks_to_writer(
         }
     }
     appender.flush(session).await
+}
+
+async fn stream_line_chunks_to_writer(
+    session: &mut WriterSession<'_>,
+    chunk_rx: &mut mpsc::Receiver<eyre::Result<Bytes>>,
+    max_logical_record_bytes: usize,
+) -> eyre::Result<()> {
+    let mut line_appender = LineRecordAppender::new(max_logical_record_bytes);
+    while let Some(chunk) = chunk_rx.recv().await {
+        line_appender.push_bytes(session, &chunk?).await?;
+    }
+    line_appender.finish(session).await
 }
 
 struct LineRecordAppender {
