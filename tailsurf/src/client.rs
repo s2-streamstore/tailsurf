@@ -407,6 +407,7 @@ impl TsfClient {
         let mut cursor: Option<String> = None;
         let mut authorizing_link_id = None;
         let mut seen_cursors = HashSet::new();
+        let mut seen_link_ids = HashSet::new();
         loop {
             let page = self
                 .list_links(
@@ -427,6 +428,15 @@ impl TsfClient {
                 ));
             }
             authorizing_link_id.get_or_insert(page.authorizing_link_id);
+            // validate_link_page rejects duplicates within a page. Keep that invariant across
+            // pages.
+            for link in &page.links {
+                if !seen_link_ids.insert(link.link_id.clone()) {
+                    return Err(TsfClientError::InvalidLinkPage(
+                        "link ID appears on multiple pages",
+                    ));
+                }
+            }
             links.extend(page.links);
             match page.next_cursor {
                 Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
@@ -1416,27 +1426,15 @@ impl TsfWriteSession {
         let operation_timeout = self.operation_timeout;
 
         with_timeout(operation_timeout, "send append frame", async move {
-            self.buffer_batch(std::iter::once(&record)).await?;
+            self.buffer_batch(&[&record]).await?;
             self.flush().await
         })
         .await
     }
 
     /// Encodes one batch into the socket's write buffer, leaving the flush to the caller.
-    async fn buffer_batch<'a>(
-        &mut self,
-        records: impl IntoIterator<Item = &'a AppendRecord>,
-    ) -> Result<(), TsfClientError> {
-        let records = records
-            .into_iter()
-            .map(|record| AppendRecord {
-                writer_seq_num: record.writer_seq_num,
-                part: record.part,
-                format: record.format,
-                data: record.data.clone(),
-            })
-            .collect();
-        let frame = ClientFrame::AppendBatch(records).encode()?;
+    async fn buffer_batch(&mut self, records: &[&AppendRecord]) -> Result<(), TsfClientError> {
+        let frame = ClientFrame::encode_append_batch(records)?;
         self.ws.feed(Message::Binary(frame)).await?;
         Ok(())
     }
@@ -1681,7 +1679,7 @@ async fn send_retained(
                 payload_bytes += next.record.data.len();
                 batch.push(&next.record);
             }
-            session.buffer_batch(batch).await?;
+            session.buffer_batch(&batch).await?;
         }
         session.flush().await
     })
@@ -1850,6 +1848,19 @@ impl TsfSseReadSession {
         self.last_caught_up
     }
 
+    fn resume_cursors(
+        &self,
+        event: &ParsedSseEvent,
+    ) -> Result<(ParsedSseResumeCursor, Option<ParsedSseResumeCursor>), TsfClientError> {
+        Ok((
+            sse_resume_cursor(event)?.1,
+            self.last_event_id
+                .as_deref()
+                .map(parse_sse_resume_cursor)
+                .transpose()?,
+        ))
+    }
+
     /// Returns the next record, reconnecting from the last safe absolute cursor when needed.
     pub async fn next_record(&mut self) -> Result<Option<ReadRecord>, TsfClientError> {
         loop {
@@ -1905,7 +1916,8 @@ impl TsfSseReadSession {
                 self.stream_metadata = connection
                     .stream_metadata
                     .expect("validated stream_metadata event");
-                self.reconnect_attempts = 0;
+                // A handshake alone is not progress. A read_batch or caught_up event resets the
+                // counter below.
                 continue;
             };
             match event.event.as_str() {
@@ -1919,12 +1931,7 @@ impl TsfSseReadSession {
                         .map(sse_read_record)
                         .collect::<Result<Vec<_>, _>>()?;
                     validate_sse_read_batch(&records, &self.options)?;
-                    let (event_id, cursor) = sse_resume_cursor(&event)?;
-                    let previous = self
-                        .last_event_id
-                        .as_deref()
-                        .map(parse_sse_resume_cursor)
-                        .transpose()?;
+                    let (cursor, previous) = self.resume_cursors(&event)?;
                     validate_sse_read_batch_cursor(
                         &records,
                         cursor,
@@ -1932,7 +1939,7 @@ impl TsfSseReadSession {
                         &self.options,
                         self.snapshot_boundary,
                     )?;
-                    self.last_event_id = Some(event_id.to_owned());
+                    self.last_event_id = event.id;
                     self.queued_records.extend(records);
                     self.reconnect_attempts = 0;
                 }
@@ -1943,12 +1950,7 @@ impl TsfSseReadSession {
                         next_seq_num: value.next_seq_num,
                         last_timestamp_ms: value.last_timestamp_ms,
                     };
-                    let (event_id, cursor) = sse_resume_cursor(&event)?;
-                    let previous = self
-                        .last_event_id
-                        .as_deref()
-                        .map(parse_sse_resume_cursor)
-                        .transpose()?;
+                    let (cursor, previous) = self.resume_cursors(&event)?;
                     validate_sse_caught_up_cursor(
                         caught_up,
                         cursor,
@@ -1956,7 +1958,7 @@ impl TsfSseReadSession {
                         &self.options,
                         self.snapshot_boundary,
                     )?;
-                    self.last_event_id = Some(event_id.to_owned());
+                    self.last_event_id = event.id;
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
                     self.reconnect_attempts = 0;
@@ -2370,21 +2372,18 @@ fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
 struct SseParser {
     buffer: Vec<u8>,
     offset: usize,
-    validated: bool,
+    /// Start of the not-yet-terminated event; only newly pushed bytes are validated.
+    tail_start: usize,
 }
 
 impl SseParser {
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), TsfClientError> {
         self.compact();
         self.buffer.extend_from_slice(chunk);
-        self.validated = false;
+        self.validate_new_bytes(chunk.len())
     }
 
     fn next_event(&mut self) -> Result<Option<ParsedSseEvent>, TsfClientError> {
-        if !self.validated {
-            validate_sse_buffer(&self.buffer[self.offset..])?;
-            self.validated = true;
-        }
         loop {
             let Some((index, length)) = sse_boundary(&self.buffer[self.offset..]) else {
                 return Ok(None);
@@ -2397,9 +2396,31 @@ impl SseParser {
         }
     }
 
+    /// Validates only the bytes appended by the last push; earlier bytes were proven on arrival.
+    /// The 3-byte overlap catches an event terminator straddling the previous chunk boundary.
+    fn validate_new_bytes(&mut self, pushed: usize) -> Result<(), TsfClientError> {
+        let new_start = self.buffer.len() - pushed;
+        let mut pos = new_start.saturating_sub(3).max(self.tail_start);
+        while let Some((index, length)) = sse_boundary(&self.buffer[pos..]) {
+            let boundary_end = pos + index + length;
+            if boundary_end - self.tail_start > MAX_SSE_EVENT_BYTES {
+                return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
+            }
+            self.tail_start = boundary_end;
+            pos = boundary_end;
+        }
+        if self.buffer.len() - self.tail_start > MAX_SSE_UNTERMINATED_EVENT_BYTES {
+            return Err(TsfClientError::InvalidSse(
+                "unterminated event exceeds 2 MiB",
+            ));
+        }
+        Ok(())
+    }
+
     fn compact(&mut self) {
         if self.offset >= 64 * 1024 && self.offset >= self.buffer.len() / 2 {
             self.buffer.drain(..self.offset);
+            self.tail_start -= self.offset;
             self.offset = 0;
         }
     }
@@ -2415,7 +2436,7 @@ async fn next_sse_event(
         }
         match body.next().await {
             Some(Ok(chunk)) => {
-                parser.push(&chunk);
+                parser.push(&chunk)?;
             }
             Some(Err(error)) => return Err(error.into()),
             None => return Ok(None),
@@ -2423,30 +2444,17 @@ async fn next_sse_event(
     }
 }
 
-fn validate_sse_buffer(buffer: &[u8]) -> Result<(), TsfClientError> {
-    let mut offset = 0;
-    while let Some((index, length)) = sse_boundary(&buffer[offset..]) {
-        if index + length > MAX_SSE_EVENT_BYTES {
-            return Err(TsfClientError::InvalidSse("event exceeds 2 MiB"));
-        }
-        offset += index + length;
-    }
-    if buffer.len() - offset > MAX_SSE_UNTERMINATED_EVENT_BYTES {
-        return Err(TsfClientError::InvalidSse(
-            "unterminated event exceeds 2 MiB",
-        ));
-    }
-    Ok(())
-}
-
 fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len().saturating_sub(1) {
-        if buffer[index..].starts_with(b"\r\n\r\n") {
-            return Some((index, 4));
+    let mut from = 0;
+    while let Some(index) = memchr::memchr(b'\n', &buffer[from..]) {
+        let at = from + index;
+        if at >= 3 && buffer[at - 3..=at] == *b"\r\n\r\n" {
+            return Some((at - 3, 4));
         }
-        if buffer[index..].starts_with(b"\n\n") {
-            return Some((index, 2));
+        if at >= 1 && buffer[at - 1] == b'\n' {
+            return Some((at - 1, 2));
         }
+        from = at + 1;
     }
     None
 }
@@ -2454,7 +2462,8 @@ fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientError> {
     let text =
         std::str::from_utf8(block).map_err(|_| TsfClientError::InvalidSse("event is not UTF-8"))?;
-    let mut event = "message".to_owned();
+    // Borrow during the scan; allocate only for blocks that actually carry data.
+    let mut event = None;
     let mut id = None;
     let mut data = Vec::new();
     for line in text.lines() {
@@ -2465,21 +2474,25 @@ fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientErro
             (name, value.strip_prefix(' ').unwrap_or(value))
         });
         match name {
-            "event" => event = value.to_owned(),
-            "id" => id = Some(value.to_owned()),
+            "event" => event = Some(value),
+            "id" => id = Some(value),
             "data" => data.push(value),
             _ => {}
         }
     }
     if data.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(ParsedSseEvent {
-            event,
-            data: data.join("\n"),
-            id,
-        }))
+        return Ok(None);
     }
+    // Single data lines dominate; join only multi-line payloads.
+    let data = match data.as_slice() {
+        [single] => (*single).to_owned(),
+        lines => lines.join("\n"),
+    };
+    Ok(Some(ParsedSseEvent {
+        event: event.unwrap_or("message").to_owned(),
+        data,
+        id: id.map(str::to_owned),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2554,30 +2567,51 @@ fn invalid_sse_resume_cursor() -> TsfClientError {
     TsfClientError::InvalidSse("SSE event does not carry a valid resume cursor")
 }
 
+/// Per-byte JSON escaped length matching serde_json's ESCAPE table: '"', '\\', and the
+/// five short-form controls take two bytes, the rest of C0 takes six (\u00XX), and every
+/// other byte passes through unescaped.
+const JSON_ESCAPED_LEN: [u8; 256] = {
+    let mut table = [1u8; 256];
+    let mut control = 0;
+    while control < 0x20 {
+        table[control] = 6;
+        control += 1;
+    }
+    table[b'"' as usize] = 2;
+    table[b'\\' as usize] = 2;
+    table[b'\x08' as usize] = 2; // \b
+    table[b'\t' as usize] = 2;
+    table[b'\n' as usize] = 2;
+    table[b'\x0C' as usize] = 2; // \f
+    table[b'\r' as usize] = 2;
+    table
+};
+
 fn compact_record_data(bytes: &[u8]) -> RecordData {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes));
     };
-    let utf8 = RecordData::Utf8(text.to_owned());
-    let utf8_len = serde_json::to_vec(&utf8)
-        .expect("record data serialization is infallible")
-        .len();
+    let escaped_len = bytes.iter().fold(0usize, |total, byte| {
+        total + JSON_ESCAPED_LEN[*byte as usize] as usize
+    });
+    let utf8_len = br#"{"encoding":"utf8","value":""}"#.len() + escaped_len;
     let base64url_len =
         br#"{"encoding":"base64url","value":""}"#.len() + bytes.len().saturating_mul(4).div_ceil(3);
     if utf8_len <= base64url_len {
-        utf8
+        RecordData::Utf8(text.to_owned())
     } else {
         RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes))
     }
 }
 
 fn sse_read_record(record: SseReadRecord) -> Result<ReadRecord, TsfClientError> {
-    let writer = URL_SAFE_NO_PAD
-        .decode(record.writer_id)
+    let mut writer = [0u8; WriterId::BYTE_LEN];
+    let decoded_len = URL_SAFE_NO_PAD
+        .decode_slice(record.writer_id, &mut writer)
         .map_err(|_| TsfClientError::InvalidSse("invalid writer_id"))?;
-    let writer: [u8; WriterId::BYTE_LEN] = writer
-        .try_into()
-        .map_err(|_| TsfClientError::InvalidSse("invalid writer_id length"))?;
+    if decoded_len != WriterId::BYTE_LEN {
+        return Err(TsfClientError::InvalidSse("invalid writer_id length"));
+    }
     let data = match record.data {
         RecordData::Utf8(value) => Bytes::from(value),
         RecordData::Base64url(value) => {
@@ -3226,9 +3260,9 @@ pub enum TsfClientError {
     /// The writer background task failed or could not be joined.
     #[error("append writer failed: {0}")]
     AppendWriterFailed(String),
-    /// Consecutive read connections ended or requested reconnect without delivering a record.
+    /// Consecutive read connections ended without delivering a record batch or caught-up event.
     #[error(
-        "read stream made no record progress across {max_connection_attempts} consecutive connection attempts"
+        "read stream delivered no record batch or caught-up event across {max_connection_attempts} consecutive connection attempts"
     )]
     ReadReconnectLimitExceeded {
         /// Configured maximum consecutive connection attempts, including the initial connection.
@@ -4114,6 +4148,168 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn sse_parser_rejects_an_event_oversized_across_fragments() {
+        let first = format!("event: read_batch\ndata: {}", "a".repeat(1_500_000));
+        let second = format!("{}\n\n", "b".repeat(700_000));
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(vec![
+            Ok::<_, reqwest::Error>(Bytes::from(first)),
+            Ok::<_, reqwest::Error>(Bytes::from(second)),
+        ]));
+        let mut parser = SseParser::default();
+
+        assert!(matches!(
+            next_sse_event(&mut body, &mut parser).await,
+            Err(TsfClientError::InvalidSse("event exceeds 2 MiB"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_parser_accepts_a_terminator_split_across_chunks() {
+        let chunks = ["data: hi\r\n\r", "\n"]
+            .into_iter()
+            .map(|chunk| Ok::<_, reqwest::Error>(Bytes::copy_from_slice(chunk.as_bytes())))
+            .collect::<Vec<_>>();
+        let mut body: SseBody = Box::pin(futures_util::stream::iter(chunks));
+        let mut parser = SseParser::default();
+
+        let event = next_sse_event(&mut body, &mut parser)
+            .await
+            .expect("straddled event")
+            .expect("straddled event value");
+        assert_eq!(event.data, "hi");
+    }
+
+    #[tokio::test]
+    async fn sse_reader_bounds_consecutive_reconnects_without_delivered_records() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind SSE listener");
+        let address = listener.local_addr().expect("SSE listener address");
+        let server = tokio::spawn(async move {
+            // Every handshake completes with valid metadata; no body ever delivers a record.
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                    event: stream_metadata\n\
+                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let mut config =
+            TsfClientConfig::new(Url::parse(&format!("http://{address}")).expect("SSE API origin"))
+                .expect("valid client config");
+        config.retry_policy = RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        };
+        let client = TsfClient::with_config(config).expect("SSE client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let mut reader = client
+            .connect_sse_reader(ReadStreamOptions::new(stream_id))
+            .await
+            .expect("initial SSE connect");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), reader.next_record()).await;
+
+        assert!(matches!(
+            result,
+            Ok(Err(TsfClientError::ReadReconnectLimitExceeded {
+                max_connection_attempts: 3,
+            }))
+        ));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn list_all_links_rejects_link_ids_repeated_across_pages() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind REST listener");
+        let address = listener.local_addr().expect("REST listener address");
+        let server = tokio::spawn(async move {
+            let link = r#"{"link_id":"reader","permissions":"r","status":"active","created_at":"2026-08-13T00:00:00Z","expires_at":null,"revoked_at":null}"#;
+            for page in [
+                format!(
+                    r#"{{"authorizing_link_id":"owner","links":[{link}],"next_cursor":"next"}}"#
+                ),
+                format!(r#"{{"authorizing_link_id":"owner","links":[{link}],"next_cursor":null}}"#),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept REST request");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let mut config = TsfClientConfig::new(
+            Url::parse(&format!("http://{address}")).expect("REST API origin"),
+        )
+        .expect("valid client config");
+        config.retry_policy = RetryPolicy::none();
+        let client = TsfClient::with_config(config).expect("REST client");
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let owner = LinkSecret::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+        let result = client.list_all_links(&stream_id, &owner).await;
+
+        assert!(matches!(
+            result,
+            Err(TsfClientError::InvalidLinkPage(
+                "link ID appears on multiple pages"
+            ))
+        ));
+        server.await.expect("join REST server");
+    }
+
+    #[test]
+    fn compact_record_data_choice_matches_serialized_lengths() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"plain text".to_vec(),
+            "unicode 😀 text".as_bytes().to_vec(),
+            b"\"\\escape\theavy\n".to_vec(),
+            vec![0x00; 64],
+            vec![0x7f; 128],
+            "😀".repeat(1024).into_bytes(),
+            vec![0xff; 32],
+        ];
+        for bytes in cases {
+            let chosen = compact_record_data(&bytes);
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                let utf8_len = serde_json::to_vec(&RecordData::Utf8(text.to_owned()))
+                    .expect("measure utf8")
+                    .len();
+                let base64url_len = br#"{"encoding":"base64url","value":""}"#.len()
+                    + bytes.len().saturating_mul(4).div_ceil(3);
+                assert_eq!(
+                    matches!(chosen, RecordData::Utf8(_)),
+                    utf8_len <= base64url_len,
+                    "bytes={bytes:?}"
+                );
+            } else {
+                assert!(matches!(chosen, RecordData::Base64url(_)));
+            }
+            let round_tripped = match &chosen {
+                RecordData::Utf8(value) => value.as_bytes().to_vec(),
+                RecordData::Base64url(value) => URL_SAFE_NO_PAD.decode(value).expect("decode"),
+            };
+            assert_eq!(round_tripped, bytes);
+        }
+    }
+
     #[test]
     fn sse_batch_validation_enforces_decoded_bounds_and_read_limits() {
         assert!(validate_sse_read_batch_count(0).is_err());
@@ -4139,19 +4335,27 @@ mod tests {
         options.end_seq_num = None;
         assert!(validate_sse_read_batch(&non_contiguous, &options).is_err());
 
-        let oversized = SseReadRecord {
+        let mut wire_record = SseReadRecord {
             seq_num: 0,
             timestamp_ms: 0,
-            writer_id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
+            writer_id: URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN - 1]),
             writer_seq_num: 0,
             part: RestRecordPart {
                 index: 0,
                 is_final: true,
             },
             format: RecordFormat::Bytes,
-            data: RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_BYTES + 1])),
+            data: RecordData::Utf8(String::new()),
         };
-        assert!(sse_read_record(oversized).is_err());
+        assert!(matches!(
+            sse_read_record(wire_record.clone()),
+            Err(TsfClientError::InvalidSse("invalid writer_id length"))
+        ));
+
+        wire_record.writer_id = URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]);
+        wire_record.data =
+            RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_BYTES + 1]));
+        assert!(sse_read_record(wire_record).is_err());
     }
 
     #[test]

@@ -299,6 +299,8 @@ pub struct ApiError {
     /// Human-readable diagnostic message.
     pub message: String,
     /// Request identifier used for support and tracing.
+    // Tolerated absent: proxy-generated errors carry the other structured fields without one.
+    #[serde(default)]
     pub request_id: String,
     /// Retry delay in milliseconds when supplied.
     pub retry_after_ms: Option<u64>,
@@ -307,29 +309,93 @@ pub struct ApiError {
     pub actual_next_seq_num: Option<u64>,
 }
 
-mod optional_safe_decimal_u64 {
-    use serde::{Deserialize, Deserializer};
+/// Parses canonical decimal u64 wire strings. Borrowed strings stay borrowed; `visit_string`
+/// keeps owned-`Value` deserializers working.
+struct DecimalU64Visitor {
+    /// Largest accepted value when the data adapter range applies.
+    max: Option<u64>,
+}
 
-    use super::MAX_READ_SELECTOR_VALUE;
+impl serde::de::Visitor<'_> for DecimalU64Visitor {
+    type Value = u64;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a canonical decimal u64 string")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<u64, E>
+    where
+        E: serde::de::Error,
+    {
+        // Integer FromStr accepts a leading '+'; canonical wire decimals are digits only.
+        if value.is_empty()
+            || (value != "0" && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(E::custom("non-canonical decimal u64"));
+        }
+        let parsed: u64 = value.parse().map_err(E::custom)?;
+        if self.max.is_some_and(|max| parsed > max) {
+            return Err(E::custom("sequence exceeds the data adapter range"));
+        }
+        Ok(parsed)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<u64, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(&value)
+    }
+}
+
+/// Maps `null` to `None` and present strings through [`DecimalU64Visitor`].
+struct OptionalDecimalU64Visitor {
+    max: Option<u64>,
+}
+
+impl<'de> serde::de::Visitor<'de> for OptionalDecimalU64Visitor {
+    type Value = Option<u64>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an optional canonical decimal u64 string")
+    }
+
+    fn visit_none<E>(self) -> Result<Option<u64>, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Option<u64>, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Option<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_str(DecimalU64Visitor { max: self.max })
+            .map(Some)
+    }
+}
+
+mod optional_safe_decimal_u64 {
+    use serde::Deserializer;
+
+    use super::{MAX_READ_SELECTOR_VALUE, OptionalDecimalU64Visitor};
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<u64>, D::Error> {
-        let value = Option::<String>::deserialize(deserializer)?;
-        value
-            .map(|value| {
-                if value != "0" && value.starts_with('0') {
-                    return Err(serde::de::Error::custom("non-canonical decimal u64"));
-                }
-                let value: u64 = value.parse().map_err(serde::de::Error::custom)?;
-                if value > MAX_READ_SELECTOR_VALUE {
-                    return Err(serde::de::Error::custom(
-                        "sequence exceeds the data adapter range",
-                    ));
-                }
-                Ok(value)
-            })
-            .transpose()
+        deserializer.deserialize_option(OptionalDecimalU64Visitor {
+            max: Some(MAX_READ_SELECTOR_VALUE),
+        })
     }
 }
 
@@ -385,21 +451,23 @@ pub struct SseSnapshotBoundaryData {
 }
 
 mod decimal_u64 {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
+
+    use super::DecimalU64Visitor;
+
     pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&value.to_string())
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        if value != "0" && value.starts_with('0') {
-            return Err(serde::de::Error::custom("non-canonical decimal u64"));
-        }
-        value.parse().map_err(serde::de::Error::custom)
+        deserializer.deserialize_str(DecimalU64Visitor { max: None })
     }
 }
 
 mod optional_decimal_u64 {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
+
+    use super::OptionalDecimalU64Visitor;
+
     pub fn serialize<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {
         match value {
             Some(value) => serializer.serialize_some(&value.to_string()),
@@ -409,15 +477,7 @@ mod optional_decimal_u64 {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<u64>, D::Error> {
-        let value = Option::<String>::deserialize(deserializer)?;
-        value
-            .map(|value| {
-                if value != "0" && value.starts_with('0') {
-                    return Err(serde::de::Error::custom("non-canonical decimal u64"));
-                }
-                value.parse().map_err(serde::de::Error::custom)
-            })
-            .transpose()
+        deserializer.deserialize_option(OptionalDecimalU64Visitor { max: None })
     }
 }
 
@@ -542,11 +602,12 @@ pub(crate) fn is_rfc3339_timestamp(value: &str) -> bool {
     {
         return false;
     }
+    // Fixed-width windows must be pure ASCII digits: integer FromStr accepts a leading '+'.
     let number = |start: usize, end: usize| -> Option<u32> {
-        std::str::from_utf8(bytes.get(start..end)?)
-            .ok()?
-            .parse()
-            .ok()
+        bytes.get(start..end)?.iter().try_fold(0u32, |value, byte| {
+            byte.is_ascii_digit()
+                .then(|| value * 10 + u32::from(byte - b'0'))
+        })
     };
     let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
         number(0, 4),
@@ -583,10 +644,9 @@ pub(crate) fn is_rfc3339_timestamp(value: &str) -> bool {
     match bytes.get(index..) {
         Some(b"Z") => true,
         Some(zone) if zone.len() == 6 && matches!(zone[0], b'+' | b'-') && zone[3] == b':' => {
-            let Ok(hour) = std::str::from_utf8(&zone[1..3]).unwrap_or("").parse::<u8>() else {
-                return false;
-            };
-            let Ok(minute) = std::str::from_utf8(&zone[4..6]).unwrap_or("").parse::<u8>() else {
+            let (Some(hour), Some(minute)) =
+                (number(index + 1, index + 3), number(index + 4, index + 6))
+            else {
                 return false;
             };
             hour <= 23 && minute <= 59
@@ -717,6 +777,26 @@ mod tests {
         });
         assert!(serde_json::from_value::<StreamMetadata>(invalid_time).is_err());
 
+        // Integer FromStr accepts a leading '+'; fixed-width windows must not.
+        for signed in [
+            "+026-08-13T00:00:00Z",
+            "2026-+8-13T00:00:00Z",
+            "2026-08-13T00:00:00++0:00",
+            "2026-08-13T00:00:00-+0:00",
+        ] {
+            let signed_time = json!({
+                "stream_id": "00000000000000000000000000000000",
+                "title": null,
+                "visibility": "private",
+                "created_at": signed,
+                "expires_at": "2026-08-23T00:00:00Z"
+            });
+            assert!(
+                serde_json::from_value::<StreamMetadata>(signed_time).is_err(),
+                "accepted {signed:?}"
+            );
+        }
+
         assert!(serde_json::from_value::<ListLinksResponse>(json!({ "links": [] })).is_err());
         assert!(
             serde_json::from_value::<ListLinksResponse>(json!({
@@ -726,5 +806,37 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn api_error_tolerates_an_absent_request_id() {
+        let error: ApiErrorResponse = serde_json::from_value(json!({
+            "error": {
+                "code": "sequence_mismatch",
+                "message": "position changed",
+                "retry_after_ms": 250,
+                "actual_next_seq_num": "42"
+            }
+        }))
+        .expect("error without request id");
+        assert!(error.error.request_id.is_empty());
+        assert_eq!(error.error.retry_after_ms, Some(250));
+        assert_eq!(error.error.actual_next_seq_num, Some(42));
+    }
+
+    #[test]
+    fn decimal_wire_strings_accept_only_unsigned_canonical_digits() {
+        let range = |seq_num: &str| {
+            serde_json::from_value::<AppendRange>(json!({
+                "start_seq_num": seq_num,
+                "end_seq_num": "2"
+            }))
+        };
+        // Without the digit gate, integer FromStr would accept a leading '+'.
+        for signed in ["+1", "+0"] {
+            assert!(range(signed).is_err(), "accepted {signed:?}");
+        }
+        assert_eq!(range("0").expect("zero").start_seq_num, 0);
+        assert_eq!(range("1").expect("one").start_seq_num, 1);
     }
 }

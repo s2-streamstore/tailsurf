@@ -1,5 +1,7 @@
 //! Exact binary codec for `tsf.v1` WebSocket traffic.
 
+use std::borrow::Borrow;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -336,16 +338,32 @@ impl ClientFrame {
                     + expected_next_seq_num.map_or(0, |_| 8)
                     + LINK_SECRET_ENCODED_LENGTH)
             }
-            Self::AppendBatch(records) => {
-                for record in records {
-                    validate_writer_seq_num(record.writer_seq_num)?;
-                }
-                batch_encoded_len(
-                    records.iter().map(|record| &record.data),
-                    Self::APPEND_BODY_HEADER_LEN,
-                    MAX_APPEND_BATCH_RECORDS,
-                )
-            }
+            Self::AppendBatch(records) => Self::append_batch_encoded_len(records),
+        }
+    }
+
+    fn append_batch_encoded_len<R: Borrow<AppendRecord>>(
+        records: &[R],
+    ) -> Result<usize, FrameCodecError> {
+        for record in records {
+            validate_writer_seq_num(record.borrow().writer_seq_num)?;
+        }
+        batch_encoded_len(
+            records.iter().map(|record| &record.borrow().data),
+            Self::APPEND_BODY_HEADER_LEN,
+            MAX_APPEND_BATCH_RECORDS,
+        )
+    }
+
+    fn put_append_batch<R: Borrow<AppendRecord>>(output: &mut BytesMut, records: &[R]) {
+        output.put_u8(ClientOp::AppendBatch.byte());
+        for record in records {
+            let record = record.borrow();
+            output.put_u32((Self::APPEND_BODY_HEADER_LEN + record.data.len()) as u32);
+            output.put_u64(record.writer_seq_num);
+            output.put_u32(record.part.raw());
+            output.put_u8(record.format.byte());
+            output.put_slice(&record.data);
         }
     }
 
@@ -397,17 +415,19 @@ impl ClientFrame {
                 }
                 output.put_slice(link_secret.expose_secret().as_bytes());
             }
-            Self::AppendBatch(records) => {
-                output.put_u8(ClientOp::AppendBatch.byte());
-                for record in records {
-                    output.put_u32((Self::APPEND_BODY_HEADER_LEN + record.data.len()) as u32);
-                    output.put_u64(record.writer_seq_num);
-                    output.put_u32(record.part.raw());
-                    output.put_u8(record.format.byte());
-                    output.put_slice(&record.data);
-                }
-            }
+            Self::AppendBatch(records) => Self::put_append_batch(output, records),
         }
+    }
+
+    /// Encodes one append batch borrowed from retained records into a complete WebSocket message.
+    ///
+    /// Uses the same wire encoding as [`ClientFrame::AppendBatch`] without taking ownership.
+    pub(crate) fn encode_append_batch<R: Borrow<AppendRecord>>(
+        records: &[R],
+    ) -> Result<Bytes, FrameCodecError> {
+        let mut output = BytesMut::with_capacity(Self::append_batch_encoded_len(records)?);
+        Self::put_append_batch(&mut output, records);
+        Ok(output.freeze())
     }
 
     /// Encodes one client frame into a complete WebSocket binary message.
@@ -434,6 +454,9 @@ impl ServerFrame {
     const MAX_FIXED_FRAME_LEN: usize = 1 + 4 * 8;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
+    ///
+    /// Covers only fixed-size and batch frames; [`ServerFrame::StreamMetadata`] carries
+    /// variable-length JSON and is serialized directly by [`ServerFrame::encode`].
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
             Self::ReadBatch(records) => {
@@ -444,13 +467,15 @@ impl ServerFrame {
                     MAX_READ_BATCH_RECORDS,
                 )
             }
-            Self::StreamMetadata(_) => Ok(1),
+            Self::StreamMetadata(_) => {
+                unreachable!("StreamMetadata is serialized directly by encode()")
+            }
             _ => Ok(Self::MAX_FIXED_FRAME_LEN),
         }
     }
 
     /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
-    fn encode_into(&self, output: &mut BytesMut) -> Result<(), FrameCodecError> {
+    fn encode_into(&self, output: &mut BytesMut) {
         match self {
             Self::Ready => output.put_u8(ServerOp::Ready.byte()),
             Self::AppendAck {
@@ -484,11 +509,8 @@ impl ServerFrame {
                 output.put_u64(caught_up.next_seq_num);
                 output.put_u64(caught_up.last_timestamp_ms);
             }
-            Self::StreamMetadata(stream) => {
-                let payload =
-                    serde_json::to_vec(stream).map_err(FrameCodecError::InvalidStreamMetadata)?;
-                output.put_u8(ServerOp::StreamMetadata.byte());
-                output.put_slice(&payload);
+            Self::StreamMetadata(_) => {
+                unreachable!("StreamMetadata is serialized directly by encode()")
             }
             Self::SnapshotBoundary(boundary) => {
                 output.put_u8(ServerOp::SnapshotBoundary.byte());
@@ -496,13 +518,20 @@ impl ServerFrame {
                 output.put_u64(boundary.last_timestamp_ms);
             }
         }
-        Ok(())
     }
 
     /// Encodes one server frame into a complete WebSocket binary message.
     pub fn encode(&self) -> Result<Bytes, FrameCodecError> {
+        // StreamMetadata carries variable-length JSON; serialize straight into the output.
+        if let Self::StreamMetadata(stream) = self {
+            let mut output = BytesMut::new();
+            output.put_u8(ServerOp::StreamMetadata.byte());
+            serde_json::to_writer((&mut output).writer(), stream)
+                .map_err(FrameCodecError::InvalidStreamMetadata)?;
+            return Ok(output.freeze());
+        }
         let mut output = BytesMut::with_capacity(self.encoded_len()?);
-        self.encode_into(&mut output)?;
+        self.encode_into(&mut output);
         Ok(output.freeze())
     }
 
@@ -575,7 +604,8 @@ fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodec
         ClientOp::AppendBatch => {
             let mut records = Vec::new();
             let mut payload_bytes = 0;
-            for (start, end) in record_body_ranges(bytes, MAX_APPEND_BATCH_RECORDS)? {
+            for range in record_body_ranges(bytes, MAX_APPEND_BATCH_RECORDS) {
+                let (start, end) = range?;
                 let record_body = &bytes[start..end];
                 let (writer_seq_num, body) = read_u64(record_body)?;
                 validate_writer_seq_num(writer_seq_num)?;
@@ -732,7 +762,8 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
         ServerOp::ReadBatch => {
             let mut records = Vec::new();
             let mut payload_bytes = 0;
-            for (start, end) in record_body_ranges(bytes, MAX_READ_BATCH_RECORDS)? {
+            for range in record_body_ranges(bytes, MAX_READ_BATCH_RECORDS) {
+                let (start, end) = range?;
                 let record_body = &bytes[start..end];
                 let (seq_num, body) = read_u64(record_body)?;
                 let (timestamp_ms, body) = read_u64(body)?;
@@ -869,38 +900,65 @@ fn validate_read_batch_sequence(records: &[ReadRecord]) -> Result<(), FrameCodec
     Ok(())
 }
 
-fn record_body_ranges(
-    input: &[u8],
+/// Lazily walks length-prefixed record bodies so decoding parses each record in one pass.
+fn record_body_ranges(input: &[u8], maximum_records: usize) -> RecordBodyRanges<'_> {
+    RecordBodyRanges {
+        input,
+        offset: 1,
+        count: 0,
+        maximum_records,
+    }
+}
+
+struct RecordBodyRanges<'a> {
+    input: &'a [u8],
+    offset: usize,
+    count: usize,
     maximum_records: usize,
-) -> Result<Vec<(usize, usize)>, FrameCodecError> {
-    let mut ranges = Vec::new();
-    let mut offset = 1;
-    while offset < input.len() {
-        if ranges.len() == maximum_records {
+}
+
+impl Iterator for RecordBodyRanges<'_> {
+    type Item = Result<(usize, usize), FrameCodecError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.input.len() {
+            return None;
+        }
+        let result = self.advance();
+        if result.is_err() {
+            // Fuse: callers stop on the first error; never yield twice.
+            self.offset = self.input.len();
+        }
+        Some(result)
+    }
+}
+
+impl RecordBodyRanges<'_> {
+    fn advance(&mut self) -> Result<(usize, usize), FrameCodecError> {
+        if self.count == self.maximum_records {
             return Err(FrameCodecError::InvalidBatchRecordCount {
-                actual: maximum_records + 1,
-                max: maximum_records,
+                actual: self.maximum_records + 1,
+                max: self.maximum_records,
             });
         }
-        let (length, _) = read_u32(&input[offset..])?;
-        offset += 4;
+        let (length, _) = read_u32(&self.input[self.offset..])?;
+        self.offset += 4;
         let length = length as usize;
-        let Some(end) = offset.checked_add(length).filter(|end| *end <= input.len()) else {
+        let Some(end) = self
+            .offset
+            .checked_add(length)
+            .filter(|end| *end <= self.input.len())
+        else {
             return Err(FrameCodecError::InvalidRecordLength);
         };
         if length == 0 {
             return Err(FrameCodecError::InvalidRecordLength);
         }
-        ranges.push((offset, end));
-        offset = end;
+        let start = self.offset;
+        self.offset = end;
+        self.count += 1;
+        Ok((start, end))
     }
-    if ranges.is_empty() {
-        return Err(FrameCodecError::InvalidBatchRecordCount {
-            actual: 0,
-            max: maximum_records,
-        });
-    }
-    Ok(ranges)
 }
 
 fn take<const N: usize>(input: &[u8]) -> Result<([u8; N], &[u8]), FrameCodecError> {
@@ -1321,6 +1379,28 @@ mod tests {
             Err(FrameCodecError::ReadSelectorOutOfRange(value))
                 if value == MAX_READ_SELECTOR_VALUE + 1
         ));
+
+        for (limit, end_seq_num) in [(Some(u64::MAX), None), (None, Some(u64::MAX))] {
+            let frame = ClientFrame::OpenRead {
+                link_secret: None,
+                start: ReadStart::SeqNum(0),
+                limit,
+                end_seq_num,
+                playback_rate_permille: None,
+                snapshot: false,
+            };
+            let encoded = frame.encode().expect("OpenRead with u64 bound");
+            let ClientFrame::OpenRead {
+                limit: decoded_limit,
+                end_seq_num: decoded_end_seq_num,
+                ..
+            } = ClientFrame::decode(&encoded).expect("decode OpenRead with u64 bound")
+            else {
+                panic!("decoded a different client frame");
+            };
+            assert_eq!(decoded_limit, limit);
+            assert_eq!(decoded_end_seq_num, end_seq_num);
+        }
 
         let empty_secret = [
             ClientOp::OpenRead.byte(),
