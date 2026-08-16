@@ -33,7 +33,7 @@ use tailsurf::{
         },
     },
     stream_url::{StreamLocator, public_stream_url, stream_link},
-    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript},
+    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript, split_logical_record},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
@@ -1224,7 +1224,9 @@ impl RawRecordAppender {
             if self.pending.is_empty() {
                 self.deadline = Some(Instant::now() + self.linger);
             }
-            fill_pending_record(&mut self.pending, &mut bytes);
+            let take = (MAX_RECORD_BYTES - self.pending.len()).min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
             if self.pending.len() == MAX_RECORD_BYTES {
                 self.flush(session).await?;
             }
@@ -1276,17 +1278,13 @@ async fn stream_raw_chunks_to_writer(
 
 struct LineRecordAppender {
     pending: BytesMut,
-    pending_parts: Vec<Bytes>,
-    logical_record_bytes: usize,
     max_logical_record_bytes: usize,
 }
 
 impl LineRecordAppender {
     fn new(max_logical_record_bytes: usize) -> Self {
         Self {
-            pending: BytesMut::with_capacity(MAX_RECORD_BYTES),
-            pending_parts: Vec::new(),
-            logical_record_bytes: 0,
+            pending: BytesMut::new(),
             max_logical_record_bytes,
         }
     }
@@ -1299,18 +1297,17 @@ impl LineRecordAppender {
         while !bytes.is_empty() {
             let newline = memchr(b'\n', bytes);
             let take = newline.map_or(bytes.len(), |index| index + 1);
-            let logical_record_bytes = self
-                .logical_record_bytes
-                .checked_add(take)
-                .context("input line length overflowed while enforcing the logical record limit")?;
+            let logical_record_bytes =
+                self.pending.len().checked_add(take).context(
+                    "input line length overflowed while enforcing the logical record limit",
+                )?;
             if logical_record_bytes > self.max_logical_record_bytes {
                 bail!(
                     "input line exceeds the configured {}-byte logical record limit; raise --max-logical-record-bytes only when readers use the same limit",
                     self.max_logical_record_bytes
                 );
             }
-            self.logical_record_bytes = logical_record_bytes;
-            self.buffer(&bytes[..take]);
+            self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if newline.is_some() {
                 self.send_line(session).await?;
@@ -1320,46 +1317,17 @@ impl LineRecordAppender {
     }
 
     async fn finish(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
-        if self.logical_record_bytes > 0 {
+        if !self.pending.is_empty() {
             self.send_line(session).await?;
         }
         Ok(())
     }
 
-    fn buffer(&mut self, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            fill_pending_record(&mut self.pending, &mut bytes);
-            if self.pending.len() == MAX_RECORD_BYTES {
-                self.pending_parts.push(self.pending.split().freeze());
-            }
-        }
-    }
-
     async fn send_line(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
-        if !self.pending.is_empty() {
-            self.pending_parts.push(self.pending.split().freeze());
-        }
-        let last_part = self
-            .pending_parts
-            .len()
-            .checked_sub(1)
-            .context("logical line is empty")?;
-        self.logical_record_bytes = 0;
-        for (index, part) in self.pending_parts.drain(..).enumerate() {
-            let part_index = u32::try_from(index).context("line split part index overflowed")?;
-            session
-                .append_line_part(part_index, index == last_part, part)
-                .await?;
-        }
-        Ok(())
+        session
+            .append_logical_record(RecordFormat::Transcript, self.pending.split().freeze())
+            .await
     }
-}
-
-/// Copies input into `pending` up to the MAX_RECORD_BYTES fill line.
-fn fill_pending_record(pending: &mut BytesMut, bytes: &mut &[u8]) {
-    let take = (MAX_RECORD_BYTES - pending.len()).min(bytes.len());
-    pending.extend_from_slice(&bytes[..take]);
-    *bytes = &bytes[take..];
 }
 
 struct WriterSession<'a> {
@@ -1379,19 +1347,22 @@ impl<'a> WriterSession<'a> {
 }
 
 impl WriterSession<'_> {
-    async fn append_line_part(
+    async fn append_logical_record(
         &mut self,
-        part_index: u32,
-        is_final: bool,
+        format: RecordFormat,
         data: Bytes,
     ) -> eyre::Result<()> {
-        let part = if part_index == 0 && is_final {
-            PartHeader::unsplit()
-        } else {
-            PartHeader::new(part_index, is_final).context("failed to encode split part")?
-        };
-        self.append_physical_record(part, RecordFormat::Transcript, data)
-            .await
+        let records = split_logical_record(self.state.next_writer_seq, format, data)
+            .context("failed to split logical record")?;
+        for record in records {
+            let reserved = self
+                .state
+                .reserve_writer_seq()
+                .context("failed to reserve writer sequence")?;
+            debug_assert_eq!(reserved, record.writer_seq_num);
+            self.submit_record(record).await?;
+        }
+        Ok(())
     }
 
     async fn append_physical_record(
@@ -1404,7 +1375,11 @@ impl WriterSession<'_> {
             .state
             .reserve_writer_seq()
             .context("failed to reserve writer sequence")?;
-        let record = AppendRecord::new(writer_seq_num, part, format, data);
+        self.submit_record(AppendRecord::new(writer_seq_num, part, format, data))
+            .await
+    }
+
+    async fn submit_record(&mut self, record: AppendRecord) -> eyre::Result<()> {
         let ticket = self
             .writer
             .submit(record)
