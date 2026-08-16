@@ -241,13 +241,6 @@ impl TsfClient {
         request: &CreateStreamRequest,
         idempotency_key: &CreateStreamIdempotencyKey,
     ) -> Result<CreateStreamResponse, TsfClientError> {
-        if request
-            .links
-            .iter()
-            .any(|link| !is_canonical_base64url_32(link.secret.expose_secret()))
-        {
-            return Err(TsfClientError::InvalidLinkSecret);
-        }
         self.retry_when(
             || {
                 self.send_json_with_bearer(
@@ -329,9 +322,6 @@ impl TsfClient {
         request: &CreateLinkInput,
         owner_link_secret: &LinkSecret,
     ) -> Result<StreamLinkCredential, TsfClientError> {
-        if !is_canonical_base64url_32(request.secret.expose_secret()) {
-            return Err(TsfClientError::InvalidLinkSecret);
-        }
         let link_id = request.link_id.clone();
         self.retry_transient(|| {
             self.send_json_with_bearer(
@@ -701,7 +691,7 @@ impl TsfClient {
         let mut request = self.apply_rest_auth(
             self.http.get(url).header("Accept", "text/event-stream"),
             options.link_secret.as_ref(),
-        )?;
+        );
         if let Some(last_event_id) = last_event_id {
             request = request.header("Last-Event-ID", last_event_id);
         }
@@ -824,14 +814,10 @@ impl TsfClient {
         &self,
         request: reqwest::RequestBuilder,
         link_secret: Option<&LinkSecret>,
-    ) -> Result<reqwest::RequestBuilder, TsfClientError> {
-        if let Some(secret) = link_secret {
-            if !is_canonical_base64url_32(secret.expose_secret()) {
-                return Err(TsfClientError::InvalidLinkSecret);
-            }
-            Ok(request.bearer_auth(secret.expose_secret()))
-        } else {
-            Ok(request)
+    ) -> reqwest::RequestBuilder {
+        match link_secret {
+            Some(secret) => request.bearer_auth(secret.expose_secret()),
+            None => request,
         }
     }
 
@@ -867,7 +853,7 @@ impl TsfClient {
         link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
         let response = self
-            .apply_rest_auth(request, link_secret)?
+            .apply_rest_auth(request, link_secret)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -881,7 +867,7 @@ impl TsfClient {
         link_secret: Option<&LinkSecret>,
     ) -> Result<(), TsfClientError> {
         let response = self
-            .apply_rest_auth(request, link_secret)?
+            .apply_rest_auth(request, link_secret)
             .timeout(self.config.rest_request_timeout)
             .send()
             .await?;
@@ -943,7 +929,7 @@ pub fn default_api_origin() -> Url {
 
 /// Non-authorizing idempotency key for one logical stream-creation request.
 #[derive(Clone, Debug)]
-pub struct CreateStreamIdempotencyKey(LinkSecret);
+pub struct CreateStreamIdempotencyKey(secrecy::SecretString);
 
 impl CreateStreamIdempotencyKey {
     /// Generates a cryptographically random canonical 256-bit key.
@@ -1123,7 +1109,7 @@ pub struct AppendReceipt {
 /// Future that resolves when one submitted record is durable or permanently fails.
 pub struct AppendTicket {
     rx: oneshot::Receiver<Result<AppendReceipt, TsfClientError>>,
-    terminal_error: Arc<OnceLock<String>>,
+    terminal_error: Arc<OnceLock<Arc<TsfClientError>>>,
 }
 
 impl AppendTicket {
@@ -1166,7 +1152,7 @@ pub struct TsfWriter {
     cmd_tx: mpsc::Sender<WriterCommand>,
     byte_permits: Arc<Semaphore>,
     record_permits: Arc<Semaphore>,
-    terminal_error: Arc<OnceLock<String>>,
+    terminal_error: Arc<OnceLock<Arc<TsfClientError>>>,
     max_unacked_bytes: usize,
     task: Option<JoinHandle<()>>,
 }
@@ -1257,7 +1243,7 @@ impl TsfWriter {
 
         if let Some(task) = self.task.take() {
             task.await
-                .map_err(|error| TsfClientError::AppendWriterFailed(error.to_string()))?;
+                .map_err(|error| TsfClientError::AppendWriterTaskFailed(error.to_string()))?;
         }
 
         done_rx.try_recv().map_err(|_| self.dropped_error())?
@@ -1273,16 +1259,18 @@ impl TsfWriter {
 }
 
 fn terminal_writer_error(
-    terminal_error: &OnceLock<String>,
+    terminal_error: &OnceLock<Arc<TsfClientError>>,
     fallback: TsfClientError,
 ) -> TsfClientError {
     retained_terminal_error(terminal_error).unwrap_or(fallback)
 }
 
-fn retained_terminal_error(terminal_error: &OnceLock<String>) -> Option<TsfClientError> {
+fn retained_terminal_error(
+    terminal_error: &OnceLock<Arc<TsfClientError>>,
+) -> Option<TsfClientError> {
     terminal_error
         .get()
-        .map(|message| TsfClientError::AppendWriterFailed(message.clone()))
+        .map(|error| TsfClientError::AppendWriterFailed(Arc::clone(error)))
 }
 
 impl Drop for TsfWriter {
@@ -1300,7 +1288,7 @@ pub struct WritePermit {
     cmd_tx_permit: mpsc::OwnedPermit<WriterCommand>,
     byte_permit: OwnedSemaphorePermit,
     record_permit: OwnedSemaphorePermit,
-    terminal_error: Arc<OnceLock<String>>,
+    terminal_error: Arc<OnceLock<Arc<TsfClientError>>>,
     reserved_bytes: usize,
 }
 
@@ -1410,15 +1398,7 @@ impl TsfWriteSession {
             "append acknowledgement",
             next_server_frame(&mut self.ws),
         )
-        .await
-        .map_err(|error| match error {
-            TsfClientError::WebSocketClosedWithReason { code: 1008, reason }
-                if reason == "sequence_mismatch" =>
-            {
-                TsfClientError::SequenceMismatch
-            }
-            other => other,
-        })?;
+        .await?;
         match frame {
             Some(ServerFrame::AppendAck {
                 writer_start_seq_num,
@@ -1465,7 +1445,7 @@ async fn run_writer(
     options: WriteStreamOptions,
     mut session: TsfWriteSession,
     mut cmd_rx: mpsc::Receiver<WriterCommand>,
-    terminal_error: Arc<OnceLock<String>>,
+    terminal_error: Arc<OnceLock<Arc<TsfClientError>>>,
 ) {
     let mut pending = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
@@ -1500,7 +1480,10 @@ async fn run_writer(
                         }
                     }
                     None => {
-                        fail_pending(&mut pending, "append writer dropped");
+                        fail_pending(
+                            &mut pending,
+                            &Arc::new(TsfClientError::AppendWriterDropped),
+                        );
                         return;
                     }
                 }
@@ -1709,23 +1692,22 @@ fn validate_append_range(
 fn finish_writer_error(
     pending: &mut VecDeque<PendingAppend>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
-    terminal_error: &OnceLock<String>,
+    terminal_error: &OnceLock<Arc<TsfClientError>>,
     error: TsfClientError,
 ) {
-    let message = error.to_string();
-    let _ = terminal_error.set(message.clone());
-    fail_pending(pending, message);
+    let error = Arc::new(error);
+    let _ = terminal_error.set(Arc::clone(&error));
+    fail_pending(pending, &error);
     if let Some(close_tx) = close_tx.take() {
-        let _ = close_tx.send(Err(error));
+        let _ = close_tx.send(Err(TsfClientError::AppendWriterFailed(error)));
     }
 }
 
-fn fail_pending(pending: &mut VecDeque<PendingAppend>, message: impl Into<String>) {
-    let message = message.into();
+fn fail_pending(pending: &mut VecDeque<PendingAppend>, error: &Arc<TsfClientError>) {
     while let Some(pending) = pending.pop_front() {
         let _ = pending
             .ack_tx
-            .send(Err(TsfClientError::AppendWriterFailed(message.clone())));
+            .send(Err(TsfClientError::AppendWriterFailed(Arc::clone(error))));
     }
 }
 
@@ -2764,6 +2746,13 @@ async fn http_status_error(response: reqwest::Response, operation: &'static str)
         .as_ref()
         .map(|response| response.error.code.clone())
         .filter(|value| !value.is_empty());
+    // The same server condition surfaces as one typed error on every plane; the WebSocket
+    // paths map the matching close reason in close_reason_error.
+    if api_code.as_deref() == Some("sequence_mismatch") {
+        return TsfClientError::SequenceMismatch {
+            actual_next_seq_num,
+        };
+    }
     let body = parsed
         .as_ref()
         .and_then(|response| api_error_message(&response.error))
@@ -2841,16 +2830,26 @@ async fn next_server_frame(
             Message::Binary(bytes) => return Ok(Some(ServerFrame::decode_bytes(bytes)?)),
             Message::Close(Some(close)) if u16::from(close.code) == 1000 => return Ok(None),
             Message::Close(Some(close)) => {
-                return Err(TsfClientError::WebSocketClosedWithReason {
-                    code: u16::from(close.code),
-                    reason: close.reason.to_string(),
-                });
+                return Err(close_reason_error(
+                    u16::from(close.code),
+                    close.reason.to_string(),
+                ));
             }
             Message::Close(None) => return Ok(None),
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Text(_) => return Err(TsfClientError::UnexpectedTextMessage),
             Message::Frame(_) => {}
         }
+    }
+}
+
+/// Maps stable server close reasons to typed errors, once for every WebSocket path.
+fn close_reason_error(code: u16, reason: String) -> TsfClientError {
+    match (code, reason.as_str()) {
+        (1008, "sequence_mismatch") => TsfClientError::SequenceMismatch {
+            actual_next_seq_num: None,
+        },
+        _ => TsfClientError::WebSocketClosedWithReason { code, reason },
     }
 }
 
@@ -3065,9 +3064,6 @@ pub enum TsfClientError {
     /// Stateless append input violates the local protocol contract.
     #[error("invalid stateless append: {0}")]
     InvalidStatelessAppend(&'static str),
-    /// A link secret is not a canonical 32-byte unpadded base64url value.
-    #[error("link secret must be canonical 43-character unpadded base64url")]
-    InvalidLinkSecret,
     /// SSE response violated the public event contract.
     #[error("invalid SSE response: {0}")]
     InvalidSse(&'static str),
@@ -3109,9 +3105,12 @@ pub enum TsfClientError {
         /// Stable server close reason when available.
         reason: String,
     },
-    /// The stream did not start the writer session at its requested sequence.
+    /// The stream next sequence did not match an append or writer-session precondition.
     #[error("stream next sequence did not match the writer session precondition")]
-    SequenceMismatch,
+    SequenceMismatch {
+        /// Actual stream next sequence when the service reported it.
+        actual_next_seq_num: Option<u64>,
+    },
     /// Link-list pagination controls are outside the supported range.
     #[error("invalid list links options: {0}")]
     InvalidListLinksOptions(&'static str),
@@ -3157,9 +3156,12 @@ pub enum TsfClientError {
     /// The writer task ended before resolving a pending ticket.
     #[error("append writer dropped with unacknowledged records")]
     AppendWriterDropped,
-    /// The writer background task failed or could not be joined.
+    /// The writer permanently failed; the typed first failure is retained for every observer.
     #[error("append writer failed: {0}")]
-    AppendWriterFailed(String),
+    AppendWriterFailed(Arc<TsfClientError>),
+    /// The writer background task panicked or could not be joined.
+    #[error("append writer task failed: {0}")]
+    AppendWriterTaskFailed(String),
     /// Consecutive read connections ended without delivering a record batch or caught-up event.
     #[error(
         "read stream delivered no record batch or caught-up event across {max_connection_attempts} consecutive connection attempts"
@@ -3205,6 +3207,7 @@ impl TsfClientError {
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::HttpStatus { request_id, .. } => request_id.as_deref(),
+            Self::AppendWriterFailed(inner) => inner.request_id(),
             _ => None,
         }
     }
@@ -3213,6 +3216,7 @@ impl TsfClientError {
     pub fn api_code(&self) -> Option<&str> {
         match self {
             Self::HttpStatus { api_code, .. } => api_code.as_deref(),
+            Self::AppendWriterFailed(inner) => inner.api_code(),
             _ => None,
         }
     }
@@ -3221,6 +3225,7 @@ impl TsfClientError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::HttpStatus { retry_after, .. } => *retry_after,
+            Self::AppendWriterFailed(inner) => inner.retry_after(),
             _ => None,
         }
     }
@@ -3231,7 +3236,11 @@ impl TsfClientError {
             Self::HttpStatus {
                 actual_next_seq_num,
                 ..
+            }
+            | Self::SequenceMismatch {
+                actual_next_seq_num,
             } => *actual_next_seq_num,
+            Self::AppendWriterFailed(inner) => inner.actual_next_seq_num(),
             _ => None,
         }
     }
@@ -3845,7 +3854,9 @@ mod tests {
         let task = tokio::spawn(async move {
             let command = cmd_rx.recv().await.expect("close command");
             task_terminal_error
-                .set("stream next sequence did not match".to_owned())
+                .set(Arc::new(TsfClientError::SequenceMismatch {
+                    actual_next_seq_num: Some(7),
+                }))
                 .expect("set terminal error");
             drop(command);
         });
@@ -3860,9 +3871,14 @@ mod tests {
 
         let error = writer.close().await.expect_err("close must fail");
         assert!(
-            matches!(&error, TsfClientError::AppendWriterFailed(message) if message.contains("stream next sequence did not match")),
+            matches!(
+                &error,
+                TsfClientError::AppendWriterFailed(inner)
+                    if matches!(**inner, TsfClientError::SequenceMismatch { .. })
+            ),
             "error={error}"
         );
+        assert_eq!(error.actual_next_seq_num(), Some(7));
     }
 
     #[test]
@@ -4168,7 +4184,9 @@ mod tests {
         let stream_id = "00000000000000000000000000000000"
             .parse()
             .expect("stream ID");
-        let owner = LinkSecret::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let owner: LinkSecret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .expect("canonical secret");
 
         let result = client.list_all_links(&stream_id, &owner).await;
 
@@ -4450,7 +4468,7 @@ mod tests {
         let stream_id = "00000000000000000000000000000000"
             .parse()
             .expect("stream ID");
-        let secret = LinkSecret::from("A".repeat(43));
+        let secret: LinkSecret = "A".repeat(43).parse().expect("canonical secret");
         let large = vec![
             AppendRecord::new(
                 0,

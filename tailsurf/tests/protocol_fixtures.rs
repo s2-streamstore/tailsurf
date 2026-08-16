@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use serde::Deserialize;
 use tailsurf::{
-    ClientWriterId, LinkSecret, WriterId,
+    ClientWriterId, WriterId,
     protocol::{
         rest::{StreamMetadata, Visibility},
         ws::{
@@ -165,7 +165,8 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             snapshot,
             link_secret,
         } => ClientFrame::OpenRead {
-            link_secret: link_secret.map(LinkSecret::from),
+            link_secret: link_secret
+                .map(|secret| secret.parse().expect("fixture link secret is canonical")),
             start: read_start(&start_type, parse_u64(&start_value)),
             limit: limit.as_deref().map(parse_u64),
             end_seq_num: end_seq_num.as_deref().map(parse_u64),
@@ -178,7 +179,9 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             expected_next_seq_num,
         } => ClientFrame::OpenWrite {
             client_writer_id: decode_client_writer_id(&client_writer_id_hex),
-            link_secret: LinkSecret::from(link_secret),
+            link_secret: link_secret
+                .parse()
+                .expect("fixture link secret is canonical"),
             expected_next_seq_num: expected_next_seq_num.as_deref().map(parse_u64),
         },
         ClientFixture::AppendBatch {

@@ -27,7 +27,8 @@ pub use client::{
     default_api_origin,
 };
 pub use ids::{
-    ClientWriterId, LinkId, LinkIdError, LinkSecret, MAX_LINK_ID_LEN, StreamId, WriterId,
+    ClientWriterId, LinkId, LinkIdError, LinkSecret, LinkSecretError, MAX_LINK_ID_LEN, StreamId,
+    WriterId,
 };
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{

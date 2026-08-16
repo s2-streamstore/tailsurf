@@ -75,8 +75,45 @@ impl<'de> Deserialize<'de> for LinkId {
 )]
 pub struct LinkIdError;
 
-/// Secret value carried by a stream link.
-pub type LinkSecret = secrecy::SecretString;
+/// Secret value carried by a stream link: the canonical unpadded base64url encoding of 256 bits.
+///
+/// Canonicality is validated once at construction; every consumer can rely on it.
+#[derive(Clone)]
+pub struct LinkSecret(secrecy::SecretString);
+
+impl LinkSecret {
+    /// Generates a cryptographically random link secret.
+    pub fn new_random() -> Self {
+        Self(random_base64url_32().into())
+    }
+
+    /// Returns the canonical secret text.
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for LinkSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LinkSecret(REDACTED)")
+    }
+}
+
+impl FromStr for LinkSecret {
+    type Err = LinkSecretError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if !is_canonical_base64url_32(value) {
+            return Err(LinkSecretError);
+        }
+        Ok(Self(value.to_owned().into()))
+    }
+}
+
+/// Error returned for a non-canonical link secret.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("link secret must be canonical 43-character unpadded base64url")]
+pub struct LinkSecretError;
 
 /// Stable 128-bit client-chosen writer identity reused across reconnects.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

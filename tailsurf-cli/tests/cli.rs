@@ -56,6 +56,12 @@ const FREE_EXPIRY_LIMIT_MESSAGE: &str = "Free streams can expire at most 10 days
 const TEST_STREAM_LINK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const UNKNOWN_STREAM_LINK: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
 
+fn canonical_test_link_secret() -> LinkSecret {
+    TEST_STREAM_LINK
+        .parse()
+        .expect("canonical test link secret")
+}
+
 #[test]
 fn update_refuses_an_unmanaged_executable() {
     let update = Command::new(env!("CARGO_BIN_EXE_tsf"))
@@ -835,7 +841,7 @@ async fn writer_close_is_not_blocked_by_an_unused_reservation() {
             tailsurf::protocol::ws::WriteStreamOptions::new(
                 stream_id,
                 ClientWriterId::new_random(),
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                canonical_test_link_secret(),
             ),
             TsfWriterConfig {
                 max_unacked_bytes: 1,
@@ -1069,7 +1075,7 @@ async fn sse_snapshot_receives_an_explicit_empty_boundary() {
     let mut options = ReadStreamOptions::new(stream_id);
     options.start = Some(ReadStart::SeqNum(0));
     options.snapshot = true;
-    options.link_secret = Some(TEST_STREAM_LINK.into());
+    options.link_secret = Some(canonical_test_link_secret());
 
     let session = TsfClient::with_api_origin(server.api_url.clone())
         .expect("valid API origin")
@@ -1145,7 +1151,7 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
         .parse::<StreamId>()
         .expect("stream id");
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
+    let request = ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let batch = reader
@@ -1176,7 +1182,8 @@ async fn reader_restarts_retries_after_established_idle_connections() {
         max_backoff: Duration::ZERO,
     };
     let client = TsfClient::with_config(config).expect("valid client config");
-    let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
+    let mut request =
+        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1205,7 +1212,8 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
         max_backoff: Duration::ZERO,
     };
     let client = TsfClient::with_config(config).expect("valid client config");
-    let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
+    let mut request =
+        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1233,7 +1241,8 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
         .parse::<StreamId>()
         .expect("stream id");
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
+    let mut request =
+        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::TailOffset(2));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1273,7 +1282,8 @@ async fn reader_reconnects_after_configured_idle_timeout() {
         max_backoff: Duration::ZERO,
     };
     let client = TsfClient::with_config(config).expect("valid client config");
-    let mut request = ReadStreamOptions::new(stream_id).with_link_secret(TEST_STREAM_LINK);
+    let mut request =
+        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1954,7 +1964,11 @@ async fn test_create_link(
     if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
-    let link = test_store_stream_link(link_id, request.secret.into(), request.permissions);
+    let link = test_store_stream_link(
+        link_id,
+        request.secret.parse().expect("canonical secret"),
+        request.permissions,
+    );
     let response = StreamLinkCredential {
         link_id: link.link_id.clone(),
         permissions: link.permissions,
@@ -2607,7 +2621,7 @@ async fn connect_default_writer(api_url: &Url) -> tailsurf::TsfWriter {
         .connect_writer(WriteStreamOptions::new(
             stream_id,
             ClientWriterId::new_random(),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            canonical_test_link_secret(),
         ))
         .await
         .expect("writer")
@@ -2623,10 +2637,14 @@ fn test_write_record(writer_seq_num: u64, data: Bytes) -> AppendRecord {
 }
 
 fn assert_sequence_mismatch(error: &TsfClientError) {
-    assert!(
-        matches!(error, TsfClientError::AppendWriterFailed(message) if message.contains("stream next sequence did not match")),
-        "error={error}"
-    );
+    let is_mismatch = match error {
+        TsfClientError::SequenceMismatch { .. } => true,
+        TsfClientError::AppendWriterFailed(inner) => {
+            matches!(**inner, TsfClientError::SequenceMismatch { .. })
+        }
+        _ => false,
+    };
+    assert!(is_mismatch, "error={error}");
 }
 
 struct HoldingWriteState {

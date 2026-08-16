@@ -3,12 +3,10 @@
 use std::borrow::Borrow;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     ClientWriterId, LinkSecret, WriterId,
-    ids::is_canonical_base64url_32,
     protocol::{
         rest::StreamMetadata,
         ws::{
@@ -538,9 +536,6 @@ impl ClientFrame {
                 snapshot,
             } => {
                 validate_open_read(*start, *end_seq_num, *playback_rate_permille, *snapshot)?;
-                if let Some(secret) = link_secret {
-                    validate_link_secret(secret)?;
-                }
                 Ok(Self::OPEN_READ_FIXED_LEN
                     + limit.map_or(0, |_| 8)
                     + end_seq_num.map_or(0, |_| 8)
@@ -550,11 +545,9 @@ impl ClientFrame {
                         .map_or(0, |_| LINK_SECRET_ENCODED_LENGTH))
             }
             Self::OpenWrite {
-                link_secret,
                 expected_next_seq_num,
                 ..
             } => {
-                validate_link_secret(link_secret)?;
                 if let Some(value) = expected_next_seq_num {
                     validate_expected_next_seq_num(*value)?;
                 }
@@ -803,8 +796,7 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
             if secret_bytes.len() != LINK_SECRET_ENCODED_LENGTH {
                 return Err(FrameCodecError::InvalidLinkSecret);
             }
-            let link_secret = LinkSecret::from(utf8_tail(secret_bytes)?);
-            validate_link_secret(&link_secret)?;
+            let link_secret = parse_link_secret(utf8_tail(secret_bytes)?)?;
             Ok(ClientFrame::OpenWrite {
                 client_writer_id: ClientWriterId::from_bytes(client_writer_id),
                 link_secret,
@@ -866,9 +858,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
             });
         };
         ensure_empty(op, trailing)?;
-        let secret = LinkSecret::from(utf8_tail(secret)?);
-        validate_link_secret(&secret)?;
-        Some(secret)
+        Some(parse_link_secret(utf8_tail(secret)?)?)
     };
     validate_open_read(start, end_seq_num, playback_rate_permille, snapshot)?;
     Ok(ClientFrame::OpenRead {
@@ -1025,10 +1015,8 @@ fn decode_position(
     Ok(frame(seq_num, last_timestamp_ms))
 }
 
-fn validate_link_secret(secret: &LinkSecret) -> Result<(), FrameCodecError> {
-    is_canonical_base64url_32(secret.expose_secret())
-        .then_some(())
-        .ok_or(FrameCodecError::InvalidLinkSecret)
+fn parse_link_secret(text: &str) -> Result<LinkSecret, FrameCodecError> {
+    text.parse().map_err(|_| FrameCodecError::InvalidLinkSecret)
 }
 
 fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
@@ -1666,7 +1654,10 @@ mod tests {
     fn open_write_strictly_validates_flags_preconditions_and_lengths() {
         let valid = ClientFrame::OpenWrite {
             client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
-            link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
+            link_secret: "A"
+                .repeat(LINK_SECRET_ENCODED_LENGTH)
+                .parse()
+                .expect("canonical secret"),
             expected_next_seq_num: Some(7),
         }
         .encode()
@@ -1682,7 +1673,7 @@ mod tests {
         assert!(matches!(
             ClientFrame::OpenWrite {
                 client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
-                link_secret: LinkSecret::from("A".repeat(LINK_SECRET_ENCODED_LENGTH)),
+                link_secret: "A".repeat(LINK_SECRET_ENCODED_LENGTH).parse().expect("canonical secret"),
                 expected_next_seq_num: Some(MAX_READ_SELECTOR_VALUE + 1),
             }
             .encode(),
