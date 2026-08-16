@@ -99,11 +99,12 @@ impl LogicalTranscript {
     /// Processes one physical record.
     ///
     /// Returns a complete logical record when one becomes available, or `None` when the input was a
-    /// duplicate, an incomplete split part, or a malformed partial sequence.
-    pub fn push_record(
+    /// duplicate, an incomplete split part, or a malformed partial sequence. Unsplit records lend
+    /// their payload from the source batch; use [`TranscriptData::into_bytes`] to retain one.
+    pub fn push_record<'a>(
         &mut self,
-        record: ReadRecord,
-    ) -> Result<Option<TranscriptRecord>, TranscriptError> {
+        record: ReadRecord<'a>,
+    ) -> Result<Option<TranscriptRecord<'a>>, TranscriptError> {
         let limits = self.limits;
         if !self.writers.contains_key(&record.writer_id)
             && self.writers.len() >= limits.max_writer_states
@@ -126,9 +127,11 @@ impl LogicalTranscript {
         if record.part == PartHeader::unsplit() {
             clear_pending(writer, &mut self.pending_bytes, &mut self.pending_parts);
             check_logical_record_len(record.data.len(), limits.max_logical_record_bytes)?;
+            // Unsplit payloads borrow from the source batch; only split parts are copied at
+            // ingest, because they must outlive their batch.
             return Ok(Some(TranscriptRecord {
                 format: record.format,
-                data: TranscriptData::from(record.data),
+                data: TranscriptData::Borrowed(record.data),
             }));
         }
 
@@ -160,7 +163,7 @@ impl LogicalTranscript {
                 chunks: Vec::new(),
             };
             if !record.data.is_empty() {
-                pending.chunks.push(record.data);
+                pending.chunks.push(Bytes::copy_from_slice(record.data));
             }
             writer.pending = Some(pending);
             self.pending_bytes = pending_bytes;
@@ -191,7 +194,7 @@ impl LogicalTranscript {
         pending.len = logical_record_len;
         pending.part_count = part_count;
         if !record.data.is_empty() {
-            pending.chunks.push(record.data);
+            pending.chunks.push(Bytes::copy_from_slice(record.data));
         }
         if record.part.is_final() {
             return Ok(Some(TranscriptRecord {
@@ -221,27 +224,43 @@ impl Default for LogicalTranscript {
 }
 
 /// One complete logical transcript record after deduplication and reassembly.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TranscriptRecord {
+///
+/// Unsplit records borrow their payload from the source batch; split-record completions own
+/// their assembled chunks. Retain past the batch with [`TranscriptRecord::into_owned`] (keeps
+/// chunks uncoalesced) or [`TranscriptData::into_bytes`] (explicitly contiguous).
+#[derive(Clone, Debug)]
+pub struct TranscriptRecord<'a> {
     /// Presentation hint shared by every physical part.
     pub format: RecordFormat,
-    /// Exact logical payload, possibly retained as zero-copy chunks.
-    pub data: TranscriptData,
+    /// Exact logical payload, borrowed when possible and otherwise retained as owned chunks.
+    pub data: TranscriptData<'a>,
 }
 
-/// Logical payload represented as one contiguous value or multiple zero-copy chunks.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TranscriptData {
-    /// Contiguous payload bytes.
-    Single(Bytes),
+impl TranscriptRecord<'_> {
+    /// Retains this record independently of the source batch, copying only a borrowed payload.
+    pub fn into_owned(self) -> TranscriptRecord<'static> {
+        TranscriptRecord {
+            format: self.format,
+            data: self.data.into_owned(),
+        }
+    }
+}
+
+/// Logical payload: a borrow from the source batch, one owned value, or multiple owned chunks.
+#[derive(Clone, Debug)]
+pub enum TranscriptData<'a> {
+    /// Payload borrowed from the batch the record arrived in.
+    Borrowed(&'a [u8]),
+    /// Contiguous owned payload bytes.
+    Owned(Bytes),
     /// Ordered non-empty physical chunks.
     Chunked(ChunkedBytes),
 }
 
-impl TranscriptData {
+impl TranscriptData<'_> {
     /// Creates contiguous transcript data from a static byte slice.
-    pub fn from_static(data: &'static [u8]) -> Self {
-        Self::Single(Bytes::from_static(data))
+    pub fn from_static(data: &'static [u8]) -> TranscriptData<'static> {
+        TranscriptData::Borrowed(data)
     }
 
     /// Returns the number of bytes not consumed through the [`Buf`] implementation.
@@ -254,47 +273,96 @@ impl TranscriptData {
         !self.has_remaining()
     }
 
-    /// Coalesces the remaining payload into contiguous bytes when necessary.
+    /// Retains the payload independently of the source batch without coalescing chunks: only a
+    /// borrowed payload is copied.
+    pub fn into_owned(self) -> TranscriptData<'static> {
+        match self {
+            Self::Borrowed(data) => TranscriptData::Owned(Bytes::copy_from_slice(data)),
+            Self::Owned(data) => TranscriptData::Owned(data),
+            Self::Chunked(data) => TranscriptData::Chunked(data),
+        }
+    }
+
+    /// Coalesces the remaining payload into owned contiguous bytes, copying when borrowed or
+    /// chunked. Use [`TranscriptData::into_owned`] to retain without forcing contiguity.
     pub fn into_bytes(self) -> Bytes {
         match self {
-            Self::Single(bytes) => bytes,
+            Self::Borrowed(slice) => Bytes::copy_from_slice(slice),
+            Self::Owned(bytes) => bytes,
             Self::Chunked(chunked) => chunked.into_bytes(),
         }
     }
 
     fn from_ordered_chunks(chunks: Vec<Bytes>, len: usize) -> Self {
         match chunks.len() {
-            0 => Self::Single(Bytes::new()),
-            1 => Self::Single(chunks.into_iter().next().expect("single chunk")),
+            0 => Self::Owned(Bytes::new()),
+            1 => Self::Owned(chunks.into_iter().next().expect("single chunk")),
             _ => Self::Chunked(ChunkedBytes::new(chunks, len)),
         }
     }
 }
 
-impl From<Bytes> for TranscriptData {
+impl From<Bytes> for TranscriptData<'_> {
     fn from(bytes: Bytes) -> Self {
-        Self::Single(bytes)
+        Self::Owned(bytes)
     }
 }
 
-impl Buf for TranscriptData {
+/// Storage shape does not change payload identity: compare contents, not variants.
+impl<'a, 'b> PartialEq<TranscriptData<'b>> for TranscriptData<'a> {
+    fn eq(&self, other: &TranscriptData<'b>) -> bool {
+        let mut this = self.clone();
+        let mut other = other.clone();
+        if this.remaining() != other.remaining() {
+            return false;
+        }
+        loop {
+            let left = this.chunk();
+            let right = other.chunk();
+            if left.is_empty() && right.is_empty() {
+                return true;
+            }
+            let shared = left.len().min(right.len());
+            if shared == 0 || left[..shared] != right[..shared] {
+                return false;
+            }
+            this.advance(shared);
+            other.advance(shared);
+        }
+    }
+}
+
+impl Eq for TranscriptData<'_> {}
+
+impl<'a, 'b> PartialEq<TranscriptRecord<'b>> for TranscriptRecord<'a> {
+    fn eq(&self, other: &TranscriptRecord<'b>) -> bool {
+        self.format == other.format && self.data == other.data
+    }
+}
+
+impl Eq for TranscriptRecord<'_> {}
+
+impl Buf for TranscriptData<'_> {
     fn remaining(&self) -> usize {
         match self {
-            Self::Single(bytes) => bytes.len(),
+            Self::Borrowed(slice) => slice.len(),
+            Self::Owned(bytes) => bytes.len(),
             Self::Chunked(chunked) => chunked.remaining(),
         }
     }
 
     fn chunk(&self) -> &[u8] {
         match self {
-            Self::Single(bytes) => bytes.as_ref(),
+            Self::Borrowed(slice) => slice,
+            Self::Owned(bytes) => bytes.as_ref(),
             Self::Chunked(chunked) => chunked.chunk(),
         }
     }
 
     fn advance(&mut self, cnt: usize) {
         match self {
-            Self::Single(bytes) => bytes.advance(cnt),
+            Self::Borrowed(slice) => slice.advance(cnt),
+            Self::Owned(bytes) => bytes.advance(cnt),
             Self::Chunked(chunked) => chunked.advance(cnt),
         }
     }
@@ -480,8 +548,86 @@ fn clear_pending(writer: &mut WriterState, pending_bytes: &mut usize, pending_pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ws::frame::{OwnedReadRecord, ReadBatch};
 
-    fn record(seq: u64, part: PartHeader, data: &[u8]) -> ReadRecord {
+    fn owned_batch_record(seq: u64, part: PartHeader, data: &'static [u8]) -> OwnedReadRecord {
+        OwnedReadRecord {
+            seq_num: seq,
+            timestamp_ms: seq,
+            writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
+            writer_seq_num: seq,
+            part,
+            format: RecordFormat::Transcript,
+            data: Bytes::from_static(data),
+        }
+    }
+
+    #[test]
+    fn unsplit_records_lend_the_source_payload() {
+        let mut transcript = LogicalTranscript::new();
+        let data = b"lent";
+        let pushed =
+            push(&mut transcript, record(0, PartHeader::unsplit(), data)).expect("unsplit record");
+
+        // Content equality alone cannot catch an accidental copy regression; require the exact
+        // source slice.
+        let TranscriptData::Borrowed(slice) = &pushed.data else {
+            panic!("unsplit record must lend the source payload");
+        };
+        assert!(std::ptr::eq(*slice, data.as_slice()));
+    }
+
+    #[test]
+    fn into_owned_retains_records_beyond_the_source_batch() {
+        let mut transcript = LogicalTranscript::new();
+        let retained: TranscriptRecord<'static> = {
+            let batch = ReadBatch::try_from_records(vec![owned_batch_record(
+                0,
+                PartHeader::unsplit(),
+                b"kept",
+            )])
+            .expect("batch");
+            push(&mut transcript, batch.first().expect("first"))
+                .expect("record")
+                .into_owned()
+        };
+        // The batch is dropped; the retained record must own its payload.
+        assert!(matches!(retained.data, TranscriptData::Owned(_)));
+        assert_eq!(retained.data.into_bytes(), Bytes::from_static(b"kept"));
+    }
+
+    #[test]
+    fn split_completion_across_batches_retains_without_coalescing() {
+        let mut transcript = LogicalTranscript::new();
+        {
+            let first_batch = ReadBatch::try_from_records(vec![owned_batch_record(
+                0,
+                PartHeader::new(0, false).expect("part"),
+                b"hel",
+            )])
+            .expect("batch");
+            assert!(push(&mut transcript, first_batch.first().expect("first")).is_none());
+        }
+        // The first batch is dropped; the pending part was copied at ingest.
+        let second_batch = ReadBatch::try_from_records(vec![owned_batch_record(
+            1,
+            PartHeader::new(1, true).expect("part"),
+            b"lo",
+        )])
+        .expect("batch");
+        let completed =
+            push(&mut transcript, second_batch.first().expect("first")).expect("split completion");
+        assert!(matches!(completed.data, TranscriptData::Chunked(_)));
+
+        let retained = completed.into_owned();
+        assert!(
+            matches!(retained.data, TranscriptData::Chunked(_)),
+            "retention must not coalesce chunks"
+        );
+        assert_eq!(retained.data.into_bytes(), Bytes::from_static(b"hello"));
+    }
+
+    fn record(seq: u64, part: PartHeader, data: &[u8]) -> ReadRecord<'_> {
         record_with_writer(
             WriterId::from_bytes([1; WriterId::BYTE_LEN]),
             seq,
@@ -495,7 +641,7 @@ mod tests {
         seq: u64,
         part: PartHeader,
         data: &[u8],
-    ) -> ReadRecord {
+    ) -> ReadRecord<'_> {
         ReadRecord {
             seq_num: seq,
             timestamp_ms: seq,
@@ -503,11 +649,14 @@ mod tests {
             writer_seq_num: seq,
             part,
             format: RecordFormat::Transcript,
-            data: Bytes::copy_from_slice(data),
+            data,
         }
     }
 
-    fn push(transcript: &mut LogicalTranscript, record: ReadRecord) -> Option<TranscriptRecord> {
+    fn push<'a>(
+        transcript: &mut LogicalTranscript,
+        record: ReadRecord<'a>,
+    ) -> Option<TranscriptRecord<'a>> {
         transcript.push_record(record).expect("push record")
     }
 

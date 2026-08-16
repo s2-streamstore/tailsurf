@@ -33,7 +33,7 @@ use tailsurf::{
         },
     },
     stream_url::{StreamLocator, stream_link},
-    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript, TranscriptRecord},
+    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
@@ -47,8 +47,10 @@ const INTERRUPT_EXIT_CODE: i32 = 130;
 const RAW_LINGER: Duration = Duration::from_millis(10);
 /// Stdout batching window for `tail` and `replay`.
 const TRANSCRIPT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
-/// Decoded transcript records held while stdout drains.
-const TRANSCRIPT_RECORD_QUEUE: usize = 8;
+/// Read batches held while stdout drains. Each frame carries at most MAX_READ_BATCH_RECORDS
+/// records and about 1 MiB of payload backing, so the queue bounds in-flight output to roughly
+/// 8 MiB plus the batch being printed and transcript split-part pending state.
+const TRANSCRIPT_BATCH_QUEUE: usize = 8;
 /// Stdin read block size for line-framed and raw writes.
 const STDIN_READ_BYTES: usize = 16 * 1024;
 const MAX_INITIAL_LINKS: usize = 3;
@@ -1719,42 +1721,52 @@ async fn read_transcript(
                 .context("failed to connect reader")?,
         ))
     };
-    let (record_tx, mut record_rx) = mpsc::channel(TRANSCRIPT_RECORD_QUEUE);
-    let reader_task = tokio::spawn(assemble_transcript_records(
-        reader,
-        max_logical_record_bytes,
-        record_tx,
-    ));
+    let (batch_tx, mut batch_rx) = mpsc::channel(TRANSCRIPT_BATCH_QUEUE);
+    let reader_task = tokio::spawn(forward_read_batches(reader, batch_tx));
 
     let mut stdout = BufWriter::with_capacity(TRANSCRIPT_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
-    let result = write_transcript_records(&mut record_rx, &mut stdout).await;
+    let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
+    let result = write_transcript_batches(&mut batch_rx, &mut stdout, &mut transcript).await;
     stdout.flush().await.context("failed to flush stdout")?;
     result?;
 
     reader_task.await.context("transcript reader task panicked")
 }
 
-/// Writes decoded records until the reader finishes, flushing whenever none is already waiting.
-async fn write_transcript_records(
-    record_rx: &mut mpsc::Receiver<eyre::Result<TranscriptRecord>>,
+/// Writes decoded batches until the reader finishes, flushing whenever none is already waiting.
+///
+/// Assembly happens here so transient output borrows payloads straight from each batch instead
+/// of copying every record into an owned transcript record.
+async fn write_transcript_batches(
+    batch_rx: &mut mpsc::Receiver<eyre::Result<tailsurf::ReadBatch>>,
     stdout: &mut BufWriter<tokio::io::Stdout>,
+    transcript: &mut LogicalTranscript,
 ) -> eyre::Result<()> {
     loop {
-        let record = tokio::select! {
-            record = record_rx.recv() => record,
+        let batch = tokio::select! {
+            batch = batch_rx.recv() => batch,
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt.context("failed to listen for interrupt signal")?;
                 stdout.flush().await.context("failed to flush stdout")?;
                 exit_interrupted();
             }
         };
-        let Some(record) = record else {
+        let Some(batch) = batch else {
             return Ok(());
         };
 
-        write_transcript_data(stdout, record?.data).await?;
+        let batch = batch?;
+        for record in &batch {
+            let Some(record) = transcript
+                .push_record(record)
+                .context("failed to assemble transcript record")?
+            else {
+                continue;
+            };
+            write_transcript_data(stdout, record.data).await?;
+        }
         // Batching must never hold output back, so flush as soon as nothing is already decoded.
-        if record_rx.is_empty() {
+        if batch_rx.is_empty() {
             stdout.flush().await.context("failed to flush stdout")?;
         }
     }
@@ -1766,33 +1778,25 @@ enum TranscriptReader {
 }
 
 impl TranscriptReader {
-    async fn next_record(&mut self) -> eyre::Result<Option<tailsurf::ReadRecord>> {
+    async fn next_batch(&mut self) -> eyre::Result<Option<tailsurf::ReadBatch>> {
         match self {
-            Self::WebSocket(reader) => reader.next_record().await.context("failed to read stream"),
+            Self::WebSocket(reader) => reader.next_batch().await.context("failed to read stream"),
             Self::Sse(reader) => reader
-                .next_record()
+                .next_batch()
                 .await
                 .context("failed to read SSE stream"),
         }
     }
 }
 
-/// Reassembles logical records off the output path so reads overlap stdout writes.
-async fn assemble_transcript_records(
+/// Forwards read batches off the output path so reads overlap stdout writes.
+async fn forward_read_batches(
     mut reader: TranscriptReader,
-    max_logical_record_bytes: usize,
-    record_tx: mpsc::Sender<eyre::Result<TranscriptRecord>>,
+    batch_tx: mpsc::Sender<eyre::Result<tailsurf::ReadBatch>>,
 ) {
-    let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
     let result = async {
-        while let Some(record) = reader.next_record().await? {
-            let Some(record) = transcript
-                .push_record(record)
-                .context("failed to assemble transcript record")?
-            else {
-                continue;
-            };
-            if record_tx.send(Ok(record)).await.is_err() {
+        while let Some(batch) = reader.next_batch().await? {
+            if batch_tx.send(Ok(batch)).await.is_err() {
                 return eyre::Result::<()>::Ok(());
             }
         }
@@ -1800,8 +1804,8 @@ async fn assemble_transcript_records(
     }
     .await;
     if let Err(error) = result {
-        // Failures belong in stream order behind records already sent, not in the join result.
-        let _ = record_tx.send(Err(error)).await;
+        // Failures belong in stream order behind batches already sent, not in the join result.
+        let _ = batch_tx.send(Err(error)).await;
     }
 }
 async fn write_transcript_data(

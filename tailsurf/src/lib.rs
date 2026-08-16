@@ -32,6 +32,8 @@ pub use ids::{
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     rest::StreamMetadata,
-    ws::frame::{AppendRecord, CaughtUpPosition, ReadRecord, SnapshotBoundary},
+    ws::frame::{
+        AppendRecord, CaughtUpPosition, OwnedReadRecord, ReadBatch, ReadRecord, SnapshotBoundary,
+    },
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

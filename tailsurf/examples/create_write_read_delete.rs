@@ -82,8 +82,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     read_request.start = Some(ReadStart::SeqNum(0));
     read_request.limit = Some(1);
     let mut reader = client.connect_reader(read_request).await?;
-    if let Some(record) = reader.next_record().await? {
-        print!("{}", String::from_utf8_lossy(&record.data));
+    if let Some(batch) = reader.next_batch().await? {
+        for record in &batch {
+            print!("{}", String::from_utf8_lossy(record.data));
+        }
     }
 
     client
