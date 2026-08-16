@@ -2751,6 +2751,8 @@ async fn http_status_error(response: reqwest::Response, operation: &'static str)
     if api_code.as_deref() == Some("sequence_mismatch") {
         return TsfClientError::SequenceMismatch {
             actual_next_seq_num,
+            request_id,
+            retry_after,
         };
     }
     let body = parsed
@@ -2848,6 +2850,8 @@ fn close_reason_error(code: u16, reason: String) -> TsfClientError {
     match (code, reason.as_str()) {
         (1008, "sequence_mismatch") => TsfClientError::SequenceMismatch {
             actual_next_seq_num: None,
+            request_id: None,
+            retry_after: None,
         },
         _ => TsfClientError::WebSocketClosedWithReason { code, reason },
     }
@@ -3110,6 +3114,10 @@ pub enum TsfClientError {
     SequenceMismatch {
         /// Actual stream next sequence when the service reported it.
         actual_next_seq_num: Option<u64>,
+        /// Server request ID used for support and tracing, when reported over REST.
+        request_id: Option<String>,
+        /// Server-requested retry delay, when reported over REST.
+        retry_after: Option<Duration>,
     },
     /// Link-list pagination controls are outside the supported range.
     #[error("invalid list links options: {0}")]
@@ -3206,7 +3214,9 @@ impl TsfClientError {
     /// Returns the request ID attached to an HTTP failure.
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::HttpStatus { request_id, .. } => request_id.as_deref(),
+            Self::HttpStatus { request_id, .. } | Self::SequenceMismatch { request_id, .. } => {
+                request_id.as_deref()
+            }
             Self::AppendWriterFailed(inner) => inner.request_id(),
             _ => None,
         }
@@ -3224,7 +3234,9 @@ impl TsfClientError {
     /// Returns the server-requested retry delay.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::HttpStatus { retry_after, .. } => *retry_after,
+            Self::HttpStatus { retry_after, .. } | Self::SequenceMismatch { retry_after, .. } => {
+                *retry_after
+            }
             Self::AppendWriterFailed(inner) => inner.retry_after(),
             _ => None,
         }
@@ -3239,6 +3251,7 @@ impl TsfClientError {
             }
             | Self::SequenceMismatch {
                 actual_next_seq_num,
+                ..
             } => *actual_next_seq_num,
             Self::AppendWriterFailed(inner) => inner.actual_next_seq_num(),
             _ => None,
@@ -3856,6 +3869,8 @@ mod tests {
             task_terminal_error
                 .set(Arc::new(TsfClientError::SequenceMismatch {
                     actual_next_seq_num: Some(7),
+                    request_id: Some("request-42".to_owned()),
+                    retry_after: None,
                 }))
                 .expect("set terminal error");
             drop(command);
@@ -3879,6 +3894,7 @@ mod tests {
             "error={error}"
         );
         assert_eq!(error.actual_next_seq_num(), Some(7));
+        assert_eq!(error.request_id(), Some("request-42"));
     }
 
     #[test]
