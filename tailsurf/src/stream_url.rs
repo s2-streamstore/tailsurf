@@ -1,9 +1,8 @@
 //! Parsing and construction for human-facing `/s/{stream_id}` stream links.
 
-use secrecy::ExposeSecret;
 use url::{Url, form_urlencoded};
 
-use crate::{LinkPermissions, LinkSecret, StreamId, ids::is_canonical_base64url_32};
+use crate::{LinkPermissions, LinkSecret, StreamId};
 
 /// Default origin for Tailsurf stream links.
 pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";
@@ -61,7 +60,6 @@ pub fn stream_link(
     permissions: LinkPermissions,
     secret: &LinkSecret,
 ) -> Result<Url, StreamLinkError> {
-    validate_link_secret(secret.expose_secret())?;
     let mut url = public_stream_url(base_url, stream_id)?;
 
     let fragment = form_urlencoded::Serializer::new(String::new())
@@ -110,22 +108,17 @@ fn parse_fragment(fragment: &str) -> Result<Option<StreamLinkParam>, StreamLinkE
         return Ok(None);
     };
     let permissions = permissions.parse()?;
-    validate_link_secret(&link)?;
+    let secret = link
+        .parse()
+        .map_err(|_| StreamLinkError::InvalidLinkSecret)?;
     if pairs.next().is_some() {
         return Err(StreamLinkError::MultipleLinks);
     }
-    let link = link.into_owned();
 
     Ok(Some(StreamLinkParam {
         declared_permissions: permissions,
-        secret: link.into(),
+        secret,
     }))
-}
-
-fn validate_link_secret(secret: &str) -> Result<(), StreamLinkError> {
-    is_canonical_base64url_32(secret)
-        .then_some(())
-        .ok_or(StreamLinkError::InvalidLinkSecret)
 }
 
 fn validate_web_scheme(url: &Url) -> Result<(), StreamLinkError> {
@@ -256,7 +249,7 @@ mod tests {
         let base_url = Url::parse("http://user:password@localhost:8787/old?query=yes#fragment")
             .expect("base URL");
         let stream_id = STREAM_ID.parse::<StreamId>().expect("stream id");
-        let link = LinkSecret::from(SECRET);
+        let link: LinkSecret = SECRET.parse().expect("canonical secret");
 
         let url = stream_link(&base_url, &stream_id, LinkPermissions::owner(), &link)
             .expect("valid stream link");
@@ -268,28 +261,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_link_secret_when_building_stream_link() {
-        let base_url = Url::parse("http://localhost:8787").expect("base URL");
-        let stream_id = STREAM_ID.parse::<StreamId>().expect("stream id");
-
-        assert!(matches!(
-            stream_link(
-                &base_url,
-                &stream_id,
-                LinkPermissions::owner(),
-                &LinkSecret::from("too-short")
-            ),
-            Err(StreamLinkError::InvalidLinkSecret)
-        ));
-        assert!(matches!(
-            stream_link(
-                &base_url,
-                &stream_id,
-                LinkPermissions::owner(),
-                &LinkSecret::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            ),
-            Err(StreamLinkError::InvalidLinkSecret)
-        ));
+    fn rejects_invalid_link_secret_text() {
+        assert!("too-short".parse::<LinkSecret>().is_err());
+        // Correct length but non-canonical trailing bits.
+        assert!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse::<LinkSecret>()
+                .is_err()
+        );
     }
 
     #[test]
@@ -308,7 +287,7 @@ mod tests {
                 &base_url,
                 &stream_id,
                 LinkPermissions::read(),
-                &LinkSecret::from(SECRET)
+                &SECRET.parse().expect("canonical secret")
             ),
             Err(StreamLinkError::InvalidScheme(scheme)) if scheme == "ftp"
         ));

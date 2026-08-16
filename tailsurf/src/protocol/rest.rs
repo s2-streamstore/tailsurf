@@ -4,7 +4,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
-    ids::{is_canonical_base64url_32, random_base64url_32},
     protocol::ws::{MAX_READ_SELECTOR_VALUE, frame::RecordFormat},
 };
 
@@ -97,7 +96,10 @@ pub struct InitialStreamLink {
     /// Permissions carried by the link.
     pub permissions: LinkPermissions,
     /// Client-generated secret retained with this prepared request.
-    #[serde(serialize_with = "crate::ids::serialize_link_secret")]
+    #[serde(
+        serialize_with = "crate::ids::serialize_link_secret",
+        deserialize_with = "deserialize_link_secret"
+    )]
     pub secret: LinkSecret,
 }
 
@@ -107,7 +109,7 @@ impl InitialStreamLink {
         Self {
             link_id,
             permissions,
-            secret: random_link_secret(),
+            secret: LinkSecret::new_random(),
         }
     }
 }
@@ -167,15 +169,11 @@ impl CreateLinkInput {
     pub fn new(link_id: LinkId, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
         Self {
             link_id,
-            secret: random_link_secret(),
+            secret: LinkSecret::new_random(),
             permissions,
             expires_at,
         }
     }
-}
-
-fn random_link_secret() -> LinkSecret {
-    random_base64url_32().into()
 }
 
 /// Effective lifecycle state for a stream link.
@@ -585,11 +583,9 @@ fn deserialize_link_secret<'de, D>(deserializer: D) -> Result<LinkSecret, D::Err
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
-    if !is_canonical_base64url_32(&value) {
-        return Err(serde::de::Error::custom("invalid link secret"));
-    }
-    Ok(value.into())
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
 }
 
 fn deserialize_nullable_non_empty_string<'de, D>(
