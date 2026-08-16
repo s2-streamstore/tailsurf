@@ -309,9 +309,7 @@ impl ReadBatch {
         for record in &records {
             validate_record_len(record.data.len())?;
             // MAX_READ_BATCH_RECORDS records of MAX_RECORD_BYTES each cannot overflow.
-            payload_bytes = payload_bytes
-                .checked_add(record.data.len())
-                .expect("bounded batch payload sum");
+            payload_bytes += record.data.len();
         }
         if payload_bytes > MAX_BATCH_PAYLOAD_BYTES {
             return Err(FrameCodecError::BatchPayloadTooLarge {
@@ -342,27 +340,23 @@ impl ReadBatch {
     }
 
     pub(crate) fn from_parts(payload: Bytes, records: Vec<RecordMeta>) -> Self {
+        debug_assert!(!records.is_empty());
         Self { payload, records }
     }
 
-    /// Returns the number of records in this batch.
-    pub fn len(&self) -> usize {
+    /// Returns the number of records in this non-empty batch.
+    pub fn record_count(&self) -> usize {
         self.records.len()
     }
 
-    /// Returns whether this batch contains no records.
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+    /// Returns the first record.
+    pub fn first(&self) -> ReadRecord<'_> {
+        self.record(&self.records[0])
     }
 
-    /// Returns the first record, or `None` for an empty batch.
-    pub fn first(&self) -> Option<ReadRecord<'_>> {
-        self.records.first().map(|meta| self.record(meta))
-    }
-
-    /// Returns the last record, or `None` for an empty batch.
-    pub fn last(&self) -> Option<ReadRecord<'_>> {
-        self.records.last().map(|meta| self.record(meta))
+    /// Returns the last record.
+    pub fn last(&self) -> ReadRecord<'_> {
+        self.record(&self.records[self.records.len() - 1])
     }
 
     /// Iterates the records, borrowing payloads from the shared buffer.
@@ -669,7 +663,7 @@ impl ClientFrame {
 
     /// Decodes one client frame, copying any record payload into owned bytes.
     pub fn decode(input: &[u8]) -> Result<Self, FrameCodecError> {
-        decode_client_frame(input)
+        decode_client_frame(Bytes::copy_from_slice(input))
     }
 
     /// Decodes one client frame while retaining a zero-copy slice for record payload data.
@@ -770,7 +764,7 @@ impl ServerFrame {
 
     /// Decodes one server frame, copying any record payload into owned bytes.
     pub fn decode(input: &[u8]) -> Result<Self, FrameCodecError> {
-        decode_server_frame(input)
+        decode_server_frame(Bytes::copy_from_slice(input))
     }
 
     /// Decodes one server frame while retaining a zero-copy slice for record payload data.
@@ -779,24 +773,7 @@ impl ServerFrame {
     }
 }
 
-trait FrameInput {
-    fn into_bytes(self) -> Bytes;
-}
-
-impl FrameInput for &[u8] {
-    fn into_bytes(self) -> Bytes {
-        Bytes::copy_from_slice(self)
-    }
-}
-
-impl FrameInput for Bytes {
-    fn into_bytes(self) -> Bytes {
-        self
-    }
-}
-
-fn decode_client_frame(input: impl FrameInput) -> Result<ClientFrame, FrameCodecError> {
-    let input = input.into_bytes();
+fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
     let bytes = input.as_ref();
     let Some((&op_byte, body)) = bytes.split_first() else {
         return Err(FrameCodecError::EmptyFrame);
@@ -955,20 +932,15 @@ const fn read_start_wire(start: ReadStart) -> (u8, u64) {
 }
 
 fn read_start_from_wire(tag: u8, value: u64) -> Result<ReadStart, FrameCodecError> {
-    let start = match tag {
-        READ_START_SEQ_NUM => ReadStart::SeqNum(value),
-        READ_START_TIMESTAMP_MS => ReadStart::TimestampMs(value),
-        READ_START_TAIL_OFFSET => ReadStart::TailOffset(value),
-        other => return Err(FrameCodecError::UnknownReadStartTag(other)),
-    };
-    if value > MAX_READ_SELECTOR_VALUE {
-        return Err(FrameCodecError::ReadSelectorOutOfRange(value));
+    match tag {
+        READ_START_SEQ_NUM => Ok(ReadStart::SeqNum(value)),
+        READ_START_TIMESTAMP_MS => Ok(ReadStart::TimestampMs(value)),
+        READ_START_TAIL_OFFSET => Ok(ReadStart::TailOffset(value)),
+        other => Err(FrameCodecError::UnknownReadStartTag(other)),
     }
-    Ok(start)
 }
 
-fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodecError> {
-    let input = input.into_bytes();
+fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
     let bytes = input.as_ref();
     let Some((&op_byte, body)) = bytes.split_first() else {
         return Err(FrameCodecError::EmptyFrame);
@@ -1021,10 +993,11 @@ fn decode_server_frame(input: impl FrameInput) -> Result<ServerFrame, FrameCodec
                     data_len: data.len() as u32,
                 });
             }
-            let batch = ReadBatch::from_parts(input, records);
-            validate_batch(batch.len(), payload_bytes, MAX_READ_BATCH_RECORDS)?;
-            validate_read_batch_sequence(&batch)?;
-            Ok(ServerFrame::ReadBatch(batch))
+            validate_batch(records.len(), payload_bytes, MAX_READ_BATCH_RECORDS)?;
+            validate_sequence_contiguous(records.iter().map(|record| record.seq_num))?;
+            Ok(ServerFrame::ReadBatch(ReadBatch::from_parts(
+                input, records,
+            )))
         }
         ServerOp::Heartbeat => {
             ensure_empty(op_byte, body)?;
@@ -1147,10 +1120,6 @@ fn validate_sequence_contiguous(
         previous = Some(seq_num);
     }
     Ok(())
-}
-
-fn validate_read_batch_sequence(batch: &ReadBatch) -> Result<(), FrameCodecError> {
-    validate_sequence_contiguous(batch.records.iter().map(|record| record.seq_num))
 }
 
 /// Lazily walks length-prefixed record bodies so decoding parses each record in one pass.
@@ -1869,10 +1838,9 @@ mod tests {
         let batch =
             ReadBatch::try_from_records(vec![alpha.clone(), beta.clone()]).expect("valid batch");
 
-        assert_eq!(batch.len(), 2);
-        assert!(!batch.is_empty());
-        assert_eq!(batch.first().expect("first"), alpha.as_record());
-        assert_eq!(batch.last().expect("last"), beta.as_record());
+        assert_eq!(batch.record_count(), 2);
+        assert_eq!(batch.first(), alpha.as_record());
+        assert_eq!(batch.last(), beta.as_record());
 
         let viewed: Vec<ReadRecord<'_>> = batch.iter().collect();
         assert_eq!(viewed, [alpha.as_record(), beta.as_record()]);

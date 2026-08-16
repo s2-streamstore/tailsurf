@@ -1,11 +1,10 @@
 //! JSON models for the REST v1 management and HTTP data planes.
 
-use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
-    ids::{encode_base64url_32, is_canonical_base64url_32},
+    ids::{is_canonical_base64url_32, random_base64url_32},
     protocol::ws::{MAX_READ_SELECTOR_VALUE, frame::RecordFormat},
 };
 
@@ -157,9 +156,7 @@ impl CreateLinkInput {
 }
 
 fn random_link_secret() -> LinkSecret {
-    let mut secret = [0_u8; 32];
-    rand::rng().fill_bytes(&mut secret);
-    encode_base64url_32(&secret).into()
+    random_base64url_32().into()
 }
 
 /// Effective lifecycle state for a stream link.

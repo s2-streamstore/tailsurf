@@ -14,7 +14,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use reqwest::StatusCode;
 use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
@@ -37,7 +37,7 @@ use url::Url;
 
 use crate::{
     ClientWriterId, LinkId, LinkSecret, StreamId, WriterId,
-    ids::{encode_base64url_32, is_canonical_base64url_32},
+    ids::{is_canonical_base64url_32, random_base64url_32},
     protocol::{
         rest::{
             ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest, CreateLinkInput,
@@ -773,34 +773,7 @@ impl TsfClient {
         &self,
         options: &ReadStreamOptions,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
-        if let Some(start) = options.start {
-            let value = match start {
-                ReadStart::SeqNum(value)
-                | ReadStart::TimestampMs(value)
-                | ReadStart::TailOffset(value) => value,
-            };
-            if value > MAX_READ_SELECTOR_VALUE {
-                return Err(TsfClientError::InvalidReadSelector {
-                    value,
-                    maximum: MAX_READ_SELECTOR_VALUE,
-                });
-            }
-        }
-        if let Some(rate) = options.playback_rate_permille {
-            if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
-                return Err(TsfClientError::InvalidPlaybackRate {
-                    value: rate,
-                    minimum: MIN_PLAYBACK_RATE_PERMILLE,
-                    maximum: MAX_PLAYBACK_RATE_PERMILLE,
-                });
-            }
-            if options.end_seq_num.is_none() && !options.snapshot {
-                return Err(TsfClientError::PlaybackRequiresEnd);
-            }
-        }
-        if options.snapshot && options.end_seq_num.is_some() {
-            return Err(TsfClientError::SnapshotWithEnd);
-        }
+        validate_read_options(options)?;
         let opening_frame = ClientFrame::OpenRead {
             link_secret: options.link_secret.clone(),
             start: options
@@ -984,9 +957,7 @@ pub struct CreateStreamIdempotencyKey(LinkSecret);
 impl CreateStreamIdempotencyKey {
     /// Generates a cryptographically random canonical 256-bit key.
     pub fn new_random() -> Self {
-        let mut bytes = [0_u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
-        Self(encode_base64url_32(&bytes).into())
+        Self(random_base64url_32().into())
     }
 }
 
@@ -2130,8 +2101,8 @@ impl TsfReadSession {
 }
 
 fn advance_read_options_for_batch(options: &mut ReadStreamOptions, batch: &ReadBatch) -> bool {
-    let last = batch.last().expect("validated non-empty batch");
-    advance_read_options(options, last.seq_num, batch.len())
+    let last = batch.last();
+    advance_read_options(options, last.seq_num, batch.record_count())
 }
 
 fn advance_read_options(
@@ -2161,9 +2132,7 @@ fn validate_read_batch_for_request(
     batch: &ReadBatch,
     options: &ReadStreamOptions,
 ) -> Result<(), TsfClientError> {
-    let Some(first) = batch.first() else {
-        return Err(TsfClientError::InvalidReadResponse("ReadBatch is empty"));
-    };
+    let first = batch.first();
     let wrong_start = match options.start {
         Some(ReadStart::SeqNum(start)) => first.seq_num != start,
         Some(ReadStart::TimestampMs(start)) => first.timestamp_ms < start,
@@ -2176,7 +2145,7 @@ fn validate_read_batch_for_request(
     }
     if options
         .limit
-        .is_some_and(|remaining| batch.len() as u64 > remaining)
+        .is_some_and(|remaining| batch.record_count() as u64 > remaining)
     {
         return Err(TsfClientError::InvalidReadResponse(
             "ReadBatch exceeds the remaining record limit",
@@ -2185,7 +2154,7 @@ fn validate_read_batch_for_request(
     // Decode enforces strictly increasing sequences, so only the last record can cross.
     if options
         .end_seq_num
-        .is_some_and(|end_seq_num| batch.last().is_some_and(|last| last.seq_num >= end_seq_num))
+        .is_some_and(|end_seq_num| batch.last().seq_num >= end_seq_num)
     {
         return Err(TsfClientError::InvalidReadResponse(
             "ReadBatch crosses the requested end sequence",
@@ -2685,7 +2654,7 @@ fn validate_sse_read_batch(
     }
     if options
         .limit
-        .is_some_and(|remaining| batch.len() as u64 > remaining)
+        .is_some_and(|remaining| batch.record_count() as u64 > remaining)
     {
         return Err(TsfClientError::InvalidSse(
             "read_batch exceeds the remaining record limit",
@@ -2710,13 +2679,8 @@ fn validate_sse_read_batch_cursor(
     options: &ReadStreamOptions,
     snapshot_boundary: Option<SnapshotBoundary>,
 ) -> Result<(), TsfClientError> {
-    let Some(first) = batch.first() else {
-        return Err(TsfClientError::InvalidSse("read_batch is empty"));
-    };
-    let Some(expected_next_seq_num) = batch
-        .last()
-        .and_then(|record| record.seq_num.checked_add(1))
-    else {
+    let first = batch.first();
+    let Some(expected_next_seq_num) = batch.last().seq_num.checked_add(1) else {
         return Err(TsfClientError::InvalidSse(
             "read_batch cursor cannot follow its records",
         ));
@@ -2747,7 +2711,7 @@ fn validate_sse_read_batch_cursor(
     }
     let expected_consumed = previous
         .map_or(0, |value| value.consumed_records)
-        .checked_add(batch.len() as u64)
+        .checked_add(batch.record_count() as u64)
         .ok_or(TsfClientError::InvalidSse(
             "read_batch consumed count overflowed",
         ))?;
@@ -4518,13 +4482,13 @@ mod tests {
         })
         .expect("valid read_batch event");
 
-        assert_eq!(batch.len(), 2);
-        let first = batch.first().expect("first");
+        assert_eq!(batch.record_count(), 2);
+        let first = batch.first();
         assert_eq!(first.data, "héllo".as_bytes());
         assert_eq!(first.format, RecordFormat::Transcript);
         assert_eq!(first.writer_id, WriterId::from_bytes([7_u8; 16]));
         assert_eq!(first.writer_seq_num, 30);
-        let last = batch.last().expect("last");
+        let last = batch.last();
         assert_eq!(last.data, &[0_u8, 159, 146, 150]);
         assert_eq!(last.seq_num, 4);
 

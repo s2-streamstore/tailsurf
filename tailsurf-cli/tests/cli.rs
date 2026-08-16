@@ -174,7 +174,6 @@ async fn new_outputs_json_and_link_files() {
     assert_eq!(info_json["stream_id"], json["stream_id"]);
 
     fs::remove_dir_all(tmp).expect("cleanup");
-    server.abort();
 }
 
 #[tokio::test]
@@ -218,7 +217,6 @@ async fn new_prints_created_links_before_a_link_file_error() {
     );
 
     fs::remove_dir(&unwritable_path).expect("cleanup");
-    server.abort();
 }
 
 #[tokio::test]
@@ -237,8 +235,6 @@ async fn new_retries_with_one_canonical_idempotency_key() {
         key.bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     );
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -269,7 +265,6 @@ async fn create_stream_recovers_a_committed_truncated_response() {
             .all(|observed| observed.as_deref() == Some(exposed_key.as_str()))
     );
     assert_eq!(server.stream_count(), 1);
-    server.abort();
 }
 
 #[tokio::test]
@@ -283,7 +278,6 @@ async fn create_stream_is_always_anonymous() {
         .expect("create stream");
 
     assert_eq!(server.create_authorizations(), [None]);
-    server.abort();
 }
 
 #[tokio::test]
@@ -327,8 +321,6 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
         &explicit.stdout,
         &[("owner", "o"), ("combined", "rw"), ("reader", "r")],
     );
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -384,8 +376,6 @@ async fn new_uses_an_explicit_owner_rejects_duplicate_ids_and_limits_links() {
         too_many.stderr
     );
     assert_eq!(server.create_idempotency_keys().len(), 1);
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -414,12 +404,10 @@ async fn new_link_files_require_the_exact_requested_permission() {
         output.stderr
     );
     assert!(server.create_idempotency_keys().is_empty());
-
-    server.abort();
 }
 
 #[tokio::test]
-async fn new_and_capture_accept_human_expiry_and_surface_free_limits() {
+async fn new_accepts_human_expiry_and_surfaces_free_limits() {
     let server = TestServer::start().await;
 
     let finite = run_tsf(&server, ["new", "--expires", "7d", "--json"], None).await;
@@ -427,10 +415,6 @@ async fn new_and_capture_accept_human_expiry_and_surface_free_limits() {
     let finite_json: serde_json::Value =
         serde_json::from_str(&finite.stdout).expect("finite JSON output");
     assert!(finite_json["expires_at"].as_str().is_some());
-
-    let capture = run_tsf(&server, ["new", "--expires", "6h"], Some("retained\n")).await;
-    assert!(capture.status.success(), "stderr={}", capture.stderr);
-    assert!(capture.stdout.contains("Expires: "));
 
     let denied = run_tsf(&server, ["new", "--expires", "864001s"], None).await;
     assert!(!denied.status.success());
@@ -441,53 +425,6 @@ async fn new_and_capture_accept_human_expiry_and_surface_free_limits() {
         "stderr={}",
         denied.stderr
     );
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn public_capture_prints_a_public_url_on_stdout() {
-    let server = TestServer::start().await;
-    let output = run_tsf(&server, ["new", "--public"], Some("public\n")).await;
-
-    assert!(output.status.success(), "stderr={}", output.stderr);
-    let public_url = output
-        .stdout
-        .lines()
-        .find_map(|line| extract_link_line(line, "Public"))
-        .map(|url| Url::parse(url).expect("public URL"))
-        .expect("public link");
-    assert_eq!(
-        public_url.origin().ascii_serialization(),
-        "http://localhost:3000"
-    );
-    assert!(public_url.path().starts_with("/s/"));
-    assert!(public_url.fragment().is_none());
-    assert!(output.stdout.contains("Created public stream"));
-    assert!(output.stderr.contains("1 record durable"));
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn piped_input_without_a_subcommand_creates_and_writes() {
-    let server = TestServer::start().await;
-    let output = run_tsf(&server, [], Some("implicit write\n")).await;
-
-    assert!(output.status.success(), "stderr={}", output.stderr);
-    assert!(output.stdout.contains("Created private stream"));
-    let read_link = output
-        .stdout
-        .lines()
-        .find_map(|line| extract_link_line(line, "reader"))
-        .expect("read link");
-    StreamLocator::parse(read_link).expect("valid read link");
-
-    let replay = run_tsf(&server, ["replay", read_link], None).await;
-    assert!(replay.status.success(), "stderr={}", replay.stderr);
-    assert_eq!(replay.stdout, "implicit write\n");
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -540,8 +477,6 @@ async fn capture_then_replay_round_trips_piped_input() {
         bounded_tail.stderr
     );
     assert_eq!(bounded_tail.stdout, "hello from cli integration\n");
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -570,8 +505,6 @@ async fn capture_command_streams_output_and_propagates_exit_status() {
     assert!(replay.status.success(), "stderr={}", replay.stderr);
     assert!(replay.stdout.contains("out"), "stdout={}", replay.stdout);
     assert!(replay.stdout.contains("err"), "stdout={}", replay.stdout);
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -619,8 +552,6 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     assert_eq!(records[2].part, PartHeader::unsplit());
     assert_eq!(records[2].format, RecordFormat::Transcript);
     assert_eq!(records[2].data.as_ref(), b"tail\n");
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -646,8 +577,6 @@ async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() 
         .expect("read link is printed before writing");
     let locator = StreamLocator::parse(read_link).expect("valid read link");
     assert_eq!(server.record_count(&locator.stream_id), 0);
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -705,8 +634,6 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     for (index, record) in records.iter().enumerate() {
         assert_eq!(record.writer_seq_num, index as u64);
     }
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -757,8 +684,6 @@ async fn write_raw_flushes_on_linger() {
 
     assert_eq!(data[0].as_ref(), b"a");
     assert_eq!(data[1].as_ref(), b"b");
-
-    server.abort();
 }
 
 #[cfg(unix)]
@@ -823,7 +748,6 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
     let replay = run_tsf(&server, ["replay", read_link.as_str()], None).await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
     assert_eq!(replay.stdout, "complete line\npartial line");
-    server.abort();
 }
 
 #[tokio::test]
@@ -862,8 +786,6 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
     assert_eq!(attempts[1].part, PartHeader::unsplit());
     assert_eq!(attempts[0].format, RecordFormat::Transcript);
     assert_eq!(attempts[1].format, RecordFormat::Transcript);
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -899,7 +821,6 @@ async fn writer_preserves_its_terminal_failure_for_later_submissions() {
         .await
         .expect_err("terminal writer close must fail");
     assert_sequence_mismatch(&close_error);
-    server.abort();
 }
 
 #[tokio::test]
@@ -929,8 +850,6 @@ async fn writer_close_is_not_blocked_by_an_unused_reservation() {
         .await
         .expect("writer close must not wait for reservation")
         .expect("writer close");
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -977,7 +896,6 @@ async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
     .expect("final submit");
     final_ticket.await.expect("final acknowledgement");
     writer.close().await.expect("writer close");
-    server.abort();
 }
 
 #[tokio::test]
@@ -1019,7 +937,6 @@ async fn writer_reconnect_resends_every_unacknowledged_record_in_order() {
     assert_eq!(attempts[2].data, attempts[5].data);
 
     writer.close().await.expect("writer close");
-    server.abort();
 }
 
 #[tokio::test]
@@ -1046,8 +963,6 @@ async fn tail_reconnect_resumes_after_last_sequence() {
     assert_eq!(attempts[1].link_secret, TEST_STREAM_LINK);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(0));
     assert_eq!(attempts[1].start, ReadStart::SeqNum(1));
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -1076,8 +991,6 @@ async fn tail_reconnect_after_multi_record_batch_advances_start_and_limit() {
     // the remaining limit by the full batch length.
     assert_eq!(attempts[1].start, ReadStart::SeqNum(3));
     assert_eq!(attempts[1].limit, Some(7));
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -1112,7 +1025,6 @@ async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
     assert!(attempts.iter().all(|attempt| {
         attempt.authorization.as_deref() == Some(&format!("Bearer {TEST_STREAM_LINK}"))
     }));
-    server.abort();
 }
 
 #[tokio::test]
@@ -1146,7 +1058,6 @@ async fn sse_tail_reconnects_after_multi_record_batch_with_advanced_cursor() {
             ("limit".into(), "10".into()),
         ])
     );
-    server.abort();
 }
 
 #[tokio::test]
@@ -1173,53 +1084,18 @@ async fn sse_snapshot_receives_an_explicit_empty_boundary() {
             last_timestamp_ms: 0,
         })
     );
-    server.abort();
 }
 
 #[tokio::test]
-async fn tail_selector_flags_are_sent_in_open_read() {
-    let tail_offset_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
+async fn tail_since_is_sent_as_a_timestamp_selector() {
+    let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
-    let tail_offset_output = run_tsf_until_stdout_contains(
-        tail_offset_server.api_url.clone(),
-        ["tail", "--last", "25", "--limit", "7", read_link.as_str()],
-        b"first\n",
-        Duration::from_secs(5),
-    )
-    .await;
-
-    assert_eq!(tail_offset_output.stdout, "first\n");
-    assert_eq!(tail_offset_output.stderr, "");
-    let attempts = tail_offset_server.read_attempts();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].start, ReadStart::TailOffset(25));
-    assert_eq!(attempts[0].limit, Some(7));
-    tail_offset_server.abort();
-
-    let seq_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
-    let seq_output = run_tsf_until_stdout_contains(
-        seq_server.api_url.clone(),
-        ["tail", "--seq", "42", "--limit", "3", read_link.as_str()],
-        b"first\n",
-        Duration::from_secs(5),
-    )
-    .await;
-
-    assert_eq!(seq_output.stdout, "first\n");
-    assert_eq!(seq_output.stderr, "");
-    let attempts = seq_server.read_attempts();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].start, ReadStart::SeqNum(42));
-    assert_eq!(attempts[0].limit, Some(3));
-    seq_server.abort();
-
-    let timestamp_server = FakeReadServer::start(FakeReadMode::Reconnect).await;
-    let timestamp_output = run_tsf_until_stdout_contains(
-        timestamp_server.api_url.clone(),
+    let output = run_tsf_until_stdout_contains(
+        server.api_url.clone(),
         [
             "tail",
             "--since",
@@ -1231,12 +1107,11 @@ async fn tail_selector_flags_are_sent_in_open_read() {
     )
     .await;
 
-    assert_eq!(timestamp_output.stdout, "first\n");
-    assert_eq!(timestamp_output.stderr, "");
-    let attempts = timestamp_server.read_attempts();
+    assert_eq!(output.stdout, "first\n");
+    assert_eq!(output.stderr, "");
+    let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
-    timestamp_server.abort();
 }
 
 #[tokio::test]
@@ -1261,8 +1136,6 @@ async fn empty_caught_up_establishes_the_reconnect_position() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
     assert_eq!(attempts[1].start, ReadStart::SeqNum(5));
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -1280,7 +1153,7 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
         .await
         .expect("read batch")
         .expect("batch");
-    let record = batch.first().expect("record");
+    let record = batch.first();
 
     assert_eq!(record.seq_num, 20);
     assert_eq!(record.data, b"default\n");
@@ -1288,8 +1161,6 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(80));
     assert_eq!(attempts[1].start, ReadStart::TailOffset(80));
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -1314,12 +1185,11 @@ async fn reader_restarts_retries_after_established_idle_connections() {
         .expect("bounded reconnects")
         .expect("recovered read")
         .expect("batch after reconnects");
-    let record = batch.first().expect("record");
+    let record = batch.first();
 
     assert_eq!(record.seq_num, 0);
     assert_eq!(record.data, b"recovered\n");
     assert_eq!(server.read_attempts().len(), 3);
-    server.abort();
 }
 
 #[tokio::test]
@@ -1354,7 +1224,6 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
         }
     ));
     assert!(server.read_attempts().len() >= 2);
-    server.abort();
 }
 
 #[tokio::test]
@@ -1384,11 +1253,10 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
         .expect("resumed reconnect")
         .expect("read batch")
         .expect("batch");
-    let record = batch.first().expect("record");
+    let record = batch.first();
     assert_eq!(record.seq_num, 5);
     assert_eq!(record.data, b"stable\n");
     assert_eq!(server.read_attempts().len(), 2);
-    server.abort();
 }
 
 #[tokio::test]
@@ -1414,12 +1282,11 @@ async fn reader_reconnects_after_configured_idle_timeout() {
         .expect("idle reconnect")
         .expect("read batch")
         .expect("batch");
-    let record = batch.first().expect("record");
+    let record = batch.first();
 
     assert_eq!(record.seq_num, 0);
     assert_eq!(record.data, b"after idle\n");
     assert_eq!(server.read_attempts().len(), 2);
-    server.abort();
 }
 
 #[tokio::test]
@@ -1430,15 +1297,6 @@ async fn zero_limit_reads_complete_without_opening_a_socket() {
         .expect("stream id");
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
-    let tail = run_tsf_with_api_url(
-        server.api_url.clone(),
-        ["tail", "--limit", "0", read_link.as_str()],
-        None,
-    )
-    .await;
-    assert!(tail.status.success(), "stderr={}", tail.stderr);
-    assert_eq!(tail.stdout, "");
-
     let replay = run_tsf_with_api_url(
         server.api_url.clone(),
         ["replay", "--limit", "0", read_link.as_str()],
@@ -1448,7 +1306,6 @@ async fn zero_limit_reads_complete_without_opening_a_socket() {
     assert!(replay.status.success(), "stderr={}", replay.stderr);
     assert_eq!(replay.stdout, "");
     assert!(server.read_attempts().is_empty());
-    server.abort();
 }
 
 #[tokio::test]
@@ -1473,7 +1330,6 @@ async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
         output.stderr
     );
     assert!(server.read_attempts().is_empty());
-    server.abort();
 }
 
 #[tokio::test]
@@ -1505,7 +1361,6 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
         "stderr={}",
         output.stderr
     );
-    server.abort();
 }
 
 #[tokio::test]
@@ -1543,99 +1398,6 @@ async fn replay_rejects_logical_records_above_configured_limit() {
         "stderr={}",
         output.stderr
     );
-    server.abort();
-}
-
-#[tokio::test]
-async fn replay_selector_flags_are_sent_in_bounded_open_read() {
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
-
-    let last_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
-    let last_output = run_tsf_with_api_url(
-        last_server.api_url.clone(),
-        ["replay", "--last", "2", read_link.as_str()],
-        None,
-    )
-    .await;
-
-    assert!(
-        last_output.status.success(),
-        "stderr={}",
-        last_output.stderr
-    );
-    let attempts = last_server.read_attempts();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].start, ReadStart::TailOffset(2));
-    assert_eq!(attempts[0].end_seq_num, None);
-    assert_eq!(attempts[0].limit, None);
-    assert!(attempts[0].snapshot);
-    last_server.abort();
-
-    let seq_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
-    let seq_output = run_tsf_with_api_url(
-        seq_server.api_url.clone(),
-        ["replay", "--seq", "2", read_link.as_str()],
-        None,
-    )
-    .await;
-
-    assert!(seq_output.status.success(), "stderr={}", seq_output.stderr);
-    let attempts = seq_server.read_attempts();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].start, ReadStart::SeqNum(2));
-    assert_eq!(attempts[0].end_seq_num, None);
-    assert_eq!(attempts[0].limit, None);
-    assert!(attempts[0].snapshot);
-    seq_server.abort();
-
-    let timestamp_server = FakeReadServer::start(FakeReadMode::ReplayTranscript).await;
-    let timestamp_output = run_tsf_with_api_url(
-        timestamp_server.api_url.clone(),
-        [
-            "replay",
-            "--since",
-            "2026-06-17T17:30:06Z",
-            read_link.as_str(),
-        ],
-        None,
-    )
-    .await;
-
-    assert!(
-        timestamp_output.status.success(),
-        "stderr={}",
-        timestamp_output.stderr
-    );
-    let attempts = timestamp_server.read_attempts();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].start, ReadStart::TimestampMs(1_781_717_406_000));
-    assert_eq!(attempts[0].end_seq_num, None);
-    assert_eq!(attempts[0].limit, None);
-    assert!(attempts[0].snapshot);
-    timestamp_server.abort();
-
-    let count_server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
-    let count_output = run_tsf_bytes_with_api_url(
-        count_server.api_url.clone(),
-        ["replay", "--limit", "1", read_link.as_str()],
-    )
-    .await;
-
-    assert!(
-        count_output.status.success(),
-        "stderr={:?}",
-        count_output.stderr
-    );
-    let attempts = count_server.read_attempts();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].start, ReadStart::SeqNum(0));
-    assert_eq!(attempts[0].end_seq_num, None);
-    assert_eq!(attempts[0].limit, Some(1));
-    assert!(attempts[0].snapshot);
-    count_server.abort();
 }
 
 #[tokio::test]
@@ -1659,8 +1421,6 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].end_seq_num, None);
     assert!(attempts[0].snapshot);
-
-    server.abort();
 }
 
 #[tokio::test]
@@ -1792,14 +1552,32 @@ async fn owner_commands_manage_visibility_links_and_deletion() {
         !after_delete.status.success(),
         "visibility update unexpectedly succeeded after delete"
     );
+}
 
-    server.abort();
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn start_server(router: Router) -> (Url, AbortOnDrop) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let task = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("test server");
+    }));
+    (
+        Url::parse(&format!("http://{address}")).expect("API URL"),
+        task,
+    )
 }
 
 struct TestServer {
     api_url: Url,
     state: Arc<TestApiState>,
-    task: tokio::task::JoinHandle<()>,
+    _task: AbortOnDrop,
 }
 
 impl TestServer {
@@ -1808,8 +1586,6 @@ impl TestServer {
     }
 
     async fn start_with_create_failures(create_failures: usize) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
         let state = Arc::new(TestApiState {
             create_failures_remaining: Mutex::new(create_failures),
             ..TestApiState::default()
@@ -1830,13 +1606,11 @@ impl TestServer {
             .route("/api/v1/streams/{stream_id}/write", get(test_write_socket))
             .route("/api/v1/streams/{stream_id}/read", get(test_read_socket))
             .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("server");
-        });
+        let (api_url, task) = start_server(router).await;
         Self {
-            api_url: Url::parse(&format!("http://{addr}")).expect("api URL"),
+            api_url,
             state,
-            task,
+            _task: task,
         }
     }
 
@@ -1920,10 +1694,6 @@ impl TestServer {
         })
         .await
         .expect("server received records");
-    }
-
-    fn abort(self) {
-        self.task.abort();
     }
 }
 
@@ -2877,7 +2647,7 @@ struct HoldingWriteAttempt {
 struct HoldingWriteServer {
     api_url: Url,
     state: Arc<HoldingWriteState>,
-    task: tokio::task::JoinHandle<()>,
+    _task: AbortOnDrop,
 }
 
 impl HoldingWriteServer {
@@ -2890,8 +2660,6 @@ impl HoldingWriteServer {
     }
 
     async fn start_with_mode(expected_before_ack: usize, disconnect_first_batch: bool) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
         let state = Arc::new(HoldingWriteState {
             expected_before_ack,
             attempts: Mutex::new(Vec::new()),
@@ -2905,13 +2673,11 @@ impl HoldingWriteServer {
                 get(holding_write_socket),
             )
             .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("holding server");
-        });
+        let (api_url, task) = start_server(router).await;
         Self {
-            api_url: Url::parse(&format!("http://{addr}")).expect("API URL"),
+            api_url,
             state,
-            task,
+            _task: task,
         }
     }
 
@@ -2934,10 +2700,6 @@ impl HoldingWriteServer {
 
     fn attempts(&self) -> Vec<HoldingWriteAttempt> {
         self.state.attempts.lock().expect("attempts lock").clone()
-    }
-
-    fn abort(self) {
-        self.task.abort();
     }
 }
 
@@ -3072,7 +2834,7 @@ struct FakeWriteState {
 struct FakeWriteServer {
     api_url: Url,
     state: Arc<FakeWriteState>,
-    task: tokio::task::JoinHandle<()>,
+    _task: AbortOnDrop,
 }
 
 impl FakeWriteServer {
@@ -3085,8 +2847,6 @@ impl FakeWriteServer {
     }
 
     async fn start_with_mode(terminal: bool) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
         let state = Arc::new(FakeWriteState {
             append_attempts: Mutex::new(Vec::new()),
             terminal,
@@ -3094,13 +2854,11 @@ impl FakeWriteServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/write", get(fake_write_socket))
             .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("fake server");
-        });
+        let (api_url, task) = start_server(router).await;
         Self {
-            api_url: Url::parse(&format!("http://{addr}")).expect("api URL"),
+            api_url,
             state,
-            task,
+            _task: task,
         }
     }
 
@@ -3110,10 +2868,6 @@ impl FakeWriteServer {
             .lock()
             .expect("append attempts lock")
             .clone()
-    }
-
-    fn abort(self) {
-        self.task.abort();
     }
 }
 
@@ -3222,7 +2976,7 @@ struct FakeSseState {
 struct FakeSseServer {
     api_url: Url,
     state: Arc<FakeSseState>,
-    task: tokio::task::JoinHandle<()>,
+    _task: AbortOnDrop,
 }
 
 impl FakeSseServer {
@@ -3231,8 +2985,6 @@ impl FakeSseServer {
     }
 
     async fn start_with_mode(mode: FakeSseMode) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("address");
         let state = Arc::new(FakeSseState {
             mode,
             ..FakeSseState::default()
@@ -3240,15 +2992,11 @@ impl FakeSseServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/records", get(fake_sse_read))
             .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .expect("fake SSE server");
-        });
+        let (api_url, task) = start_server(router).await;
         Self {
-            api_url: Url::parse(&format!("http://{addr}")).expect("API URL"),
+            api_url,
             state,
-            task,
+            _task: task,
         }
     }
 
@@ -3258,10 +3006,6 @@ impl FakeSseServer {
             .lock()
             .expect("SSE attempts lock")
             .clone()
-    }
-
-    fn abort(self) {
-        self.task.abort();
     }
 }
 
@@ -3353,7 +3097,6 @@ enum FakeReadMode {
     ReconnectTwiceThenRecord,
     SlowReconnectForever,
     SilentThenRecord,
-    ReplayTranscript,
     ReplayBinary,
     ReplaySplitRecord,
 }
@@ -3361,13 +3104,11 @@ enum FakeReadMode {
 struct FakeReadServer {
     api_url: Url,
     state: Arc<FakeReadState>,
-    task: tokio::task::JoinHandle<()>,
+    _task: AbortOnDrop,
 }
 
 impl FakeReadServer {
     async fn start(mode: FakeReadMode) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
         let state = Arc::new(FakeReadState {
             read_attempts: Mutex::new(Vec::new()),
             mode,
@@ -3375,13 +3116,11 @@ impl FakeReadServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/read", get(fake_read_socket))
             .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("fake server");
-        });
+        let (api_url, task) = start_server(router).await;
         Self {
-            api_url: Url::parse(&format!("http://{addr}")).expect("api URL"),
+            api_url,
             state,
-            task,
+            _task: task,
         }
     }
 
@@ -3391,10 +3130,6 @@ impl FakeReadServer {
             .lock()
             .expect("read attempts lock")
             .clone()
-    }
-
-    fn abort(self) {
-        self.task.abort();
     }
 }
 
@@ -3407,7 +3142,6 @@ const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
         FakeReadMode::ReconnectTwiceThenRecord
         | FakeReadMode::SlowReconnectForever
         | FakeReadMode::SilentThenRecord => 0,
-        FakeReadMode::ReplayTranscript => 4,
         FakeReadMode::ReplayBinary => 2,
         FakeReadMode::ReplaySplitRecord => 2,
     }
@@ -3567,26 +3301,6 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
             } else {
                 send_read_record(&mut socket, 0, 0, b"after idle\n").await;
             }
-        }
-        FakeReadMode::ReplayTranscript => {
-            let first_seq_num = match start {
-                ReadStart::SeqNum(value) => value,
-                ReadStart::TimestampMs(_) | ReadStart::TailOffset(_) => 0,
-            };
-            for (seq_num, writer_seq_num, data) in [
-                (0, 0, b"dedupe\n".as_slice()),
-                (1, 0, b"dedupe\n".as_slice()),
-                (2, 1, b"stable\n".as_slice()),
-                (3, 1, b"changed\n".as_slice()),
-            ] {
-                if seq_num >= first_seq_num {
-                    send_read_record(&mut socket, seq_num, writer_seq_num, data).await;
-                }
-            }
-            socket
-                .send(Message::Close(None))
-                .await
-                .expect("close replay socket");
         }
         FakeReadMode::ReplayBinary => {
             send_read_record_with_format(

@@ -2,6 +2,16 @@
 
 set -euo pipefail
 
+package_args=(--workspace --no-verify --locked)
+if [[ "${1:-}" == "--allow-dirty" ]]; then
+  package_args+=(--allow-dirty)
+  shift
+fi
+if [[ "$#" -ne 0 ]]; then
+  echo "usage: $0 [--allow-dirty]" >&2
+  exit 2
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 temp_parent="$(cd "${TMPDIR:-/tmp}" && pwd)"
 work_dir="$(mktemp -d "$temp_parent/tailsurf-package-verify.XXXXXX")"
@@ -20,7 +30,7 @@ verify_root="$work_dir/packages"
 
 (
   cd "$repo_root"
-  CARGO_TARGET_DIR="$package_target" "$cargo_bin" package --workspace --no-verify --locked
+  CARGO_TARGET_DIR="$package_target" "$cargo_bin" package "${package_args[@]}"
 )
 
 shopt -s nullglob

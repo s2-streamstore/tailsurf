@@ -587,7 +587,7 @@ mod tests {
                 b"kept",
             )])
             .expect("batch");
-            push(&mut transcript, batch.first().expect("first"))
+            push(&mut transcript, batch.first())
                 .expect("record")
                 .into_owned()
         };
@@ -606,7 +606,7 @@ mod tests {
                 b"hel",
             )])
             .expect("batch");
-            assert!(push(&mut transcript, first_batch.first().expect("first")).is_none());
+            assert!(push(&mut transcript, first_batch.first()).is_none());
         }
         // The first batch is dropped; the pending part was copied at ingest.
         let second_batch = ReadBatch::try_from_records(vec![owned_batch_record(
@@ -615,8 +615,7 @@ mod tests {
             b"lo",
         )])
         .expect("batch");
-        let completed =
-            push(&mut transcript, second_batch.first().expect("first")).expect("split completion");
+        let completed = push(&mut transcript, second_batch.first()).expect("split completion");
         assert!(matches!(completed.data, TranscriptData::Chunked(_)));
 
         let retained = completed.into_owned();
