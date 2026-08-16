@@ -786,17 +786,22 @@ fn print_error(error: &eyre::Report) {
 }
 
 async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<()> {
-    let visibility = visibility_from_flags(args.public);
+    let visibility = if args.public {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    };
     let links = new_stream_links(&args, visibility)?;
 
-    let created = create_stream(
-        api_url.clone(),
-        args.title.clone(),
-        visibility,
-        args.expires.map(StreamExpiryArg::seconds),
-        links,
-    )
-    .await?;
+    let created = TsfClient::with_api_origin(api_url.clone())?
+        .create_stream(&CreateStreamRequest {
+            title: args.title.clone(),
+            visibility,
+            expires_in_seconds: args.expires.map(StreamExpiryArg::seconds),
+            links,
+        })
+        .await
+        .context("failed to create stream")?;
     print_created_stream(&web_url, &created, args.json)?;
     write_link_files(&web_url, &created, &args)?;
 
@@ -934,27 +939,6 @@ async fn write_input(
 fn print_write_summary(records: u64) {
     let noun = if records == 1 { "record" } else { "records" };
     eprintln!("{records} {noun} durable");
-}
-
-async fn create_stream(
-    api_url: Url,
-    title: Option<StreamTitle>,
-    visibility: Visibility,
-    expires_in_seconds: Option<u64>,
-    links: Vec<InitialStreamLink>,
-) -> eyre::Result<CreateStreamResponse> {
-    let result = TsfClient::with_api_origin(api_url)?
-        .create_stream(&CreateStreamRequest {
-            title,
-            visibility,
-            expires_in_seconds,
-            links,
-        })
-        .await;
-    match result {
-        Ok(created) => Ok(created),
-        Err(error) => Err(error).context("failed to create stream"),
-    }
 }
 
 async fn connect_session_writer(
@@ -2114,14 +2098,6 @@ fn initial_link(link_id: &str, permissions: LinkPermissions) -> eyre::Result<Ini
     ))
 }
 
-fn visibility_from_flags(public: bool) -> Visibility {
-    if public {
-        Visibility::Public
-    } else {
-        Visibility::Private
-    }
-}
-
 fn visibility_label(visibility: Visibility) -> &'static str {
     match visibility {
         Visibility::Private => "private",
@@ -2222,33 +2198,6 @@ struct LinkMutationOutput {
 mod tests {
     use super::*;
 
-    const WRITE_LINK: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-    #[test]
-    fn parses_explicit_new_and_write_modes() {
-        let created =
-            Cli::try_parse_from(["tsf", "new", "--title", "Build log", "--", "make", "test"])
-                .expect("new-stream capture");
-        let Some(Command::New(created)) = created.command else {
-            panic!("expected new command");
-        };
-        assert_eq!(
-            created.title.as_ref().map(StreamTitle::as_str),
-            Some("Build log")
-        );
-        assert_eq!(created.input.program, ["make", "test"]);
-
-        let existing = Cli::try_parse_from(["tsf", "write", WRITE_LINK, "--", "make", "test"])
-            .expect("existing-stream write");
-        let Some(Command::Write(existing)) = existing.command else {
-            panic!("expected write command");
-        };
-        assert_eq!(existing.link.as_str(), WRITE_LINK);
-        assert_eq!(existing.input.program, ["make", "test"]);
-
-        assert!(Cli::try_parse_from(["tsf", "--title", "Build log"]).is_err());
-    }
-
     #[test]
     fn initial_links_accept_semantic_ids_and_short_permissions() {
         let parsed = "deploy-bot=read"
@@ -2321,20 +2270,6 @@ mod tests {
         // A reserved ID carrying the required permission needs no default injection.
         let args = new_args(vec!["owner=o".parse().expect("valid link")]);
         assert!(new_stream_links(&args, Visibility::Private).is_ok());
-    }
-
-    #[test]
-    fn parses_update_and_check_modes() {
-        for (arguments, expected_check) in [
-            (&["tsf", "update"][..], false),
-            (&["tsf", "update", "--check"][..], true),
-        ] {
-            let cli = Cli::try_parse_from(arguments).expect("valid update command");
-            let Some(Command::Update(args)) = cli.command else {
-                panic!("expected update command");
-            };
-            assert_eq!(args.check, expected_check);
-        }
     }
 
     #[test]

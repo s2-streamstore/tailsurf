@@ -1,8 +1,8 @@
 //! Canonical owner, read, and write permissions carried by stream links.
 
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, str::FromStr};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Valid permissions for a stream link.
 ///
@@ -131,24 +131,9 @@ impl<'de> Deserialize<'de> for LinkPermissions {
     where
         D: Deserializer<'de>,
     {
-        struct PermissionsVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for PermissionsVisitor {
-            type Value = LinkPermissions;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a valid permissions string")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                value.parse().map_err(de::Error::custom)
-            }
-        }
-
-        deserializer.deserialize_str(PermissionsVisitor)
+        Cow::<str>::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 

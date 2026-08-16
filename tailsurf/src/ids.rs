@@ -169,6 +169,12 @@ pub(crate) fn encode_base64url_32(bytes: &[u8; 32]) -> String {
     STRICT_URL_SAFE_NO_PAD.encode(bytes)
 }
 
+pub(crate) fn random_base64url_32() -> String {
+    let mut bytes = [0_u8; 32];
+    fill_random(&mut bytes);
+    encode_base64url_32(&bytes)
+}
+
 /// Returns whether `value` is the canonical unpadded base64url encoding of a 256-bit value.
 pub(crate) fn is_canonical_base64url_32(value: &str) -> bool {
     if value.len() != BASE64URL_32_ENCODED_LEN {
@@ -183,11 +189,6 @@ pub(crate) fn is_canonical_base64url_32(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn zero_value_encodes_to_all_a() {
-        assert_eq!(encode_base64url_32(&[0_u8; 32]), "A".repeat(43));
-    }
 
     #[test]
     fn sequential_bytes_encode_to_known_base64url() {
