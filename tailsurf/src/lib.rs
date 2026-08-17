@@ -10,7 +10,7 @@ pub mod client;
 pub mod ids;
 /// Stream-link permission parsing and validation.
 pub mod permissions;
-/// TSF REST models and v1 binary WebSocket protocol types.
+/// TSF read options, REST models, and v1 binary WebSocket protocol types.
 pub mod protocol;
 /// User-provided stream titles.
 pub mod stream_title;
@@ -31,9 +31,8 @@ pub use ids::{
 };
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
+    read::{ReadOptions, ReadStart, ReadStop},
     rest::StreamMetadata,
-    ws::frame::{
-        AppendRecord, CaughtUpPosition, OwnedReadRecord, ReadBatch, ReadRecord, SnapshotBoundary,
-    },
+    ws::frame::{AppendRecord, CaughtUpPosition, OwnedReadRecord, ReadBatch, ReadRecord},
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

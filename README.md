@@ -120,15 +120,15 @@ Tail or replay a link or public stream URL:
 ```sh
 tsf tail '{url}'
 tsf tail -n 200 '{url}'
-tsf tail --seq 0 --limit 500 '{url}'
+tsf tail --seq 0 --count 500 '{url}'
 tsf tail --since 15m '{url}'
 tsf replay '{url}'
 tsf tail --sse '{url}'
 ```
 
-`--last` or `-n` starts relative to the durable tail. `--seq` starts at an absolute sequence number. `--since` accepts a duration or RFC 3339 timestamp. `--limit` bounds the number of records.
+`--last` or `-n` starts relative to the durable tail. `--seq` starts at an absolute sequence number. `--since` accepts a duration or RFC 3339 timestamp. `--count` bounds the number of records.
 
-`tail` follows new records unless `--limit` bounds it. `replay` snapshots the current durable tail and exits after printing that range.
+`tail` follows new records unless `--count` bounds it. `replay` drains through the tail observed by its connection and exits.
 
 `--sse` uses the resumable HTTP event-stream transport. The default binary WebSocket transport remains best for interactive CLI use.
 

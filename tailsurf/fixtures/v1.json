@@ -6,36 +6,19 @@
   "max_batch_payload_bytes": 1048576,
   "client_frames": [
     {
-      "name": "open anonymous tail read",
+      "name": "open anonymous read",
       "frame": {
-        "type": "open_read",
-        "start_type": "tail_offset",
-        "start_value": "80"
+        "type": "open_read"
       },
-      "hex": "0100030000000000000050"
+      "hex": "0100"
     },
     {
-      "name": "open authenticated paced read",
+      "name": "open authenticated read",
       "frame": {
         "type": "open_read",
-        "start_type": "timestamp_ms",
-        "start_value": "1000",
-        "limit": "20",
-        "end_seq_num": "2001",
-        "playback_rate_permille": "2000",
         "link_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
       },
-      "hex": "010f0200000000000003e8000000000000001400000000000007d100000000000007d04141414141414141414141414141414141414141414141414141414141414141"
-    },
-    {
-      "name": "open fixed snapshot read",
-      "frame": {
-        "type": "open_read",
-        "start_type": "seq_num",
-        "start_value": "0",
-        "snapshot": true
-      },
-      "hex": "0110010000000000000000"
+      "hex": "01014141414141414141414141414141414141414141414141414141414141414141"
     },
     {
       "name": "open write",
@@ -146,15 +129,6 @@
         "expires_at": "2026-08-21T00:00:00Z"
       },
       "hex": "857b2273747265616d5f6964223a223030303030303030303030303030303030303030303030303030303030303030222c227469746c65223a224465706c6f79206c6f67222c227669736962696c697479223a2270726976617465222c22637265617465645f6174223a22323032362d30382d31335430303a30303a30305a222c22657870697265735f6174223a22323032362d30382d32315430303a30303a30305a227d"
-    },
-    {
-      "name": "snapshot boundary",
-      "frame": {
-        "type": "snapshot_boundary",
-        "end_seq_num": "102",
-        "last_timestamp_ms": "1786000000456"
-      },
-      "hex": "8600000000000000660000019fd5e545c8"
     }
   ]
 }

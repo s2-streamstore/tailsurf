@@ -19,8 +19,9 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
-    AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, StreamId,
-    StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
+    AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, ReadOptions,
+    ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession,
+    TsfWriter, default_api_origin,
     protocol::{
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
@@ -28,7 +29,7 @@ use tailsurf::{
             UpdateStreamRequest, Visibility,
         },
         ws::{
-            ReadStart, ReadStreamOptions, WriteStreamOptions,
+            WriteStreamOptions,
             frame::{MAX_RECORD_BYTES, PartHeader, RecordFormat},
         },
     },
@@ -94,7 +95,7 @@ enum Command {
     Write(WriteArgs),
     /// Follow a stream, optionally starting from existing records.
     Tail(TailArgs),
-    /// Print a bounded snapshot of existing records.
+    /// Print existing records and stop at the current tail.
     Replay(ReplayArgs),
     /// Show current stream metadata.
     Info(InfoArgs),
@@ -233,7 +234,7 @@ struct ReadArgs {
     since: Option<SinceArg>,
     /// Read at most this many records.
     #[arg(long)]
-    limit: Option<u64>,
+    count: Option<u64>,
     /// Maximum assembled transcript record size.
     #[arg(
         long,
@@ -1365,19 +1366,18 @@ impl WriterSession<'_> {
     }
 }
 
-fn read_options(
-    locator: &StreamLocator,
-    read: &ReadArgs,
-    default_start: ReadStart,
-) -> ReadStreamOptions {
-    let mut options = ReadStreamOptions::new(locator.stream_id);
+fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadStart) -> ReadOptions {
+    let mut options = ReadOptions::new(locator.stream_id);
     options.start = Some(selected_read_start(
         read.last,
         read.seq,
         read.since,
         default_start,
     ));
-    options.limit = read.limit;
+    options.stop = read.count.map(|count| ReadStop {
+        count: Some(count),
+        ..ReadStop::default()
+    });
     if let Some(link) = locator.link_declaring(LinkPermissions::allows_read) {
         options = options.with_link_secret(link.clone());
     }
@@ -1400,7 +1400,10 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
-    request.snapshot = true;
+    request.stop.get_or_insert(ReadStop {
+        wait_seconds: Some(0),
+        ..ReadStop::default()
+    });
 
     read_transcript(
         api_url,
@@ -1597,11 +1600,11 @@ async fn revoke_link(api_url: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
 
 async fn read_transcript(
     api_url: Url,
-    options: ReadStreamOptions,
+    options: ReadOptions,
     max_logical_record_bytes: usize,
     sse: bool,
 ) -> eyre::Result<()> {
-    if options.limit == Some(0) {
+    if options.stop.is_some_and(|stop| stop.count == Some(0)) {
         return Ok(());
     }
 

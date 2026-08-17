@@ -39,22 +39,26 @@ use crate::{
     ClientWriterId, LinkId, LinkSecret, StreamId, WriterId,
     ids::{is_canonical_base64url_32, random_base64url_32},
     protocol::{
+        MAX_SAFE_INTEGER_U64,
+        read::{
+            DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE, MAX_READ_WAIT_SECONDS, MIN_PLAYBACK_RATE,
+            ReadOptions, ReadStart,
+        },
         rest::{
             ApiError, ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest,
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
             MAX_LINK_PAGE_ITEMS, MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES,
             MAX_SSE_EVENT_BYTES, MAX_SSE_UNTERMINATED_EVENT_BYTES,
             MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, RecordData,
-            RestRecordPart, SseCaughtUpData, SseReadBatchData, SseSnapshotBoundaryData,
-            StreamLinkCredential, StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
+            RestRecordPart, SseCaughtUpData, SseReadBatchData, StreamLinkCredential,
+            StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
         },
         ws::{
-            DEFAULT_READ_TAIL_OFFSET, MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE,
-            MIN_PLAYBACK_RATE_PERMILLE, ReadStart, ReadStreamOptions, WriteStreamOptions,
+            WriteStreamOptions,
             frame::{
                 self, AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
                 MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES, OwnedReadRecord, PartHeader,
-                ReadBatch, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
+                ReadBatch, RecordFormat, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -509,7 +513,7 @@ impl TsfClient {
                 "writer sequence range must end before u64::MAX",
             ));
         }
-        if expected_next_seq_num.is_some_and(|value| value > MAX_READ_SELECTOR_VALUE) {
+        if expected_next_seq_num.is_some_and(|value| value > MAX_SAFE_INTEGER_U64) {
             return Err(TsfClientError::InvalidStatelessAppend(
                 "expected next sequence exceeds the data adapter range",
             ));
@@ -627,23 +631,20 @@ impl TsfClient {
         })
     }
 
-    /// Connects a resumable read session at the requested position and bounds.
+    /// Connects a resumable read session at the requested position and stop conditions.
     pub async fn connect_reader(
         &self,
-        mut options: ReadStreamOptions,
+        options: ReadOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
         let ConnectedReadSocket {
             socket,
             stream_metadata,
-            snapshot_boundary,
         } = self.connect_read_socket(&options).await?;
-        apply_snapshot_boundary(&mut options, snapshot_boundary);
         Ok(TsfReadSession::new(
             self.clone(),
             options,
             socket,
             stream_metadata,
-            snapshot_boundary,
         ))
     }
 
@@ -654,35 +655,46 @@ impl TsfClient {
     /// opening handshake but not the established event body.
     pub async fn connect_sse_reader(
         &self,
-        mut options: ReadStreamOptions,
+        options: ReadOptions,
     ) -> Result<TsfSseReadSession, TsfClientError> {
         validate_read_options(&options)?;
-        let request_options = options.clone();
-        let connection = self
-            .open_sse_connection(&request_options, None)
-            .await?
-            .ok_or(TsfClientError::InvalidSse(
-                "initial read completed without stream_metadata",
-            ))?;
-        apply_snapshot_boundary(&mut options, connection.snapshot_boundary);
+        let request = self.sse_read_request(&options);
+        let connection =
+            self.open_sse_connection(&request, None)
+                .await?
+                .ok_or(TsfClientError::InvalidSse(
+                    "initial read completed without stream_metadata",
+                ))?;
         Ok(TsfSseReadSession {
             client: self.clone(),
             options,
-            request_options,
+            request,
             body: connection.body,
             parser: connection.parser,
             stream_metadata: connection.stream_metadata,
             last_caught_up: None,
-            snapshot_boundary: connection.snapshot_boundary,
             reconnect_attempts: 0,
             last_event: connection.resume_event,
             finished: false,
         })
     }
 
+    fn sse_read_request(&self, options: &ReadOptions) -> SseReadRequest {
+        let mut url = self.rest_url(format_args!("/streams/{}/records", options.stream_id));
+        append_read_query(&mut url, options);
+        let finite = options.stop.is_some_and(|stop| {
+            stop.count.is_some() || stop.until_timestamp_ms.is_some() || stop.wait_seconds.is_some()
+        });
+        SseReadRequest {
+            url,
+            link_secret: options.link_secret.clone(),
+            finite,
+        }
+    }
+
     async fn open_sse_connection(
         &self,
-        options: &ReadStreamOptions,
+        request: &SseReadRequest,
         last_event: Option<&SseResumeEvent>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
         let handshake_timeout = self.config.rest_request_timeout;
@@ -690,7 +702,7 @@ impl TsfClient {
             with_timeout(
                 handshake_timeout,
                 "SSE handshake",
-                self.open_sse_connection_once(options, last_event),
+                self.open_sse_connection_once(request, last_event),
             )
             .await
         })
@@ -699,14 +711,14 @@ impl TsfClient {
 
     async fn open_sse_connection_once(
         &self,
-        options: &ReadStreamOptions,
+        sse_request: &SseReadRequest,
         last_event: Option<&SseResumeEvent>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
-        let mut url = self.rest_url(format_args!("/streams/{}/records", options.stream_id));
-        append_sse_query(&mut url, options);
         let mut request = self.apply_rest_auth(
-            self.http.get(url).header("Accept", "text/event-stream"),
-            options.link_secret.as_ref(),
+            self.http
+                .get(sse_request.url.clone())
+                .header("Accept", "text/event-stream"),
+            sse_request.link_secret.as_ref(),
         );
         if let Some((event_id, _)) = last_event {
             request = request.header("Last-Event-ID", event_id.as_str());
@@ -738,62 +750,28 @@ impl TsfClient {
             let (event_id, cursor) = sse_resume_cursor(&event)?;
             resume_event = Some((event_id.to_owned(), cursor));
         }
-        let mut snapshot_boundary = None;
-        if options.snapshot {
-            let event =
-                next_sse_event(&mut body, &mut parser)
-                    .await?
-                    .ok_or(TsfClientError::InvalidSse(
-                        "response ended before snapshot_boundary",
-                    ))?;
-            if event.event != "snapshot_boundary" {
-                return Err(TsfClientError::InvalidSse(
-                    "snapshot_boundary must follow stream_metadata",
-                ));
-            }
-            let (event_id, cursor) = sse_resume_cursor(&event)?;
-            let boundary: SseSnapshotBoundaryData = serde_json::from_str(&event.data)
-                .map_err(|_| TsfClientError::InvalidSse("invalid snapshot_boundary event"))?;
-            let boundary = SnapshotBoundary {
-                end_seq_num: boundary.end_seq_num,
-                last_timestamp_ms: boundary.last_timestamp_ms,
-            };
-            let previous = last_event.map(|(_, previous)| *previous);
-            validate_sse_snapshot_cursor(boundary, cursor, previous)?;
-            resume_event = Some((event_id.to_owned(), cursor));
-            snapshot_boundary = Some(boundary);
-        }
         Ok(Some(SseConnection {
             body,
             parser,
             stream_metadata,
-            snapshot_boundary,
             resume_event,
         }))
     }
 
     async fn connect_read_socket(
         &self,
-        options: &ReadStreamOptions,
+        options: &ReadOptions,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
         validate_read_options(options)?;
         let opening_frame = ClientFrame::OpenRead {
             link_secret: options.link_secret.clone(),
-            start: options
-                .start
-                .unwrap_or(ReadStart::TailOffset(DEFAULT_READ_TAIL_OFFSET)),
-            limit: options.limit,
-            end_seq_num: options.end_seq_num,
-            playback_rate_permille: options.playback_rate_permille,
-            snapshot: options.snapshot,
         }
         .encode()?;
-        let url = self.websocket_url(format_args!("/streams/{}/read", options.stream_id))?;
+        let mut url = self.websocket_url(format_args!("/streams/{}/read", options.stream_id))?;
+        append_read_query(&mut url, options);
         let connect_timeout = self.config.websocket_connect_timeout;
         let operation_timeout = self.config.websocket_operation_timeout;
         let read_idle_timeout = self.config.websocket_read_idle_timeout;
-        let snapshot = options.snapshot;
-
         self.retry_transient(|| {
             let url = url.clone();
             let opening_frame = opening_frame.clone();
@@ -802,10 +780,10 @@ impl TsfClient {
                 let mut ws =
                     connect_websocket(url, connect_timeout, operation_timeout, opening_frame)
                         .await?;
-                let handshake = with_timeout(
+                let stream_metadata = with_timeout(
                     operation_timeout,
                     "reader handshake",
-                    expect_read_handshake(&mut ws, snapshot),
+                    expect_read_handshake(&mut ws),
                 )
                 .await?;
 
@@ -814,8 +792,7 @@ impl TsfClient {
                         ws,
                         read_idle_timeout,
                     },
-                    stream_metadata: handshake.stream_metadata,
-                    snapshot_boundary: handshake.snapshot_boundary,
+                    stream_metadata,
                 })
             }
         })
@@ -1740,23 +1717,28 @@ struct SseConnection {
     body: SseBody,
     parser: SseParser,
     stream_metadata: StreamMetadata,
-    snapshot_boundary: Option<SnapshotBoundary>,
     resume_event: Option<SseResumeEvent>,
+}
+
+struct SseReadRequest {
+    url: Url,
+    link_secret: Option<LinkSecret>,
+    finite: bool,
 }
 
 /// Resumable HTTP event-stream reader.
 ///
 /// Transient transport and service interruptions reconnect from the next sequence number. Normal
-/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
+/// completion and configured stop conditions return `None`; protocol and policy failures surface
+/// as errors.
 pub struct TsfSseReadSession {
     client: TsfClient,
-    options: ReadStreamOptions,
-    request_options: ReadStreamOptions,
+    options: ReadOptions,
+    request: SseReadRequest,
     body: SseBody,
     parser: SseParser,
     stream_metadata: StreamMetadata,
     last_caught_up: Option<CaughtUpPosition>,
-    snapshot_boundary: Option<SnapshotBoundary>,
     reconnect_attempts: usize,
     last_event: Option<SseResumeEvent>,
     finished: bool,
@@ -1766,11 +1748,6 @@ impl TsfSseReadSession {
     /// Returns authorized stream metadata from the opening event.
     pub fn stream_metadata(&self) -> &StreamMetadata {
         &self.stream_metadata
-    }
-
-    /// Returns the fixed boundary captured for a snapshot read.
-    pub fn snapshot_boundary(&self) -> Option<SnapshotBoundary> {
-        self.snapshot_boundary
     }
 
     /// Returns the most recent reconnect-safe caught-up position.
@@ -1799,6 +1776,10 @@ impl TsfSseReadSession {
                 return Ok(None);
             }
             let event = match next_sse_event(&mut self.body, &mut self.parser).await {
+                Ok(None) if self.request.finite => {
+                    self.finished = true;
+                    return Ok(None);
+                }
                 Ok(event) => event,
                 Err(error) if error.is_resumable_sse_interruption() => None,
                 Err(error) => return Err(error),
@@ -1818,23 +1799,12 @@ impl TsfSseReadSession {
                 self.reconnect_attempts += 1;
                 let Some(connection) = self
                     .client
-                    .open_sse_connection(&self.request_options, self.last_event.as_ref())
+                    .open_sse_connection(&self.request, self.last_event.as_ref())
                     .await?
                 else {
                     self.finished = true;
                     return Ok(None);
                 };
-                if let Some(boundary) = connection.snapshot_boundary {
-                    if self
-                        .snapshot_boundary
-                        .is_some_and(|previous| previous != boundary)
-                    {
-                        return Err(TsfClientError::InvalidSse(
-                            "snapshot boundary changed during resume",
-                        ));
-                    }
-                    self.snapshot_boundary = Some(boundary);
-                }
                 if connection.resume_event.is_some() {
                     self.last_event = connection.resume_event;
                 }
@@ -1852,13 +1822,7 @@ impl TsfSseReadSession {
                     let batch = sse_read_batch(batch)?;
                     validate_sse_read_batch(&batch, &self.options)?;
                     let (cursor, previous) = self.resume_cursors(&event)?;
-                    validate_sse_read_batch_cursor(
-                        &batch,
-                        cursor,
-                        previous,
-                        &self.options,
-                        self.snapshot_boundary,
-                    )?;
+                    validate_sse_read_batch_cursor(&batch, cursor, previous, &self.options)?;
                     self.last_event = event.id.map(|id| (id, cursor));
                     self.reconnect_attempts = 0;
                     self.finished = advance_read_options_for_batch(&mut self.options, &batch);
@@ -1872,13 +1836,7 @@ impl TsfSseReadSession {
                         last_timestamp_ms: value.last_timestamp_ms,
                     };
                     let (cursor, previous) = self.resume_cursors(&event)?;
-                    validate_sse_caught_up_cursor(
-                        caught_up,
-                        cursor,
-                        previous,
-                        &self.options,
-                        self.snapshot_boundary,
-                    )?;
+                    validate_sse_caught_up_cursor(caught_up, cursor, previous, &self.options)?;
                     self.last_event = event.id.map(|id| (id, cursor));
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
@@ -1898,15 +1856,15 @@ impl TsfSseReadSession {
 /// Resumable WebSocket reader.
 ///
 /// Transient transport and service interruptions reconnect from the next sequence number. Normal
-/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
+/// completion and configured stop conditions return `None`; protocol and policy failures surface
+/// as errors.
 pub struct TsfReadSession {
     client: TsfClient,
-    options: ReadStreamOptions,
+    options: ReadOptions,
     socket: ReadSocket,
     stream_metadata: StreamMetadata,
     finished: bool,
     last_caught_up: Option<CaughtUpPosition>,
-    snapshot_boundary: Option<SnapshotBoundary>,
     no_progress_reconnects: usize,
     reconnect_needed: bool,
 }
@@ -1914,10 +1872,9 @@ pub struct TsfReadSession {
 impl TsfReadSession {
     fn new(
         client: TsfClient,
-        options: ReadStreamOptions,
+        options: ReadOptions,
         socket: ReadSocket,
         stream_metadata: StreamMetadata,
-        snapshot_boundary: Option<SnapshotBoundary>,
     ) -> Self {
         Self {
             client,
@@ -1926,7 +1883,6 @@ impl TsfReadSession {
             stream_metadata,
             finished: false,
             last_caught_up: None,
-            snapshot_boundary,
             no_progress_reconnects: 0,
             reconnect_needed: false,
         }
@@ -1935,11 +1891,6 @@ impl TsfReadSession {
     /// Returns the latest reconnect-safe position reported after preceding records were delivered.
     pub const fn last_caught_up(&self) -> Option<CaughtUpPosition> {
         self.last_caught_up
-    }
-
-    /// Returns the fixed exclusive end captured for a snapshot read.
-    pub const fn snapshot_boundary(&self) -> Option<SnapshotBoundary> {
-        self.snapshot_boundary
     }
 
     /// Returns metadata supplied by the latest successful read handshake.
@@ -2007,13 +1958,9 @@ impl TsfReadSession {
         let ConnectedReadSocket {
             socket,
             stream_metadata,
-            snapshot_boundary,
         } = self.client.connect_read_socket(&self.options).await?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
-        // The initial connect resolved any snapshot request into a fixed end bound, so
-        // reconnect handshakes never renegotiate a boundary.
-        debug_assert!(snapshot_boundary.is_none());
         self.no_progress_reconnects = 0;
         self.reconnect_needed = false;
         Ok(())
@@ -2042,40 +1989,37 @@ impl TsfReadSession {
     }
 }
 
-fn advance_read_options_for_batch(options: &mut ReadStreamOptions, batch: &ReadBatch) -> bool {
+fn advance_read_options_for_batch(options: &mut ReadOptions, batch: &ReadBatch) -> bool {
     let last = batch.last();
     advance_read_options(options, last.seq_num, batch.record_count())
 }
 
-fn advance_read_options(
-    options: &mut ReadStreamOptions,
-    last_seq_num: u64,
-    record_count: usize,
-) -> bool {
+fn advance_read_options(options: &mut ReadOptions, last_seq_num: u64, record_count: usize) -> bool {
     let Some(next_seq_num) = last_seq_num.checked_add(1) else {
         return true;
     };
     options.start = Some(ReadStart::SeqNum(next_seq_num));
-    if let Some(remaining) = options.limit.as_mut() {
+    if let Some(remaining) = options.stop.as_mut().and_then(|stop| stop.count.as_mut()) {
         *remaining = remaining.saturating_sub(record_count as u64);
     }
-    read_options_exhausted(options)
+    options.stop.is_some_and(|stop| stop.count == Some(0))
 }
 
-fn read_options_exhausted(options: &ReadStreamOptions) -> bool {
-    options.limit == Some(0)
+fn read_options_exhausted(options: &ReadOptions) -> bool {
+    let stop = options.stop.unwrap_or_default();
+    stop.count == Some(0)
         || matches!(
-            (options.start, options.end_seq_num),
-            (Some(ReadStart::SeqNum(start)), Some(end_seq_num)) if start >= end_seq_num
+            (options.start, stop.until_timestamp_ms),
+            (Some(ReadStart::TimestampMs(start)), Some(until)) if start >= until
         )
 }
 
 fn validate_read_batch_for_request(
     batch: &ReadBatch,
-    options: &ReadStreamOptions,
+    options: &ReadOptions,
 ) -> Result<(), TsfClientError> {
     if let Some(message) = read_batch_start_violation(batch, options.start)
-        .or_else(|| read_batch_bounds_violation(batch, options))
+        .or_else(|| read_batch_stop_violation(batch, options))
     {
         return Err(TsfClientError::InvalidReadResponse(message));
     }
@@ -2095,29 +2039,26 @@ fn read_batch_start_violation(batch: &ReadBatch, start: Option<ReadStart>) -> Op
     }
 }
 
-fn read_batch_bounds_violation(
-    batch: &ReadBatch,
-    options: &ReadStreamOptions,
-) -> Option<&'static str> {
-    if options
-        .limit
+fn read_batch_stop_violation(batch: &ReadBatch, options: &ReadOptions) -> Option<&'static str> {
+    let stop = options.stop.unwrap_or_default();
+    if stop
+        .count
         .is_some_and(|remaining| batch.record_count() as u64 > remaining)
     {
-        return Some("read batch exceeds the remaining record limit");
+        return Some("read batch exceeds the remaining record count");
     }
-    // Decode enforces strictly increasing sequences, so only the last record can cross.
-    if options
-        .end_seq_num
-        .is_some_and(|end_seq_num| batch.last().seq_num >= end_seq_num)
+    if stop
+        .until_timestamp_ms
+        .is_some_and(|until| batch.iter().any(|record| record.timestamp_ms >= until))
     {
-        return Some("read batch crosses the requested end sequence");
+        return Some("read batch reaches the exclusive until timestamp");
     }
     None
 }
 
 fn validate_caught_up_for_request(
     caught_up: CaughtUpPosition,
-    options: &ReadStreamOptions,
+    options: &ReadOptions,
 ) -> Result<(), TsfClientError> {
     if matches!(options.start, Some(ReadStart::SeqNum(next)) if caught_up.next_seq_num != next) {
         return Err(TsfClientError::InvalidReadResponse(
@@ -2135,15 +2076,6 @@ struct ReadSocket {
 struct ConnectedReadSocket {
     socket: ReadSocket,
     stream_metadata: StreamMetadata,
-    snapshot_boundary: Option<SnapshotBoundary>,
-}
-
-fn apply_snapshot_boundary(options: &mut ReadStreamOptions, boundary: Option<SnapshotBoundary>) {
-    let Some(boundary) = boundary else {
-        return;
-    };
-    options.snapshot = false;
-    options.end_seq_num = Some(boundary.end_seq_num);
 }
 
 impl ReadSocket {
@@ -2230,57 +2162,82 @@ async fn with_timeout<T>(
         .map_err(|_| TsfClientError::Timeout { operation })?
 }
 
-fn validate_read_options(options: &ReadStreamOptions) -> Result<(), TsfClientError> {
-    let start = options
+fn validate_read_options(options: &ReadOptions) -> Result<(), TsfClientError> {
+    let selector = match options
         .start
-        .unwrap_or(ReadStart::TailOffset(DEFAULT_READ_TAIL_OFFSET));
-    frame::validate_open_read(
-        start,
-        options.end_seq_num,
-        options.playback_rate_permille,
-        options.snapshot,
-    )
-    .map_err(|error| match error {
-        FrameCodecError::ReadSelectorOutOfRange(value) => TsfClientError::InvalidReadSelector {
+        .unwrap_or(ReadStart::TailOffset(DEFAULT_READ_TAIL_OFFSET))
+    {
+        ReadStart::SeqNum(value) | ReadStart::TimestampMs(value) | ReadStart::TailOffset(value) => {
+            value
+        }
+    };
+    if selector > MAX_SAFE_INTEGER_U64 {
+        return Err(TsfClientError::InvalidReadSelector {
+            value: selector,
+            maximum: MAX_SAFE_INTEGER_U64,
+        });
+    }
+    let stop = options.stop.unwrap_or_default();
+    if let Some(value) = stop.until_timestamp_ms
+        && value > MAX_SAFE_INTEGER_U64
+    {
+        return Err(TsfClientError::InvalidReadSelector {
             value,
-            maximum: MAX_READ_SELECTOR_VALUE,
-        },
-        FrameCodecError::PlaybackRateOutOfRange(value) => TsfClientError::InvalidPlaybackRate {
+            maximum: MAX_SAFE_INTEGER_U64,
+        });
+    }
+    if let Some(value) = stop.wait_seconds
+        && value > MAX_READ_WAIT_SECONDS
+    {
+        return Err(TsfClientError::InvalidReadWait {
             value,
-            minimum: MIN_PLAYBACK_RATE_PERMILLE,
-            maximum: MAX_PLAYBACK_RATE_PERMILLE,
-        },
-        FrameCodecError::PlaybackRequiresEnd => TsfClientError::PlaybackRequiresEnd,
-        FrameCodecError::SnapshotWithEnd => TsfClientError::SnapshotWithEnd,
-        other => TsfClientError::Frame(other),
-    })
+            maximum: MAX_READ_WAIT_SECONDS,
+        });
+    }
+    if let Some(value) = options.rate {
+        if !value.is_finite() || !(MIN_PLAYBACK_RATE..=MAX_PLAYBACK_RATE).contains(&value) {
+            return Err(TsfClientError::InvalidPlaybackRate {
+                value,
+                minimum: MIN_PLAYBACK_RATE,
+                maximum: MAX_PLAYBACK_RATE,
+            });
+        }
+        if stop.count.is_none() && stop.until_timestamp_ms.is_none() && stop.wait_seconds != Some(0)
+        {
+            return Err(TsfClientError::PlaybackRequiresCountUntilOrWaitZero);
+        }
+    }
+    Ok(())
 }
 
-fn append_sse_query(url: &mut Url, options: &ReadStreamOptions) {
+fn append_read_query(url: &mut Url, options: &ReadOptions) {
     let mut query = url.query_pairs_mut();
     match options.start {
         Some(ReadStart::SeqNum(value)) => {
             query.append_pair("seq_num", &value.to_string());
         }
         Some(ReadStart::TimestampMs(value)) => {
-            query.append_pair("timestamp_ms", &value.to_string());
+            query.append_pair("timestamp", &value.to_string());
         }
         Some(ReadStart::TailOffset(value)) => {
             query.append_pair("tail_offset", &value.to_string());
         }
-        None => {}
+        None => {
+            query.append_pair("tail_offset", &DEFAULT_READ_TAIL_OFFSET.to_string());
+        }
     }
-    if let Some(value) = options.limit {
-        query.append_pair("limit", &value.to_string());
+    let stop = options.stop.unwrap_or_default();
+    if let Some(value) = stop.count {
+        query.append_pair("count", &value.to_string());
     }
-    if let Some(value) = options.end_seq_num {
-        query.append_pair("end_seq_num", &value.to_string());
+    if let Some(value) = stop.until_timestamp_ms {
+        query.append_pair("until", &value.to_string());
     }
-    if let Some(value) = options.playback_rate_permille {
-        query.append_pair("playback_rate_permille", &value.to_string());
+    if let Some(value) = options.rate {
+        query.append_pair("rate", &value.to_string());
     }
-    if options.snapshot {
-        query.append_pair("snapshot", "true");
+    if let Some(value) = stop.wait_seconds {
+        query.append_pair("wait", &value.to_string());
     }
 }
 
@@ -2418,7 +2375,6 @@ fn parse_sse_block(block: &[u8]) -> Result<Option<ParsedSseEvent>, TsfClientErro
 struct ParsedSseResumeCursor {
     next_seq_num: u64,
     consumed_records: u64,
-    snapshot: Option<(u64, u64)>,
 }
 
 fn sse_resume_cursor(
@@ -2441,30 +2397,15 @@ fn parse_sse_resume_cursor(id: &str) -> Result<ParsedSseResumeCursor, TsfClientE
     let Some(consumed_count) = fields.next().and_then(parse_canonical_decimal_u64) else {
         return Err(invalid_sse_resume_cursor());
     };
-    let snapshot = match (fields.next(), fields.next()) {
-        (None, None) => None,
-        (Some(next), Some(timestamp)) => Some((
-            parse_canonical_decimal_u64(next).ok_or_else(invalid_sse_resume_cursor)?,
-            parse_canonical_decimal_u64(timestamp).ok_or_else(invalid_sse_resume_cursor)?,
-        )),
-        _ => return Err(invalid_sse_resume_cursor()),
-    };
     if fields.next().is_some()
-        || next_seq_num > MAX_READ_SELECTOR_VALUE
+        || next_seq_num > MAX_SAFE_INTEGER_U64
         || consumed_count > next_seq_num
-        || snapshot.is_some_and(|(snapshot_end_seq_num, snapshot_last_timestamp_ms)| {
-            snapshot_end_seq_num > MAX_READ_SELECTOR_VALUE
-                || next_seq_num > snapshot_end_seq_num
-                || snapshot_last_timestamp_ms > MAX_READ_SELECTOR_VALUE
-                || (snapshot_end_seq_num == 0 && snapshot_last_timestamp_ms != 0)
-        })
     {
         return Err(invalid_sse_resume_cursor());
     }
     Ok(ParsedSseResumeCursor {
         next_seq_num,
         consumed_records: consumed_count,
-        snapshot,
     })
 }
 
@@ -2556,13 +2497,10 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
     })
 }
 
-fn validate_sse_read_batch(
-    batch: &ReadBatch,
-    options: &ReadStreamOptions,
-) -> Result<(), TsfClientError> {
+fn validate_sse_read_batch(batch: &ReadBatch, options: &ReadOptions) -> Result<(), TsfClientError> {
     // Construction upholds batch shape; only conformance to this request remains. The start
     // position is checked against the resume cursor in `validate_sse_read_batch_cursor`.
-    match read_batch_bounds_violation(batch, options) {
+    match read_batch_stop_violation(batch, options) {
         Some(message) => Err(TsfClientError::InvalidSse(message)),
         None => Ok(()),
     }
@@ -2572,8 +2510,7 @@ fn validate_sse_read_batch_cursor(
     batch: &ReadBatch,
     cursor: ParsedSseResumeCursor,
     previous: Option<ParsedSseResumeCursor>,
-    options: &ReadStreamOptions,
-    snapshot_boundary: Option<SnapshotBoundary>,
+    options: &ReadOptions,
 ) -> Result<(), TsfClientError> {
     let first = batch.first();
     let Some(expected_next_seq_num) = batch.last().seq_num.checked_add(1) else {
@@ -2607,85 +2544,38 @@ fn validate_sse_read_batch_cursor(
             "read_batch cursor has the wrong consumed count",
         ));
     }
-    validate_sse_cursor_boundary(cursor, previous, snapshot_boundary)
+    Ok(())
 }
 
 fn validate_sse_caught_up_cursor(
     caught_up: CaughtUpPosition,
     cursor: ParsedSseResumeCursor,
     previous: Option<ParsedSseResumeCursor>,
-    options: &ReadStreamOptions,
-    snapshot_boundary: Option<SnapshotBoundary>,
+    options: &ReadOptions,
 ) -> Result<(), TsfClientError> {
     if cursor.next_seq_num != caught_up.next_seq_num {
         return Err(TsfClientError::InvalidSse(
             "caught_up cursor does not match its position",
         ));
     }
-    validate_sse_cursor_continuity(
-        cursor,
-        previous,
-        "caught_up does not continue the previous cursor",
-        "initial caught_up cursor has a consumed count",
-    )?;
+    if let Some(previous) = previous {
+        if cursor.next_seq_num != previous.next_seq_num
+            || cursor.consumed_records != previous.consumed_records
+        {
+            return Err(TsfClientError::InvalidSse(
+                "caught_up does not continue the previous cursor",
+            ));
+        }
+    } else if cursor.consumed_records != 0 {
+        return Err(TsfClientError::InvalidSse(
+            "initial caught_up cursor has a consumed count",
+        ));
+    }
     if previous.is_none()
         && matches!(options.start, Some(ReadStart::SeqNum(start)) if cursor.next_seq_num != start)
     {
         return Err(TsfClientError::InvalidSse(
             "initial caught_up does not match the requested sequence",
-        ));
-    }
-    validate_sse_cursor_boundary(cursor, previous, snapshot_boundary)
-}
-
-fn validate_sse_snapshot_cursor(
-    boundary: SnapshotBoundary,
-    cursor: ParsedSseResumeCursor,
-    previous: Option<ParsedSseResumeCursor>,
-) -> Result<(), TsfClientError> {
-    if cursor.snapshot != Some((boundary.end_seq_num, boundary.last_timestamp_ms)) {
-        return Err(TsfClientError::InvalidSse(
-            "snapshot_boundary cursor does not match its boundary",
-        ));
-    }
-    validate_sse_cursor_continuity(
-        cursor,
-        previous,
-        "snapshot_boundary does not continue the previous cursor",
-        "initial snapshot_boundary cursor has a consumed count",
-    )?;
-    validate_sse_cursor_boundary(cursor, previous, Some(boundary))
-}
-
-fn validate_sse_cursor_continuity(
-    cursor: ParsedSseResumeCursor,
-    previous: Option<ParsedSseResumeCursor>,
-    discontinuous: &'static str,
-    initial_consumed: &'static str,
-) -> Result<(), TsfClientError> {
-    if let Some(previous) = previous {
-        if cursor.next_seq_num != previous.next_seq_num
-            || cursor.consumed_records != previous.consumed_records
-        {
-            return Err(TsfClientError::InvalidSse(discontinuous));
-        }
-    } else if cursor.consumed_records != 0 {
-        return Err(TsfClientError::InvalidSse(initial_consumed));
-    }
-    Ok(())
-}
-
-fn validate_sse_cursor_boundary(
-    cursor: ParsedSseResumeCursor,
-    previous: Option<ParsedSseResumeCursor>,
-    boundary: Option<SnapshotBoundary>,
-) -> Result<(), TsfClientError> {
-    let expected_snapshot = boundary.map(|value| (value.end_seq_num, value.last_timestamp_ms));
-    if cursor.snapshot != expected_snapshot
-        || previous.is_some_and(|value| cursor.snapshot != value.snapshot)
-    {
-        return Err(TsfClientError::InvalidSse(
-            "SSE resume cursor changed its snapshot boundary",
         ));
     }
     Ok(())
@@ -2888,36 +2778,13 @@ async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
     .await
 }
 
-struct ReadHandshake {
-    stream_metadata: StreamMetadata,
-    snapshot_boundary: Option<SnapshotBoundary>,
-}
-
-async fn expect_read_handshake(
-    ws: &mut ClientWebSocket,
-    snapshot: bool,
-) -> Result<ReadHandshake, TsfClientError> {
+async fn expect_read_handshake(ws: &mut ClientWebSocket) -> Result<StreamMetadata, TsfClientError> {
     expect_ready(ws).await?;
-    let stream_metadata = expect_frame(ws, |frame| match frame {
+    expect_frame(ws, |frame| match frame {
         ServerFrame::StreamMetadata(stream_metadata) => Ok(stream_metadata),
         other => Err(other),
     })
-    .await?;
-    let snapshot_boundary = if snapshot {
-        Some(
-            expect_frame(ws, |frame| match frame {
-                ServerFrame::SnapshotBoundary(boundary) => Ok(boundary),
-                other => Err(other),
-            })
-            .await?,
-        )
-    } else {
-        None
-    };
-    Ok(ReadHandshake {
-        stream_metadata,
-        snapshot_boundary,
-    })
+    .await
 }
 
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
@@ -2928,7 +2795,6 @@ fn server_frame_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Heartbeat => "heartbeat",
         ServerFrame::CaughtUp(_) => "caught_up",
         ServerFrame::StreamMetadata(_) => "stream_metadata",
-        ServerFrame::SnapshotBoundary(_) => "snapshot_boundary",
     }
 }
 
@@ -3183,22 +3049,27 @@ pub enum TsfClientError {
         /// Largest supported selector value.
         maximum: u64,
     },
+    /// A read wait exceeds the supported long-poll duration.
+    #[error("read wait {value} exceeds the supported maximum {maximum}")]
+    InvalidReadWait {
+        /// Requested wait in seconds.
+        value: u32,
+        /// Largest supported wait in seconds.
+        maximum: u32,
+    },
     /// A timestamp playback rate is outside the protocol range.
-    #[error("playback rate {value} must be between {minimum} and {maximum} permille")]
+    #[error("playback rate {value} must be between {minimum} and {maximum}")]
     InvalidPlaybackRate {
         /// Requested playback rate.
-        value: u64,
+        value: f64,
         /// Slowest accepted playback rate.
-        minimum: u64,
+        minimum: f64,
         /// Fastest accepted playback rate.
-        maximum: u64,
+        maximum: f64,
     },
-    /// Timestamp playback needs a stable exclusive ending sequence.
-    #[error("playback rate requires an exclusive end_seq_num sequence")]
-    PlaybackRequiresEnd,
-    /// A snapshot request also supplied an explicit ending sequence.
-    #[error("snapshot and end_seq_num are mutually exclusive")]
-    SnapshotWithEnd,
+    /// Timestamp playback needs `count`, `until`, or `wait=0`.
+    #[error("playback rate requires count, until, or wait=0")]
+    PlaybackRequiresCountUntilOrWaitZero,
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),
@@ -3327,6 +3198,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{
+        read::ReadStop,
         rest::SseReadRecord,
         ws::frame::{MAX_RECORD_BYTES, OwnedReadRecord},
     };
@@ -3383,9 +3255,7 @@ mod tests {
             .expect("stream ID");
 
         let started_at = std::time::Instant::now();
-        let result = client
-            .connect_sse_reader(ReadStreamOptions::new(stream_id))
-            .await;
+        let result = client.connect_sse_reader(ReadOptions::new(stream_id)).await;
 
         assert!(matches!(
             result,
@@ -3504,12 +3374,11 @@ mod tests {
             }
         });
 
-        let handshake = expect_read_handshake(&mut client, false)
+        let stream_metadata = expect_read_handshake(&mut client)
             .await
             .expect("read handshake");
 
-        assert_eq!(handshake.stream_metadata, expected_stream_metadata);
-        assert_eq!(handshake.snapshot_boundary, None);
+        assert_eq!(stream_metadata, expected_stream_metadata);
         sender.await.expect("join handshake sender");
     }
 
@@ -3714,7 +3583,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_versioned_rest_and_path_only_websocket_urls() {
+    fn builds_versioned_rest_and_websocket_base_urls() {
         let client =
             TsfClient::with_api_origin(Url::parse("https://example.com").expect("API origin"))
                 .expect("valid API origin");
@@ -3749,19 +3618,67 @@ mod tests {
     }
 
     #[test]
-    fn sse_query_keeps_the_original_absolute_selector_and_limit() {
+    fn read_query_keeps_the_original_absolute_selector_and_count() {
         let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
             .parse()
             .expect("stream ID");
-        let mut options = ReadStreamOptions::new(stream_id);
+        let mut options = ReadOptions::new(stream_id);
         options.start = Some(ReadStart::SeqNum(42));
-        options.limit = Some(7);
-        options.snapshot = true;
-        let mut url = Url::parse("https://tail.surf/api/v1/streams/id/records").expect("SSE URL");
+        options.stop = Some(ReadStop {
+            count: Some(7),
+            until_timestamp_ms: Some(1_787_000_000_000),
+            wait_seconds: Some(30),
+        });
+        options.rate = Some(0.5);
+        let mut url = Url::parse("https://tail.surf/api/v1/streams/id/read").expect("read URL");
 
-        append_sse_query(&mut url, &options);
+        append_read_query(&mut url, &options);
 
-        assert_eq!(url.query(), Some("seq_num=42&limit=7&snapshot=true"));
+        assert_eq!(
+            url.query(),
+            Some("seq_num=42&count=7&until=1787000000000&rate=0.5&wait=30")
+        );
+
+        let mut default_url =
+            Url::parse("https://tail.surf/api/v1/streams/id/read").expect("read URL");
+        append_read_query(&mut default_url, &ReadOptions::new(stream_id));
+        assert_eq!(default_url.query(), Some("tail_offset=0"));
+    }
+
+    #[test]
+    fn read_rate_rejects_non_finite_and_out_of_range_values() {
+        let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+            .parse()
+            .expect("stream ID");
+        for rate in [f64::NAN, f64::INFINITY, 0.09, 101.0] {
+            let mut options = ReadOptions::new(stream_id);
+            options.stop = Some(ReadStop {
+                wait_seconds: Some(0),
+                ..ReadStop::default()
+            });
+            options.rate = Some(rate);
+            assert!(matches!(
+                validate_read_options(&options),
+                Err(TsfClientError::InvalidPlaybackRate { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn read_wait_rejects_values_above_the_supported_maximum() {
+        let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+            .parse()
+            .expect("stream ID");
+        let mut options = ReadOptions::new(stream_id);
+        options.stop = Some(ReadStop {
+            wait_seconds: Some(MAX_READ_WAIT_SECONDS + 1),
+            ..ReadStop::default()
+        });
+
+        assert!(matches!(
+            validate_read_options(&options),
+            Err(TsfClientError::InvalidReadWait { .. })
+        ));
     }
 
     #[test]
@@ -3775,19 +3692,6 @@ mod tests {
             .expect("data event");
 
         assert_eq!(sse_resume_cursor(&event).expect("resume cursor").0, cursor);
-
-        let snapshot_cursor = "v1,4,0,5,0";
-        let snapshot_event = ParsedSseEvent {
-            event: "read_batch".to_owned(),
-            data: "{}".to_owned(),
-            id: Some(snapshot_cursor.to_owned()),
-        };
-        assert_eq!(
-            sse_resume_cursor(&snapshot_event)
-                .expect("snapshot resume cursor")
-                .0,
-            snapshot_cursor
-        );
 
         for invalid in [
             "v2,4,0",
@@ -3817,19 +3721,19 @@ mod tests {
         let client =
             TsfClient::with_api_origin(Url::parse("http://localhost").expect("API origin"))
                 .expect("valid API origin");
-        let mut options = ReadStreamOptions::new(
+        let mut options = ReadOptions::new(
             "0123456789abcdefghjkmnpqrstvwxyz"
                 .parse()
                 .expect("stream ID"),
         );
-        options.start = Some(ReadStart::TailOffset(MAX_READ_SELECTOR_VALUE + 1));
+        options.start = Some(ReadStart::TailOffset(MAX_SAFE_INTEGER_U64 + 1));
 
         assert!(matches!(
             client.connect_reader(options).await,
             Err(TsfClientError::InvalidReadSelector {
                 value,
-                maximum: MAX_READ_SELECTOR_VALUE,
-            }) if value == MAX_READ_SELECTOR_VALUE + 1
+                maximum: MAX_SAFE_INTEGER_U64,
+            }) if value == MAX_SAFE_INTEGER_U64 + 1
         ));
     }
 
@@ -3912,7 +3816,7 @@ mod tests {
             Err(TsfClientError::InvalidAppendRange(_))
         ));
 
-        let mut options = ReadStreamOptions::new(
+        let mut options = ReadOptions::new(
             "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
@@ -3921,7 +3825,7 @@ mod tests {
         assert!(
             validate_read_batch_for_request(
                 &ReadBatch::try_from_records(vec![sse_test_record(1, 0)]).expect("valid batch"),
-                &options
+                &options,
             )
             .is_err()
         );
@@ -4153,7 +4057,7 @@ mod tests {
             .parse()
             .expect("stream ID");
         let mut reader = client
-            .connect_sse_reader(ReadStreamOptions::new(stream_id))
+            .connect_sse_reader(ReadOptions::new(stream_id))
             .await
             .expect("initial SSE connect");
 
@@ -4253,10 +4157,10 @@ mod tests {
     }
 
     #[test]
-    fn sse_batch_validation_enforces_decoded_bounds_and_read_limits() {
+    fn sse_batch_validation_enforces_decoded_bounds_and_read_count() {
         assert!(sse_read_batch(SseReadBatchData { records: vec![] }).is_err());
 
-        let mut options = ReadStreamOptions::new(
+        let mut options = ReadOptions::new(
             "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
@@ -4272,13 +4176,18 @@ mod tests {
             ))
         ));
 
-        options.limit = Some(1);
+        options.stop = Some(ReadStop {
+            count: Some(1),
+            ..ReadStop::default()
+        });
         let two = ReadBatch::try_from_records(vec![sse_test_record(0, 0), sse_test_record(1, 0)])
             .expect("valid batch");
         assert!(validate_sse_read_batch(&two, &options).is_err());
 
-        options.limit = None;
-        options.end_seq_num = Some(1);
+        options.stop = Some(ReadStop {
+            until_timestamp_ms: Some(1),
+            ..ReadStop::default()
+        });
         assert!(validate_sse_read_batch(&two, &options).is_err());
 
         assert!(matches!(
@@ -4321,8 +4230,8 @@ mod tests {
     }
 
     #[test]
-    fn sse_cursor_validation_binds_positions_counts_and_snapshot_timestamps() {
-        let mut options = ReadStreamOptions::new(
+    fn sse_cursor_validation_binds_positions_and_counts() {
+        let mut options = ReadOptions::new(
             "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
@@ -4336,18 +4245,15 @@ mod tests {
                 ParsedSseResumeCursor {
                     next_seq_num: 2,
                     consumed_records: 1,
-                    snapshot: None,
                 },
                 None,
                 &options,
-                None,
             )
             .is_err()
         );
         let previous = ParsedSseResumeCursor {
             next_seq_num: 1,
             consumed_records: 1,
-            snapshot: None,
         };
         assert!(
             validate_sse_caught_up_cursor(
@@ -4358,28 +4264,9 @@ mod tests {
                 ParsedSseResumeCursor {
                     next_seq_num: 2,
                     consumed_records: 1,
-                    snapshot: None,
                 },
                 Some(previous),
                 &options,
-                None,
-            )
-            .is_err()
-        );
-
-        let boundary = SnapshotBoundary {
-            end_seq_num: 2,
-            last_timestamp_ms: 10,
-        };
-        assert!(
-            validate_sse_snapshot_cursor(
-                boundary,
-                ParsedSseResumeCursor {
-                    next_seq_num: 0,
-                    consumed_records: 0,
-                    snapshot: Some((2, 11)),
-                },
-                None,
             )
             .is_err()
         );
@@ -4453,7 +4340,7 @@ mod tests {
         assert_eq!(last.data, &[0_u8, 159, 146, 150]);
         assert_eq!(last.seq_num, 4);
 
-        let options = ReadStreamOptions::new(
+        let options = ReadOptions::new(
             "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
@@ -4549,7 +4436,7 @@ mod tests {
                     &stream_id,
                     ClientWriterId::from_bytes([0; 16]),
                     &valid,
-                    Some(MAX_READ_SELECTOR_VALUE + 1),
+                    Some(MAX_SAFE_INTEGER_U64 + 1),
                     &secret,
                 )
                 .await,
