@@ -631,7 +631,7 @@ impl TsfClient {
         })
     }
 
-    /// Connects a resumable read session at the requested position and bounds.
+    /// Connects a resumable read session at the requested position and stop conditions.
     pub async fn connect_reader(
         &self,
         options: ReadOptions,
@@ -1710,7 +1710,8 @@ struct SseConnection {
 /// Resumable HTTP event-stream reader.
 ///
 /// Transient transport and service interruptions reconnect from the next sequence number. Normal
-/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
+/// completion and configured stop conditions return `None`; protocol and policy failures surface
+/// as errors.
 pub struct TsfSseReadSession {
     client: TsfClient,
     options: ReadOptions,
@@ -1836,7 +1837,8 @@ impl TsfSseReadSession {
 /// Resumable WebSocket reader.
 ///
 /// Transient transport and service interruptions reconnect from the next sequence number. Normal
-/// completion and configured bounds return `None`; protocol and policy failures surface as errors.
+/// completion and configured stop conditions return `None`; protocol and policy failures surface
+/// as errors.
 pub struct TsfReadSession {
     client: TsfClient,
     options: ReadOptions,
@@ -2003,7 +2005,7 @@ fn validate_read_batch_for_request(
     options: &ReadOptions,
 ) -> Result<(), TsfClientError> {
     if let Some(message) = read_batch_start_violation(batch, options.start)
-        .or_else(|| read_batch_bounds_violation(batch, options))
+        .or_else(|| read_batch_stop_violation(batch, options))
     {
         return Err(TsfClientError::InvalidReadResponse(message));
     }
@@ -2023,7 +2025,7 @@ fn read_batch_start_violation(batch: &ReadBatch, start: Option<ReadStart>) -> Op
     }
 }
 
-fn read_batch_bounds_violation(batch: &ReadBatch, options: &ReadOptions) -> Option<&'static str> {
+fn read_batch_stop_violation(batch: &ReadBatch, options: &ReadOptions) -> Option<&'static str> {
     if options
         .count
         .is_some_and(|remaining| batch.record_count() as u64 > remaining)
@@ -2034,7 +2036,7 @@ fn read_batch_bounds_violation(batch: &ReadBatch, options: &ReadOptions) -> Opti
         .until_timestamp_ms
         .is_some_and(|until| batch.iter().any(|record| record.timestamp_ms >= until))
     {
-        return Some("read batch crosses the requested end timestamp");
+        return Some("read batch reaches the exclusive until timestamp");
     }
     None
 }
@@ -2188,7 +2190,7 @@ fn validate_read_options(options: &ReadOptions) -> Result<(), TsfClientError> {
             && options.until_timestamp_ms.is_none()
             && options.wait_seconds != Some(0)
         {
-            return Err(TsfClientError::PlaybackRequiresEnd);
+            return Err(TsfClientError::PlaybackRequiresCountUntilOrWaitZero);
         }
     }
     Ok(())
@@ -2483,7 +2485,7 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
 fn validate_sse_read_batch(batch: &ReadBatch, options: &ReadOptions) -> Result<(), TsfClientError> {
     // Construction upholds batch shape; only conformance to this request remains. The start
     // position is checked against the resume cursor in `validate_sse_read_batch_cursor`.
-    match read_batch_bounds_violation(batch, options) {
+    match read_batch_stop_violation(batch, options) {
         Some(message) => Err(TsfClientError::InvalidSse(message)),
         None => Ok(()),
     }
@@ -2541,36 +2543,25 @@ fn validate_sse_caught_up_cursor(
             "caught_up cursor does not match its position",
         ));
     }
-    validate_sse_cursor_continuity(
-        cursor,
-        previous,
-        "caught_up does not continue the previous cursor",
-        "initial caught_up cursor has a consumed count",
-    )?;
+    if let Some(previous) = previous {
+        if cursor.next_seq_num != previous.next_seq_num
+            || cursor.consumed_records != previous.consumed_records
+        {
+            return Err(TsfClientError::InvalidSse(
+                "caught_up does not continue the previous cursor",
+            ));
+        }
+    } else if cursor.consumed_records != 0 {
+        return Err(TsfClientError::InvalidSse(
+            "initial caught_up cursor has a consumed count",
+        ));
+    }
     if previous.is_none()
         && matches!(options.start, Some(ReadStart::SeqNum(start)) if cursor.next_seq_num != start)
     {
         return Err(TsfClientError::InvalidSse(
             "initial caught_up does not match the requested sequence",
         ));
-    }
-    Ok(())
-}
-
-fn validate_sse_cursor_continuity(
-    cursor: ParsedSseResumeCursor,
-    previous: Option<ParsedSseResumeCursor>,
-    discontinuous: &'static str,
-    initial_consumed: &'static str,
-) -> Result<(), TsfClientError> {
-    if let Some(previous) = previous {
-        if cursor.next_seq_num != previous.next_seq_num
-            || cursor.consumed_records != previous.consumed_records
-        {
-            return Err(TsfClientError::InvalidSse(discontinuous));
-        }
-    } else if cursor.consumed_records != 0 {
-        return Err(TsfClientError::InvalidSse(initial_consumed));
     }
     Ok(())
 }
@@ -3061,9 +3052,9 @@ pub enum TsfClientError {
         /// Fastest accepted playback rate.
         maximum: f64,
     },
-    /// Timestamp playback needs a finite read boundary.
+    /// Timestamp playback needs `count`, `until`, or `wait=0`.
     #[error("playback rate requires count, until, or wait=0")]
-    PlaybackRequiresEnd,
+    PlaybackRequiresCountUntilOrWaitZero,
     /// The service sent a valid TSF frame that is not allowed at this protocol state.
     #[error("server sent unexpected {0} frame")]
     UnexpectedServerFrame(&'static str),

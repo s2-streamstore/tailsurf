@@ -11,7 +11,7 @@ pub const MAX_PLAYBACK_RATE: f64 = 100.0;
 /// Longest explicit S2 tail wait accepted by TSF.
 pub const MAX_READ_WAIT_SECONDS: u32 = 60;
 
-/// Position, bounds, and credentials for a stream read.
+/// Position, stop conditions, and credentials for a stream read.
 #[derive(Clone, Debug)]
 pub struct ReadOptions {
     /// Stream to read.
