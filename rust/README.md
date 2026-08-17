@@ -13,7 +13,7 @@ cargo add tokio --features macros,rt-multi-thread
 
 ## Quickstart
 
-```rust
+```rust,no_run
 use tailsurf::{CreateStreamRequest, TsfClient};
 
 #[tokio::main]
@@ -32,17 +32,25 @@ The default API origin is `https://tail.surf`. Use `TsfClient::with_api_origin` 
 
 `TsfReadSession` reads bounded binary batches. `TsfSseReadSession` provides the same resumable read contract over HTTP event streams.
 
-```rust
-use tailsurf::{ReadOptions, ReadStart};
+```rust,no_run
+use tailsurf::{LinkSecret, ReadOptions, ReadStart, StreamId, TsfClient};
 
-let mut options = ReadOptions::new(stream_id).with_link_secret(read_link_secret);
-options.start = Some(ReadStart::SeqNum(0));
-let mut reader = client.connect_reader(options).await?;
+async fn read_stream(
+    client: &TsfClient,
+    stream_id: StreamId,
+    read_link_secret: LinkSecret,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = ReadOptions::new(stream_id).with_link_secret(read_link_secret);
+    options.start = Some(ReadStart::SeqNum(0));
+    let mut reader = client.connect_reader(options).await?;
 
-while let Some(batch) = reader.next_batch().await? {
-    for record in &batch {
-        println!("{}", String::from_utf8_lossy(record.data));
+    while let Some(batch) = reader.next_batch().await? {
+        for record in &batch {
+            println!("{}", String::from_utf8_lossy(record.data));
+        }
     }
+
+    Ok(())
 }
 ```
 
@@ -52,27 +60,37 @@ The session reconnects from the latest record or caught-up position after transi
 
 `TsfWriter` retains unacknowledged records across bounded reconnects. Await each `AppendTicket` when you need its durable sequence number. `close` stops new submissions and waits for accepted records to settle. A terminal `AppendDurabilityUnknown` means an append may be durable but its acknowledgement could not be recovered.
 
-```rust
+```rust,no_run
 use tailsurf::{
-    AppendRecord, ClientWriterId, PartHeader, RecordFormat, WriteStreamOptions,
+    AppendRecord, ClientWriterId, LinkSecret, PartHeader, RecordFormat, StreamId, TsfClient,
+    WriteStreamOptions,
 };
 
-let writer = client.connect_writer(WriteStreamOptions::new(
-    stream_id,
-    ClientWriterId::new_random(),
-    write_link_secret,
-)).await?;
-let ticket = writer.submit(AppendRecord::new(
-    0,
-    PartHeader::unsplit(),
-    RecordFormat::Transcript,
-    b"deploy started\n",
-)).await?;
-let receipt = ticket.await?;
-writer.close().await?;
+async fn write_stream(
+    client: &TsfClient,
+    stream_id: StreamId,
+    write_link_secret: LinkSecret,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writer = client.connect_writer(WriteStreamOptions::new(
+        stream_id,
+        ClientWriterId::new_random(),
+        write_link_secret,
+    )).await?;
+    let ticket = writer.submit(AppendRecord::new(
+        0,
+        PartHeader::unsplit(),
+        RecordFormat::Transcript,
+        b"deploy started\n",
+    )).await?;
+    let receipt = ticket.await?;
+    writer.close().await?;
+
+    println!("durable at sequence {}", receipt.ack.start_seq_num);
+    Ok(())
+}
 ```
 
-The complete create, write, read, and delete flow is in [`examples/create_write_read_delete.rs`](examples/create_write_read_delete.rs).
+The [complete example](https://github.com/s2-streamstore/tailsurf/blob/main/rust/examples/create_write_read_delete.rs) creates, writes, reads, and deletes a stream.
 
 ## Manage
 
