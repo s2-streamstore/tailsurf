@@ -1,9 +1,10 @@
 # Development
 
-This repository contains public Rust and TypeScript implementations.
+The repository root is the `tailsurf-cli` Cargo package. Its binary is named `tsf`.
 
-- `rust/tailsurf`: Rust SDK and common crate with API types, stream URL parsing, permissions, IDs, and binary frame encoding.
-- `rust/tailsurf-cli`: Rust CLI shell for stream workflows and URL validation. Its binary is named `tsf`.
+- `cli`: CLI implementation.
+- `tests`: CLI integration tests.
+- `rust`: Rust SDK and common crate with API types, stream URL parsing, permissions, IDs, and binary frame encoding.
 - `typescript/packages/client`: Supported high-level TypeScript API for browsers and Node.js.
 - `typescript/packages/protocol`: Low-level TypeScript schemas, codecs, primitives, and fixtures.
 
@@ -14,7 +15,7 @@ Language-neutral TSF v1 frame vectors live in both protocol packages. Forward-co
 Install the CLI from the checkout:
 
 ```sh
-cargo install --path rust/tailsurf-cli
+cargo install --path .
 ```
 
 ## Local service

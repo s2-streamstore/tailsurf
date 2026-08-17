@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const rustFixtures = new URL("../../rust/tailsurf/fixtures/", import.meta.url);
+const rustFixtures = new URL("../../rust/fixtures/", import.meta.url);
 const typescriptFixtures = new URL("../packages/protocol/fixtures/", import.meta.url);
 
 for (const name of ["rest-v1.json", "v1.json"]) {

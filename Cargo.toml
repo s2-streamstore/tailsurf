@@ -1,8 +1,23 @@
+[package]
+name = "tailsurf-cli"
+version.workspace = true
+description = "Command line client for tail.surf live transcript streams"
+edition.workspace = true
+license.workspace = true
+homepage = "https://tail.surf"
+repository.workspace = true
+keywords = ["streaming", "websocket", "transcript", "logs", "cli"]
+categories = ["command-line-utilities", "development-tools", "network-programming"]
+readme = "README.md"
+rust-version.workspace = true
+include = ["/cli/**", "/tests/**", "/CHANGELOG.md", "/LICENSE", "/README.md"]
+
+[[bin]]
+name = "tsf"
+path = "cli/main.rs"
+
 [workspace]
-members = [
-    "rust/tailsurf",
-    "rust/tailsurf-cli",
-]
+members = ["rust"]
 resolver = "3"
 
 [workspace.package]
@@ -40,6 +55,26 @@ unsafe_code = "forbid"
 dbg_macro = "deny"
 todo = "deny"
 unwrap_used = "deny"
+
+[dependencies]
+axoupdater.workspace = true
+bytes.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+humantime.workspace = true
+memchr.workspace = true
+secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "process", "rt", "signal", "sync"] }
+tailsurf = { version = "0.11.0", path = "rust" }
+url.workspace = true
+
+[dev-dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+
+[lints]
+workspace = true
 
 # The profile used by cargo-dist for release binaries.
 [profile.dist]

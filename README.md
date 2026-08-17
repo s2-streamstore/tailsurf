@@ -12,23 +12,7 @@ Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or
 - Give agents a reliable async channel with durable catch-up.
 - Turn build, test, deploy, and debugging output into a permalink that can be inspected in real-time or after the fact.
 
-Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or install the `tsf` CLI below. Rust SDK documentation and examples live in [Rustdoc](https://docs.rs/tailsurf).
-
-## SDKs
-
-The repository contains public Rust and TypeScript implementations.
-
-- The Rust SDK is published as [`tailsurf`](https://crates.io/crates/tailsurf). See the [Rust SDK guide](rust/tailsurf/README.md).
-- The supported TypeScript API is published as [`@tailsurf/client`](https://www.npmjs.com/package/@tailsurf/client).
-- Low-level TypeScript codecs and schemas are published as [`@tailsurf/protocol`](https://www.npmjs.com/package/@tailsurf/protocol).
-
-Install the TypeScript client:
-
-```sh
-npm install @tailsurf/client
-```
-
-See the [TypeScript workspace](typescript/README.md) for package documentation and development commands.
+Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or install the `tsf` CLI below.
 
 ## Install
 
@@ -181,6 +165,15 @@ Every link has a client-chosen immutable Link ID. Link IDs contain 1 to 64 lower
 Link file options write complete URLs. Any command that accepts a link also accepts `@PATH` to read one complete URL from a file. On Unix, `tsf` creates and tightens link files to mode `0600`.
 
 Commands with structured output accept `--json`.
+
+## SDKs
+
+The repository also contains public Rust and TypeScript SDKs.
+
+- [`rust`](rust/README.md) is the `tailsurf` Rust SDK crate.
+- [`typescript`](typescript/README.md) contains `@tailsurf/client` and the lower-level `@tailsurf/protocol` package.
+
+Install the TypeScript client with `npm install @tailsurf/client`. Rust API documentation is available on [docs.rs](https://docs.rs/tailsurf).
 
 ## Development
 
