@@ -2,7 +2,7 @@
 
 use url::{Url, form_urlencoded};
 
-use crate::{LinkPermissions, LinkSecret, StreamId};
+use crate::{LinkPermissions, LinkSecret, StreamId, protocol::MAX_SAFE_INTEGER_U64};
 
 /// Default origin for Tailsurf stream links.
 pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";
@@ -17,13 +17,22 @@ pub struct StreamLinkParam {
     pub secret: LinkSecret,
 }
 
-/// Stream ID and optional authorization extracted from a stream link.
+/// Browser record anchor decoded from a stream link fragment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamAnchor {
+    /// Physical sequence number to highlight within the supported selector range.
+    pub seq_num: u64,
+}
+
+/// Stream ID and optional client-only state extracted from a stream link.
 #[derive(Clone, Debug)]
 pub struct StreamLocator {
     /// Stream named by the `/s/{stream_id}` path.
     pub stream_id: StreamId,
     /// Optional single link fragment.
     pub link: Option<StreamLinkParam>,
+    /// Optional browser record anchor.
+    pub anchor: Option<StreamAnchor>,
 }
 
 impl StreamLocator {
@@ -31,11 +40,22 @@ impl StreamLocator {
     pub fn parse(input: &str) -> Result<Self, StreamLinkError> {
         let url = Url::parse(input)?;
         validate_web_scheme(&url)?;
+        if url.query().is_some() {
+            return Err(StreamLinkError::QueryNotAllowed);
+        }
         let stream_id = parse_stream_id(&url)?;
 
-        let link = url.fragment().map(parse_fragment).transpose()?.flatten();
+        let (link, anchor) = url
+            .fragment()
+            .map(parse_fragment)
+            .transpose()?
+            .unwrap_or((None, None));
 
-        Ok(Self { stream_id, link })
+        Ok(Self {
+            stream_id,
+            link,
+            anchor,
+        })
     }
 
     /// Returns the secret only when the fragment declares matching permissions.
@@ -102,23 +122,52 @@ fn parse_stream_id(url: &Url) -> Result<StreamId, StreamLinkError> {
     }
 }
 
-fn parse_fragment(fragment: &str) -> Result<Option<StreamLinkParam>, StreamLinkError> {
-    let mut pairs = form_urlencoded::parse(fragment.as_bytes());
-    let Some((permissions, link)) = pairs.next() else {
-        return Ok(None);
-    };
-    let permissions = permissions.parse()?;
-    let secret = link
-        .parse()
-        .map_err(|_| StreamLinkError::InvalidLinkSecret)?;
-    if pairs.next().is_some() {
-        return Err(StreamLinkError::MultipleLinks);
+fn parse_fragment(
+    fragment: &str,
+) -> Result<(Option<StreamLinkParam>, Option<StreamAnchor>), StreamLinkError> {
+    if fragment.is_empty() || fragment.split('&').any(str::is_empty) {
+        return Err(StreamLinkError::InvalidFragment);
+    }
+    let mut link = None;
+    let mut anchor = None;
+    let mut found_parameter = false;
+    for (key, value) in form_urlencoded::parse(fragment.as_bytes()) {
+        found_parameter = true;
+        if key == "at" {
+            if anchor.is_some() {
+                return Err(StreamLinkError::MultipleAnchors);
+            }
+            let canonical = value == "0"
+                || (!value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit()));
+            let seq_num = if canonical {
+                value.parse().map_err(|_| StreamLinkError::InvalidAnchor)?
+            } else {
+                return Err(StreamLinkError::InvalidAnchor);
+            };
+            if seq_num > MAX_SAFE_INTEGER_U64 {
+                return Err(StreamLinkError::InvalidAnchor);
+            }
+            anchor = Some(StreamAnchor { seq_num });
+            continue;
+        }
+        if link.is_some() {
+            return Err(StreamLinkError::MultipleLinks);
+        }
+        let declared_permissions = key.parse()?;
+        let secret = value
+            .parse()
+            .map_err(|_| StreamLinkError::InvalidLinkSecret)?;
+        link = Some(StreamLinkParam {
+            declared_permissions,
+            secret,
+        });
     }
 
-    Ok(Some(StreamLinkParam {
-        declared_permissions: permissions,
-        secret,
-    }))
+    if !found_parameter {
+        return Err(StreamLinkError::InvalidFragment);
+    }
+
+    Ok((link, anchor))
 }
 
 fn validate_web_scheme(url: &Url) -> Result<(), StreamLinkError> {
@@ -151,6 +200,12 @@ pub enum StreamLinkError {
         /// Source UBID decoding failure.
         source: ubid::DecodeError,
     },
+    /// Browser stream URLs do not carry transport read controls or other query state.
+    #[error("stream URLs do not accept query parameters")]
+    QueryNotAllowed,
+    /// The fragment does not contain a link credential or anchor.
+    #[error("stream URL fragment must contain a credential or at")]
+    InvalidFragment,
     /// The fragment key is not a valid permission string.
     #[error("stream URL fragment has invalid permissions")]
     InvalidPermissions(#[from] crate::PermissionsError),
@@ -160,6 +215,12 @@ pub enum StreamLinkError {
     /// More than one link parameter appears in the fragment.
     #[error("stream URL fragment contains multiple links")]
     MultipleLinks,
+    /// The `at` fragment value is not a canonical decimal u64.
+    #[error("stream URL at anchor must be a canonical decimal u64")]
+    InvalidAnchor,
+    /// More than one `at` parameter appears in the fragment.
+    #[error("stream URL fragment contains multiple at parameters")]
+    MultipleAnchors,
 }
 
 #[cfg(test)]
@@ -186,10 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_percent_encoded_link_fragment_and_ignores_query_params() {
+    fn parses_percent_encoded_link_fragment() {
         let encoded_secret = format!("%41{}", &SECRET[1..]);
         let locator = StreamLocator::parse(&format!(
-            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz?view=raw#o={encoded_secret}"
+            "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#o={encoded_secret}"
         ))
         .expect("stream URL");
 
@@ -200,6 +261,20 @@ mod tests {
         let link = locator.link.expect("link");
         assert_eq!(link.declared_permissions.to_string(), "o");
         assert_eq!(link.secret.expose_secret(), SECRET);
+    }
+
+    #[test]
+    fn parses_a_composite_client_fragment() {
+        let locator =
+            StreamLocator::parse(&format!("https://tail.surf/s/{STREAM_ID}#r={SECRET}&at=50"))
+                .expect("stream URL");
+
+        assert_eq!(locator.anchor, Some(StreamAnchor { seq_num: 50 }));
+        assert_eq!(locator.link.expect("link").secret.expose_secret(), SECRET);
+        let anchor_only = StreamLocator::parse(&format!("https://tail.surf/s/{STREAM_ID}#at=0"))
+            .expect("anchor URL");
+        assert!(anchor_only.link.is_none());
+        assert_eq!(anchor_only.anchor, Some(StreamAnchor { seq_num: 0 }));
     }
 
     #[test]
@@ -241,6 +316,38 @@ mod tests {
                 "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w={SECRET}&r={SECRET}"
             )),
             Err(StreamLinkError::MultipleLinks)
+        ));
+        for fragment in ["at=01", "at=-1", "at=9007199254740992"] {
+            assert!(matches!(
+                StreamLocator::parse(&format!(
+                    "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#{fragment}"
+                )),
+                Err(StreamLinkError::InvalidAnchor)
+            ));
+        }
+        assert!(matches!(
+            StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#at=1&at=2"),
+            Err(StreamLinkError::MultipleAnchors)
+        ));
+        for query in ["", "at=50", "seq_num=100", "view=raw"] {
+            assert!(matches!(
+                StreamLocator::parse(&format!(
+                    "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz?{query}"
+                )),
+                Err(StreamLinkError::QueryNotAllowed)
+            ));
+        }
+        assert!(matches!(
+            StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#&"),
+            Err(StreamLinkError::InvalidFragment)
+        ));
+        assert!(matches!(
+            StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#"),
+            Err(StreamLinkError::InvalidFragment)
+        ));
+        assert!(matches!(
+            StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#at=1&"),
+            Err(StreamLinkError::InvalidFragment)
         ));
     }
 

@@ -4,9 +4,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
-    protocol::ws::{
-        MAX_READ_SELECTOR_VALUE,
-        frame::{self, RecordFormat},
+    protocol::{
+        MAX_SAFE_INTEGER_U64,
+        ws::frame::{self, RecordFormat},
     },
 };
 
@@ -417,13 +417,13 @@ impl<'de> serde::de::Visitor<'de> for OptionalDecimalU64Visitor {
 mod optional_safe_decimal_u64 {
     use serde::Deserializer;
 
-    use super::{MAX_READ_SELECTOR_VALUE, OptionalDecimalU64Visitor};
+    use super::{MAX_SAFE_INTEGER_U64, OptionalDecimalU64Visitor};
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<u64>, D::Error> {
         deserializer.deserialize_option(OptionalDecimalU64Visitor {
-            max: Some(MAX_READ_SELECTOR_VALUE),
+            max: Some(MAX_SAFE_INTEGER_U64),
         })
     }
 }
@@ -463,18 +463,7 @@ pub struct SseCaughtUpData {
     /// Next safe reconnect sequence.
     #[serde(with = "decimal_u64")]
     pub next_seq_num: u64,
-    /// Last record timestamp at the captured boundary.
-    #[serde(with = "decimal_u64")]
-    pub last_timestamp_ms: u64,
-}
-
-/// Payload of an SSE `snapshot_boundary` event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
-pub struct SseSnapshotBoundaryData {
-    /// Exclusive end of the fixed snapshot.
-    #[serde(with = "decimal_u64")]
-    pub end_seq_num: u64,
-    /// Timestamp of the last record at the snapshot boundary.
+    /// Last record timestamp at this caught-up position.
     #[serde(with = "decimal_u64")]
     pub last_timestamp_ms: u64,
 }

@@ -5,9 +5,10 @@ use std::env;
 use tailsurf::{
     ClientWriterId, LinkPermissions, TsfClient,
     protocol::{
+        read::{ReadOptions, ReadStart},
         rest::{CreateStreamRequest, InitialStreamLink, Visibility},
         ws::{
-            ReadStart, ReadStreamOptions, WriteStreamOptions,
+            WriteStreamOptions,
             frame::{PartHeader, RecordFormat},
         },
     },
@@ -77,10 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _receipt = ticket.await?;
     writer.close().await?;
 
-    let mut read_request =
-        ReadStreamOptions::new(created.stream_id).with_link_secret(read_link_secret);
+    let mut read_request = ReadOptions::new(created.stream_id).with_link_secret(read_link_secret);
     read_request.start = Some(ReadStart::SeqNum(0));
-    read_request.limit = Some(1);
+    read_request.count = Some(1);
     let mut reader = client.connect_reader(read_request).await?;
     if let Some(batch) = reader.next_batch().await? {
         for record in &batch {

@@ -6,8 +6,7 @@ use tailsurf::protocol::rest::{
     MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
     MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS, MAX_SSE_UNTERMINATED_EVENT_BYTES,
     MAX_STATELESS_APPEND_JSON_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
-    MAX_STATELESS_APPEND_RECORDS, SseCaughtUpData, SseReadBatchData, SseSnapshotBoundaryData,
-    StreamMetadata,
+    MAX_STATELESS_APPEND_RECORDS, SseCaughtUpData, SseReadBatchData, StreamMetadata,
 };
 
 #[test]
@@ -71,19 +70,7 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     assert_eq!(error.error.actual_next_seq_num, Some(9));
     let records: SseReadBatchData = fixture(&fixtures, "sse_read_batch");
     assert_eq!(records.records.len(), 1);
-    assert_eq!(
-        fixtures["sse_resume_cursor"].as_str(),
-        Some("v1,2,2,2,1786579200000")
-    );
-    assert_eq!(
-        fixtures["sse_snapshot_cursor"].as_str(),
-        Some("v1,0,0,2,1786579200000")
-    );
-    let snapshot: SseSnapshotBoundaryData = fixture(&fixtures, "sse_snapshot_boundary");
-    assert_eq!(
-        (snapshot.end_seq_num, snapshot.last_timestamp_ms),
-        (2, 1_786_579_200_000)
-    );
+    assert_eq!(fixtures["sse_resume_cursor"].as_str(), Some("v1,2,2"));
     let caught_up: SseCaughtUpData = fixture(&fixtures, "sse_caught_up");
     assert_eq!(caught_up.next_seq_num, 8);
 }

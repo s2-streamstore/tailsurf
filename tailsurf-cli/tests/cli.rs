@@ -27,16 +27,17 @@ use tailsurf::{
     AppendRecord, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret, RetryPolicy,
     StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
     protocol::{
+        read::{ReadOptions, ReadStart},
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
             StreamLinkCredential, StreamLinkStatus, StreamLinkSummary, StreamMetadata,
             StreamTitleUpdate, UpdateStreamRequest, Visibility,
         },
         ws::{
-            ReadStart, ReadStreamOptions, WriteStreamOptions,
+            WriteStreamOptions,
             frame::{
                 CaughtUpPosition, ClientFrame, MAX_RECORD_BYTES, OwnedReadRecord, PartHeader,
-                ReadBatch, RecordFormat, ServerFrame, SnapshotBoundary, TSF_WEBSOCKET_PROTOCOL,
+                ReadBatch, RecordFormat, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -506,7 +507,7 @@ async fn capture_then_replay_round_trips_piped_input() {
 
     let bounded_tail = run_tsf(
         &server,
-        ["tail", "--seq", "0", "--limit", "1", read_link],
+        ["tail", "--seq", "0", "--count", "1", read_link],
         None,
     )
     .await;
@@ -565,9 +566,9 @@ async fn write_defaults_to_lines_and_splits_large_records() {
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
+    let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.limit = Some(3);
+    request.count = Some(3);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut records = Vec::new();
@@ -635,9 +636,9 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
+    let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.limit = Some(16);
+    request.count = Some(16);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut records = Vec::new();
@@ -703,9 +704,9 @@ async fn write_raw_flushes_on_linger() {
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let mut request = ReadStreamOptions::new(locator.stream_id).with_link_secret(read_link.clone());
+    let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.limit = Some(2);
+    request.count = Some(2);
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut data = Vec::new();
@@ -1005,7 +1006,7 @@ async fn tail_reconnect_resumes_after_last_sequence() {
 }
 
 #[tokio::test]
-async fn tail_reconnect_after_multi_record_batch_advances_start_and_limit() {
+async fn tail_reconnect_after_multi_record_batch_advances_start_and_count() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectAfterBatch).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1014,7 +1015,7 @@ async fn tail_reconnect_after_multi_record_batch_advances_start_and_limit() {
 
     let output = run_tsf_until_stdout_contains(
         server.api_url.clone(),
-        ["tail", "--seq", "0", "--limit", "10", read_link.as_str()],
+        ["tail", "--seq", "0", "--count", "10", read_link.as_str()],
         b"four\n",
         Duration::from_secs(5),
     )
@@ -1025,22 +1026,22 @@ async fn tail_reconnect_after_multi_record_batch_advances_start_and_limit() {
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].start, ReadStart::SeqNum(0));
-    assert_eq!(attempts[0].limit, Some(10));
+    assert_eq!(attempts[0].count, Some(10));
     // The three-record batch moves the resume position past its last sequence and decrements
-    // the remaining limit by the full batch length.
+    // the remaining count by the full batch length.
     assert_eq!(attempts[1].start, ReadStart::SeqNum(3));
-    assert_eq!(attempts[1].limit, Some(7));
+    assert_eq!(attempts[1].count, Some(7));
 }
 
 #[tokio::test]
-async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
+async fn bounded_sse_tail_finishes_at_clean_eof() {
     let server = FakeSseServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["tail", "--sse", "--limit", "1", read_link.as_str()],
+        ["tail", "--sse", "--count", "1", read_link.as_str()],
         None,
     )
     .await;
@@ -1048,33 +1049,31 @@ async fn sse_tail_reconnects_with_versioned_cursor_and_unchanged_query() {
     assert!(output.status.success(), "stderr={}", output.stderr);
     assert_eq!(output.stdout, "");
     let attempts = server.attempts();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].query, attempts[1].query);
+    assert_eq!(attempts.len(), 1);
     let query = attempts[0].query.as_deref().expect("SSE query");
     let query = Url::parse(&format!("http://localhost/?{query}")).expect("parse captured query");
     assert_eq!(
         query.query_pairs().collect::<HashMap<_, _>>(),
         HashMap::from([
             ("tail_offset".into(), "0".into()),
-            ("limit".into(), "1".into()),
+            ("count".into(), "1".into()),
         ])
     );
     assert_eq!(attempts[0].last_event_id, None);
-    assert_eq!(attempts[1].last_event_id.as_deref(), Some("v1,0,0"));
     assert!(attempts.iter().all(|attempt| {
         attempt.authorization.as_deref() == Some(&format!("Bearer {TEST_STREAM_LINK}"))
     }));
 }
 
 #[tokio::test]
-async fn sse_tail_reconnects_after_multi_record_batch_with_advanced_cursor() {
+async fn bounded_sse_tail_finishes_after_a_multi_record_batch() {
     let server = FakeSseServer::start_with_mode(FakeSseMode::BatchThenClose).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["tail", "--sse", "--limit", "10", read_link.as_str()],
+        ["tail", "--sse", "--count", "10", read_link.as_str()],
         None,
     )
     .await;
@@ -1082,46 +1081,50 @@ async fn sse_tail_reconnects_after_multi_record_batch_with_advanced_cursor() {
     assert!(output.status.success(), "stderr={}", output.stderr);
     assert_eq!(output.stdout, "one\ntwo\nthree\n");
     let attempts = server.attempts();
-    assert_eq!(attempts.len(), 2);
-    // The resume cursor carries the sequence past the batch's last record and its consumed
-    // count; the query (including the original limit) is unchanged.
+    assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].last_event_id, None);
-    assert_eq!(attempts[1].last_event_id.as_deref(), Some("v1,3,3"));
-    assert_eq!(attempts[0].query, attempts[1].query);
-    let query = attempts[1].query.as_deref().expect("SSE query");
+    let query = attempts[0].query.as_deref().expect("SSE query");
     let query = Url::parse(&format!("http://localhost/?{query}")).expect("parse captured query");
     assert_eq!(
         query.query_pairs().collect::<HashMap<_, _>>(),
         HashMap::from([
             ("tail_offset".into(), "0".into()),
-            ("limit".into(), "10".into()),
+            ("count".into(), "10".into()),
         ])
     );
 }
 
 #[tokio::test]
-async fn sse_snapshot_receives_an_explicit_empty_boundary() {
+async fn sse_wait_zero_finishes_at_the_current_tail() {
     let server = FakeSseServer::start().await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut options = ReadStreamOptions::new(stream_id);
+    let mut options = ReadOptions::new(stream_id);
     options.start = Some(ReadStart::SeqNum(0));
-    options.snapshot = true;
+    options.wait_seconds = Some(0);
     options.link_secret = Some(canonical_test_link_secret());
 
-    let session = TsfClient::with_api_origin(server.api_url.clone())
+    let mut session = TsfClient::with_api_origin(server.api_url.clone())
         .expect("valid API origin")
         .connect_sse_reader(options)
         .await
-        .expect("snapshot SSE session");
+        .expect("finite SSE session");
 
-    assert_eq!(
-        session.snapshot_boundary(),
-        Some(SnapshotBoundary {
-            end_seq_num: 0,
-            last_timestamp_ms: 0,
-        })
+    assert!(
+        session
+            .next_batch()
+            .await
+            .expect("read current tail")
+            .is_none()
+    );
+    let attempts = server.attempts();
+    assert_eq!(attempts.len(), 1);
+    assert!(
+        attempts[0]
+            .query
+            .as_deref()
+            .is_some_and(|query| query.split('&').any(|pair| pair == "wait=0"))
     );
 }
 
@@ -1184,7 +1187,7 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
         .parse::<StreamId>()
         .expect("stream id");
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let request = ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
+    let request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let batch = reader
@@ -1198,8 +1201,8 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     assert_eq!(record.data, b"default\n");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].start, ReadStart::TailOffset(80));
-    assert_eq!(attempts[1].start, ReadStart::TailOffset(80));
+    assert_eq!(attempts[0].start, ReadStart::TailOffset(0));
+    assert_eq!(attempts[1].start, ReadStart::TailOffset(0));
 }
 
 #[tokio::test]
@@ -1215,8 +1218,7 @@ async fn reader_restarts_retries_after_established_idle_connections() {
         max_backoff: Duration::ZERO,
     };
     let client = TsfClient::with_config(config).expect("valid client config");
-    let mut request =
-        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
+    let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1245,8 +1247,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
         max_backoff: Duration::ZERO,
     };
     let client = TsfClient::with_config(config).expect("valid client config");
-    let mut request =
-        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
+    let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1274,8 +1275,7 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
         .parse::<StreamId>()
         .expect("stream id");
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let mut request =
-        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
+    let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::TailOffset(2));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1315,8 +1315,7 @@ async fn reader_reconnects_after_configured_idle_timeout() {
         max_backoff: Duration::ZERO,
     };
     let client = TsfClient::with_config(config).expect("valid client config");
-    let mut request =
-        ReadStreamOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
+    let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1333,7 +1332,7 @@ async fn reader_reconnects_after_configured_idle_timeout() {
 }
 
 #[tokio::test]
-async fn zero_limit_reads_complete_without_opening_a_socket() {
+async fn count_zero_reads_complete_without_opening_a_socket() {
     let server = FakeReadServer::start(FakeReadMode::Reconnect).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1342,7 +1341,7 @@ async fn zero_limit_reads_complete_without_opening_a_socket() {
 
     let replay = run_tsf_with_api_url(
         server.api_url.clone(),
-        ["replay", "--limit", "0", read_link.as_str()],
+        ["replay", "--count", "0", read_link.as_str()],
         None,
     )
     .await;
@@ -1462,8 +1461,8 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     assert_eq!(output.stderr, Vec::<u8>::new());
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].end_seq_num, None);
-    assert!(attempts[0].snapshot);
+    assert_eq!(attempts[0].until_timestamp_ms, None);
+    assert_eq!(attempts[0].wait_seconds, Some(0));
 }
 
 #[tokio::test]
@@ -2275,27 +2274,31 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
 async fn test_read_socket(
     State(state): State<Arc<TestApiState>>,
     Path(stream_id): Path<String>,
+    Query(query): Query<TestReadQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     ws.protocols([TSF_WEBSOCKET_PROTOCOL])
-        .on_upgrade(move |socket| test_read_flow(state, stream_id, socket))
+        .on_upgrade(move |socket| test_read_flow(state, stream_id, query, socket))
 }
 
-async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket: WebSocket) {
+async fn test_read_flow(
+    state: Arc<TestApiState>,
+    stream_id: String,
+    query: TestReadQuery,
+    mut socket: WebSocket,
+) {
     let Some(Ok(Message::Binary(opening))) = socket.recv().await else {
         return;
     };
     let Ok(ClientFrame::OpenRead {
         link_secret: Some(link_secret),
-        start,
-        limit,
-        end_seq_num,
-        snapshot,
-        ..
     }) = ClientFrame::decode_bytes(opening)
     else {
         return;
     };
+    let start = query.start();
+    let count = query.count;
+    let until_timestamp_ms = query.until;
     let (stream_metadata, caught_up, records) = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
@@ -2320,7 +2323,7 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
         (
             test_read_stream_metadata(stream),
             caught_up,
-            test_select_records(stream, start, limit, end_seq_num),
+            test_select_records(stream, start, count, until_timestamp_ms),
         )
     };
     send_server_frame(&mut socket, ServerFrame::Ready)
@@ -2329,17 +2332,6 @@ async fn test_read_flow(state: Arc<TestApiState>, stream_id: String, mut socket:
     send_server_frame(&mut socket, ServerFrame::StreamMetadata(stream_metadata))
         .await
         .expect("send stream metadata");
-    if snapshot {
-        send_server_frame(
-            &mut socket,
-            ServerFrame::SnapshotBoundary(SnapshotBoundary {
-                end_seq_num: caught_up.next_seq_num,
-                last_timestamp_ms: caught_up.last_timestamp_ms,
-            }),
-        )
-        .await
-        .expect("send snapshot boundary");
-    }
     if !records.is_empty() {
         send_server_frame(
             &mut socket,
@@ -2452,8 +2444,8 @@ fn test_error(status: StatusCode, code: &str, message: &str) -> Response {
 fn test_select_records(
     stream: &TestStream,
     start: ReadStart,
-    limit: Option<u64>,
-    end_seq_num: Option<u64>,
+    count: Option<u64>,
+    until_timestamp_ms: Option<u64>,
 ) -> Vec<TestRecord> {
     let mut records = stream.records.clone();
     match start {
@@ -2467,11 +2459,11 @@ fn test_select_records(
             records = records[start..].to_vec();
         }
     }
-    if let Some(end_seq_num) = end_seq_num {
-        records.retain(|record| record.seq_num < end_seq_num);
+    if let Some(until_timestamp_ms) = until_timestamp_ms {
+        records.retain(|record| record.timestamp_ms < until_timestamp_ms);
     }
-    if let Some(limit) = limit {
-        records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    if let Some(count) = count {
+        records.truncate(usize::try_from(count).unwrap_or(usize::MAX));
     }
     records
 }
@@ -3136,10 +3128,6 @@ async fn fake_sse_read(
     Path(stream_id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    let snapshot = request
-        .uri()
-        .query()
-        .is_some_and(|query| query.split('&').any(|pair| pair == "snapshot=true"));
     let attempt_count = {
         let mut attempts = state.attempts.lock().expect("SSE attempts lock");
         attempts.push(SseAttempt {
@@ -3160,12 +3148,7 @@ async fn fake_sse_read(
     if attempt_count > 1 {
         return StatusCode::NO_CONTENT.into_response();
     }
-    let snapshot_boundary = if snapshot {
-        "id: v1,0,0,0,0\nevent: snapshot_boundary\ndata: {\"end_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}\n\n"
-    } else {
-        ""
-    };
-    let cursor = if snapshot { "v1,0,0,0,0" } else { "v1,0,0" };
+    let cursor = "v1,0,0";
     let record = |seq_num: u64, value: &str| {
         format!(
             "{{\"seq_num\":\"{seq_num}\",\"timestamp_ms\":\"1781717406000\",\"writer_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"writer_seq_num\":\"{seq_num}\",\"part\":{{\"index\":0,\"is_final\":true}},\"format\":\"transcript\",\"data\":{{\"encoding\":\"utf8\",\"value\":\"{value}\"}}}}"
@@ -3173,7 +3156,7 @@ async fn fake_sse_read(
     };
     let events = match state.mode {
         FakeSseMode::CaughtUpThenClose => format!(
-            "{snapshot_boundary}id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
+            "id: {cursor}\nevent: caught_up\ndata: {{\"next_seq_num\":\"0\",\"last_timestamp_ms\":\"0\"}}\n\n"
         ),
         // A three-record batch with a resume cursor past its last sequence, then EOF: the
         // client must reconnect with this cursor.
@@ -3195,14 +3178,37 @@ async fn fake_sse_read(
         .into_response()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ReadAttempt {
     link_secret: String,
     start: ReadStart,
-    limit: Option<u64>,
-    end_seq_num: Option<u64>,
-    playback_rate_permille: Option<u64>,
-    snapshot: bool,
+    count: Option<u64>,
+    until_timestamp_ms: Option<u64>,
+    rate: Option<f64>,
+    wait_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct TestReadQuery {
+    seq_num: Option<u64>,
+    timestamp: Option<u64>,
+    tail_offset: Option<u64>,
+    count: Option<u64>,
+    until: Option<u64>,
+    rate: Option<f64>,
+    wait: Option<u32>,
+}
+
+impl TestReadQuery {
+    fn start(&self) -> ReadStart {
+        if let Some(value) = self.seq_num {
+            ReadStart::SeqNum(value)
+        } else if let Some(value) = self.timestamp {
+            ReadStart::TimestampMs(value)
+        } else {
+            ReadStart::TailOffset(self.tail_offset.unwrap_or(0))
+        }
+    }
 }
 
 struct FakeReadState {
@@ -3255,20 +3261,6 @@ impl FakeReadServer {
     }
 }
 
-const fn fake_read_next_seq_num(mode: FakeReadMode) -> u64 {
-    match mode {
-        FakeReadMode::Reconnect => 0,
-        FakeReadMode::ReconnectAfterBatch => 3,
-        FakeReadMode::ReconnectAfterEmptyCaughtUp => 7,
-        FakeReadMode::ReconnectBeforeFirstDefault => 100,
-        FakeReadMode::ReconnectTwiceThenRecord
-        | FakeReadMode::SlowReconnectForever
-        | FakeReadMode::SilentThenRecord => 0,
-        FakeReadMode::ReplayBinary => 2,
-        FakeReadMode::ReplaySplitRecord => 2,
-    }
-}
-
 fn fake_stream_metadata(stream_id: &str) -> StreamMetadata {
     StreamMetadata {
         stream_id: stream_id.parse().expect("fake stream ID"),
@@ -3282,36 +3274,42 @@ fn fake_stream_metadata(stream_id: &str) -> StreamMetadata {
 async fn fake_read_socket(
     State(state): State<Arc<FakeReadState>>,
     Path(stream_id): Path<String>,
+    Query(query): Query<TestReadQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     ws.protocols([TSF_WEBSOCKET_PROTOCOL])
-        .on_upgrade(move |socket| fake_read_flow(state, stream_id, socket))
+        .on_upgrade(move |socket| fake_read_flow(state, stream_id, query, socket))
 }
 
-async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket: WebSocket) {
+async fn fake_read_flow(
+    state: Arc<FakeReadState>,
+    stream_id: String,
+    query: TestReadQuery,
+    mut socket: WebSocket,
+) {
     let Some(Ok(Message::Binary(opening))) = socket.recv().await else {
         return;
     };
     let ClientFrame::OpenRead {
         link_secret: Some(link_secret),
-        start,
-        limit,
-        end_seq_num,
-        playback_rate_permille,
-        snapshot,
     } = ClientFrame::decode_bytes(opening).expect("open read")
     else {
         return;
     };
+    let start = query.start();
+    let count = query.count;
+    let until_timestamp_ms = query.until;
+    let rate = query.rate;
+    let wait_seconds = query.wait;
     let attempt_count = {
         let mut attempts = state.read_attempts.lock().expect("read attempts lock");
         attempts.push(ReadAttempt {
             link_secret: link_secret.expose_secret().to_owned(),
             start,
-            limit,
-            end_seq_num,
-            playback_rate_permille,
-            snapshot,
+            count,
+            until_timestamp_ms,
+            rate,
+            wait_seconds,
         });
         attempts.len()
     };
@@ -3324,17 +3322,6 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
     )
     .await
     .expect("send stream metadata");
-    if snapshot {
-        send_server_frame(
-            &mut socket,
-            ServerFrame::SnapshotBoundary(SnapshotBoundary {
-                end_seq_num: fake_read_next_seq_num(state.mode),
-                last_timestamp_ms: 1_781_717_406_000,
-            }),
-        )
-        .await
-        .expect("send snapshot boundary");
-    }
     match state.mode {
         FakeReadMode::Reconnect => {
             let first_seq_num = match start {
@@ -3351,7 +3338,7 @@ async fn fake_read_flow(state: Arc<FakeReadState>, stream_id: String, mut socket
         FakeReadMode::ReconnectAfterBatch => {
             if attempt_count == 1 {
                 // One frame carrying three records, then a retryable drop: the client must
-                // resume after the batch's last sequence with the limit reduced by three.
+                // resume after the batch's last sequence with the count reduced by three.
                 send_server_frame(
                     &mut socket,
                     ServerFrame::ReadBatch(

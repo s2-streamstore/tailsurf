@@ -6,14 +6,10 @@ use tailsurf::{
     ClientWriterId, WriterId,
     protocol::{
         rest::{StreamMetadata, Visibility},
-        ws::{
-            ReadStart,
-            frame::{
-                AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_BATCH_RECORDS,
-                MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, OwnedReadRecord,
-                PartHeader, ReadBatch, RecordFormat, ServerFrame, SnapshotBoundary,
-                TSF_WEBSOCKET_PROTOCOL,
-            },
+        ws::frame::{
+            AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_BATCH_RECORDS,
+            MAX_BATCH_PAYLOAD_BYTES, MAX_READ_BATCH_RECORDS, MAX_RECORD_BYTES, OwnedReadRecord,
+            PartHeader, ReadBatch, RecordFormat, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
         },
     },
 };
@@ -42,13 +38,6 @@ struct FrameFixture<T> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientFixture {
     OpenRead {
-        start_type: String,
-        start_value: String,
-        limit: Option<String>,
-        end_seq_num: Option<String>,
-        playback_rate_permille: Option<String>,
-        #[serde(default)]
-        snapshot: bool,
         link_secret: Option<String>,
     },
     OpenWrite {
@@ -86,10 +75,6 @@ enum ServerFixture {
     Heartbeat,
     CaughtUp {
         next_seq_num: String,
-        last_timestamp_ms: String,
-    },
-    SnapshotBoundary {
-        end_seq_num: String,
         last_timestamp_ms: String,
     },
     StreamMetadata {
@@ -156,22 +141,9 @@ fn fixtures() -> Fixtures {
 
 fn client_frame(fixture: ClientFixture) -> ClientFrame {
     match fixture {
-        ClientFixture::OpenRead {
-            start_type,
-            start_value,
-            limit,
-            end_seq_num,
-            playback_rate_permille,
-            snapshot,
-            link_secret,
-        } => ClientFrame::OpenRead {
+        ClientFixture::OpenRead { link_secret } => ClientFrame::OpenRead {
             link_secret: link_secret
                 .map(|secret| secret.parse().expect("fixture link secret is canonical")),
-            start: read_start(&start_type, parse_u64(&start_value)),
-            limit: limit.as_deref().map(parse_u64),
-            end_seq_num: end_seq_num.as_deref().map(parse_u64),
-            playback_rate_permille: playback_rate_permille.as_deref().map(parse_u64),
-            snapshot,
         },
         ClientFixture::OpenWrite {
             client_writer_id_hex,
@@ -195,15 +167,6 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
             format: parse_format(format),
             data: Bytes::from(decode_hex(&data_hex)),
         }]),
-    }
-}
-
-fn read_start(kind: &str, value: u64) -> ReadStart {
-    match kind {
-        "seq_num" => ReadStart::SeqNum(value),
-        "timestamp_ms" => ReadStart::TimestampMs(value),
-        "tail_offset" => ReadStart::TailOffset(value),
-        other => panic!("unknown fixture read start {other}"),
     }
 }
 
@@ -247,13 +210,6 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             last_timestamp_ms,
         } => ServerFrame::CaughtUp(CaughtUpPosition {
             next_seq_num: parse_u64(&next_seq_num),
-            last_timestamp_ms: parse_u64(&last_timestamp_ms),
-        }),
-        ServerFixture::SnapshotBoundary {
-            end_seq_num,
-            last_timestamp_ms,
-        } => ServerFrame::SnapshotBoundary(SnapshotBoundary {
-            end_seq_num: parse_u64(&end_seq_num),
             last_timestamp_ms: parse_u64(&last_timestamp_ms),
         }),
         ServerFixture::StreamMetadata {

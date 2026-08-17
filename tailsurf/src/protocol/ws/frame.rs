@@ -7,13 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ClientWriterId, LinkSecret, WriterId,
-    protocol::{
-        rest::StreamMetadata,
-        ws::{
-            MAX_PLAYBACK_RATE_PERMILLE, MAX_READ_SELECTOR_VALUE, MIN_PLAYBACK_RATE_PERMILLE,
-            ReadStart,
-        },
-    },
+    protocol::{MAX_SAFE_INTEGER_U64, rest::StreamMetadata},
 };
 /// WebSocket subprotocol offered and selected for TSF v1 connections.
 pub const TSF_WEBSOCKET_PROTOCOL: &str = "tsf.v1";
@@ -54,22 +48,10 @@ impl TryFrom<u8> for ClientOp {
 }
 
 const OPEN_READ_LINK_SECRET: u8 = 0x01;
-const OPEN_READ_LIMIT: u8 = 0x02;
-const OPEN_READ_END_SEQ_NUM: u8 = 0x04;
-const OPEN_READ_PLAYBACK_RATE: u8 = 0x08;
-const OPEN_READ_SNAPSHOT: u8 = 0x10;
-const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET
-    | OPEN_READ_LIMIT
-    | OPEN_READ_END_SEQ_NUM
-    | OPEN_READ_PLAYBACK_RATE
-    | OPEN_READ_SNAPSHOT;
+const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET;
 
 const OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM: u8 = 0x01;
 const OPEN_WRITE_FLAGS: u8 = OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM;
-
-const READ_START_SEQ_NUM: u8 = 0x01;
-const READ_START_TIMESTAMP_MS: u8 = 0x02;
-const READ_START_TAIL_OFFSET: u8 = 0x03;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +62,6 @@ enum ServerOp {
     Heartbeat = 0x83,
     CaughtUp = 0x84,
     StreamMetadata = 0x85,
-    SnapshotBoundary = 0x86,
 }
 
 impl ServerOp {
@@ -100,7 +81,6 @@ impl TryFrom<u8> for ServerOp {
             value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
             value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
             value if value == Self::StreamMetadata.byte() => Ok(Self::StreamMetadata),
-            value if value == Self::SnapshotBoundary.byte() => Ok(Self::SnapshotBoundary),
             other => Err(FrameCodecError::UnknownOperation(other)),
         }
     }
@@ -451,32 +431,13 @@ pub struct CaughtUpPosition {
     pub last_timestamp_ms: u64,
 }
 
-/// Fixed exclusive ending position captured when a snapshot read opens.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SnapshotBoundary {
-    /// Exclusive end of the fixed snapshot.
-    pub end_seq_num: u64,
-    /// Timestamp of the last record. This is zero when `end_seq_num` is zero.
-    pub last_timestamp_ms: u64,
-}
-
 /// Frame sent from a reader or writer to the service.
 #[derive(Clone, Debug)]
 pub enum ClientFrame {
-    /// Opens a read connection with its complete request and optional authentication.
+    /// Opens a read connection with optional authentication.
     OpenRead {
         /// Secret from a read-capable stream link for a private stream.
         link_secret: Option<LinkSecret>,
-        /// Initial absolute, timestamp, or tail-relative read position.
-        start: ReadStart,
-        /// Maximum number of physical records to deliver.
-        limit: Option<u64>,
-        /// Exclusive ending sequence number.
-        end_seq_num: Option<u64>,
-        /// Timestamp playback rate in thousandths.
-        playback_rate_permille: Option<u64>,
-        /// Whether the server captures a fixed ending position.
-        snapshot: bool,
     },
     /// Opens a write connection and establishes authorization and client writer identity.
     OpenWrite {
@@ -515,32 +476,17 @@ pub enum ServerFrame {
     CaughtUp(CaughtUpPosition),
     /// Supplies stream metadata from the read authorization result.
     StreamMetadata(StreamMetadata),
-    /// Supplies the fixed exclusive end for a snapshot read.
-    SnapshotBoundary(SnapshotBoundary),
 }
 
 impl ClientFrame {
     const APPEND_BODY_HEADER_LEN: usize = 8 + 4 + 1;
-    const OPEN_READ_FIXED_LEN: usize = 1 + 1 + 1 + 8;
+    const OPEN_READ_FIXED_LEN: usize = 1 + 1;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
-            Self::OpenRead {
-                link_secret,
-                start,
-                limit,
-                end_seq_num,
-                playback_rate_permille,
-                snapshot,
-            } => {
-                validate_open_read(*start, *end_seq_num, *playback_rate_permille, *snapshot)?;
-                Ok(Self::OPEN_READ_FIXED_LEN
-                    + limit.map_or(0, |_| 8)
-                    + end_seq_num.map_or(0, |_| 8)
-                    + playback_rate_permille.map_or(0, |_| 8)
-                    + link_secret.as_ref().map_or(0, |_| LinkSecret::ENCODED_LEN))
-            }
+            Self::OpenRead { link_secret } => Ok(Self::OPEN_READ_FIXED_LEN
+                + link_secret.as_ref().map_or(0, |_| LinkSecret::ENCODED_LEN)),
             Self::OpenWrite {
                 expected_next_seq_num,
                 ..
@@ -584,33 +530,10 @@ impl ClientFrame {
     /// Writes this frame into `output`, which must have at least [`Self::encoded_len`] capacity.
     fn encode_into(&self, output: &mut BytesMut) {
         match self {
-            Self::OpenRead {
-                link_secret,
-                start,
-                limit,
-                end_seq_num,
-                playback_rate_permille,
-                snapshot,
-            } => {
+            Self::OpenRead { link_secret } => {
                 output.put_u8(ClientOp::OpenRead.byte());
-                let flags = link_secret.as_ref().map_or(0, |_| OPEN_READ_LINK_SECRET)
-                    | limit.map_or(0, |_| OPEN_READ_LIMIT)
-                    | end_seq_num.map_or(0, |_| OPEN_READ_END_SEQ_NUM)
-                    | playback_rate_permille.map_or(0, |_| OPEN_READ_PLAYBACK_RATE)
-                    | if *snapshot { OPEN_READ_SNAPSHOT } else { 0 };
+                let flags = link_secret.as_ref().map_or(0, |_| OPEN_READ_LINK_SECRET);
                 output.put_u8(flags);
-                let (tag, value) = read_start_wire(*start);
-                output.put_u8(tag);
-                output.put_u64(value);
-                if let Some(value) = limit {
-                    output.put_u64(*value);
-                }
-                if let Some(value) = end_seq_num {
-                    output.put_u64(*value);
-                }
-                if let Some(value) = playback_rate_permille {
-                    output.put_u64(*value);
-                }
                 if let Some(secret) = link_secret {
                     output.put_slice(secret.expose_secret().as_bytes());
                 }
@@ -729,11 +652,6 @@ impl ServerFrame {
             Self::StreamMetadata(_) => {
                 unreachable!("StreamMetadata is serialized directly by encode()")
             }
-            Self::SnapshotBoundary(boundary) => {
-                output.put_u8(ServerOp::SnapshotBoundary.byte());
-                output.put_u64(boundary.end_seq_num);
-                output.put_u64(boundary.last_timestamp_ms);
-            }
         }
     }
 
@@ -835,15 +753,6 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
             flags & !OPEN_READ_FLAGS,
         ));
     }
-    let (&start_tag, body) = body
-        .split_first()
-        .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
-    let (start_value, mut body) = read_u64(body)?;
-    let start = read_start_from_wire(start_tag, start_value)?;
-    let limit = read_flagged_u64(flags, OPEN_READ_LIMIT, &mut body)?;
-    let end_seq_num = read_flagged_u64(flags, OPEN_READ_END_SEQ_NUM, &mut body)?;
-    let playback_rate_permille = read_flagged_u64(flags, OPEN_READ_PLAYBACK_RATE, &mut body)?;
-    let snapshot = flags & OPEN_READ_SNAPSHOT != 0;
     let link_secret = if flags & OPEN_READ_LINK_SECRET == 0 {
         ensure_empty(op, body)?;
         None
@@ -857,65 +766,7 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
         ensure_empty(op, trailing)?;
         Some(parse_link_secret(utf8_tail(secret)?)?)
     };
-    validate_open_read(start, end_seq_num, playback_rate_permille, snapshot)?;
-    Ok(ClientFrame::OpenRead {
-        link_secret,
-        start,
-        limit,
-        end_seq_num,
-        playback_rate_permille,
-        snapshot,
-    })
-}
-
-fn read_flagged_u64(flags: u8, bit: u8, body: &mut &[u8]) -> Result<Option<u64>, FrameCodecError> {
-    if flags & bit == 0 {
-        return Ok(None);
-    }
-    let (value, tail) = read_u64(body)?;
-    *body = tail;
-    Ok(Some(value))
-}
-
-pub(crate) fn validate_open_read(
-    start: ReadStart,
-    end_seq_num: Option<u64>,
-    playback_rate_permille: Option<u64>,
-    snapshot: bool,
-) -> Result<(), FrameCodecError> {
-    let (_, selector) = read_start_wire(start);
-    if selector > MAX_READ_SELECTOR_VALUE {
-        return Err(FrameCodecError::ReadSelectorOutOfRange(selector));
-    }
-    if snapshot && end_seq_num.is_some() {
-        return Err(FrameCodecError::SnapshotWithEnd);
-    }
-    if let Some(rate) = playback_rate_permille {
-        if !(MIN_PLAYBACK_RATE_PERMILLE..=MAX_PLAYBACK_RATE_PERMILLE).contains(&rate) {
-            return Err(FrameCodecError::PlaybackRateOutOfRange(rate));
-        }
-        if end_seq_num.is_none() && !snapshot {
-            return Err(FrameCodecError::PlaybackRequiresEnd);
-        }
-    }
-    Ok(())
-}
-
-const fn read_start_wire(start: ReadStart) -> (u8, u64) {
-    match start {
-        ReadStart::SeqNum(value) => (READ_START_SEQ_NUM, value),
-        ReadStart::TimestampMs(value) => (READ_START_TIMESTAMP_MS, value),
-        ReadStart::TailOffset(value) => (READ_START_TAIL_OFFSET, value),
-    }
-}
-
-fn read_start_from_wire(tag: u8, value: u64) -> Result<ReadStart, FrameCodecError> {
-    match tag {
-        READ_START_SEQ_NUM => Ok(ReadStart::SeqNum(value)),
-        READ_START_TIMESTAMP_MS => Ok(ReadStart::TimestampMs(value)),
-        READ_START_TAIL_OFFSET => Ok(ReadStart::TailOffset(value)),
-        other => Err(FrameCodecError::UnknownReadStartTag(other)),
-    }
+    Ok(ClientFrame::OpenRead { link_secret })
 }
 
 fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
@@ -990,14 +841,6 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
         ServerOp::StreamMetadata => serde_json::from_slice(body)
             .map(ServerFrame::StreamMetadata)
             .map_err(FrameCodecError::InvalidStreamMetadata),
-        ServerOp::SnapshotBoundary => {
-            decode_position(op_byte, body, |end_seq_num, last_timestamp_ms| {
-                ServerFrame::SnapshotBoundary(SnapshotBoundary {
-                    end_seq_num,
-                    last_timestamp_ms,
-                })
-            })
-        }
     }
 }
 
@@ -1035,7 +878,7 @@ fn validate_writer_seq_num(value: u64) -> Result<(), FrameCodecError> {
 }
 
 fn validate_expected_next_seq_num(value: u64) -> Result<(), FrameCodecError> {
-    if value > MAX_READ_SELECTOR_VALUE {
+    if value > MAX_SAFE_INTEGER_U64 {
         Err(FrameCodecError::ExpectedNextSeqNumOutOfRange(value))
     } else {
         Ok(())
@@ -1216,26 +1059,9 @@ pub enum FrameCodecError {
     /// An `OpenWrite` flag bit is not defined by TSF v1.
     #[error("OpenWrite has unknown flags 0x{0:02x}")]
     UnknownOpenWriteFlags(u8),
-    /// An `OpenRead` selector tag is not defined by TSF v1.
-    #[error("OpenRead has unknown start tag 0x{0:02x}")]
-    UnknownReadStartTag(u8),
-    /// A selector exceeds the exact integer range of the current data adapter.
-    #[error("read selector {0} exceeds {MAX_READ_SELECTOR_VALUE}")]
-    ReadSelectorOutOfRange(u64),
     /// A write precondition exceeds the exact integer range of the current data adapter.
-    #[error("expected next sequence {0} exceeds {MAX_READ_SELECTOR_VALUE}")]
+    #[error("expected next sequence {0} exceeds {MAX_SAFE_INTEGER_U64}")]
     ExpectedNextSeqNumOutOfRange(u64),
-    /// Timestamp playback was outside the accepted rate range.
-    #[error(
-        "playback rate {0} must be between {MIN_PLAYBACK_RATE_PERMILLE} and {MAX_PLAYBACK_RATE_PERMILLE} permille"
-    )]
-    PlaybackRateOutOfRange(u64),
-    /// A snapshot request also supplied an explicit ending sequence.
-    #[error("snapshot and end_seq_num are mutually exclusive")]
-    SnapshotWithEnd,
-    /// Timestamp playback did not include a fixed ending sequence.
-    #[error("playback rate requires an exclusive end_seq_num sequence or snapshot")]
-    PlaybackRequiresEnd,
     /// An opening credential is not canonical 24-byte unpadded base64url.
     #[error("opening link secret must be canonical 32-character unpadded base64url")]
     InvalidLinkSecret,
@@ -1483,19 +1309,7 @@ mod tests {
 
     #[test]
     fn frame_decoders_reject_invalid_utf8_and_trailing_bytes() {
-        let mut invalid_utf8 = vec![
-            ClientOp::OpenRead.byte(),
-            OPEN_READ_LINK_SECRET,
-            READ_START_SEQ_NUM,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
+        let mut invalid_utf8 = vec![ClientOp::OpenRead.byte(), OPEN_READ_LINK_SECRET];
         invalid_utf8.extend_from_slice(&[b'A'; LinkSecret::ENCODED_LEN]);
         *invalid_utf8.last_mut().expect("secret byte") = 0xff;
         assert!(matches!(
@@ -1528,78 +1342,20 @@ mod tests {
     }
 
     #[test]
-    fn open_read_strictly_validates_tags_flags_fields_and_bounds() {
-        let valid = ClientFrame::OpenRead {
-            link_secret: None,
-            start: ReadStart::TailOffset(80),
-            limit: None,
-            end_seq_num: None,
-            playback_rate_permille: None,
-            snapshot: false,
-        }
-        .encode()
-        .expect("valid OpenRead");
+    fn open_read_strictly_validates_flags_credentials_and_lengths() {
+        let valid = ClientFrame::OpenRead { link_secret: None }
+            .encode()
+            .expect("valid OpenRead");
         assert_eq!(valid.len(), ClientFrame::OPEN_READ_FIXED_LEN);
 
         let mut unknown_flags = valid.to_vec();
-        unknown_flags[1] = 0x20;
+        unknown_flags[1] = 0x02;
         assert!(matches!(
             ClientFrame::decode(&unknown_flags),
-            Err(FrameCodecError::UnknownOpenReadFlags(0x20))
+            Err(FrameCodecError::UnknownOpenReadFlags(0x02))
         ));
 
-        let mut unknown_tag = valid.to_vec();
-        unknown_tag[2] = 0xff;
-        assert!(matches!(
-            ClientFrame::decode(&unknown_tag),
-            Err(FrameCodecError::UnknownReadStartTag(0xff))
-        ));
-
-        let mut oversized_selector = valid.to_vec();
-        oversized_selector[3..11].copy_from_slice(&(MAX_READ_SELECTOR_VALUE + 1).to_be_bytes());
-        assert!(matches!(
-            ClientFrame::decode(&oversized_selector),
-            Err(FrameCodecError::ReadSelectorOutOfRange(value))
-                if value == MAX_READ_SELECTOR_VALUE + 1
-        ));
-
-        for (limit, end_seq_num) in [(Some(u64::MAX), None), (None, Some(u64::MAX))] {
-            let frame = ClientFrame::OpenRead {
-                link_secret: None,
-                start: ReadStart::SeqNum(0),
-                limit,
-                end_seq_num,
-                playback_rate_permille: None,
-                snapshot: false,
-            };
-            let encoded = frame.encode().expect("OpenRead with u64 bound");
-            let ClientFrame::OpenRead {
-                limit: decoded_limit,
-                end_seq_num: decoded_end_seq_num,
-                ..
-            } = ClientFrame::decode(&encoded).expect("decode OpenRead with u64 bound")
-            else {
-                panic!("decoded a different client frame");
-            };
-            assert_eq!(decoded_limit, limit);
-            assert_eq!(decoded_end_seq_num, end_seq_num);
-        }
-
-        let empty_secret = [
-            ClientOp::OpenRead.byte(),
-            OPEN_READ_LINK_SECRET,
-            READ_START_SEQ_NUM,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
+        let empty_secret = [ClientOp::OpenRead.byte(), OPEN_READ_LINK_SECRET];
         assert!(matches!(
             ClientFrame::decode(&empty_secret),
             Err(FrameCodecError::TruncatedFrame { .. })
@@ -1620,30 +1376,6 @@ mod tests {
         assert!(matches!(
             ClientFrame::decode(&trailing),
             Err(FrameCodecError::TrailingBytes { count: 1, .. })
-        ));
-        assert!(matches!(
-            ClientFrame::OpenRead {
-                link_secret: None,
-                start: ReadStart::SeqNum(0),
-                limit: None,
-                end_seq_num: None,
-                playback_rate_permille: Some(1_000),
-                snapshot: false,
-            }
-            .encode(),
-            Err(FrameCodecError::PlaybackRequiresEnd)
-        ));
-        assert!(matches!(
-            ClientFrame::OpenRead {
-                link_secret: None,
-                start: ReadStart::SeqNum(0),
-                limit: None,
-                end_seq_num: Some(1),
-                playback_rate_permille: Some(MAX_PLAYBACK_RATE_PERMILLE + 1),
-                snapshot: false,
-            }
-            .encode(),
-            Err(FrameCodecError::PlaybackRateOutOfRange(_))
         ));
     }
 
@@ -1671,11 +1403,11 @@ mod tests {
             ClientFrame::OpenWrite {
                 client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
                 link_secret: "A".repeat(LinkSecret::ENCODED_LEN).parse().expect("canonical secret"),
-                expected_next_seq_num: Some(MAX_READ_SELECTOR_VALUE + 1),
+                expected_next_seq_num: Some(MAX_SAFE_INTEGER_U64 + 1),
             }
             .encode(),
             Err(FrameCodecError::ExpectedNextSeqNumOutOfRange(value))
-                if value == MAX_READ_SELECTOR_VALUE + 1
+                if value == MAX_SAFE_INTEGER_U64 + 1
         ));
     }
 

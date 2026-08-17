@@ -59,8 +59,6 @@
     ],
     "future_field": true
   },
-  "sse_resume_cursor": "v1,2,2,2,1786579200000",
-  "sse_snapshot_cursor": "v1,0,0,2,1786579200000",
-  "sse_snapshot_boundary": { "end_seq_num": "2", "last_timestamp_ms": "1786579200000", "future_field": true },
+  "sse_resume_cursor": "v1,2,2",
   "sse_caught_up": { "next_seq_num": "8", "last_timestamp_ms": "1786579200000", "future_field": true }
 }
