@@ -6,7 +6,7 @@ use crate::{LinkPermissions, LinkSecret, StreamId};
 
 /// Default origin for Tailsurf stream links.
 pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";
-/// Encoded length of a 256-bit stream link.
+/// Encoded length of a 24-byte stream link credential.
 pub const LINK_SECRET_ENCODED_LENGTH: usize = LinkSecret::ENCODED_LEN;
 /// Declared permission and secret value decoded from a stream link fragment.
 #[derive(Clone, Debug)]
@@ -154,8 +154,8 @@ pub enum StreamLinkError {
     /// The fragment key is not a valid permission string.
     #[error("stream URL fragment has invalid permissions")]
     InvalidPermissions(#[from] crate::PermissionsError),
-    /// The fragment link is not canonical 256-bit unpadded base64url.
-    #[error("stream link secret must be canonical 43-character unpadded base64url")]
+    /// The fragment link is not canonical 24-byte unpadded base64url.
+    #[error("stream link secret must be canonical 32-character unpadded base64url")]
     InvalidLinkSecret,
     /// More than one link parameter appears in the fragment.
     #[error("stream URL fragment contains multiple links")]
@@ -167,7 +167,7 @@ mod tests {
     use super::*;
 
     const STREAM_ID: &str = "0123456789abcdefghjkmnpqrstvwxyz";
-    const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     #[test]
     fn parses_stream_link() {

@@ -72,7 +72,7 @@ pub struct CreateStreamRequest {
     /// Requested lifetime in seconds, or the service default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in_seconds: Option<u64>,
-    /// Prepared initial links. At least one must be an owner. At most
+    /// Requested initial links. At least one must be an owner. At most
     /// [`MAX_INITIAL_STREAM_LINKS`] are allowed.
     pub links: Vec<InitialStreamLink>,
 }
@@ -98,21 +98,14 @@ pub struct InitialStreamLink {
     pub link_id: LinkId,
     /// Permissions carried by the link.
     pub permissions: LinkPermissions,
-    /// Client-generated secret retained with this prepared request.
-    #[serde(
-        serialize_with = "crate::ids::serialize_link_secret",
-        deserialize_with = "deserialize_link_secret"
-    )]
-    pub secret: LinkSecret,
 }
 
 impl InitialStreamLink {
-    /// Creates one initial link with an independent random secret.
+    /// Creates one initial link request.
     pub fn new(link_id: LinkId, permissions: LinkPermissions) -> Self {
         Self {
             link_id,
             permissions,
-            secret: LinkSecret::new_random(),
         }
     }
 }
@@ -157,9 +150,6 @@ pub struct CreateLinkInput {
     /// Client-generated stable link identifier carried in the request path.
     #[serde(skip_serializing)]
     pub link_id: LinkId,
-    /// Client-generated secret. The same request can be retried safely.
-    #[serde(serialize_with = "crate::ids::serialize_link_secret")]
-    pub secret: LinkSecret,
     /// Permissions carried by the requested link.
     pub permissions: LinkPermissions,
     /// Optional RFC 3339 expiration timestamp.
@@ -168,11 +158,10 @@ pub struct CreateLinkInput {
 }
 
 impl CreateLinkInput {
-    /// Creates retry-safe link material.
+    /// Creates a link request.
     pub fn new(link_id: LinkId, permissions: LinkPermissions, expires_at: Option<String>) -> Self {
         Self {
             link_id,
-            secret: LinkSecret::new_random(),
             permissions,
             expires_at,
         }
@@ -707,7 +696,7 @@ mod tests {
         assert_eq!(value["visibility"], "private");
         assert_eq!(value["links"][0]["link_id"], "owner");
         assert_eq!(value["links"][0]["permissions"], "o");
-        assert!(value["links"][0]["secret"].is_string());
+        assert!(value["links"][0].get("secret").is_none());
     }
 
     #[test]
@@ -736,7 +725,7 @@ mod tests {
         let link = serde_json::to_value(link).expect("serialize link request");
         assert_eq!(link["permissions"], "r");
         assert!(link.get("link_id").is_none());
-        assert!(link["secret"].is_string());
+        assert!(link.get("secret").is_none());
         assert_eq!(
             serde_json::to_value(UpdateStreamRequest::default()).expect("serialize update request"),
             json!({})

@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::{
     collections::HashMap,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,14 +24,13 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    AppendRecord, ClientWriterId, CreateStreamIdempotencyKey, LinkId, LinkPermissions, LinkSecret,
-    RetryPolicy, StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError,
-    TsfWriterConfig, WriterId,
+    AppendRecord, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret, RetryPolicy,
+    StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
     protocol::{
         rest::{
-            CreateStreamRequest, CreateStreamResponse, ListLinksResponse, StreamLinkCredential,
-            StreamLinkStatus, StreamLinkSummary, StreamMetadata, StreamTitleUpdate,
-            UpdateStreamRequest, Visibility,
+            CreateLinkInput, CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
+            StreamLinkCredential, StreamLinkStatus, StreamLinkSummary, StreamMetadata,
+            StreamTitleUpdate, UpdateStreamRequest, Visibility,
         },
         ws::{
             ReadStart, ReadStreamOptions, WriteStreamOptions,
@@ -53,8 +53,8 @@ use tokio::{
 use url::Url;
 
 const FREE_EXPIRY_LIMIT_MESSAGE: &str = "Free streams can expire at most 10 days from now.";
-const TEST_STREAM_LINK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const UNKNOWN_STREAM_LINK: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
+const TEST_STREAM_LINK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const UNKNOWN_STREAM_LINK: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
 fn canonical_test_link_secret() -> LinkSecret {
     TEST_STREAM_LINK
@@ -77,7 +77,8 @@ fn update_refuses_an_unmanaged_executable() {
 
 #[test]
 fn renew_rejects_an_overflowing_expiry() {
-    const OWNER_LINK: &str = "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#o=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const OWNER_LINK: &str =
+        "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#o=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     let renewed = Command::new(env!("CARGO_BIN_EXE_tsf"))
         .args(["renew", OWNER_LINK, "18446744073709551615s"])
@@ -247,10 +248,12 @@ async fn new_retries_with_one_canonical_idempotency_key() {
 async fn create_stream_recovers_a_committed_truncated_response() {
     let server = TestServer::start().await;
     server.fail_next_create_body();
-    let key = CreateStreamIdempotencyKey::new_random();
+    let key = IdempotencyKey::new_random();
     let exposed_key = key.expose_secret().to_owned();
     let request = CreateStreamRequest::default();
-    let expected_owner_secret = request.links[0].secret.expose_secret().to_owned();
+    let expected_owner_secret = test_minted_link_secret(&request.links[0].link_id)
+        .expose_secret()
+        .to_owned();
 
     let created = TsfClient::with_api_origin(server.api_url.clone())
         .expect("valid API origin")
@@ -271,6 +274,36 @@ async fn create_stream_recovers_a_committed_truncated_response() {
             .all(|observed| observed.as_deref() == Some(exposed_key.as_str()))
     );
     assert_eq!(server.stream_count(), 1);
+}
+
+#[tokio::test]
+async fn create_link_recovers_a_committed_truncated_response() {
+    let server = TestServer::start().await;
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let created = client
+        .create_stream(&CreateStreamRequest::default())
+        .await
+        .expect("create stream");
+    let owner = &created.links[0].secret;
+    let link_id: LinkId = "reader".parse().expect("link ID");
+    let request = CreateLinkInput::new(link_id.clone(), LinkPermissions::read(), None);
+    let key = IdempotencyKey::new_random();
+    let exposed_key = key.expose_secret().to_owned();
+    server.fail_next_link_create_body();
+
+    let link = client
+        .create_link_with_idempotency_key(&created.stream_id, &request, &key, owner)
+        .await
+        .expect("recover committed link creation");
+
+    assert_eq!(link.link_id, link_id);
+    assert_eq!(link.permissions, LinkPermissions::read());
+    assert_eq!(
+        link.secret.expose_secret(),
+        test_minted_link_secret(&link_id).expose_secret()
+    );
+    let observed_keys = server.link_create_idempotency_keys();
+    assert_eq!(observed_keys, vec![exposed_key.clone(), exposed_key]);
 }
 
 #[tokio::test]
@@ -1640,11 +1673,27 @@ impl TestServer {
             .expect("create body failure lock") += 1;
     }
 
+    fn fail_next_link_create_body(&self) {
+        *self
+            .state
+            .link_create_invalid_json_remaining
+            .lock()
+            .expect("link create body failure lock") += 1;
+    }
+
     fn create_idempotency_keys(&self) -> Vec<Option<String>> {
         self.state
             .create_idempotency_keys
             .lock()
             .expect("create idempotency keys lock")
+            .clone()
+    }
+
+    fn link_create_idempotency_keys(&self) -> Vec<String> {
+        self.state
+            .link_create_idempotency_keys
+            .lock()
+            .expect("link create idempotency keys lock")
             .clone()
     }
 
@@ -1715,6 +1764,8 @@ struct TestApiState {
     create_responses: Mutex<HashMap<String, CreateStreamResponse>>,
     create_idempotency_keys: Mutex<Vec<Option<String>>>,
     create_authorizations: Mutex<Vec<Option<String>>>,
+    link_create_invalid_json_remaining: Mutex<usize>,
+    link_create_idempotency_keys: Mutex<Vec<String>>,
     write_link_secrets: Mutex<Vec<String>>,
     write_expected_next_seq_nums: Mutex<Vec<Option<u64>>>,
     link_list_failures_remaining: Mutex<usize>,
@@ -1741,7 +1792,6 @@ struct TestLink {
 
 #[derive(serde::Deserialize)]
 struct TestCreateLinkInput {
-    secret: String,
     permissions: LinkPermissions,
 }
 
@@ -1827,7 +1877,10 @@ async fn test_create_stream(
     let requested_links = request.links;
     let links = requested_links
         .into_iter()
-        .map(|link| test_store_stream_link(link.link_id, link.secret, link.permissions))
+        .map(|link| {
+            let secret = test_minted_link_secret(&link.link_id);
+            test_store_stream_link(link.link_id, secret, link.permissions)
+        })
         .collect::<Vec<_>>();
     let response_links = links
         .iter()
@@ -1954,6 +2007,23 @@ async fn test_create_link(
     headers: HeaderMap,
     Json(request): Json<TestCreateLinkInput>,
 ) -> Response {
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.parse::<IdempotencyKey>().is_ok())
+        .map(str::to_owned)
+    else {
+        return test_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "canonical idempotency key required from SDK",
+        );
+    };
+    state
+        .link_create_idempotency_keys
+        .lock()
+        .expect("link create idempotency keys lock")
+        .push(idempotency_key);
     let mut streams = state.streams.lock().expect("streams lock");
     let Some(stream) = streams.get_mut(&stream_id) else {
         return test_error(StatusCode::NOT_FOUND, "not_found", "stream not found");
@@ -1964,17 +2034,42 @@ async fn test_create_link(
     if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
-    let link = test_store_stream_link(
-        link_id,
-        request.secret.parse().expect("canonical secret"),
-        request.permissions,
-    );
-    let response = StreamLinkCredential {
-        link_id: link.link_id.clone(),
-        permissions: link.permissions,
-        secret: link.secret.clone(),
+    let response = if let Some(link) = stream.links.iter().find(|link| link.link_id == link_id) {
+        if link.permissions != request.permissions {
+            return test_error(
+                StatusCode::CONFLICT,
+                "conflict",
+                "link already exists with different permissions",
+            );
+        }
+        StreamLinkCredential {
+            link_id: link.link_id.clone(),
+            permissions: link.permissions,
+            secret: link.secret.clone(),
+        }
+    } else {
+        let link = test_store_stream_link(
+            link_id.clone(),
+            test_minted_link_secret(&link_id),
+            request.permissions,
+        );
+        let response = StreamLinkCredential {
+            link_id: link.link_id.clone(),
+            permissions: link.permissions,
+            secret: link.secret.clone(),
+        };
+        stream.links.push(link);
+        response
     };
-    stream.links.push(link);
+    drop(streams);
+    let mut invalid_json = state
+        .link_create_invalid_json_remaining
+        .lock()
+        .expect("link create body failure lock");
+    if *invalid_json > 0 {
+        *invalid_json -= 1;
+        return (StatusCode::OK, [("content-type", "application/json")], "{").into_response();
+    }
     Json(response).into_response()
 }
 
@@ -2289,6 +2384,15 @@ fn test_store_stream_link(
         secret,
         active: true,
     }
+}
+
+fn test_minted_link_secret(link_id: &LinkId) -> LinkSecret {
+    let mut hasher = DefaultHasher::new();
+    link_id.hash(&mut hasher);
+    let digest = hasher.finish();
+    format!("{digest:016x}{digest:016x}")
+        .parse()
+        .expect("canonical test link secret")
 }
 
 fn test_get_stream_response(stream: &TestStream) -> StreamMetadata {
