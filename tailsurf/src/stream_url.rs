@@ -130,9 +130,7 @@ fn parse_fragment(
     }
     let mut link = None;
     let mut anchor = None;
-    let mut found_parameter = false;
     for (key, value) in form_urlencoded::parse(fragment.as_bytes()) {
-        found_parameter = true;
         if key == "at" {
             if anchor.is_some() {
                 return Err(StreamLinkError::MultipleAnchors);
@@ -161,10 +159,6 @@ fn parse_fragment(
             declared_permissions,
             secret,
         });
-    }
-
-    if !found_parameter {
-        return Err(StreamLinkError::InvalidFragment);
     }
 
     Ok((link, anchor))

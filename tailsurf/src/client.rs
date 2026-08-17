@@ -658,17 +658,17 @@ impl TsfClient {
         options: ReadOptions,
     ) -> Result<TsfSseReadSession, TsfClientError> {
         validate_read_options(&options)?;
-        let request_options = options.clone();
-        let connection = self
-            .open_sse_connection(&request_options, None)
-            .await?
-            .ok_or(TsfClientError::InvalidSse(
-                "initial read completed without stream_metadata",
-            ))?;
+        let request = self.sse_read_request(&options);
+        let connection =
+            self.open_sse_connection(&request, None)
+                .await?
+                .ok_or(TsfClientError::InvalidSse(
+                    "initial read completed without stream_metadata",
+                ))?;
         Ok(TsfSseReadSession {
             client: self.clone(),
             options,
-            request_options,
+            request,
             body: connection.body,
             parser: connection.parser,
             stream_metadata: connection.stream_metadata,
@@ -679,9 +679,22 @@ impl TsfClient {
         })
     }
 
+    fn sse_read_request(&self, options: &ReadOptions) -> SseReadRequest {
+        let mut url = self.rest_url(format_args!("/streams/{}/records", options.stream_id));
+        append_read_query(&mut url, options);
+        let finite = options.stop.is_some_and(|stop| {
+            stop.count.is_some() || stop.until_timestamp_ms.is_some() || stop.wait_seconds.is_some()
+        });
+        SseReadRequest {
+            url,
+            link_secret: options.link_secret.clone(),
+            finite,
+        }
+    }
+
     async fn open_sse_connection(
         &self,
-        options: &ReadOptions,
+        request: &SseReadRequest,
         last_event: Option<&SseResumeEvent>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
         let handshake_timeout = self.config.rest_request_timeout;
@@ -689,7 +702,7 @@ impl TsfClient {
             with_timeout(
                 handshake_timeout,
                 "SSE handshake",
-                self.open_sse_connection_once(options, last_event),
+                self.open_sse_connection_once(request, last_event),
             )
             .await
         })
@@ -698,14 +711,14 @@ impl TsfClient {
 
     async fn open_sse_connection_once(
         &self,
-        options: &ReadOptions,
+        sse_request: &SseReadRequest,
         last_event: Option<&SseResumeEvent>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
-        let mut url = self.rest_url(format_args!("/streams/{}/records", options.stream_id));
-        append_read_query(&mut url, options);
         let mut request = self.apply_rest_auth(
-            self.http.get(url).header("Accept", "text/event-stream"),
-            options.link_secret.as_ref(),
+            self.http
+                .get(sse_request.url.clone())
+                .header("Accept", "text/event-stream"),
+            sse_request.link_secret.as_ref(),
         );
         if let Some((event_id, _)) = last_event {
             request = request.header("Last-Event-ID", event_id.as_str());
@@ -1707,6 +1720,12 @@ struct SseConnection {
     resume_event: Option<SseResumeEvent>,
 }
 
+struct SseReadRequest {
+    url: Url,
+    link_secret: Option<LinkSecret>,
+    finite: bool,
+}
+
 /// Resumable HTTP event-stream reader.
 ///
 /// Transient transport and service interruptions reconnect from the next sequence number. Normal
@@ -1715,7 +1734,7 @@ struct SseConnection {
 pub struct TsfSseReadSession {
     client: TsfClient,
     options: ReadOptions,
-    request_options: ReadOptions,
+    request: SseReadRequest,
     body: SseBody,
     parser: SseParser,
     stream_metadata: StreamMetadata,
@@ -1757,7 +1776,7 @@ impl TsfSseReadSession {
                 return Ok(None);
             }
             let event = match next_sse_event(&mut self.body, &mut self.parser).await {
-                Ok(None) if finite_read(&self.request_options) => {
+                Ok(None) if self.request.finite => {
                     self.finished = true;
                     return Ok(None);
                 }
@@ -1780,7 +1799,7 @@ impl TsfSseReadSession {
                 self.reconnect_attempts += 1;
                 let Some(connection) = self
                     .client
-                    .open_sse_connection(&self.request_options, self.last_event.as_ref())
+                    .open_sse_connection(&self.request, self.last_event.as_ref())
                     .await?
                 else {
                     self.finished = true;
@@ -1993,11 +2012,6 @@ fn read_options_exhausted(options: &ReadOptions) -> bool {
             (options.start, stop.until_timestamp_ms),
             (Some(ReadStart::TimestampMs(start)), Some(until)) if start >= until
         )
-}
-
-fn finite_read(options: &ReadOptions) -> bool {
-    let stop = options.stop.unwrap_or_default();
-    stop.count.is_some() || stop.until_timestamp_ms.is_some() || stop.wait_seconds.is_some()
 }
 
 fn validate_read_batch_for_request(

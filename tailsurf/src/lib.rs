@@ -31,6 +31,7 @@ pub use ids::{
 };
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
+    read::{ReadOptions, ReadStart, ReadStop},
     rest::StreamMetadata,
     ws::frame::{AppendRecord, CaughtUpPosition, OwnedReadRecord, ReadBatch, ReadRecord},
 };

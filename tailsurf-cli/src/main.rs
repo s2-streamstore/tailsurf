@@ -19,10 +19,10 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
-    AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, StreamId,
-    StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
+    AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, ReadOptions,
+    ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession,
+    TsfWriter, default_api_origin,
     protocol::{
-        read::{ReadOptions, ReadStart, ReadStop},
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
             MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamMetadata, StreamTitleUpdate,
@@ -1400,7 +1400,10 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
-    request.stop.get_or_insert_default().wait_seconds = Some(0);
+    request.stop.get_or_insert(ReadStop {
+        wait_seconds: Some(0),
+        ..ReadStop::default()
+    });
 
     read_transcript(
         api_url,
