@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/s2-streamstore/tailsurf/compare/v0.9.0...v0.10.0) - 2026-08-17
+
+### Added
+
+- accept server-minted link secrets ([#40](https://github.com/s2-streamstore/tailsurf/pull/40))
+
+### Other
+
+- consolidate duplicated validation, simplify SSE internals, fix hot-path scan ([#38](https://github.com/s2-streamstore/tailsurf/pull/38))
+
 ## [0.9.0](https://github.com/s2-streamstore/tailsurf/compare/v0.8.0...v0.9.0) - 2026-08-16
 
 ### Added
