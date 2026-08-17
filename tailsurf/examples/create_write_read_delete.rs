@@ -5,7 +5,7 @@ use std::env;
 use tailsurf::{
     ClientWriterId, LinkPermissions, TsfClient,
     protocol::{
-        read::{ReadOptions, ReadStart},
+        read::{ReadOptions, ReadStart, ReadStop},
         rest::{CreateStreamRequest, InitialStreamLink, Visibility},
         ws::{
             WriteStreamOptions,
@@ -80,7 +80,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut read_request = ReadOptions::new(created.stream_id).with_link_secret(read_link_secret);
     read_request.start = Some(ReadStart::SeqNum(0));
-    read_request.count = Some(1);
+    read_request.stop = Some(ReadStop {
+        count: Some(1),
+        ..ReadStop::default()
+    });
     let mut reader = client.connect_reader(read_request).await?;
     if let Some(batch) = reader.next_batch().await? {
         for record in &batch {

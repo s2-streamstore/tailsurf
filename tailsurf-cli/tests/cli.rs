@@ -27,7 +27,7 @@ use tailsurf::{
     AppendRecord, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret, RetryPolicy,
     StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
     protocol::{
-        read::{ReadOptions, ReadStart},
+        read::{ReadOptions, ReadStart, ReadStop},
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
             StreamLinkCredential, StreamLinkStatus, StreamLinkSummary, StreamMetadata,
@@ -568,7 +568,10 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.count = Some(3);
+    request.stop = Some(ReadStop {
+        count: Some(3),
+        ..ReadStop::default()
+    });
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut records = Vec::new();
@@ -638,7 +641,10 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.count = Some(16);
+    request.stop = Some(ReadStop {
+        count: Some(16),
+        ..ReadStop::default()
+    });
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut records = Vec::new();
@@ -706,7 +712,10 @@ async fn write_raw_flushes_on_linger() {
     let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
-    request.count = Some(2);
+    request.stop = Some(ReadStop {
+        count: Some(2),
+        ..ReadStop::default()
+    });
     let mut reader = client.connect_reader(request).await.expect("reader");
 
     let mut data = Vec::new();
@@ -1102,7 +1111,10 @@ async fn sse_wait_zero_finishes_at_the_current_tail() {
         .expect("stream id");
     let mut options = ReadOptions::new(stream_id);
     options.start = Some(ReadStart::SeqNum(0));
-    options.wait_seconds = Some(0);
+    options.stop = Some(ReadStop {
+        wait_seconds: Some(0),
+        ..ReadStop::default()
+    });
     options.link_secret = Some(canonical_test_link_secret());
 
     let mut session = TsfClient::with_api_origin(server.api_url.clone())

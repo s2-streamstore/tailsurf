@@ -1980,24 +1980,24 @@ fn advance_read_options(options: &mut ReadOptions, last_seq_num: u64, record_cou
         return true;
     };
     options.start = Some(ReadStart::SeqNum(next_seq_num));
-    if let Some(remaining) = options.count.as_mut() {
+    if let Some(remaining) = options.stop.as_mut().and_then(|stop| stop.count.as_mut()) {
         *remaining = remaining.saturating_sub(record_count as u64);
     }
-    options.count == Some(0)
+    options.stop.is_some_and(|stop| stop.count == Some(0))
 }
 
 fn read_options_exhausted(options: &ReadOptions) -> bool {
-    options.count == Some(0)
+    let stop = options.stop.unwrap_or_default();
+    stop.count == Some(0)
         || matches!(
-            (options.start, options.until_timestamp_ms),
+            (options.start, stop.until_timestamp_ms),
             (Some(ReadStart::TimestampMs(start)), Some(until)) if start >= until
         )
 }
 
 fn finite_read(options: &ReadOptions) -> bool {
-    options.count.is_some()
-        || options.until_timestamp_ms.is_some()
-        || options.wait_seconds.is_some()
+    let stop = options.stop.unwrap_or_default();
+    stop.count.is_some() || stop.until_timestamp_ms.is_some() || stop.wait_seconds.is_some()
 }
 
 fn validate_read_batch_for_request(
@@ -2026,13 +2026,14 @@ fn read_batch_start_violation(batch: &ReadBatch, start: Option<ReadStart>) -> Op
 }
 
 fn read_batch_stop_violation(batch: &ReadBatch, options: &ReadOptions) -> Option<&'static str> {
-    if options
+    let stop = options.stop.unwrap_or_default();
+    if stop
         .count
         .is_some_and(|remaining| batch.record_count() as u64 > remaining)
     {
         return Some("read batch exceeds the remaining record count");
     }
-    if options
+    if stop
         .until_timestamp_ms
         .is_some_and(|until| batch.iter().any(|record| record.timestamp_ms >= until))
     {
@@ -2162,7 +2163,8 @@ fn validate_read_options(options: &ReadOptions) -> Result<(), TsfClientError> {
             maximum: MAX_SAFE_INTEGER_U64,
         });
     }
-    if let Some(value) = options.until_timestamp_ms
+    let stop = options.stop.unwrap_or_default();
+    if let Some(value) = stop.until_timestamp_ms
         && value > MAX_SAFE_INTEGER_U64
     {
         return Err(TsfClientError::InvalidReadSelector {
@@ -2170,7 +2172,7 @@ fn validate_read_options(options: &ReadOptions) -> Result<(), TsfClientError> {
             maximum: MAX_SAFE_INTEGER_U64,
         });
     }
-    if let Some(value) = options.wait_seconds
+    if let Some(value) = stop.wait_seconds
         && value > MAX_READ_WAIT_SECONDS
     {
         return Err(TsfClientError::InvalidReadWait {
@@ -2186,9 +2188,7 @@ fn validate_read_options(options: &ReadOptions) -> Result<(), TsfClientError> {
                 maximum: MAX_PLAYBACK_RATE,
             });
         }
-        if options.count.is_none()
-            && options.until_timestamp_ms.is_none()
-            && options.wait_seconds != Some(0)
+        if stop.count.is_none() && stop.until_timestamp_ms.is_none() && stop.wait_seconds != Some(0)
         {
             return Err(TsfClientError::PlaybackRequiresCountUntilOrWaitZero);
         }
@@ -2212,16 +2212,17 @@ fn append_read_query(url: &mut Url, options: &ReadOptions) {
             query.append_pair("tail_offset", &DEFAULT_READ_TAIL_OFFSET.to_string());
         }
     }
-    if let Some(value) = options.count {
+    let stop = options.stop.unwrap_or_default();
+    if let Some(value) = stop.count {
         query.append_pair("count", &value.to_string());
     }
-    if let Some(value) = options.until_timestamp_ms {
+    if let Some(value) = stop.until_timestamp_ms {
         query.append_pair("until", &value.to_string());
     }
     if let Some(value) = options.rate {
         query.append_pair("rate", &value.to_string());
     }
-    if let Some(value) = options.wait_seconds {
+    if let Some(value) = stop.wait_seconds {
         query.append_pair("wait", &value.to_string());
     }
 }
@@ -3183,6 +3184,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{
+        read::ReadStop,
         rest::SseReadRecord,
         ws::frame::{MAX_RECORD_BYTES, OwnedReadRecord},
     };
@@ -3608,9 +3610,11 @@ mod tests {
             .expect("stream ID");
         let mut options = ReadOptions::new(stream_id);
         options.start = Some(ReadStart::SeqNum(42));
-        options.count = Some(7);
-        options.until_timestamp_ms = Some(1_787_000_000_000);
-        options.wait_seconds = Some(30);
+        options.stop = Some(ReadStop {
+            count: Some(7),
+            until_timestamp_ms: Some(1_787_000_000_000),
+            wait_seconds: Some(30),
+        });
         options.rate = Some(0.5);
         let mut url = Url::parse("https://tail.surf/api/v1/streams/id/read").expect("read URL");
 
@@ -3634,7 +3638,10 @@ mod tests {
             .expect("stream ID");
         for rate in [f64::NAN, f64::INFINITY, 0.09, 101.0] {
             let mut options = ReadOptions::new(stream_id);
-            options.wait_seconds = Some(0);
+            options.stop = Some(ReadStop {
+                wait_seconds: Some(0),
+                ..ReadStop::default()
+            });
             options.rate = Some(rate);
             assert!(matches!(
                 validate_read_options(&options),
@@ -3649,7 +3656,10 @@ mod tests {
             .parse()
             .expect("stream ID");
         let mut options = ReadOptions::new(stream_id);
-        options.wait_seconds = Some(MAX_READ_WAIT_SECONDS + 1);
+        options.stop = Some(ReadStop {
+            wait_seconds: Some(MAX_READ_WAIT_SECONDS + 1),
+            ..ReadStop::default()
+        });
 
         assert!(matches!(
             validate_read_options(&options),
@@ -4152,13 +4162,18 @@ mod tests {
             ))
         ));
 
-        options.count = Some(1);
+        options.stop = Some(ReadStop {
+            count: Some(1),
+            ..ReadStop::default()
+        });
         let two = ReadBatch::try_from_records(vec![sse_test_record(0, 0), sse_test_record(1, 0)])
             .expect("valid batch");
         assert!(validate_sse_read_batch(&two, &options).is_err());
 
-        options.count = None;
-        options.until_timestamp_ms = Some(1);
+        options.stop = Some(ReadStop {
+            until_timestamp_ms: Some(1),
+            ..ReadStop::default()
+        });
         assert!(validate_sse_read_batch(&two, &options).is_err());
 
         assert!(matches!(

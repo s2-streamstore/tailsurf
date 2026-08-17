@@ -22,7 +22,7 @@ use tailsurf::{
     AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, StreamId,
     StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
     protocol::{
-        read::{ReadOptions, ReadStart},
+        read::{ReadOptions, ReadStart, ReadStop},
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
             MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamMetadata, StreamTitleUpdate,
@@ -1374,7 +1374,10 @@ fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadSta
         read.since,
         default_start,
     ));
-    options.count = read.count;
+    options.stop = read.count.map(|count| ReadStop {
+        count: Some(count),
+        ..ReadStop::default()
+    });
     if let Some(link) = locator.link_declaring(LinkPermissions::allows_read) {
         options = options.with_link_secret(link.clone());
     }
@@ -1397,7 +1400,7 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
 async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
-    request.wait_seconds = Some(0);
+    request.stop.get_or_insert_default().wait_seconds = Some(0);
 
     read_transcript(
         api_url,
@@ -1598,7 +1601,7 @@ async fn read_transcript(
     max_logical_record_bytes: usize,
     sse: bool,
 ) -> eyre::Result<()> {
-    if options.count == Some(0) {
+    if options.stop.is_some_and(|stop| stop.count == Some(0)) {
         return Ok(());
     }
 
