@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "tailsurf",
-    "tailsurf-cli",
+    "rust/tailsurf",
+    "rust/tailsurf-cli",
 ]
 resolver = "3"
 

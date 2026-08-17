@@ -3,3 +3,9 @@
 /.env.*
 !.env.example
 target/
+node_modules/
+/typescript/packages/*/dist/
+/typescript/test-results/
+/typescript/playwright-report/
+/typescript/coverage/
+*.tsbuildinfo

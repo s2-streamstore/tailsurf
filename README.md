@@ -14,6 +14,22 @@ Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or
 
 Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or install the `tsf` CLI below. Rust SDK documentation and examples live in [Rustdoc](https://docs.rs/tailsurf).
 
+## SDKs
+
+The repository contains public Rust and TypeScript implementations.
+
+- The Rust SDK is published as [`tailsurf`](https://crates.io/crates/tailsurf).
+- The supported TypeScript API is published as [`@tailsurf/client`](https://www.npmjs.com/package/@tailsurf/client).
+- Low-level TypeScript codecs and schemas are published as [`@tailsurf/protocol`](https://www.npmjs.com/package/@tailsurf/protocol).
+
+Install the TypeScript client:
+
+```sh
+npm install @tailsurf/client
+```
+
+See the [TypeScript workspace](typescript/README.md) for package documentation and development commands.
+
 ## Install
 
 Install the prebuilt CLI on macOS or Linux:
@@ -172,4 +188,4 @@ See [Development](docs/development.md) for the workspace layout, local-service s
 
 ## License
 
-The Rust SDK and CLI are MIT licensed. See [LICENSE](LICENSE).
+The SDKs and CLI are MIT licensed. See [LICENSE](LICENSE).

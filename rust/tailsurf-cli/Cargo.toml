@@ -8,7 +8,7 @@ homepage = "https://tail.surf"
 repository.workspace = true
 keywords = ["streaming", "websocket", "transcript", "logs", "cli"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]
-readme = "../README.md"
+readme = "../../README.md"
 rust-version.workspace = true
 
 [[bin]]

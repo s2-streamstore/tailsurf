@@ -1,6 +1,6 @@
 # Release operations
 
-The Rust SDK and CLI share one version. Release-plz and dist coordinate crates.io publication and binary distribution.
+The Rust SDK and CLI share one version. The TypeScript packages use independent versions.
 
 ## Release flow
 
@@ -15,6 +15,30 @@ The release contains versioned archives, shell and PowerShell installers, SHA-25
 The installer routes on `tail.surf` redirect to the latest public GitHub release. Homebrew distribution is not configured.
 
 Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamstore/tailsurf` repository, the `release-plz.yml` workflow, and the `crates-io` GitHub environment.
+
+## TypeScript releases
+
+`@tailsurf/protocol` and `@tailsurf/client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
+
+Change the selected package version in its `package.json`. Run `pnpm check` from `typescript`. Merge the change to `main`, then dispatch `publish-npm.yml` for that package.
+
+The workflow rejects versions already present on npm. It packs and tests both packages before publishing the selected tarball from the `npm` GitHub environment.
+
+Each npm package trusts `publish-npm.yml` in `s2-streamstore/tailsurf` with the `npm` environment. Trusted publishing uses GitHub OIDC and creates provenance. A new package name can use the optional `NPM_TOKEN` repository secret for its first publication. Delete that secret after the trusted publisher is configured.
+
+Published npm versions are immutable. Fix a bad release with a new version. Deprecate the bad version on npm when consumers should not select it.
+
+## Protocol and service upgrades
+
+Public protocol changes start in this repository. Update the Rust and TypeScript implementations and both fixture copies in one pull request.
+
+Additive response fields can ship in the service first when every released client ignores them. Request changes, frame changes, and stricter validation require compatible client releases before the service uses them.
+
+Publish `@tailsurf/protocol` first. Publish `@tailsurf/client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
+
+After the required client versions are public, update `tailsurf-web` to exact released versions and run its full check, cross-client test, and browser suite. Deploy the service only after those checks pass.
+
+Keep the preceding service version deployable until the new clients and service have completed production probes. Roll the service back independently if the public wire behavior remains compatible.
 
 Release builds, macOS signing and notarization, hosting, and artifact attestations run on GitHub-hosted runners. The release workflow accepts only tags reachable from the default branch. It carries the validated commit SHA through every build and checks that the tag has not moved before hosting.
 
@@ -44,7 +68,7 @@ The `release` environment identifies binary build, signing, notarization, and ho
 
 Both environments accept deployments only from `main`. Both require approval from `shikhar`. Self-approval is allowed because the repository has one maintainer. Administrators cannot bypass approval.
 
-The default branch accepts only squash merges from pull requests. The `rust`, `msrv`, `lint`, and `plan` checks must pass against the latest commit. Review threads must be resolved. Force pushes and deletion are blocked.
+The default branch accepts only squash merges from pull requests. The `rust`, `typescript`, `msrv`, `lint`, and `plan` checks must pass against the latest commit. Review threads must be resolved. Force pushes and deletion are blocked.
 
 Release tags matching `v*` cannot be rewritten or deleted.
 
