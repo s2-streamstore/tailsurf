@@ -613,6 +613,85 @@ describe("TsfClient REST API", () => {
     })).rejects.toMatchObject({ code: "invalid_api_response" });
   });
 
+  it("lists all links across pages", async () => {
+    const request = vi.fn<typeof fetch>(
+      async (input) => {
+        const cursor = new URL(String(input)).searchParams.get("cursor");
+        return Response.json(cursor === null
+          ? {
+              authorizing_link_id: "owner",
+              links: [linkSummary("reader")],
+              next_cursor: "second-page",
+            }
+          : {
+              authorizing_link_id: "owner",
+              links: [linkSummary("writer")],
+              next_cursor: null,
+            });
+      },
+    );
+    const client = new TsfClient({ fetch: request });
+
+    await expect(client.listAllLinks(generateStreamId(), {
+      linkSecret: LINK_SECRET,
+    })).resolves.toMatchObject({
+      authorizingLinkId: "owner",
+      links: [{ linkId: "reader" }, { linkId: "writer" }],
+      nextCursor: null,
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(new URL(String(request.mock.calls[0]?.[0])).searchParams.get("limit"))
+      .toBe("100");
+    expect(new URL(String(request.mock.calls[1]?.[0])).searchParams.get("cursor"))
+      .toBe("second-page");
+  });
+
+  it.each([
+    [
+      "a changed authorizing link",
+      {
+        authorizing_link_id: "other-owner",
+        links: [linkSummary("writer")],
+        next_cursor: null,
+      },
+    ],
+    [
+      "a link ID repeated across pages",
+      {
+        authorizing_link_id: "owner",
+        links: [linkSummary("reader")],
+        next_cursor: null,
+      },
+    ],
+    [
+      "a repeated cursor",
+      {
+        authorizing_link_id: "owner",
+        links: [linkSummary("writer")],
+        next_cursor: "next",
+      },
+    ],
+  ] as const)("rejects link pagination with %s", async (_label, secondPage) => {
+    let page = 0;
+    const client = new TsfClient({
+      fetch: vi.fn<typeof fetch>(async () => {
+        page += 1;
+        return Response.json(page === 1
+          ? {
+              authorizing_link_id: "owner",
+              links: [linkSummary("reader")],
+              next_cursor: "next",
+            }
+          : secondPage);
+      }),
+      retryPolicy: { maxAttempts: 1 },
+    });
+
+    await expect(client.listAllLinks(generateStreamId(), {
+      linkSecret: LINK_SECRET,
+    })).rejects.toMatchObject({ code: "invalid_api_response" });
+  });
+
   it.each([
     "https://user@tail.surf",
     "https://tail.surf/api",

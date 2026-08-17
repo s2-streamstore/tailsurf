@@ -334,23 +334,26 @@ describe("TsfReadSession", () => {
     expect(connectionCount).toBe(2);
   });
 
-  it("bounds reconnects that make no read progress", async () => {
+  it("bounds consecutive failed reconnect handshakes", async () => {
     const streamId = generateStreamId();
     let connections = 0;
     const client = new TsfClient({
       webSocketFactory: () => {
         connections += 1;
-        return new ScriptedWebSocket(
-          [{ type: "ready" }, streamMetadataFrame(streamId)],
-          1006,
-        );
+        return connections === 1
+          ? new ScriptedWebSocket(
+              [{ type: "ready" }, streamMetadataFrame(streamId)],
+              1006,
+            )
+          : new HangingWebSocket(false);
       },
+      webSocketConnectTimeoutMs: 5,
       retryPolicy: { maxAttempts: 3, initialBackoffMs: 0, maxBackoffMs: 0 },
     });
     const session = await client.connectReader({ streamId });
 
     await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "websocket_closed",
+      code: "operation_timeout",
     });
     expect(connections).toBe(3);
   });
@@ -769,11 +772,6 @@ describe("TsfReadSession", () => {
               ? [
                   { type: "ready" },
                   streamMetadataFrame(streamId),
-                  {
-                    type: "caughtUp" as const,
-                    nextSeqNum: 0n,
-                    lastTimestampMs: 0n,
-                  },
                 ]
               : [
                   { type: "ready" },

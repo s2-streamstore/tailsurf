@@ -64,6 +64,10 @@ for await (const record of session) {
 
 Omit `stop` to follow new records. Use `connectSseReader` for a resumable HTTP event stream.
 
+## Manage
+
+Management methods require an owner link secret. `listLinks` returns one page. `listAllLinks` follows pagination and validates the complete inventory.
+
 ## Write
 
 `connectWriter` keeps one writer identity across reconnects. Concurrent append calls are coalesced into bounded batches. `close` rejects new appends and waits for accepted appends to settle.
@@ -92,7 +96,7 @@ REST mutations use idempotency keys. Pass a caller-owned key as the second argum
 await client.createStream(request, { idempotencyKey });
 ```
 
-Transient REST and connection failures use the configured bounded `retryPolicy`. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
+Transient REST and connection failures use the configured bounded `retryPolicy`. A successful WebSocket handshake starts a fresh retry burst. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
 
 ## Runtime configuration
 

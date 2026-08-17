@@ -368,6 +368,61 @@ export class BaseTsfClient {
     });
   }
 
+  /** Lists every retained link, following pagination until completion. */
+  public async listAllLinks(
+    streamId: StreamId,
+    options: OwnerAuthOptions,
+  ): Promise<ListLinksResponse> {
+    const links: ListLinksResponse["links"][number][] = [];
+    const seenCursors = new Set<string>();
+    const seenLinkIds = new Set<LinkId>();
+    let authorizingLinkId: LinkId | undefined;
+    let cursor: string | undefined;
+
+    for (;;) {
+      const page = await this.listLinks(streamId, {
+        ...options,
+        limit: MAX_LINK_PAGE_ITEMS,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      if (
+        authorizingLinkId !== undefined &&
+        page.authorizingLinkId !== authorizingLinkId
+      ) {
+        throw new TsfClientError(
+          "invalid_api_response",
+          "authorizing link changed across link pages",
+        );
+      }
+      authorizingLinkId ??= page.authorizingLinkId;
+      for (const link of page.links) {
+        if (seenLinkIds.has(link.linkId)) {
+          throw new TsfClientError(
+            "invalid_api_response",
+            "link ID appears on multiple pages",
+          );
+        }
+        seenLinkIds.add(link.linkId);
+        links.push(link);
+      }
+      if (page.nextCursor === null) {
+        return {
+          authorizingLinkId,
+          links,
+          nextCursor: null,
+        };
+      }
+      if (seenCursors.has(page.nextCursor)) {
+        throw new TsfClientError(
+          "invalid_api_response",
+          "link pagination cursor repeated",
+        );
+      }
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+  }
+
   public revokeLink(
     streamId: StreamId,
     linkId: LinkId,

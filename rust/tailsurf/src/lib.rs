@@ -32,7 +32,17 @@ pub use ids::{
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     read::{ReadOptions, ReadStart, ReadStop},
-    rest::StreamMetadata,
-    ws::frame::{AppendRecord, CaughtUpPosition, OwnedReadRecord, ReadBatch, ReadRecord},
+    rest::{
+        AppendRange, CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
+        ListLinksResponse, StreamLinkCredential, StreamLinkSummary, StreamMetadata,
+        UpdateStreamRequest, Visibility,
+    },
+    ws::{
+        WriteStreamOptions,
+        frame::{
+            AppendRecord, CaughtUpPosition, OwnedReadRecord, PartHeader, ReadBatch, ReadRecord,
+            RecordFormat,
+        },
+    },
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};

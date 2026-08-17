@@ -304,15 +304,15 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
           throw reconnectError;
         }
         this.#socket = recovered.socket;
-        reconnectAttempts = recovered.attempts;
-        reconnectDelay = recovered.nextDelayMs;
+        // A completed handshake starts a fresh retry burst. The retry budget bounds
+        // consecutive connection failures, not established connections that later close.
+        reconnectAttempts = 0;
+        reconnectDelay = this.policy.initialBackoffMs;
         continue;
       }
 
       if (frame.type === "readBatch") {
         validateReadBatchForRequest(frame.records, this.options);
-        reconnectAttempts = 0;
-        reconnectDelay = this.policy.initialBackoffMs;
         this.pendingRecords = frame.records;
         this.pendingRecordIndex = 0;
         continue;
@@ -322,8 +322,6 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
       }
       if (frame.type === "caughtUp") {
         validateCaughtUpForRequest(frame.nextSeqNum, this.options);
-        reconnectAttempts = 0;
-        reconnectDelay = this.policy.initialBackoffMs;
         const caughtUp: CaughtUpPosition = {
           nextSeqNum: frame.nextSeqNum,
           lastTimestampMs: frame.lastTimestampMs,

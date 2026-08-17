@@ -18,7 +18,7 @@ Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or insta
 
 The repository contains public Rust and TypeScript implementations.
 
-- The Rust SDK is published as [`tailsurf`](https://crates.io/crates/tailsurf).
+- The Rust SDK is published as [`tailsurf`](https://crates.io/crates/tailsurf). See the [Rust SDK guide](rust/tailsurf/README.md).
 - The supported TypeScript API is published as [`@tailsurf/client`](https://www.npmjs.com/package/@tailsurf/client).
 - Low-level TypeScript codecs and schemas are published as [`@tailsurf/protocol`](https://www.npmjs.com/package/@tailsurf/protocol).
 
