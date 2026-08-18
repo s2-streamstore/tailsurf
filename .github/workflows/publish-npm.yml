@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   publish:
+    name: Publish @s2-dev/tailsurf-${{ inputs.package }}
     if: github.repository == 's2-streamstore/tailsurf'
     runs-on: ubuntu-24.04
     timeout-minutes: 30

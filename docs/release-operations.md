@@ -4,7 +4,7 @@ The Rust SDK and CLI share one version. The TypeScript packages use independent 
 
 ## Release flow
 
-Release-plz opens or updates a release PR after changes reach `main`. It derives the next workspace version from conventional commits and checks SDK API compatibility.
+Release-plz opens or updates a Rust SDK and CLI release PR after relevant changes reach `main`. Pushes that only change `typescript/` do not run Release-plz. It derives the next workspace version from conventional commits and checks SDK API compatibility.
 
 Merging the release PR publishes `tailsurf` first and then `tailsurf-cli`. Release-plz creates one `vX.Y.Z` tag. It sends a repository dispatch for the binary release. Repository dispatch always loads the release workflow from the default branch.
 
@@ -68,7 +68,9 @@ The `release` environment identifies binary build, signing, notarization, and ho
 
 Both environments accept deployments only from `main`. Both require approval from `shikhar`. Self-approval is allowed because the repository has one maintainer. Administrators cannot bypass approval.
 
-The default branch accepts only squash merges from pull requests. The `rust`, `typescript`, `msrv`, `lint`, and `plan` checks must pass against the latest commit. Review threads must be resolved. Force pushes and deletion are blocked.
+Pull requests run the `Rust SDK and CLI (stable)`, `TypeScript SDK (Node and browser)`, `Rust SDK and CLI (MSRV 1.95)`, `Validate conventional PR title`, and `Plan Rust binary release` checks.
+
+The default branch accepts only squash merges from pull requests. Review threads must be resolved. Force pushes and deletion are blocked.
 
 Release tags matching `v*` cannot be rewritten or deleted.
 
