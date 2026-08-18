@@ -8,7 +8,7 @@ import {
   type ServerFrame,
   type StreamId,
   type StreamMetadata,
-} from "@tailsurf/protocol";
+} from "@s2-dev/tailsurf-protocol";
 
 import {
   TsfClientError,

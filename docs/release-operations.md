@@ -18,7 +18,7 @@ Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamst
 
 ## TypeScript releases
 
-`@tailsurf/protocol` and `@tailsurf/client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
+`@s2-dev/tailsurf-protocol` and `@s2-dev/tailsurf-client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
 
 Change the selected package version in its `package.json`. Run `pnpm check` from `typescript`. Merge the change to `main`, then dispatch `publish-npm.yml` for that package.
 
@@ -34,7 +34,7 @@ Public protocol changes start in this repository. Update the Rust and TypeScript
 
 Additive response fields can ship in the service first when every released client ignores them. Request changes, frame changes, and stricter validation require compatible client releases before the service uses them.
 
-Publish `@tailsurf/protocol` first. Publish `@tailsurf/client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
+Publish `@s2-dev/tailsurf-protocol` first. Publish `@s2-dev/tailsurf-client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
 
 After the required client versions are public, update `tailsurf-web` to exact released versions and run its full check, cross-client test, and browser suite. Deploy the service only after those checks pass.
 
