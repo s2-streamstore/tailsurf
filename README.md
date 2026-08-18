@@ -12,7 +12,7 @@ Use it to stream sandbox output, build output, deploy logs, sandbox sessions, or
 - Give agents a reliable async channel with durable catch-up.
 - Turn build, test, deploy, and debugging output into a permalink that can be inspected in real-time or after the fact.
 
-Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or install the `tsf` CLI below. Rust SDK documentation and examples live in [Rustdoc](https://docs.rs/tailsurf).
+Open [tail.surf](https://tail.surf) for the scrubbable live transcript, or install the `tsf` CLI below.
 
 ## Install
 
@@ -166,10 +166,19 @@ Link file options write complete URLs. Any command that accepts a link also acce
 
 Commands with structured output accept `--json`.
 
+## SDKs
+
+The repository also contains public Rust and TypeScript SDKs.
+
+- [`rust`](rust/README.md) is the `tailsurf` Rust SDK crate.
+- [`typescript`](typescript/README.md) contains `@tailsurf/client` and the lower-level `@tailsurf/protocol` package.
+
+Install the TypeScript client with `npm install @tailsurf/client`. Rust API documentation is available on [docs.rs](https://docs.rs/tailsurf).
+
 ## Development
 
 See [Development](docs/development.md) for the workspace layout, local-service setup, checks, and diagnostics. Release maintainers should also read [Release operations](docs/release-operations.md).
 
 ## License
 
-The Rust SDK and CLI are MIT licensed. See [LICENSE](LICENSE).
+The SDKs and CLI are MIT licensed. See [LICENSE](LICENSE).

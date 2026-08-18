@@ -1,0 +1,51 @@
+{
+  "name": "@tailsurf/client",
+  "version": "0.1.0",
+  "description": "TypeScript client for tail.surf live transcript streams",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm run clean && tsc --project tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { force: true, recursive: true })\"",
+    "prepack": "pnpm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/s2-streamstore/tailsurf.git",
+    "directory": "typescript/packages/client"
+  },
+  "homepage": "https://github.com/s2-streamstore/tailsurf/tree/main/typescript/packages/client#readme",
+  "bugs": {
+    "url": "https://github.com/s2-streamstore/tailsurf/issues"
+  },
+  "keywords": [
+    "streaming",
+    "websocket",
+    "transcript",
+    "logs"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "dependencies": {
+    "@tailsurf/protocol": "workspace:^"
+  }
+}

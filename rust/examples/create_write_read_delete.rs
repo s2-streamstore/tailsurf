@@ -3,14 +3,8 @@
 use std::env;
 
 use tailsurf::{
-    ClientWriterId, LinkPermissions, ReadOptions, ReadStart, ReadStop, TsfClient,
-    protocol::{
-        rest::{CreateStreamRequest, InitialStreamLink, Visibility},
-        ws::{
-            WriteStreamOptions,
-            frame::{PartHeader, RecordFormat},
-        },
-    },
+    ClientWriterId, CreateStreamRequest, InitialStreamLink, LinkPermissions, PartHeader,
+    ReadOptions, ReadStart, ReadStop, RecordFormat, TsfClient, Visibility, WriteStreamOptions,
 };
 use url::Url;
 

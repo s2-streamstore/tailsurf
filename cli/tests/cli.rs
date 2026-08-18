@@ -2747,7 +2747,7 @@ fn test_write_record(writer_seq_num: u64, data: Bytes) -> AppendRecord {
 fn assert_sequence_mismatch(error: &TsfClientError) {
     let is_mismatch = match error {
         TsfClientError::SequenceMismatch { .. } => true,
-        TsfClientError::AppendWriterFailed(inner) => {
+        TsfClientError::AppendDurabilityUnknown(inner) => {
             matches!(**inner, TsfClientError::SequenceMismatch { .. })
         }
         _ => false,

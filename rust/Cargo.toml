@@ -9,7 +9,7 @@ repository.workspace = true
 documentation = "https://docs.rs/tailsurf"
 keywords = ["streaming", "websocket", "transcript", "logs"]
 categories = ["api-bindings", "asynchronous", "network-programming"]
-readme = "../README.md"
+readme = "README.md"
 rust-version.workspace = true
 
 [dependencies]

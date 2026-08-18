@@ -1260,7 +1260,7 @@ fn retained_terminal_error(
 ) -> Option<TsfClientError> {
     terminal_error
         .get()
-        .map(|error| TsfClientError::AppendWriterFailed(Arc::clone(error)))
+        .map(|error| TsfClientError::AppendDurabilityUnknown(Arc::clone(error)))
 }
 
 impl Drop for TsfWriter {
@@ -1689,7 +1689,7 @@ fn finish_writer_error(
     let _ = terminal_error.set(Arc::clone(&error));
     fail_pending(pending, &error);
     if let Some(close_tx) = close_tx.take() {
-        let _ = close_tx.send(Err(TsfClientError::AppendWriterFailed(error)));
+        let _ = close_tx.send(Err(TsfClientError::AppendDurabilityUnknown(error)));
     }
 }
 
@@ -1697,7 +1697,9 @@ fn fail_pending(pending: &mut VecDeque<PendingAppend>, error: &Arc<TsfClientErro
     while let Some(pending) = pending.pop_front() {
         let _ = pending
             .ack_tx
-            .send(Err(TsfClientError::AppendWriterFailed(Arc::clone(error))));
+            .send(Err(TsfClientError::AppendDurabilityUnknown(Arc::clone(
+                error,
+            ))));
     }
 }
 
@@ -2899,7 +2901,7 @@ pub enum TsfClientError {
     /// HTTP transport or response-decoding failure.
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
-    /// A REST response contained malformed JSON.
+    /// A REST response contained malformed JSON or did not match the expected schema.
     #[error("invalid JSON in REST response: {0}")]
     Json(#[from] serde_json::Error),
     /// A REST response exceeded the SDK memory-safety bound.
@@ -3027,9 +3029,11 @@ pub enum TsfClientError {
     /// The writer task ended before resolving a pending ticket.
     #[error("append writer dropped with unacknowledged records")]
     AppendWriterDropped,
-    /// The writer permanently failed; the typed first failure is retained for every observer.
-    #[error("append writer failed: {0}")]
-    AppendWriterFailed(Arc<TsfClientError>),
+    /// An append may be durable, but its acknowledgement could not be recovered.
+    ///
+    /// The writer is terminal. The typed first failure is retained for every observer.
+    #[error("append durability is unknown; this writer cannot safely continue: {0}")]
+    AppendDurabilityUnknown(Arc<TsfClientError>),
     /// The writer background task panicked or could not be joined.
     #[error("append writer task failed: {0}")]
     AppendWriterTaskFailed(String),
@@ -3085,7 +3089,7 @@ impl TsfClientError {
             Self::HttpStatus { request_id, .. } | Self::SequenceMismatch { request_id, .. } => {
                 request_id.as_deref()
             }
-            Self::AppendWriterFailed(inner) => inner.request_id(),
+            Self::AppendDurabilityUnknown(inner) => inner.request_id(),
             _ => None,
         }
     }
@@ -3094,7 +3098,7 @@ impl TsfClientError {
     pub fn api_code(&self) -> Option<&str> {
         match self {
             Self::HttpStatus { api_code, .. } => api_code.as_deref(),
-            Self::AppendWriterFailed(inner) => inner.api_code(),
+            Self::AppendDurabilityUnknown(inner) => inner.api_code(),
             _ => None,
         }
     }
@@ -3105,7 +3109,7 @@ impl TsfClientError {
             Self::HttpStatus { retry_after, .. } | Self::SequenceMismatch { retry_after, .. } => {
                 *retry_after
             }
-            Self::AppendWriterFailed(inner) => inner.retry_after(),
+            Self::AppendDurabilityUnknown(inner) => inner.retry_after(),
             _ => None,
         }
     }
@@ -3121,7 +3125,7 @@ impl TsfClientError {
                 actual_next_seq_num,
                 ..
             } => *actual_next_seq_num,
-            Self::AppendWriterFailed(inner) => inner.actual_next_seq_num(),
+            Self::AppendDurabilityUnknown(inner) => inner.actual_next_seq_num(),
             _ => None,
         }
     }
@@ -3142,6 +3146,7 @@ impl TsfClientError {
         }
         match self {
             Self::Http(error) => error.is_timeout() || error.is_connect(),
+            Self::Json(_) => true,
             Self::HttpStatus { status, .. } => is_retryable_http_status(status.as_u16()),
             _ => false,
         }
@@ -3224,6 +3229,40 @@ mod tests {
         let blank: ApiErrorResponse =
             serde_json::from_str(r#"{"error":{"code":" ","message":" "}}"#).expect("blank error");
         assert_eq!(api_error_message(&blank.error), None);
+    }
+
+    #[tokio::test]
+    async fn retries_invalid_rest_json() {
+        let config = TsfClientConfig {
+            retry_policy: RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+            },
+            ..TsfClientConfig::default()
+        };
+        let client = TsfClient::with_config(config).expect("client");
+        let attempts = std::cell::Cell::new(0);
+
+        let result = client
+            .retry_transient(|| {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                async move {
+                    if attempt == 0 {
+                        Err(TsfClientError::Json(
+                            serde_json::from_str::<serde_json::Value>("{")
+                                .expect_err("invalid JSON"),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 2);
     }
 
     #[tokio::test]
@@ -3794,7 +3833,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                TsfClientError::AppendWriterFailed(inner)
+                TsfClientError::AppendDurabilityUnknown(inner)
                     if matches!(**inner, TsfClientError::SequenceMismatch { .. })
             ),
             "error={error}"

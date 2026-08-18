@@ -1,0 +1,28 @@
+{
+  "name": "tailsurf-typescript",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <27"
+  },
+  "packageManager": "pnpm@11.21.0",
+  "scripts": {
+    "build": "pnpm --recursive build",
+    "check": "pnpm build && pnpm lint && pnpm typecheck && pnpm test && pnpm test:fixtures && pnpm test:packages",
+    "lint": "oxlint . --max-warnings 0",
+    "test": "vitest run",
+    "test:fixtures": "node scripts/verify-fixtures.mjs",
+    "test:packages": "node scripts/package-smoke.mjs",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^26.2.0",
+    "esbuild": "^0.28.2",
+    "oxlint": "^1.78.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

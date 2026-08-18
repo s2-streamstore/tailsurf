@@ -10,6 +10,7 @@ keywords = ["streaming", "websocket", "transcript", "logs", "cli"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]
 readme = "../README.md"
 rust-version.workspace = true
+include = ["/src/**", "/tests/**"]
 
 [[bin]]
 name = "tsf"
@@ -26,7 +27,7 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "process", "rt", "signal", "sync"] }
-tailsurf = { version = "0.11.0", path = "../tailsurf" }
+tailsurf = { version = "0.11.0", path = "../rust" }
 url.workspace = true
 
 [dev-dependencies]

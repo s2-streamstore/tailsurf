@@ -1,8 +1,6 @@
 [workspace]
-members = [
-    "tailsurf",
-    "tailsurf-cli",
-]
+members = ["cli", "rust"]
+default-members = ["cli"]
 resolver = "3"
 
 [workspace.package]

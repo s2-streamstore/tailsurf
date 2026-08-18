@@ -1,8 +1,4 @@
-//! Async Rust SDK and shared TSF v1 protocol types for [tail.surf](https://tail.surf).
-//!
-//! Use [`TsfClient`] for HTTP operations, [`TsfWriter`] for durable reconnecting writes, and
-//! [`TsfReadSession`] or [`TsfSseReadSession`] for resumable reads. Stream links and transcript
-//! reconstruction are available in [`stream_url`] and [`transcript`].
+#![doc = include_str!("../README.md")]
 
 /// REST, SSE, and WebSocket clients, retry policy, and durable writer types.
 pub mod client;
@@ -32,7 +28,17 @@ pub use ids::{
 pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     read::{ReadOptions, ReadStart, ReadStop},
-    rest::StreamMetadata,
-    ws::frame::{AppendRecord, CaughtUpPosition, OwnedReadRecord, ReadBatch, ReadRecord},
+    rest::{
+        AppendRange, CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
+        ListLinksResponse, StreamLinkCredential, StreamLinkSummary, StreamMetadata,
+        UpdateStreamRequest, Visibility,
+    },
+    ws::{
+        WriteStreamOptions,
+        frame::{
+            AppendRecord, CaughtUpPosition, OwnedReadRecord, PartHeader, ReadBatch, ReadRecord,
+            RecordFormat,
+        },
+    },
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};
