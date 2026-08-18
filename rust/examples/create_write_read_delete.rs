@@ -3,8 +3,8 @@
 use std::env;
 
 use tailsurf::{
-    ClientWriterId, CreateStreamRequest, InitialStreamLink, LinkPermissions, PartHeader,
-    ReadOptions, ReadStart, ReadStop, RecordFormat, TsfClient, Visibility, WriteStreamOptions,
+    CreateStreamRequest, DurableWriterOptions, InitialStreamLink, LinkPermissions, ReadOptions,
+    ReadStart, ReadStop, RecordFormat, TsfClient, Visibility,
 };
 use url::Url;
 
@@ -52,23 +52,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let writer = client
         .connect_writer(
-            WriteStreamOptions::new(
-                created.stream_id,
-                ClientWriterId::new_random(),
-                write_link_secret,
-            )
-            .with_expected_next_seq_num(0),
+            DurableWriterOptions::new(created.stream_id, write_link_secret)
+                .with_expected_next_seq_num(0),
         )
         .await?;
     let ticket = writer
-        .submit(tailsurf::AppendRecord::new(
-            0,
-            PartHeader::unsplit(),
+        .submit(tailsurf::AppendBatch::split_logical(
             RecordFormat::Transcript,
-            b"hello from tailsurf\n",
-        ))
+            b"hello from tailsurf\n".as_slice(),
+        )?)
         .await?;
-    let _receipt = ticket.await?;
+    let _receipts = ticket.await?;
     writer.close().await?;
 
     let mut read_request = ReadOptions::new(created.stream_id).with_link_secret(read_link_secret);

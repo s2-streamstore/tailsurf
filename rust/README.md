@@ -58,34 +58,29 @@ The session reconnects from the latest record or caught-up position after transi
 
 ## Write
 
-`TsfWriter` retains unacknowledged records across bounded reconnects. Await each `AppendTicket` when you need its durable sequence number. `close` stops new submissions and waits for accepted records to settle. A terminal `AppendDurabilityUnknown` means an append may be durable but its acknowledgement could not be recovered.
+`TsfWriter` retains unacknowledged records across bounded reconnects. Records are submitted as a non-empty `AppendBatch` — the writer assigns writer sequence numbers in submission order, so cloned `TsfProducer` handles can submit concurrently without interleaving, and `AppendBatch::split_logical` keeps the parts of an oversized logical record contiguous. Await each `AppendTicket` when you need its durable sequence numbers. `close` stops new submissions and waits for accepted records to settle. A terminal `AppendDurabilityUnknown` means an append may be durable but its acknowledgement could not be recovered.
 
 ```rust,no_run
-use tailsurf::{
-    AppendRecord, ClientWriterId, LinkSecret, PartHeader, RecordFormat, StreamId, TsfClient,
-    WriteStreamOptions,
-};
+use tailsurf::{AppendBatch, DurableWriterOptions, LinkSecret, RecordFormat, StreamId, TsfClient};
 
 async fn write_stream(
     client: &TsfClient,
     stream_id: StreamId,
     write_link_secret: LinkSecret,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let writer = client.connect_writer(WriteStreamOptions::new(
-        stream_id,
-        ClientWriterId::new_random(),
-        write_link_secret,
-    )).await?;
-    let ticket = writer.submit(AppendRecord::new(
-        0,
-        PartHeader::unsplit(),
-        RecordFormat::Transcript,
-        b"deploy started\n",
-    )).await?;
-    let receipt = ticket.await?;
+    let writer = client
+        .connect_writer(DurableWriterOptions::new(stream_id, write_link_secret))
+        .await?;
+    let ticket = writer
+        .submit(AppendBatch::split_logical(
+            RecordFormat::Transcript,
+            b"deploy started\n".as_slice(),
+        )?)
+        .await?;
+    let receipts = ticket.await?;
     writer.close().await?;
 
-    println!("durable at sequence {}", receipt.ack.start_seq_num);
+    println!("durable at sequence {}", receipts[0].seq_num);
     Ok(())
 }
 ```

@@ -19,22 +19,20 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
-    AppendRecord, AppendTicket, ClientWriterId, LinkId, LinkPermissions, LinkSecret, ReadOptions,
-    ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession,
-    TsfWriter, default_api_origin,
+    AppendBatch, AppendTicket, DurableWriterOptions, LinkId, LinkPermissions, LinkSecret,
+    MAX_WRITER_UNACKED_PAYLOAD_BYTES, MAX_WRITER_UNACKED_RECORDS, ReadOptions, ReadStart, ReadStop,
+    StreamId, StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter,
+    TsfWriterConfig, default_api_origin,
     protocol::{
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
             MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamMetadata, StreamTitleUpdate,
             UpdateStreamRequest, Visibility,
         },
-        ws::{
-            WriteStreamOptions,
-            frame::{MAX_RECORD_BYTES, PartHeader, RecordFormat},
-        },
+        ws::frame::{MAX_APPEND_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, RecordFormat},
     },
     stream_url::{DEFAULT_WEB_BASE_URL, StreamLocator, public_stream_url, stream_link},
-    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript, split_logical_record},
+    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
@@ -165,6 +163,50 @@ struct WriteArgs {
     input: InputArgs,
 }
 
+/// `--max-logical-record-bytes`, bounded at parse time to what the wire can represent.
+///
+/// [`AppendBatch::split_logical`] encodes one logical record as at most
+/// [`MAX_APPEND_BATCH_RECORDS`] parts of [`MAX_RECORD_BYTES`], so anything above that product could
+/// never be written and anything at zero could never hold a record. Rejecting both here keeps every
+/// downstream consumer working with a value that is provably small and nonzero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaxLogicalRecordBytes(usize);
+
+impl MaxLogicalRecordBytes {
+    /// Largest logical record the append-batch splitter can encode.
+    const MAX: usize = MAX_APPEND_BATCH_RECORDS * MAX_RECORD_BYTES;
+    /// CLI default, shared with readers via [`DEFAULT_MAX_LOGICAL_RECORD_BYTES`].
+    const DEFAULT: Self = Self(DEFAULT_MAX_LOGICAL_RECORD_BYTES);
+}
+
+impl fmt::Display for MaxLogicalRecordBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for MaxLogicalRecordBytes {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = value
+            .parse::<usize>()
+            .map_err(|_| format!("expected a byte count, got {value:?}"))?;
+        if bytes == 0 {
+            return Err("must be at least 1 byte".to_string());
+        }
+        if bytes > Self::MAX {
+            return Err(format!(
+                "exceeds the {}-byte maximum one logical record can occupy on the wire ({} parts of {} bytes)",
+                Self::MAX,
+                MAX_APPEND_BATCH_RECORDS,
+                MAX_RECORD_BYTES,
+            ));
+        }
+        Ok(Self(bytes))
+    }
+}
+
 #[derive(Debug, Args)]
 struct InputArgs {
     /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
@@ -174,10 +216,10 @@ struct InputArgs {
     #[arg(
         long,
         value_name = "BYTES",
-        default_value_t = DEFAULT_MAX_LOGICAL_RECORD_BYTES,
+        default_value_t = MaxLogicalRecordBytes::DEFAULT,
         help_heading = "Advanced"
     )]
-    max_logical_record_bytes: usize,
+    max_logical_record_bytes: MaxLogicalRecordBytes,
     /// Program to run. Its stdout and stderr are written to the stream.
     #[arg(last = true, value_name = "PROGRAM")]
     program: Vec<String>,
@@ -187,7 +229,7 @@ impl InputArgs {
     fn piped_defaults() -> Self {
         Self {
             raw: false,
-            max_logical_record_bytes: DEFAULT_MAX_LOGICAL_RECORD_BYTES,
+            max_logical_record_bytes: MaxLogicalRecordBytes::DEFAULT,
             program: Vec::new(),
         }
     }
@@ -594,30 +636,6 @@ enum WriteBuffering {
     Lines,
 }
 
-#[derive(Debug)]
-struct WriterState {
-    client_writer_id: ClientWriterId,
-    next_writer_seq: u64,
-}
-
-impl WriterState {
-    fn new_random() -> Self {
-        Self {
-            client_writer_id: ClientWriterId::new_random(),
-            next_writer_seq: 0,
-        }
-    }
-
-    fn reserve_writer_seq(&mut self) -> eyre::Result<u64> {
-        let reserved = self.next_writer_seq;
-        self.next_writer_seq = self
-            .next_writer_seq
-            .checked_add(1)
-            .context("writer sequence overflowed")?;
-        Ok(reserved)
-    }
-}
-
 // One socket, one stdin, one stdout: worker threads only add wakeup and handoff cost.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -915,7 +933,7 @@ async fn write_input(
             link,
             expected_next_seq_num,
             buffering,
-            input.max_logical_record_bytes,
+            input.max_logical_record_bytes.0,
         )
         .await
     } else {
@@ -925,7 +943,7 @@ async fn write_input(
             link,
             expected_next_seq_num,
             buffering,
-            input.max_logical_record_bytes,
+            input.max_logical_record_bytes.0,
             input.program,
         )
         .await
@@ -942,16 +960,23 @@ async fn connect_session_writer(
     stream_id: StreamId,
     link: LinkSecret,
     expected_next_seq_num: Option<u64>,
-) -> eyre::Result<(TsfWriter, WriterState)> {
+    max_logical_record_bytes: usize,
+) -> eyre::Result<TsfWriter> {
     let client = TsfClient::with_api_origin(api_url)?;
-    let state = WriterState::new_random();
-    let mut options = WriteStreamOptions::new(stream_id, state.client_writer_id, link);
+    let mut options = DurableWriterOptions::new(stream_id, link);
     options.expected_next_seq_num = expected_next_seq_num;
-    let writer = client
-        .connect_writer(options)
+    // One maximum-size logical record must always fit the retained backlog, alongside a full
+    // in-flight window of ordinary records. MaxLogicalRecordBytes caps the value at 64 MiB
+    // during argument parsing, so both sums stay far below usize::MAX on any supported target.
+    let config = TsfWriterConfig {
+        max_unacked_bytes: max_logical_record_bytes + MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+        max_unacked_records: max_logical_record_bytes.div_ceil(MAX_RECORD_BYTES)
+            + MAX_WRITER_UNACKED_RECORDS,
+    };
+    client
+        .connect_writer_with_config(options, config)
         .await
-        .context("failed to connect writer")?;
-    Ok((writer, state))
+        .context("failed to connect writer")
 }
 
 async fn stream_stdin_to_writer(
@@ -962,8 +987,14 @@ async fn stream_stdin_to_writer(
     buffering: WriteBuffering,
     max_logical_record_bytes: usize,
 ) -> eyre::Result<()> {
-    let (writer, mut state) =
-        connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
+    let writer = connect_session_writer(
+        api_url,
+        stream_id,
+        link,
+        expected_next_seq_num,
+        max_logical_record_bytes,
+    )
+    .await?;
 
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<eyre::Result<Bytes>>(16);
     // Ctrl-C drops the sender, so the consumer sees the channel close, flushes any
@@ -979,8 +1010,8 @@ async fn stream_stdin_to_writer(
             }
         }
     });
-    {
-        let mut session = WriterSession::new(&writer, &mut state);
+    let records = {
+        let mut session = WriterSession::new(&writer);
         match buffering {
             WriteBuffering::Raw => stream_raw_chunks_to_writer(&mut session, &mut chunk_rx).await?,
             WriteBuffering::Lines => {
@@ -988,11 +1019,11 @@ async fn stream_stdin_to_writer(
                     .await?
             }
         }
-        session.finish().await?;
-    }
+        session.finish().await?
+    };
     let interrupted = stdin_task.await.context("stdin reader task panicked")??;
     writer.close().await.context("failed to close writer")?;
-    print_write_summary(state.next_writer_seq);
+    print_write_summary(records);
     if interrupted {
         exit_interrupted();
     }
@@ -1008,18 +1039,21 @@ async fn stream_command_to_writer(
     max_logical_record_bytes: usize,
     command: Vec<String>,
 ) -> eyre::Result<()> {
-    let (writer, mut state) =
-        connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
-    let outcome = {
-        let mut session = WriterSession::new(&writer, &mut state);
-        let outcome =
-            stream_child_command_output(&mut session, buffering, max_logical_record_bytes, command)
-                .await?;
-        session.finish().await?;
-        outcome
-    };
+    let writer = connect_session_writer(
+        api_url,
+        stream_id,
+        link,
+        expected_next_seq_num,
+        max_logical_record_bytes,
+    )
+    .await?;
+    let mut session = WriterSession::new(&writer);
+    let outcome =
+        stream_child_command_output(&mut session, buffering, max_logical_record_bytes, command)
+            .await?;
+    let records = session.finish().await?;
     writer.close().await.context("failed to close writer")?;
-    print_write_summary(state.next_writer_seq);
+    print_write_summary(records);
     if outcome.interrupted {
         exit_interrupted();
     }
@@ -1287,16 +1321,16 @@ impl LineRecordAppender {
 
 struct WriterSession<'a> {
     writer: &'a TsfWriter,
-    state: &'a mut WriterState,
     pending_tickets: VecDeque<AppendTicket>,
+    records: u64,
 }
 
 impl<'a> WriterSession<'a> {
-    fn new(writer: &'a TsfWriter, state: &'a mut WriterState) -> Self {
+    fn new(writer: &'a TsfWriter) -> Self {
         Self {
             writer,
-            state,
             pending_tickets: VecDeque::new(),
+            records: 0,
         }
     }
 }
@@ -1307,17 +1341,9 @@ impl WriterSession<'_> {
         format: RecordFormat,
         data: Bytes,
     ) -> eyre::Result<()> {
-        let records = split_logical_record(self.state.next_writer_seq, format, data)
-            .context("failed to split logical record")?;
-        for record in records {
-            let reserved = self
-                .state
-                .reserve_writer_seq()
-                .context("failed to reserve writer sequence")?;
-            debug_assert_eq!(reserved, record.writer_seq_num);
-            self.submit_record(record).await?;
-        }
-        Ok(())
+        let batch =
+            AppendBatch::split_logical(format, data).context("failed to split logical record")?;
+        self.submit_batch(batch).await
     }
 
     async fn append_physical_record(
@@ -1326,29 +1352,26 @@ impl WriterSession<'_> {
         format: RecordFormat,
         data: Bytes,
     ) -> eyre::Result<()> {
-        let writer_seq_num = self
-            .state
-            .reserve_writer_seq()
-            .context("failed to reserve writer sequence")?;
-        self.submit_record(AppendRecord::new(writer_seq_num, part, format, data))
-            .await
+        let batch = AppendBatch::single(part, format, data).context("failed to build record")?;
+        self.submit_batch(batch).await
     }
 
-    async fn submit_record(&mut self, record: AppendRecord) -> eyre::Result<()> {
+    async fn submit_batch(&mut self, batch: AppendBatch) -> eyre::Result<()> {
+        self.records += batch.record_count() as u64;
         let ticket = self
             .writer
-            .submit(record)
+            .submit(batch)
             .await
             .context("failed to submit record")?;
         self.pending_tickets.push_back(ticket);
         self.drain_ready_tickets()
     }
 
-    async fn finish(&mut self) -> eyre::Result<()> {
+    async fn finish(mut self) -> eyre::Result<u64> {
         while let Some(ticket) = self.pending_tickets.pop_front() {
             ticket.await.context("failed to append record")?;
         }
-        Ok(())
+        Ok(self.records)
     }
 
     fn drain_ready_tickets(&mut self) -> eyre::Result<()> {
@@ -2105,6 +2128,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn max_logical_record_bytes_parsing_enforces_the_wire_bound() {
+        assert_eq!(
+            "1048576".parse::<MaxLogicalRecordBytes>(),
+            Ok(MaxLogicalRecordBytes(1024 * 1024))
+        );
+        assert_eq!(
+            MaxLogicalRecordBytes::MAX
+                .to_string()
+                .parse::<MaxLogicalRecordBytes>(),
+            Ok(MaxLogicalRecordBytes(MaxLogicalRecordBytes::MAX))
+        );
+
+        assert_eq!(
+            "0".parse::<MaxLogicalRecordBytes>()
+                .expect_err("zero is rejected"),
+            "must be at least 1 byte"
+        );
+        assert!(
+            (MaxLogicalRecordBytes::MAX + 1)
+                .to_string()
+                .parse::<MaxLogicalRecordBytes>()
+                .expect_err("above-maximum is rejected")
+                .contains("exceeds")
+        );
+        assert!("soon".parse::<MaxLogicalRecordBytes>().is_err());
+    }
+
+    #[test]
     fn initial_links_accept_semantic_ids_and_short_permissions() {
         let parsed = "deploy-bot=read"
             .parse::<InitialLinkArg>()
@@ -2139,7 +2190,7 @@ mod tests {
             write_link_file: None,
             input: InputArgs {
                 raw: false,
-                max_logical_record_bytes: DEFAULT_MAX_LOGICAL_RECORD_BYTES,
+                max_logical_record_bytes: MaxLogicalRecordBytes::DEFAULT,
                 program: Vec::new(),
             },
         };

@@ -422,6 +422,205 @@ pub struct AppendRecord {
     pub data: Bytes,
 }
 
+/// Conversion into payload bytes accepted by record constructors.
+///
+/// Owned buffers are moved without copying; borrowed input is copied once.
+pub trait IntoRecordData {
+    /// Converts this value into reference-counted immutable bytes.
+    fn into_record_data(self) -> Bytes;
+}
+
+impl IntoRecordData for Bytes {
+    fn into_record_data(self) -> Bytes {
+        self
+    }
+}
+
+impl IntoRecordData for Vec<u8> {
+    fn into_record_data(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoRecordData for Box<[u8]> {
+    fn into_record_data(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoRecordData for String {
+    fn into_record_data(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoRecordData for &Bytes {
+    fn into_record_data(self) -> Bytes {
+        self.clone()
+    }
+}
+
+impl IntoRecordData for &[u8] {
+    fn into_record_data(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl<const N: usize> IntoRecordData for &[u8; N] {
+    fn into_record_data(self) -> Bytes {
+        Bytes::copy_from_slice(&self[..])
+    }
+}
+
+impl IntoRecordData for &str {
+    fn into_record_data(self) -> Bytes {
+        Bytes::copy_from_slice(self.as_bytes())
+    }
+}
+
+impl AppendRecord {
+    /// Creates a physical record without allocating when the input already owns compatible bytes.
+    pub fn new(
+        writer_seq_num: u64,
+        part: PartHeader,
+        format: RecordFormat,
+        data: impl IntoRecordData,
+    ) -> Self {
+        Self {
+            writer_seq_num,
+            part,
+            format,
+            data: data.into_record_data(),
+        }
+    }
+
+    /// Checks this record against the wire payload bound.
+    pub(crate) fn validate(&self) -> Result<(), FrameCodecError> {
+        validate_record_len(self.data.len())
+    }
+}
+
+/// One physical record before writer-sequence assignment.
+///
+/// Carries everything but the writer-local sequence number, which a durable writer assigns when
+/// the owning actor admits the record. Use [`AppendRecord`] for manually numbered low-level
+/// sessions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordPayload {
+    /// Logical split-part metadata.
+    pub part: PartHeader,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record payload bytes.
+    pub data: Bytes,
+}
+
+impl RecordPayload {
+    /// Creates an unsequenced physical record payload.
+    pub fn new(part: PartHeader, format: RecordFormat, data: impl IntoRecordData) -> Self {
+        Self {
+            part,
+            format,
+            data: data.into_record_data(),
+        }
+    }
+}
+
+/// Splits one logical record into unsequenced physical parts at [`MAX_RECORD_BYTES`].
+///
+/// Parts carry contiguous zero-based part indices in the layout logical readers reassemble; the
+/// caller assigns writer sequence numbers. An empty payload yields one unsplit empty record.
+pub(crate) fn split_record_payloads(
+    format: RecordFormat,
+    data: Bytes,
+) -> Result<Vec<RecordPayload>, FrameCodecError> {
+    let part_count = data.len().div_ceil(MAX_RECORD_BYTES).max(1);
+    if part_count > PartHeader::MAX_INDEX as usize + 1 {
+        return Err(FrameCodecError::PartIndexTooLarge(
+            u32::try_from(part_count - 1).unwrap_or(u32::MAX),
+        ));
+    }
+
+    if part_count == 1 {
+        return Ok(vec![RecordPayload {
+            part: PartHeader::unsplit(),
+            format,
+            data,
+        }]);
+    }
+
+    let mut records = Vec::with_capacity(part_count);
+    for index in 0..part_count {
+        let start = index * MAX_RECORD_BYTES;
+        let end = data.len().min(start + MAX_RECORD_BYTES);
+        records.push(RecordPayload {
+            part: PartHeader::new(index as u32, index == part_count - 1)?,
+            format,
+            data: data.slice(start..end),
+        });
+    }
+    Ok(records)
+}
+
+/// A non-empty set of physical records submitted to a durable writer as one logical unit.
+///
+/// The writer actor assigns each batch one contiguous writer-sequence range in submission order,
+/// so the split parts of a logical record never interleave with another producer's records.
+/// Construction upholds the wire bounds: 1 to [`MAX_APPEND_BATCH_RECORDS`] records, each at most
+/// [`MAX_RECORD_BYTES`]. Submission additionally requires the whole batch to fit the writer's
+/// configured retained backlog; the actor streams oversized batches under the server's
+/// sent-but-unacknowledged socket window either way.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendBatch {
+    records: Vec<RecordPayload>,
+}
+
+impl AppendBatch {
+    /// Builds a batch from explicit physical records, rejecting an empty or out-of-bounds batch.
+    pub fn from_records(records: Vec<RecordPayload>) -> Result<Self, FrameCodecError> {
+        validate_batch_count(records.len(), MAX_APPEND_BATCH_RECORDS)?;
+        for record in &records {
+            validate_record_len(record.data.len())?;
+        }
+        Ok(Self { records })
+    }
+
+    /// Builds a one-record batch.
+    pub fn single(
+        part: PartHeader,
+        format: RecordFormat,
+        data: impl IntoRecordData,
+    ) -> Result<Self, FrameCodecError> {
+        Self::from_records(vec![RecordPayload::new(part, format, data)])
+    }
+
+    /// Splits one logical record into the physical-part batch logical readers reassemble.
+    ///
+    /// A payload that fits in [`MAX_RECORD_BYTES`] becomes one unsplit record; larger payloads
+    /// are sliced into parts without further copying once the input is converted to `Bytes`
+    /// (borrowed inputs are copied once by that conversion). A logical record spanning more than
+    /// [`MAX_APPEND_BATCH_RECORDS`] parts exceeds the batch record bound and is rejected.
+    pub fn split_logical(
+        format: RecordFormat,
+        data: impl IntoRecordData,
+    ) -> Result<Self, FrameCodecError> {
+        Self::from_records(split_record_payloads(format, data.into_record_data())?)
+    }
+
+    /// Returns the number of physical records in this non-empty batch.
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    pub(crate) fn payloads(&self) -> &[RecordPayload] {
+        &self.records
+    }
+
+    pub(crate) fn into_payloads(self) -> Vec<RecordPayload> {
+        self.records
+    }
+}
+
 /// Reconnect-safe position emitted after all preceding records have been delivered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaughtUpPosition {
@@ -1413,23 +1612,36 @@ mod tests {
 
     #[test]
     fn multi_record_batches_round_trip_and_enforce_bounds() {
-        let append = ClientFrame::AppendBatch(
-            (0..2)
-                .map(|writer_seq_num| AppendRecord {
-                    writer_seq_num,
-                    part: PartHeader::unsplit(),
-                    format: RecordFormat::Bytes,
-                    data: Bytes::from(vec![writer_seq_num as u8]),
-                })
-                .collect(),
-        );
-        let encoded = append.encode().expect("encode append batch");
+        // Varied part headers, formats, and payload lengths so field-for-field equality can
+        // catch any record-boundary or header mix-up in either direction.
+        let records: Vec<AppendRecord> = vec![
+            AppendRecord {
+                writer_seq_num: 41,
+                part: PartHeader::unsplit(),
+                format: RecordFormat::Transcript,
+                data: Bytes::from_static(b"alpha\n"),
+            },
+            AppendRecord {
+                writer_seq_num: 42,
+                part: PartHeader::new(1, true).expect("valid part header"),
+                format: RecordFormat::Bytes,
+                data: Bytes::from(vec![0x00, 0xff, 0x10, 0x7f]),
+            },
+            AppendRecord {
+                writer_seq_num: 43,
+                part: PartHeader::new(2, false).expect("valid part header"),
+                format: RecordFormat::Bytes,
+                data: Bytes::new(),
+            },
+        ];
+        let encoded = ClientFrame::AppendBatch(records.clone())
+            .encode()
+            .expect("encode append batch");
         let ClientFrame::AppendBatch(decoded) = ClientFrame::decode_bytes(encoded).expect("decode")
         else {
             panic!("expected append batch");
         };
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[1].writer_seq_num, 1);
+        assert_eq!(decoded, records);
 
         assert!(matches!(
             ClientFrame::AppendBatch(Vec::new()).encode(),
@@ -1471,6 +1683,99 @@ mod tests {
                     .collect()
             )
             .encode(),
+            Err(FrameCodecError::InvalidBatchRecordCount {
+                max: MAX_APPEND_BATCH_RECORDS,
+                ..
+            })
+        ));
+    }
+
+    /// Decoding a hand-written wire fixture, so encoder and decoder cannot share a framing
+    /// defect that a round trip would cancel out.
+    ///
+    /// Layout: op byte `0x03` (AppendBatch), then per record a big-endian u32 body length
+    /// (13-byte header plus payload), a big-endian u64 writer sequence number, a big-endian
+    /// u32 packed part header, a one-byte format, and the payload bytes.
+    #[test]
+    fn append_batch_decodes_a_canonical_wire_fixture() {
+        #[rustfmt::skip]
+        const FRAME: &[u8] = &[
+            0x03, // AppendBatch
+            // Record 1: writer_seq_num 7, unsplit part, Transcript, "hi" (body len 13 + 2).
+            0x00, 0x00, 0x00, 0x0f,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+            0x80, 0x00, 0x00, 0x00,
+            0x01,
+            b'h', b'i',
+            // Record 2: writer_seq_num 8, part index 1 non-final, Bytes, [0x00, 0xff, 0x10]
+            // (body len 13 + 3).
+            0x00, 0x00, 0x00, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+            0x00, 0x00, 0x00, 0x01,
+            0x00,
+            0x00, 0xff, 0x10,
+        ];
+
+        let expected = vec![
+            AppendRecord {
+                writer_seq_num: 7,
+                part: PartHeader::unsplit(),
+                format: RecordFormat::Transcript,
+                data: Bytes::from_static(b"hi"),
+            },
+            AppendRecord {
+                writer_seq_num: 8,
+                part: PartHeader::new(1, false).expect("valid part header"),
+                format: RecordFormat::Bytes,
+                data: Bytes::from_static(&[0x00, 0xff, 0x10]),
+            },
+        ];
+        let ClientFrame::AppendBatch(decoded) = ClientFrame::decode(FRAME).expect("decode fixture")
+        else {
+            panic!("expected append batch");
+        };
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn append_batch_construction_enforces_wire_bounds() {
+        assert!(matches!(
+            AppendBatch::from_records(vec![]),
+            Err(FrameCodecError::InvalidBatchRecordCount { actual: 0, .. })
+        ));
+        assert!(matches!(
+            AppendBatch::single(
+                PartHeader::unsplit(),
+                RecordFormat::Bytes,
+                vec![0_u8; MAX_RECORD_BYTES + 1],
+            ),
+            Err(FrameCodecError::RecordTooLarge {
+                max: MAX_RECORD_BYTES,
+                ..
+            })
+        ));
+
+        let batch = AppendBatch::split_logical(
+            RecordFormat::Transcript,
+            Bytes::from(vec![7_u8; MAX_RECORD_BYTES * 2 + 5]),
+        )
+        .expect("split logical record");
+        assert_eq!(batch.record_count(), 3);
+        assert_eq!(
+            batch.payloads()[0].part,
+            PartHeader::new(0, false).expect("part")
+        );
+        assert_eq!(
+            batch.payloads()[2].part,
+            PartHeader::new(2, true).expect("part")
+        );
+        assert_eq!(batch.payloads()[2].data.len(), 5);
+
+        assert!(matches!(
+            AppendBatch::split_logical(
+                RecordFormat::Bytes,
+                vec![0_u8; MAX_RECORD_BYTES * MAX_APPEND_BATCH_RECORDS + 1],
+            ),
             Err(FrameCodecError::InvalidBatchRecordCount {
                 max: MAX_APPEND_BATCH_RECORDS,
                 ..

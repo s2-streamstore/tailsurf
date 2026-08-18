@@ -11,6 +11,7 @@ use crate::{
     WriterId,
     protocol::ws::frame::{
         AppendRecord, FrameCodecError, MAX_RECORD_BYTES, PartHeader, ReadRecord, RecordFormat,
+        split_record_payloads,
     },
 };
 
@@ -239,46 +240,31 @@ impl Default for LogicalTranscript {
 /// submitting them in order upholds the invariant. A record that fits in [`MAX_RECORD_BYTES`]
 /// is returned unsplit; larger payloads are sliced without copying. Readers drop logical
 /// records above their configured [`TranscriptLimits::max_logical_record_bytes`].
+///
+/// This numbers parts for manually sequenced sinks (stateless appends and
+/// [`TsfWriteSession`](crate::TsfWriteSession)); durable writers assign sequences themselves and
+/// take [`AppendBatch::split_logical`](crate::protocol::ws::frame::AppendBatch::split_logical)
+/// instead.
 pub fn split_logical_record(
     writer_start_seq_num: u64,
     format: RecordFormat,
     data: Bytes,
 ) -> Result<Vec<AppendRecord>, FrameCodecError> {
-    let part_count = data.len().div_ceil(MAX_RECORD_BYTES).max(1);
-    if part_count > PartHeader::MAX_INDEX as usize + 1 {
-        return Err(FrameCodecError::PartIndexTooLarge(
-            u32::try_from(part_count - 1).unwrap_or(u32::MAX),
-        ));
-    }
-    // Every part must carry a usable sequence number; u64::MAX is the exhaustion sentinel.
-    if writer_start_seq_num
-        .checked_add(part_count as u64 - 1)
-        .is_none_or(|last_seq_num| last_seq_num == u64::MAX)
-    {
-        return Err(FrameCodecError::WriterSequenceExhausted);
-    }
-
-    if part_count == 1 {
-        return Ok(vec![AppendRecord {
-            writer_seq_num: writer_start_seq_num,
-            part: PartHeader::unsplit(),
-            format,
-            data,
-        }]);
-    }
-
-    let mut records = Vec::with_capacity(part_count);
-    for index in 0..part_count {
-        let start = index * MAX_RECORD_BYTES;
-        let end = data.len().min(start + MAX_RECORD_BYTES);
-        records.push(AppendRecord {
+    let payloads = split_record_payloads(format, data)?;
+    // The exclusive end of the range is an ack boundary and must stay representable.
+    writer_start_seq_num
+        .checked_add(payloads.len() as u64)
+        .ok_or(FrameCodecError::WriterSequenceExhausted)?;
+    Ok(payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| AppendRecord {
             writer_seq_num: writer_start_seq_num + index as u64,
-            part: PartHeader::new(index as u32, index == part_count - 1)?,
-            format,
-            data: data.slice(start..end),
-        });
-    }
-    Ok(records)
+            part: payload.part,
+            format: payload.format,
+            data: payload.data,
+        })
+        .collect())
 }
 
 /// One complete logical transcript record after deduplication and reassembly.

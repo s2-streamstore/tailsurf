@@ -7,7 +7,10 @@ use std::{
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,8 +27,9 @@ use axum::{
 use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
-    AppendRecord, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret, RetryPolicy,
-    StreamId, StreamTitle, TsfClient, TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
+    AppendBatch, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret,
+    MAX_WRITER_UNACKED_RECORDS, RecordPayload, RetryPolicy, StreamId, StreamTitle, TsfClient,
+    TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
     protocol::{
         read::{ReadOptions, ReadStart, ReadStop},
         rest::{
@@ -33,12 +37,10 @@ use tailsurf::{
             StreamLinkCredential, StreamLinkStatus, StreamLinkSummary, StreamMetadata,
             StreamTitleUpdate, UpdateStreamRequest, Visibility,
         },
-        ws::{
-            WriteStreamOptions,
-            frame::{
-                CaughtUpPosition, ClientFrame, MAX_RECORD_BYTES, OwnedReadRecord, PartHeader,
-                ReadBatch, RecordFormat, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
-            },
+        ws::frame::{
+            CaughtUpPosition, ClientFrame, MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES,
+            OwnedReadRecord, PartHeader, ReadBatch, RecordFormat, ServerFrame,
+            TSF_WEBSOCKET_PROTOCOL,
         },
     },
     stream_url::StreamLocator,
@@ -48,7 +50,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     process::Command as TokioCommand,
-    sync::Notify,
+    sync::watch,
     time::{sleep, timeout},
 };
 use url::Url;
@@ -598,6 +600,25 @@ async fn write_defaults_to_lines_and_splits_large_records() {
 }
 
 #[tokio::test]
+async fn write_line_at_the_default_logical_limit_round_trips() {
+    let server = TestServer::start().await;
+    let mut input = "x".repeat(DEFAULT_MAX_LOGICAL_RECORD_BYTES - 1);
+    input.push('\n');
+
+    let output = run_tsf(&server, [], Some(input.as_str())).await;
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    let read_link = output
+        .stdout
+        .lines()
+        .find_map(|line| extract_link_line(line, "reader"))
+        .expect("read link");
+
+    let replay = run_tsf(&server, ["replay", read_link], None).await;
+    assert!(replay.status.success(), "stderr={}", replay.stderr);
+    assert_eq!(replay.stdout, input);
+}
+
+#[tokio::test]
 async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() {
     let server = TestServer::start().await;
     let mut input = "x".repeat(DEFAULT_MAX_LOGICAL_RECORD_BYTES);
@@ -841,23 +862,25 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
 async fn writer_preserves_its_terminal_failure_for_later_submissions() {
     let server = FakeWriteServer::start_terminal().await;
     let writer = connect_default_writer(&server.api_url).await;
-    let pre_admitted = writer.reserve(1).await.expect("reserve before failure");
+    let pre_admitted = writer
+        .reserve(&test_write_batch(Bytes::from_static(b"x")))
+        .await
+        .expect("reserve before failure");
     let first = writer
-        .submit(test_write_record(0, Bytes::from_static(b"first")))
+        .submit(test_write_batch(Bytes::from_static(b"first")))
         .await
         .expect("submit first record");
     let first_error = first.await.expect_err("first record must fail");
     assert_sequence_mismatch(&first_error);
 
-    let pre_admitted_error =
-        match pre_admitted.submit(test_write_record(1, Bytes::from_static(b"x"))) {
-            Ok(_) => panic!("terminal writer accepted a pre-admitted record"),
-            Err(error) => error,
-        };
+    let pre_admitted_error = match pre_admitted.submit(test_write_batch(Bytes::from_static(b"x"))) {
+        Ok(_) => panic!("terminal writer accepted a pre-admitted record"),
+        Err(error) => error,
+    };
     assert_sequence_mismatch(&pre_admitted_error);
 
     let later_error = match writer
-        .submit(test_write_record(1, Bytes::from_static(b"later")))
+        .submit(test_write_batch(Bytes::from_static(b"later")))
         .await
     {
         Ok(_) => panic!("terminal writer accepted a later record"),
@@ -873,35 +896,6 @@ async fn writer_preserves_its_terminal_failure_for_later_submissions() {
 }
 
 #[tokio::test]
-async fn writer_close_is_not_blocked_by_an_unused_reservation() {
-    let server = FakeWriteServer::start().await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
-    let writer = client
-        .connect_writer_with_config(
-            tailsurf::protocol::ws::WriteStreamOptions::new(
-                stream_id,
-                ClientWriterId::new_random(),
-                canonical_test_link_secret(),
-            ),
-            TsfWriterConfig {
-                max_unacked_bytes: 1,
-                max_unacked_records: 1,
-            },
-        )
-        .await
-        .expect("writer");
-    let _permit = writer.reserve(1).await.expect("reservation");
-
-    timeout(Duration::from_secs(1), writer.close())
-        .await
-        .expect("writer close must not wait for reservation")
-        .expect("writer close");
-}
-
-#[tokio::test]
 async fn default_writer_enforces_record_and_byte_windows() {
     assert_default_writer_window(128, Bytes::from_static(b"x")).await;
     assert_default_writer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
@@ -910,12 +904,11 @@ async fn default_writer_enforces_record_and_byte_windows() {
 async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
     let server = HoldingWriteServer::start(capacity).await;
     let writer = connect_default_writer(&server.api_url).await;
-    let record_count = u64::try_from(capacity).expect("window capacity fits u64");
     let mut tickets = Vec::new();
-    for writer_seq_num in 0..record_count {
+    for _ in 0..capacity {
         tickets.push(
             writer
-                .submit(test_write_record(writer_seq_num, payload.clone()))
+                .submit(test_write_batch(payload.clone()))
                 .await
                 .expect("submit within writer window"),
         );
@@ -925,7 +918,7 @@ async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
     assert!(
         timeout(
             Duration::from_millis(100),
-            writer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
+            writer.submit(test_write_batch(Bytes::from_static(b"x"))),
         )
         .await
         .is_err(),
@@ -938,7 +931,7 @@ async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
     }
     let final_ticket = timeout(
         Duration::from_secs(1),
-        writer.submit(test_write_record(record_count, Bytes::from_static(b"x"))),
+        writer.submit(test_write_batch(Bytes::from_static(b"x"))),
     )
     .await
     .expect("writer window reopened")
@@ -952,13 +945,10 @@ async fn writer_reconnect_resends_every_unacknowledged_record_in_order() {
     let server = HoldingWriteServer::start_reconnecting(3).await;
     let writer = connect_default_writer(&server.api_url).await;
     let mut tickets = Vec::new();
-    for writer_seq_num in 0..3 {
+    for record in 0..3 {
         tickets.push(
             writer
-                .submit(test_write_record(
-                    writer_seq_num,
-                    Bytes::from(format!("record-{writer_seq_num}")),
-                ))
+                .submit(test_write_batch(Bytes::from(format!("record-{record}"))))
                 .await
                 .expect("submit"),
         );
@@ -985,6 +975,350 @@ async fn writer_reconnect_resends_every_unacknowledged_record_in_order() {
     assert_eq!(attempts[1].data, attempts[4].data);
     assert_eq!(attempts[2].data, attempts[5].data);
 
+    writer.close().await.expect("writer close");
+}
+
+#[tokio::test]
+async fn writer_reconnect_resends_only_the_unacknowledged_tail() {
+    // The first connection acknowledges record 0 of a three-record batch and then drops the
+    // socket. The reconnect must resend only the unacknowledged tail, and the ticket must
+    // retain the receipt earned on the first connection.
+    let server = HoldingWriteServer::start_partially_acknowledging(3).await;
+    let writer = connect_default_writer(&server.api_url).await;
+    let batch = AppendBatch::from_records(
+        (0..3)
+            .map(|index| {
+                RecordPayload::new(
+                    PartHeader::unsplit(),
+                    RecordFormat::Bytes,
+                    Bytes::from(format!("record-{index}")),
+                )
+            })
+            .collect(),
+    )
+    .expect("batch");
+
+    let ticket = writer.submit(batch).await.expect("submit");
+    let receipts = ticket.await.expect("acknowledgements across reconnect");
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|receipt| receipt.writer_seq_num)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    server.wait_for_records(5).await;
+
+    let attempts = server.attempts();
+    let connection_seq_nums = |connection_index: usize| {
+        attempts
+            .iter()
+            .filter(|attempt| attempt.connection_index == connection_index)
+            .map(|attempt| attempt.writer_seq_num)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(connection_seq_nums(0), [0, 1, 2]);
+    assert_eq!(
+        connection_seq_nums(1),
+        [1, 2],
+        "reconnect must resend only records still missing an acknowledgement"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.client_writer_id == attempts[0].client_writer_id)
+    );
+
+    writer.close().await.expect("writer close");
+}
+
+#[tokio::test]
+async fn blocked_reservation_wakes_when_the_writer_closes() {
+    let server = HoldingWriteServer::start(1).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let writer = TsfClient::with_api_origin(server.api_url.clone())
+        .expect("valid API origin")
+        .connect_writer_with_config(
+            tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
+            TsfWriterConfig {
+                max_unacked_bytes: 8,
+                max_unacked_records: 1,
+            },
+        )
+        .await
+        .expect("writer");
+    // The unused permit holds the only record slot; the producer blocks on it.
+    let permit = writer
+        .reserve(&test_write_batch(Bytes::new()))
+        .await
+        .expect("reserve the only slot");
+    let producer = writer.producer();
+    let blocked = tokio::spawn(async move {
+        producer
+            .submit(test_write_batch(Bytes::from_static(b"x")))
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    writer.close().await.expect("writer close");
+
+    let result = blocked.await.expect("join blocked submit");
+    assert!(
+        matches!(result, Err(TsfClientError::AppendWriterClosed)),
+        "blocked reservation must wake with closure: {}",
+        result.err().expect("submit must fail")
+    );
+    assert!(
+        matches!(
+            permit.submit(test_write_batch(Bytes::new())),
+            Err(TsfClientError::AppendWriterClosed)
+        ),
+        "pre-reserved permit must refuse submission after close"
+    );
+}
+
+#[tokio::test]
+async fn writer_paces_an_oversized_batch_under_the_wire_window() {
+    // One 6 MiB batch (12 x 512 KiB) exceeds the server's 5 MiB sent-but-unacknowledged socket
+    // window, so the writer must stop after ten records until acknowledgements arrive.
+    let server = HoldingWriteServer::start(10).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let writer = TsfClient::with_api_origin(server.api_url.clone())
+        .expect("valid API origin")
+        .connect_writer_with_config(
+            tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
+            TsfWriterConfig {
+                max_unacked_bytes: 8 * 1024 * 1024,
+                max_unacked_records: 16,
+            },
+        )
+        .await
+        .expect("writer");
+    let payload = Bytes::from(vec![7_u8; MAX_RECORD_BYTES]);
+    let batch = AppendBatch::from_records(
+        (0..12)
+            .map(|_| {
+                RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, payload.clone())
+            })
+            .collect(),
+    )
+    .expect("oversized batch");
+
+    let ticket = writer.submit(batch).await.expect("batch admitted");
+
+    server.wait_for_records(10).await;
+    server.release_acknowledgements();
+    let receipts = ticket.await.expect("batch durability");
+    assert_eq!(receipts.len(), 12);
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|receipt| receipt.writer_seq_num)
+            .collect::<Vec<_>>(),
+        (0..12).collect::<Vec<_>>()
+    );
+    server.wait_for_records(12).await;
+    assert_eq!(
+        server
+            .attempts()
+            .iter()
+            .map(|attempt| attempt.writer_seq_num)
+            .collect::<Vec<_>>(),
+        (0..12).collect::<Vec<_>>()
+    );
+    // The server kept reading while acknowledgements were withheld, so a record sent ahead of
+    // them could not have sat unread in the socket: the overrun flag observes it reliably.
+    assert!(
+        !server.overrun(),
+        "writer must not send past the wire window before acknowledgements"
+    );
+    writer.close().await.expect("writer close");
+}
+
+#[tokio::test]
+async fn cloned_producers_share_one_contiguous_writer_sequence() {
+    // Cloned producers share one writer actor: every batch must occupy one uninterrupted
+    // writer sequence range, and the ranges across producers must tile 0..total without gaps
+    // or overlaps regardless of submission order.
+    let server = TestServer::start().await;
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let created = client
+        .create_stream(&CreateStreamRequest::default())
+        .await
+        .expect("create stream");
+    let writer = client
+        .connect_writer(tailsurf::DurableWriterOptions::new(
+            created.stream_id,
+            created.links[0].secret.clone(),
+        ))
+        .await
+        .expect("writer");
+
+    const PRODUCERS: usize = 4;
+    const BATCHES_PER_PRODUCER: usize = 5;
+    const RECORDS_PER_BATCH: usize = 3;
+    let total = PRODUCERS * BATCHES_PER_PRODUCER * RECORDS_PER_BATCH;
+
+    let producer = writer.producer();
+    let mut tasks = Vec::new();
+    for producer_index in 0..PRODUCERS {
+        let producer = producer.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut tickets = Vec::new();
+            for batch_index in 0..BATCHES_PER_PRODUCER {
+                let batch = AppendBatch::from_records(
+                    (0..RECORDS_PER_BATCH)
+                        .map(|record_index| {
+                            RecordPayload::new(
+                                PartHeader::unsplit(),
+                                RecordFormat::Bytes,
+                                Bytes::from(format!(
+                                    "{producer_index}-{batch_index}-{record_index}"
+                                )),
+                            )
+                        })
+                        .collect(),
+                )
+                .expect("batch");
+                tickets.push(producer.submit(batch).await.expect("submit"));
+            }
+            tickets
+        }));
+    }
+
+    let mut all_seq_nums = Vec::new();
+    for task in tasks {
+        for ticket in task.await.expect("producer task") {
+            let receipts = ticket.await.expect("batch durability");
+            let seq_nums = receipts
+                .iter()
+                .map(|receipt| receipt.writer_seq_num)
+                .collect::<Vec<_>>();
+            assert_eq!(seq_nums.len(), RECORDS_PER_BATCH);
+            assert!(
+                seq_nums.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "one batch must be one uninterrupted range: {seq_nums:?}"
+            );
+            all_seq_nums.extend(seq_nums);
+        }
+    }
+    all_seq_nums.sort_unstable();
+    assert_eq!(
+        all_seq_nums,
+        (0..total as u64).collect::<Vec<_>>(),
+        "receipts across producers must tile the full writer sequence"
+    );
+
+    server.wait_for_records(&created.stream_id, total).await;
+    let mut attempted = server.writer_seq_nums(&created.stream_id);
+    attempted.sort_unstable();
+    assert_eq!(attempted, (0..total as u64).collect::<Vec<_>>());
+
+    writer.close().await.expect("writer close");
+}
+
+#[tokio::test]
+async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
+    // Regression: the acknowledgement deadline is absolute, armed when records go on the wire
+    // and reset only by a valid ack or a reconnect. A backlog larger than the wire window keeps
+    // submission commands flowing to the actor; that traffic must not postpone the deadline,
+    // so a silent server still triggers a reconnect.
+    let server = HoldingWriteServer::start(MAX_WRITER_UNACKED_RECORDS).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    config.websocket_operation_timeout = Duration::from_millis(100);
+    config.retry_policy = RetryPolicy {
+        max_attempts: 100,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let writer = TsfClient::with_config(config)
+        .expect("valid client config")
+        .connect_writer_with_config(
+            tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
+            TsfWriterConfig {
+                max_unacked_bytes: 1024 * 1024,
+                max_unacked_records: 4 * MAX_WRITER_UNACKED_RECORDS,
+            },
+        )
+        .await
+        .expect("writer");
+
+    let producer = writer.producer();
+    let submitter = tokio::spawn(async move {
+        // Submission intervals well under the operation timeout keep the actor's command
+        // channel busy for the whole silent window.
+        loop {
+            if producer
+                .submit(test_write_batch(Bytes::from_static(b"x")))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    // The server never acknowledges; the deadline must fire within a few timeout lengths no
+    // matter how steadily submissions arrive.
+    server
+        .wait_for_connections(2, Duration::from_millis(10 * 100))
+        .await;
+
+    // Let the drained backlog acknowledge so the writer can close cleanly.
+    server.release_acknowledgements();
+    writer.close().await.expect("writer close");
+    submitter.await.expect("submitter task");
+}
+
+#[tokio::test]
+async fn writer_reconnect_arms_a_fresh_acknowledgement_deadline() {
+    // Regression: the acknowledgement deadline belongs to the socket it was armed for. The first
+    // connection burns nearly all of it before dropping; the reconnect must be measured by a
+    // fresh deadline instead of being finished off by the dead socket's remainder.
+    let server =
+        StallingWriteServer::start(Duration::from_millis(180), Duration::from_millis(100)).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    config.websocket_operation_timeout = Duration::from_millis(200);
+    config.retry_policy = RetryPolicy {
+        max_attempts: 10,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let writer = TsfClient::with_config(config)
+        .expect("valid client config")
+        .connect_writer(tailsurf::DurableWriterOptions::new(
+            stream_id,
+            canonical_test_link_secret(),
+        ))
+        .await
+        .expect("writer");
+
+    let ticket = writer
+        .submit(test_write_batch(Bytes::from_static(b"x")))
+        .await
+        .expect("submit");
+    let receipts = timeout(Duration::from_secs(5), ticket)
+        .await
+        .expect("ticket resolves")
+        .expect("durability");
+
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        server.connections(),
+        2,
+        "the second connection must get a full deadline of its own"
+    );
     writer.close().await.expect("writer close");
 }
 
@@ -1745,6 +2079,22 @@ impl TestServer {
             .map_or(0, |stream| stream.records.len())
     }
 
+    fn writer_seq_nums(&self, stream_id: &StreamId) -> Vec<u64> {
+        self.state
+            .streams
+            .lock()
+            .expect("streams lock")
+            .get(&stream_id.to_string())
+            .map(|stream| {
+                stream
+                    .records
+                    .iter()
+                    .map(|record| record.writer_seq_num)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn wait_for_records(&self, stream_id: &StreamId, expected: usize) {
         let stream_id = stream_id.to_string();
         timeout(Duration::from_secs(5), async {
@@ -2345,28 +2695,42 @@ async fn test_read_flow(
         .await
         .expect("send stream metadata");
     if !records.is_empty() {
-        send_server_frame(
-            &mut socket,
-            ServerFrame::ReadBatch(
-                ReadBatch::try_from_records(
-                    records
-                        .into_iter()
-                        .map(|record| OwnedReadRecord {
-                            seq_num: record.seq_num,
-                            timestamp_ms: record.timestamp_ms,
-                            writer_id: record.writer_id,
-                            writer_seq_num: record.writer_seq_num,
-                            part: record.part,
-                            format: record.format,
-                            data: record.data,
-                        })
-                        .collect(),
-                )
-                .expect("test records within batch bounds"),
-            ),
-        )
-        .await
-        .expect("send records");
+        // The wire carries at most MAX_BATCH_PAYLOAD_BYTES per batch; large records force
+        // multiple batches, as the real service would send them.
+        let records = records
+            .into_iter()
+            .map(|record| OwnedReadRecord {
+                seq_num: record.seq_num,
+                timestamp_ms: record.timestamp_ms,
+                writer_id: record.writer_id,
+                writer_seq_num: record.writer_seq_num,
+                part: record.part,
+                format: record.format,
+                data: record.data,
+            })
+            .collect::<Vec<_>>();
+        let mut start = 0;
+        while start < records.len() {
+            let mut end = start;
+            let mut payload_bytes = 0;
+            while end < records.len()
+                && (end == start
+                    || payload_bytes + records[end].data.len() <= MAX_BATCH_PAYLOAD_BYTES)
+            {
+                payload_bytes += records[end].data.len();
+                end += 1;
+            }
+            send_server_frame(
+                &mut socket,
+                ServerFrame::ReadBatch(
+                    ReadBatch::try_from_records(records[start..end].to_vec())
+                        .expect("test records within batch bounds"),
+                ),
+            )
+            .await
+            .expect("send records");
+            start = end;
+        }
     }
     send_server_frame(&mut socket, ServerFrame::CaughtUp(caught_up))
         .await
@@ -2726,22 +3090,16 @@ async fn connect_default_writer(api_url: &Url) -> tailsurf::TsfWriter {
         .expect("stream id");
     TsfClient::with_api_origin(api_url.clone())
         .expect("valid API origin")
-        .connect_writer(WriteStreamOptions::new(
+        .connect_writer(tailsurf::DurableWriterOptions::new(
             stream_id,
-            ClientWriterId::new_random(),
             canonical_test_link_secret(),
         ))
         .await
         .expect("writer")
 }
 
-fn test_write_record(writer_seq_num: u64, data: Bytes) -> AppendRecord {
-    AppendRecord::new(
-        writer_seq_num,
-        PartHeader::unsplit(),
-        RecordFormat::Bytes,
-        data,
-    )
+fn test_write_batch(data: Bytes) -> AppendBatch {
+    AppendBatch::single(PartHeader::unsplit(), RecordFormat::Bytes, data).expect("valid batch")
 }
 
 fn assert_sequence_mismatch(error: &TsfClientError) {
@@ -2755,16 +3113,30 @@ fn assert_sequence_mismatch(error: &TsfClientError) {
     assert!(is_mismatch, "error={error}");
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HoldingWriteMode {
+    /// Withhold every acknowledgement until the test releases them.
+    Hold,
+    /// Drop the first connection after its first batch without acknowledging anything.
+    Reconnect,
+    /// Acknowledge only the first record of the first connection, then drop the socket.
+    PartialAckReconnect,
+}
+
 struct HoldingWriteState {
+    mode: HoldingWriteMode,
     expected_before_ack: usize,
     attempts: Mutex<Vec<HoldingWriteAttempt>>,
     connections: Mutex<usize>,
-    disconnect_first_batch: bool,
-    release_acknowledgements: Notify,
+    /// Sticky release signal: a connection that starts after release must still observe it.
+    release: watch::Sender<bool>,
+    /// Set when a record arrives past the unacknowledged cap before acknowledgements flow.
+    overrun: AtomicBool,
 }
 
 #[derive(Clone)]
 struct HoldingWriteAttempt {
+    connection_index: usize,
     client_writer_id: ClientWriterId,
     writer_seq_num: u64,
     data: Bytes,
@@ -2778,20 +3150,26 @@ struct HoldingWriteServer {
 
 impl HoldingWriteServer {
     async fn start(expected_before_ack: usize) -> Self {
-        Self::start_with_mode(expected_before_ack, false).await
+        Self::start_with_mode(expected_before_ack, HoldingWriteMode::Hold).await
     }
 
     async fn start_reconnecting(expected_before_ack: usize) -> Self {
-        Self::start_with_mode(expected_before_ack, true).await
+        Self::start_with_mode(expected_before_ack, HoldingWriteMode::Reconnect).await
     }
 
-    async fn start_with_mode(expected_before_ack: usize, disconnect_first_batch: bool) -> Self {
+    async fn start_partially_acknowledging(expected_before_ack: usize) -> Self {
+        Self::start_with_mode(expected_before_ack, HoldingWriteMode::PartialAckReconnect).await
+    }
+
+    async fn start_with_mode(expected_before_ack: usize, mode: HoldingWriteMode) -> Self {
+        let (release, _) = watch::channel(false);
         let state = Arc::new(HoldingWriteState {
+            mode,
             expected_before_ack,
             attempts: Mutex::new(Vec::new()),
             connections: Mutex::new(0),
-            disconnect_first_batch,
-            release_acknowledgements: Notify::new(),
+            release,
+            overrun: AtomicBool::new(false),
         });
         let router = Router::new()
             .route(
@@ -2820,12 +3198,29 @@ impl HoldingWriteServer {
         .expect("server received records");
     }
 
+    async fn wait_for_connections(&self, expected: usize, within: Duration) {
+        timeout(within, async {
+            loop {
+                if *self.state.connections.lock().expect("connections lock") >= expected {
+                    return;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("server observed connections");
+    }
+
     fn release_acknowledgements(&self) {
-        self.state.release_acknowledgements.notify_one();
+        let _ = self.state.release.send(true);
     }
 
     fn attempts(&self) -> Vec<HoldingWriteAttempt> {
         self.state.attempts.lock().expect("attempts lock").clone()
+    }
+
+    fn overrun(&self) -> bool {
+        self.state.overrun.load(Ordering::SeqCst)
     }
 }
 
@@ -2847,6 +3242,8 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
     else {
         return;
     };
+    // Subscribe before the connection becomes visible so a release can never be missed.
+    let mut release = state.release.subscribe();
     let connection_index = {
         let mut connections = state.connections.lock().expect("connections lock");
         let connection_index = *connections;
@@ -2860,39 +3257,80 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
         return;
     }
 
-    let mut received = 0;
-    while received < state.expected_before_ack {
-        let Some(Ok(Message::Binary(append))) = socket.recv().await else {
-            return;
+    let first_connection = connection_index == 0;
+
+    // Reads never stop at the unacknowledged cap: a writer sending past the window before
+    // acknowledgements must be observed here, not left unread in the socket buffer.
+    let mut received = 0_usize;
+    let mut first_record_acked = false;
+    loop {
+        let stop = match state.mode {
+            HoldingWriteMode::Hold => *release.borrow_and_update(),
+            HoldingWriteMode::Reconnect => received >= state.expected_before_ack,
+            // Only the first connection reads a full batch before the drop; later connections
+            // skip ahead and acknowledge each resent frame as it arrives below.
+            HoldingWriteMode::PartialAckReconnect => {
+                !first_connection || received >= state.expected_before_ack
+            }
         };
-        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
-            return;
-        };
-        if records.is_empty() || records.len() > state.expected_before_ack - received {
-            return;
+        if stop {
+            break;
         }
-        received += records.len();
-        state
-            .attempts
-            .lock()
-            .expect("attempts lock")
-            .extend(records.into_iter().map(|record| HoldingWriteAttempt {
-                client_writer_id,
-                writer_seq_num: record.writer_seq_num,
-                data: record.data,
-            }));
+        tokio::select! {
+            frame = socket.recv() => {
+                let Some(Ok(Message::Binary(append))) = frame else {
+                    return;
+                };
+                let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append)
+                else {
+                    return;
+                };
+                if records.is_empty() {
+                    return;
+                }
+                received += records.len();
+                if received > state.expected_before_ack {
+                    state.overrun.store(true, Ordering::SeqCst);
+                }
+                let first_writer_seq_num = records[0].writer_seq_num;
+                state
+                    .attempts
+                    .lock()
+                    .expect("attempts lock")
+                    .extend(records.into_iter().map(|record| HoldingWriteAttempt {
+                        connection_index,
+                        client_writer_id,
+                        writer_seq_num: record.writer_seq_num,
+                        data: record.data,
+                    }));
+                if state.mode == HoldingWriteMode::PartialAckReconnect
+                    && connection_index == 0
+                    && !first_record_acked
+                {
+                    first_record_acked = true;
+                    if send_test_ack(&mut socket, first_writer_seq_num, first_writer_seq_num)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            _ = release.changed(), if state.mode == HoldingWriteMode::Hold => {}
+        }
     }
 
-    if state.disconnect_first_batch && connection_index == 0 {
+    if first_connection && state.mode != HoldingWriteMode::Hold {
+        // Drop the socket without further acknowledgements; the writer must reconnect and
+        // resend whatever was not acknowledged.
         let _ = socket.send(Message::Close(None)).await;
         return;
     }
-    if !state.disconnect_first_batch {
-        state.release_acknowledgements.notified().await;
-    }
-    let last = u64::try_from(state.expected_before_ack - 1).expect("ack range");
-    if send_test_ack(&mut socket, 0, last).await.is_err() {
-        return;
+    if state.mode != HoldingWriteMode::PartialAckReconnect && received > 0 {
+        let last = u64::try_from(received - 1).expect("ack range");
+        if send_test_ack(&mut socket, 0, last).await.is_err() {
+            return;
+        }
     }
 
     while let Some(Ok(Message::Binary(append))) = socket.recv().await {
@@ -2910,6 +3348,7 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
             .lock()
             .expect("attempts lock")
             .extend(records.into_iter().map(|record| HoldingWriteAttempt {
+                connection_index,
                 client_writer_id,
                 writer_seq_num: record.writer_seq_num,
                 data: record.data,
@@ -2931,6 +3370,88 @@ async fn send_test_ack(socket: &mut WebSocket, start: u64, end: u64) -> Result<(
         },
     )
     .await
+}
+
+/// Write socket whose first connection stalls and then drops without acknowledging; every later
+/// connection acknowledges each frame after a delay.
+struct StallingWriteState {
+    stall: Duration,
+    ack_delay: Duration,
+    connections: AtomicUsize,
+}
+
+struct StallingWriteServer {
+    api_url: Url,
+    state: Arc<StallingWriteState>,
+    _task: AbortOnDrop,
+}
+
+impl StallingWriteServer {
+    async fn start(stall: Duration, ack_delay: Duration) -> Self {
+        let state = Arc::new(StallingWriteState {
+            stall,
+            ack_delay,
+            connections: AtomicUsize::new(0),
+        });
+        let router = Router::new()
+            .route(
+                "/api/v1/streams/{stream_id}/write",
+                get(stalling_write_socket),
+            )
+            .with_state(state.clone());
+        let (api_url, task) = start_server(router).await;
+        Self {
+            api_url,
+            state,
+            _task: task,
+        }
+    }
+
+    fn connections(&self) -> usize {
+        self.state.connections.load(Ordering::SeqCst)
+    }
+}
+
+async fn stalling_write_socket(
+    State(state): State<Arc<StallingWriteState>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.protocols([TSF_WEBSOCKET_PROTOCOL])
+        .on_upgrade(move |socket| stalling_write_flow(state, socket))
+}
+
+async fn stalling_write_flow(state: Arc<StallingWriteState>, mut socket: WebSocket) {
+    let Some(Ok(Message::Binary(_open))) = socket.recv().await else {
+        return;
+    };
+    let first_connection = state.connections.fetch_add(1, Ordering::SeqCst) == 0;
+    if send_server_frame(&mut socket, ServerFrame::Ready)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    while let Some(Ok(Message::Binary(append))) = socket.recv().await {
+        let Ok(ClientFrame::AppendBatch(records)) = ClientFrame::decode_bytes(append) else {
+            return;
+        };
+        let Some(start) = records.first().map(|record| record.writer_seq_num) else {
+            return;
+        };
+        let Some(end) = records.last().map(|record| record.writer_seq_num) else {
+            return;
+        };
+        if first_connection {
+            sleep(state.stall).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+        sleep(state.ack_delay).await;
+        if send_test_ack(&mut socket, start, end).await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn send_server_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result<(), axum::Error> {
