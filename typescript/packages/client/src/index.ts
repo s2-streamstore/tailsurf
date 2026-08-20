@@ -44,10 +44,18 @@ export type {
 export { isRetryableSocketError } from "./socket.js";
 export type { WebSocketFactory, WebSocketLike } from "./socket.js";
 export {
-  MAX_PENDING_WRITER_PAYLOAD_BYTES,
-  MAX_PENDING_WRITER_RECORDS,
+  DEFAULT_WRITER_RETAINED_BYTES,
+  DEFAULT_WRITER_RETAINED_RECORDS,
+  MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+  MAX_WRITER_UNACKED_RECORDS,
 } from "./writer.js";
-export type { AppendInput, AppendReceipt, TsfWriter } from "./writer.js";
+export type {
+  AppendInput,
+  AppendReceipt,
+  LogicalAppendInput,
+  TsfWriter,
+  TsfWriterConfig,
+} from "./writer.js";
 export {
   DEFAULT_MAX_LOGICAL_RECORD_BYTES,
   DEFAULT_MAX_TRANSCRIPT_PENDING_BYTES,

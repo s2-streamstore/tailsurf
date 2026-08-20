@@ -969,8 +969,8 @@ async fn connect_session_writer(
     // in-flight window of ordinary records. MaxLogicalRecordBytes caps the value at 64 MiB
     // during argument parsing, so both sums stay far below usize::MAX on any supported target.
     let config = TsfWriterConfig {
-        max_unacked_bytes: max_logical_record_bytes + MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-        max_unacked_records: max_logical_record_bytes.div_ceil(MAX_RECORD_BYTES)
+        max_retained_bytes: max_logical_record_bytes + MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+        max_retained_records: max_logical_record_bytes.div_ceil(MAX_RECORD_BYTES)
             + MAX_WRITER_UNACKED_RECORDS,
     };
     client

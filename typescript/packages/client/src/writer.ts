@@ -1,15 +1,15 @@
 import {
-  MAX_BATCH_PAYLOAD_BYTES,
   MAX_APPEND_BATCH_RECORDS,
+  MAX_BATCH_PAYLOAD_BYTES,
   MAX_RECORD_BYTES,
+  MAX_U64,
+  partHeader,
   RecordFormat,
   UNSPLIT_PART,
   type PartHeader,
 } from "@tailsurf/protocol";
 
 import { TsfClientError, TsfWebSocketClosedError } from "./errors.js";
-import { MAX_U64 } from "@tailsurf/protocol";
-
 import {
   type FrameSocket,
   isRetryableSocketError,
@@ -27,6 +27,11 @@ export interface AppendInput {
   readonly part?: PartHeader;
 }
 
+export interface LogicalAppendInput {
+  readonly data: string | Uint8Array;
+  readonly format?: RecordFormat;
+}
+
 export interface AppendReceipt {
   readonly writerSeqNum: bigint;
   readonly seqNum: bigint;
@@ -35,32 +40,63 @@ export interface AppendReceipt {
 export interface TsfWriter {
   append(input: AppendInput): Promise<AppendReceipt>;
   appendBatch(inputs: readonly AppendInput[]): Promise<readonly AppendReceipt[]>;
+  appendLogical(input: LogicalAppendInput): Promise<readonly AppendReceipt[]>;
   close(): Promise<void>;
 }
 
-/** Maximum append calls retained by one writer until they settle. */
-export const MAX_PENDING_WRITER_RECORDS = 128;
-/** Maximum append payload retained by one writer until calls settle. */
-export const MAX_PENDING_WRITER_PAYLOAD_BYTES = 5 * 1024 * 1024;
+/** Maximum sent-but-unacknowledged physical records on one writer socket. */
+export const MAX_WRITER_UNACKED_RECORDS = 128;
+/** Maximum sent-but-unacknowledged payload bytes on one writer socket. */
+export const MAX_WRITER_UNACKED_PAYLOAD_BYTES = 5 * 1024 * 1024;
+/** Default number of physical records retained until durability acknowledgement. */
+export const DEFAULT_WRITER_RETAINED_RECORDS = MAX_WRITER_UNACKED_RECORDS;
+/** Default payload bytes retained until durability acknowledgement. */
+export const DEFAULT_WRITER_RETAINED_BYTES = MAX_WRITER_UNACKED_PAYLOAD_BYTES;
+
+export interface TsfWriterConfig {
+  readonly maxRetainedRecords?: number;
+  readonly maxRetainedBytes?: number;
+}
+
+export interface NormalizedTsfWriterConfig {
+  readonly maxRetainedRecords: number;
+  readonly maxRetainedBytes: number;
+}
+
+export function normalizeWriterConfig(
+  config: TsfWriterConfig = {},
+): NormalizedTsfWriterConfig {
+  return {
+    maxRetainedRecords: positiveSafeInteger(
+      config.maxRetainedRecords ?? DEFAULT_WRITER_RETAINED_RECORDS,
+      "maxRetainedRecords",
+    ),
+    maxRetainedBytes: positiveSafeInteger(
+      config.maxRetainedBytes ?? DEFAULT_WRITER_RETAINED_BYTES,
+      "maxRetainedBytes",
+    ),
+  };
+}
 
 export class DefaultTsfWriter implements TsfWriter {
   #socket: FrameSocket;
-  #nextWriterSeqNum: bigint;
+  #nextWriterSeqNum = 0n;
   readonly #queue: PendingAppendCall[] = [];
   #drain: Promise<void> | undefined;
-  #pendingRecords = 0;
-  #pendingPayloadBytes = 0;
+  #retainedRecords = 0;
+  #retainedBytes = 0;
+  #unacknowledgedRecords = 0;
+  #unacknowledgedBytes = 0;
   #closing = false;
   #closed = false;
   #terminalError: TsfClientError | undefined;
 
   public constructor(
-    writerStartSeqNum: bigint,
     socket: FrameSocket,
     private readonly connect: () => Promise<FrameSocket>,
     private readonly policy: SocketPolicy,
+    private readonly config: NormalizedTsfWriterConfig,
   ) {
-    this.#nextWriterSeqNum = writerStartSeqNum;
     this.#socket = socket;
   }
 
@@ -81,7 +117,6 @@ export class DefaultTsfWriter implements TsfWriter {
     if (unavailable !== undefined) {
       return Promise.reject(unavailable);
     }
-
     if (inputs.length === 0 || inputs.length > MAX_APPEND_BATCH_RECORDS) {
       return Promise.reject(
         new TsfClientError(
@@ -90,48 +125,95 @@ export class DefaultTsfWriter implements TsfWriter {
         ),
       );
     }
-    if (inputs.length > MAX_PENDING_WRITER_RECORDS - this.#pendingRecords) {
-      return Promise.reject(writerAdmissionError("record"));
-    }
-    let availablePayloadBytes = Math.min(
-      MAX_BATCH_PAYLOAD_BYTES,
-      MAX_PENDING_WRITER_PAYLOAD_BYTES - this.#pendingPayloadBytes,
-    );
-    const pending: PendingAppend[] = [];
+
+    let records: PendingAppend[];
     try {
-      for (const input of inputs) {
-        const record = prepareAppend(input, availablePayloadBytes);
-        pending.push(record);
-        availablePayloadBytes -= record.reservedPayloadBytes;
-      }
+      records = inputs.map(prepareAppend);
     } catch (error) {
-      return Promise.reject(
-        error instanceof Error
-          ? error
-          : new TsfClientError(
-              "invalid_append_input",
-              "could not prepare append input",
-              { cause: error },
-            ),
-      );
+      return Promise.reject(asAppendInputError(error));
     }
-    const reservedPayloadBytes = pending.reduce(
-      (total, record) => total + record.reservedPayloadBytes,
+    const retainedBytes = records.reduce(
+      (total, record) => total + record.retainedBytes,
       0,
     );
-    this.#pendingRecords += pending.length;
-    this.#pendingPayloadBytes += reservedPayloadBytes;
+    if (
+      records.length > this.config.maxRetainedRecords - this.#retainedRecords ||
+      retainedBytes > this.config.maxRetainedBytes - this.#retainedBytes
+    ) {
+      return Promise.reject(writerAdmissionError(
+        records.length,
+        retainedBytes,
+        this.config,
+      ));
+    }
+
+    const writerEndSeqNum = this.#nextWriterSeqNum + BigInt(records.length);
+    if (writerEndSeqNum > MAX_U64) {
+      return Promise.reject(new TsfClientError(
+        "writer_sequence_exhausted",
+        "append batch exceeds the writer sequence range",
+      ));
+    }
+    const writerStartSeqNum = this.#nextWriterSeqNum;
+    this.#nextWriterSeqNum = writerEndSeqNum;
+    this.#retainedRecords += records.length;
+    this.#retainedBytes += retainedBytes;
 
     const result = new Promise<readonly AppendReceipt[]>((resolve, reject) => {
       this.#queue.push({
-        records: pending,
-        reservedPayloadBytes,
+        writerStartSeqNum,
+        records,
+        retainedBytes,
+        acknowledged: 0,
+        sent: 0,
+        receipts: [],
         resolve,
         reject,
       });
     });
     this.#scheduleDrain();
     return result;
+  }
+
+  public appendLogical(
+    input: LogicalAppendInput,
+  ): Promise<readonly AppendReceipt[]> {
+    const unavailable = this.#submissionError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    const maximumBytes = MAX_APPEND_BATCH_RECORDS * MAX_RECORD_BYTES;
+    if (
+      (typeof input.data === "string" && input.data.length > maximumBytes) ||
+      (typeof input.data !== "string" && input.data.byteLength > maximumBytes)
+    ) {
+      return Promise.reject(logicalRecordTooLarge());
+    }
+    let data: Uint8Array;
+    try {
+      data = typeof input.data === "string"
+        ? textEncoder.encode(input.data)
+        : new Uint8Array(input.data);
+    } catch (error) {
+      return Promise.reject(asAppendInputError(error));
+    }
+    const partCount = Math.max(1, Math.ceil(data.byteLength / MAX_RECORD_BYTES));
+    if (partCount > MAX_APPEND_BATCH_RECORDS) {
+      return Promise.reject(logicalRecordTooLarge());
+    }
+    const format = input.format ??
+      (typeof input.data === "string" ? RecordFormat.Transcript : RecordFormat.Bytes);
+    if (partCount === 1) {
+      return this.appendBatch([{ data, format }]);
+    }
+    return this.appendBatch(Array.from({ length: partCount }, (_, index) => ({
+      data: data.subarray(
+        index * MAX_RECORD_BYTES,
+        Math.min((index + 1) * MAX_RECORD_BYTES, data.byteLength),
+      ),
+      format,
+      part: partHeader(index, index + 1 === partCount),
+    })));
   }
 
   public async close(): Promise<void> {
@@ -159,152 +241,52 @@ export class DefaultTsfWriter implements TsfWriter {
     const run = Promise.resolve().then(() => this.#drainQueue());
     this.#drain = run.finally(() => {
       this.#drain = undefined;
-      if (this.#queue.length > 0) {
+      if (this.#queue.length > 0 && this.#terminalError === undefined) {
         this.#scheduleDrain();
       }
     });
   }
 
   async #drainQueue(): Promise<void> {
-    while (this.#queue.length > 0) {
-      const calls = this.#takeQueuedBatch();
-      const unavailable = this.#terminalOrClosedError();
-      if (unavailable !== undefined) {
-        this.#rejectCalls(calls, unavailable);
-        continue;
-      }
-      const records = calls.flatMap((call) => call.records);
-      try {
-        const receipts = await this.#appendBatch(records);
-        this.#resolveCalls(calls, receipts);
-      } catch (error) {
-        this.#rejectCalls(calls, error);
-      }
-    }
-  }
-
-  #takeQueuedBatch(): PendingAppendCall[] {
-    const calls: PendingAppendCall[] = [];
-    let recordCount = 0;
-    let payloadBytes = 0;
-    for (const call of this.#queue) {
-      if (
-        recordCount + call.records.length > MAX_APPEND_BATCH_RECORDS ||
-        payloadBytes + call.reservedPayloadBytes > MAX_BATCH_PAYLOAD_BYTES
-      ) {
-        break;
-      }
-      calls.push(call);
-      recordCount += call.records.length;
-      payloadBytes += call.reservedPayloadBytes;
-    }
-    this.#queue.splice(0, calls.length);
-    return calls;
-  }
-
-  #resolveCalls(
-    calls: readonly PendingAppendCall[],
-    receipts: readonly AppendReceipt[],
-  ): void {
-    let receiptOffset = 0;
-    for (const call of calls) {
-      const nextOffset = receiptOffset + call.records.length;
-      call.resolve(receipts.slice(receiptOffset, nextOffset));
-      receiptOffset = nextOffset;
-      this.#releaseCall(call);
-    }
-  }
-
-  #rejectCalls(calls: readonly PendingAppendCall[], reason: unknown): void {
-    for (const call of calls) {
-      call.reject(reason);
-      this.#releaseCall(call);
-    }
-  }
-
-  #releaseCall(call: PendingAppendCall): void {
-    this.#pendingRecords -= call.records.length;
-    this.#pendingPayloadBytes -= call.reservedPayloadBytes;
-  }
-
-  async #appendBatch(
-    inputs: readonly PendingAppend[],
-  ): Promise<readonly AppendReceipt[]> {
-    const writerStartSeqNum = this.#nextWriterSeqNum;
-    const writerEndSeqNum = writerStartSeqNum + BigInt(inputs.length);
-    if (writerEndSeqNum > MAX_U64) {
-      throw new TsfClientError(
-        "writer_sequence_exhausted",
-        "append batch exceeds the writer sequence range",
-      );
-    }
-    const frame = {
-      type: "appendBatch" as const,
-      records: inputs.map((input, index) => ({
-        writerSeqNum: writerStartSeqNum + BigInt(index),
-        part: input.part,
-        format: input.format,
-        data: input.data,
-      })),
-    };
-
     let reconnectAttempts = 0;
     let reconnectDelay = this.policy.initialBackoffMs;
-    let durabilityAmbiguous = false;
-    for (;;) {
+    while (this.#queue.length > 0) {
       try {
-        this.#socket.send(frame);
-        durabilityAmbiguous = true;
-        const receipts: AppendReceipt[] = [];
-        let nextWriterSeqNum = writerStartSeqNum;
-        while (nextWriterSeqNum < writerEndSeqNum) {
-          const response = await withTimeout(
-            this.#socket.nextFrame(),
-            this.policy.webSocketOperationTimeoutMs,
-            "append acknowledgement",
+        this.#fillSocketWindow();
+        if (!this.#hasInFlightRecords()) {
+          throw new TsfClientError(
+            "invalid_writer_state",
+            "writer could not send a retained record",
           );
-          if (response.type !== "appendAck") {
-            throw unexpectedFrame(response);
-          }
-          const records = response.writerEndSeqNum - response.writerStartSeqNum;
-          if (
-            response.writerStartSeqNum !== nextWriterSeqNum ||
-            response.writerEndSeqNum > writerEndSeqNum ||
-            response.writerEndSeqNum <= response.writerStartSeqNum ||
-            response.endSeqNum <= response.startSeqNum ||
-            response.endSeqNum - response.startSeqNum !== records
-          ) {
-            throw new TsfClientError(
-              "invalid_append_ack",
-              "append acknowledgement does not match the submitted batch",
-            );
-          }
-          for (let offset = 0n; offset < records; offset += 1n) {
-            receipts.push({
-              writerSeqNum: response.writerStartSeqNum + offset,
-              seqNum: response.startSeqNum + offset,
-            });
-          }
-          nextWriterSeqNum = response.writerEndSeqNum;
         }
-        if (writerEndSeqNum === MAX_U64) {
-          this.#closed = true;
-        } else {
-          this.#nextWriterSeqNum = writerEndSeqNum;
+        const response = await withTimeout(
+          this.#socket.nextFrame(),
+          this.policy.webSocketOperationTimeoutMs,
+          "append acknowledgement",
+        );
+        if (response.type !== "appendAck") {
+          throw unexpectedFrame(response);
         }
-        return receipts;
+        this.#dispatchAck(response);
+        reconnectAttempts = 0;
+        reconnectDelay = this.policy.initialBackoffMs;
       } catch (error) {
-        if (
-          error instanceof TsfWebSocketClosedError &&
-          error.closeCode === 1008 &&
-          error.reason === "sequence_mismatch"
-        ) {
-          throw this.#terminateSequenceMismatch(error);
+        const durabilityAmbiguous = this.#hasInFlightRecords();
+        if (isSequenceMismatch(error)) {
+          this.#finish(this.#terminateSequenceMismatch(error));
+          return;
         }
         if (!isRetryableSocketError(error)) {
-          throw durabilityAmbiguous ? this.#terminateAmbiguous(error) : error;
+          this.#finish(
+            durabilityAmbiguous
+              ? this.#terminateAmbiguous(error)
+              : this.#terminate(error),
+          );
+          return;
         }
+
         this.#socket.close();
+        this.#resetSentToAcknowledged();
         let recovered: Awaited<ReturnType<typeof reconnectSocket>>;
         try {
           recovered = await reconnectSocket(
@@ -315,15 +297,173 @@ export class DefaultTsfWriter implements TsfWriter {
             error,
           );
         } catch (reconnectError) {
-          throw durabilityAmbiguous
+          const terminal = isSequenceMismatch(reconnectError)
+            ? this.#terminateSequenceMismatch(reconnectError)
+            : durabilityAmbiguous
             ? this.#terminateAmbiguous(reconnectError)
-            : reconnectError;
+            : this.#terminate(reconnectError);
+          this.#finish(terminal);
+          return;
         }
         this.#socket = recovered.socket;
         reconnectAttempts = recovered.attempts;
         reconnectDelay = recovered.nextDelayMs;
       }
     }
+  }
+
+  #fillSocketWindow(): void {
+    while (this.#sendNextFrame()) {
+      // Fill the fixed socket window before waiting for acknowledgement progress.
+    }
+  }
+
+  #sendNextFrame(): boolean {
+    const selected: { readonly call: PendingAppendCall; readonly index: number }[] = [];
+    let payloadBytes = 0;
+    let chargedBytes = 0;
+    const availableRecords = MAX_WRITER_UNACKED_RECORDS - this.#unacknowledgedRecords;
+    const availableBytes =
+      MAX_WRITER_UNACKED_PAYLOAD_BYTES - this.#unacknowledgedBytes;
+    if (availableRecords === 0 || availableBytes === 0) {
+      return false;
+    }
+    outer: for (const call of this.#queue) {
+      for (let index = call.sent; index < call.records.length; index += 1) {
+        const record = call.records[index];
+        if (record === undefined) {
+          throw new TsfClientError("invalid_writer_state", "writer record is missing");
+        }
+        if (
+          selected.length >= Math.min(MAX_APPEND_BATCH_RECORDS, availableRecords) ||
+          record.retainedBytes > availableBytes - chargedBytes ||
+          (selected.length > 0 &&
+            record.data.byteLength > MAX_BATCH_PAYLOAD_BYTES - payloadBytes)
+        ) {
+          break outer;
+        }
+        selected.push({ call, index });
+        payloadBytes += record.data.byteLength;
+        chargedBytes += record.retainedBytes;
+      }
+    }
+    if (selected.length === 0) {
+      return false;
+    }
+
+    this.#socket.send({
+      type: "appendBatch",
+      records: selected.map(({ call, index }) => {
+        const record = call.records[index];
+        if (record === undefined) {
+          throw new TsfClientError("invalid_writer_state", "writer record is missing");
+        }
+        return {
+          writerSeqNum: call.writerStartSeqNum + BigInt(index),
+          part: record.part,
+          format: record.format,
+          data: record.data,
+        };
+      }),
+    });
+    for (const { call } of selected) {
+      call.sent += 1;
+    }
+    this.#unacknowledgedRecords += selected.length;
+    this.#unacknowledgedBytes += chargedBytes;
+    return true;
+  }
+
+  #dispatchAck(response: AppendAckFrame): void {
+    const sentRange = this.#sentRange();
+    const writerCount = response.writerEndSeqNum - response.writerStartSeqNum;
+    if (
+      sentRange === undefined ||
+      response.writerStartSeqNum !== sentRange.start ||
+      response.writerEndSeqNum > sentRange.end ||
+      writerCount <= 0n ||
+      response.endSeqNum - response.startSeqNum !== writerCount
+    ) {
+      throw new TsfClientError(
+        "invalid_append_ack",
+        "append acknowledgement does not match the sent writer range",
+      );
+    }
+
+    let remaining = Number(writerCount);
+    let streamSeqNum = response.startSeqNum;
+    while (remaining > 0) {
+      const call = this.#queue[0];
+      if (call === undefined || call.acknowledged >= call.sent) {
+        throw new TsfClientError(
+          "invalid_append_ack",
+          "append acknowledgement exceeds the sent writer range",
+        );
+      }
+      const acknowledged = Math.min(remaining, call.sent - call.acknowledged);
+      for (let offset = 0; offset < acknowledged; offset += 1) {
+        const record = call.records[call.acknowledged + offset];
+        if (record === undefined) {
+          throw new TsfClientError("invalid_writer_state", "writer record is missing");
+        }
+        call.receipts.push({
+          writerSeqNum: call.writerStartSeqNum + BigInt(call.acknowledged + offset),
+          seqNum: streamSeqNum + BigInt(offset),
+        });
+        this.#unacknowledgedBytes -= record.retainedBytes;
+      }
+      this.#unacknowledgedRecords -= acknowledged;
+      call.acknowledged += acknowledged;
+      remaining -= acknowledged;
+      streamSeqNum += BigInt(acknowledged);
+      if (call.acknowledged === call.records.length) {
+        this.#queue.shift();
+        this.#releaseCall(call);
+        call.resolve(call.receipts);
+      }
+    }
+  }
+
+  #sentRange(): { readonly start: bigint; readonly end: bigint } | undefined {
+    let start: bigint | undefined;
+    let end: bigint | undefined;
+    for (const call of this.#queue) {
+      if (call.acknowledged < call.sent) {
+        start ??= call.writerStartSeqNum + BigInt(call.acknowledged);
+        end = call.writerStartSeqNum + BigInt(call.sent);
+      } else if (start !== undefined) {
+        break;
+      }
+    }
+    return start === undefined || end === undefined ? undefined : { start, end };
+  }
+
+  #hasInFlightRecords(): boolean {
+    return this.#unacknowledgedRecords > 0;
+  }
+
+  #resetSentToAcknowledged(): void {
+    for (const call of this.#queue) {
+      call.sent = call.acknowledged;
+    }
+    this.#unacknowledgedRecords = 0;
+    this.#unacknowledgedBytes = 0;
+  }
+
+  #finish(error: TsfClientError): void {
+    while (this.#queue.length > 0) {
+      const call = this.#queue.shift();
+      if (call === undefined) {
+        break;
+      }
+      this.#releaseCall(call);
+      call.reject(error);
+    }
+  }
+
+  #releaseCall(call: PendingAppendCall): void {
+    this.#retainedRecords -= call.records.length;
+    this.#retainedBytes -= call.retainedBytes;
   }
 
   #submissionError(): TsfClientError | undefined {
@@ -343,6 +483,15 @@ export class DefaultTsfWriter implements TsfWriter {
     return this.#closed
       ? new TsfClientError("writer_closed", "TSF writer is closed")
       : undefined;
+  }
+
+  #terminate(error: unknown): TsfClientError {
+    this.#terminalError ??= error instanceof TsfClientError
+      ? error
+      : new TsfClientError("writer_failed", "TSF writer failed", { cause: error });
+    this.#closed = true;
+    this.#socket.close();
+    return this.#terminalError;
   }
 
   #terminateAmbiguous(cause: unknown): TsfClientError {
@@ -372,66 +521,77 @@ interface PendingAppend {
   readonly data: Uint8Array;
   readonly format: RecordFormat;
   readonly part: PartHeader;
-  readonly reservedPayloadBytes: number;
+  readonly retainedBytes: number;
 }
 
 interface PendingAppendCall {
+  readonly writerStartSeqNum: bigint;
   readonly records: readonly PendingAppend[];
-  readonly reservedPayloadBytes: number;
+  readonly retainedBytes: number;
+  acknowledged: number;
+  sent: number;
+  readonly receipts: AppendReceipt[];
   readonly resolve: (receipts: readonly AppendReceipt[]) => void;
   readonly reject: (reason: unknown) => void;
 }
 
-function prepareAppend(
-  input: AppendInput,
-  availablePayloadBytes: number,
-): PendingAppend {
-  if (availablePayloadBytes <= 0) {
-    throw writerAdmissionError("payload");
+interface AppendAckFrame {
+  readonly writerStartSeqNum: bigint;
+  readonly writerEndSeqNum: bigint;
+  readonly startSeqNum: bigint;
+  readonly endSeqNum: bigint;
+}
+
+function prepareAppend(input: AppendInput): PendingAppend {
+  if (
+    (typeof input.data === "string" && input.data.length > MAX_RECORD_BYTES) ||
+    (typeof input.data !== "string" && input.data.byteLength > MAX_RECORD_BYTES)
+  ) {
+    throw recordTooLarge();
   }
-  let data: Uint8Array;
-  if (typeof input.data === "string") {
-    if (input.data.length > MAX_RECORD_BYTES) {
-      throw recordTooLarge();
-    }
-    if (input.data.length > availablePayloadBytes) {
-      throw writerAdmissionError("payload");
-    }
-    data = textEncoder.encode(input.data);
-    if (data.byteLength > MAX_RECORD_BYTES) {
-      throw recordTooLarge();
-    }
-    if (Math.max(data.byteLength, 1) > availablePayloadBytes) {
-      throw writerAdmissionError("payload");
-    }
-  } else {
-    if (input.data.byteLength > MAX_RECORD_BYTES) {
-      throw recordTooLarge();
-    }
-    if (Math.max(input.data.byteLength, 1) > availablePayloadBytes) {
-      throw writerAdmissionError("payload");
-    }
-    data = new Uint8Array(input.data);
+  const data = typeof input.data === "string"
+    ? textEncoder.encode(input.data)
+    : new Uint8Array(input.data);
+  if (data.byteLength > MAX_RECORD_BYTES) {
+    throw recordTooLarge();
   }
-  const part = input.part ?? UNSPLIT_PART;
   return {
     data,
     format: input.format ??
-      (typeof input.data === "string"
-        ? RecordFormat.Transcript
-        : RecordFormat.Bytes),
-    part: part === UNSPLIT_PART
+      (typeof input.data === "string" ? RecordFormat.Transcript : RecordFormat.Bytes),
+    part: input.part === undefined
       ? UNSPLIT_PART
-      : { index: part.index, isFinal: part.isFinal },
-    reservedPayloadBytes: Math.max(data.byteLength, 1),
+      : partHeader(input.part.index, input.part.isFinal),
+    retainedBytes: Math.max(data.byteLength, 1),
   };
 }
 
-function writerAdmissionError(limit: "payload" | "record"): TsfClientError {
-  const message = limit === "record"
-    ? `writer has reached its ${MAX_PENDING_WRITER_RECORDS}-record pending limit`
-    : `writer has reached its ${MAX_PENDING_WRITER_PAYLOAD_BYTES}-byte pending payload limit`;
-  return new TsfClientError("client_write_overload", message);
+function writerAdmissionError(
+  records: number,
+  bytes: number,
+  config: NormalizedTsfWriterConfig,
+): TsfClientError {
+  return new TsfClientError(
+    "client_write_overload",
+    `append requires ${records} records and ${bytes} bytes; retained backlog is limited to ${config.maxRetainedRecords} records and ${config.maxRetainedBytes} bytes`,
+  );
+}
+
+function positiveSafeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TsfClientError(
+      "invalid_writer_config",
+      `${name} must be a positive safe integer`,
+    );
+  }
+  return value;
+}
+
+function logicalRecordTooLarge(): TsfClientError {
+  return new TsfClientError(
+    "logical_record_too_large",
+    `logical record exceeds the ${MAX_APPEND_BATCH_RECORDS * MAX_RECORD_BYTES}-byte maximum`,
+  );
 }
 
 function recordTooLarge(): TsfClientError {
@@ -439,4 +599,20 @@ function recordTooLarge(): TsfClientError {
     "record_too_large",
     `record exceeds the ${MAX_RECORD_BYTES}-byte maximum`,
   );
+}
+
+function asAppendInputError(error: unknown): Error {
+  return error instanceof Error
+    ? error
+    : new TsfClientError(
+        "invalid_append_input",
+        "could not prepare append input",
+        { cause: error },
+      );
+}
+
+function isSequenceMismatch(error: unknown): boolean {
+  return error instanceof TsfWebSocketClosedError &&
+    error.closeCode === 1008 &&
+    error.reason === "sequence_mismatch";
 }

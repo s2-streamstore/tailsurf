@@ -70,7 +70,9 @@ Management methods require an owner link secret. `listLinks` returns one page. `
 
 ## Write
 
-`connectWriter` keeps one writer identity across reconnects. Concurrent append calls are coalesced into bounded batches. `close` rejects new appends and waits for accepted appends to settle.
+`connectWriter` creates a fresh writer identity and starts its sequence at zero. It keeps that identity and sequence progress across reconnects.
+
+Concurrent append calls receive contiguous sequence ranges in call order. The writer coalesces them into bounded wire frames. It retains acknowledged progress and resends only the unacknowledged suffix after a reconnect.
 
 ```ts
 const writer = await client.connectWriter({
@@ -88,6 +90,25 @@ try {
 }
 ```
 
+`appendBatch` is one sequencing and Promise unit. It may span several wire frames. It is not an atomic service append. A terminal failure can leave a durable prefix even when the Promise rejects.
+
+`appendLogical` splits data above the 512 KiB physical-record limit into contiguous parts.
+
+The writer retains at most 128 records and 5 MiB by default. Configure a larger retained backlog when one submission can exceed those bounds. Wire sends remain capped at 128 unacknowledged records and 5 MiB per socket.
+
+```ts
+const writer = await client.connectWriter({
+  streamId: stream.streamId,
+  linkSecret: owner.secret,
+}, {
+  maxRetainedRecords: 128,
+  maxRetainedBytes: 16 * 1024 * 1024,
+});
+
+await writer.appendLogical({ data: largeTranscriptRecord });
+await writer.close();
+```
+
 ## Retries and errors
 
 REST mutations use idempotency keys. Pass a caller-owned key as the second argument when a creation must survive page reloads.
@@ -96,7 +117,7 @@ REST mutations use idempotency keys. Pass a caller-owned key as the second argum
 await client.createStream(request, { idempotencyKey });
 ```
 
-Transient REST and connection failures use the configured bounded `retryPolicy`. A successful WebSocket handshake starts a fresh retry burst. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
+Transient REST and connection failures use the configured bounded `retryPolicy`. A successful reader handshake starts a fresh retry burst. A valid writer acknowledgement starts a fresh retry burst. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
 
 ## Runtime configuration
 

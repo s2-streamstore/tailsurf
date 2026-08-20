@@ -1,7 +1,6 @@
 import {
   encodeReadQuery,
   generateClientWriterId,
-  parseClientWriterId,
   parseStreamId,
   type ClientWriterId,
   type StreamId,
@@ -34,6 +33,8 @@ import {
 } from "./socket.js";
 import {
   DefaultTsfWriter,
+  normalizeWriterConfig,
+  type TsfWriterConfig,
   type TsfWriter,
 } from "./writer.js";
 import { streamMetadataFromWire } from "./models.js";
@@ -50,8 +51,6 @@ export interface TsfClientOptions extends RestClientOptions {
 export interface WriteStreamOptions {
   readonly streamId: StreamId;
   readonly linkSecret: string;
-  readonly clientWriterId?: ClientWriterId;
-  readonly writerStartSeqNum?: bigint;
   readonly expectedNextSeqNum?: bigint;
 }
 
@@ -59,7 +58,6 @@ interface NormalizedWriteOptions {
   readonly streamId: StreamId;
   readonly linkSecret: string;
   readonly clientWriterId: ClientWriterId;
-  readonly writerStartSeqNum: bigint;
   expectedNextSeqNum?: bigint;
 }
 
@@ -114,14 +112,13 @@ export class TsfClient extends BaseTsfClient {
 
   public async connectWriter(
     options: WriteStreamOptions,
+    config: TsfWriterConfig = {},
   ): Promise<TsfWriter> {
+    const normalizedConfig = normalizeWriterConfig(config);
     const normalized: NormalizedWriteOptions = {
       streamId: parseStreamId(options.streamId),
       linkSecret: requireLinkSecret(options.linkSecret),
-      clientWriterId: parseClientWriterId(
-        options.clientWriterId ?? generateClientWriterId(),
-      ),
-      writerStartSeqNum: u64(options.writerStartSeqNum ?? 0n, "writerStartSeqNum"),
+      clientWriterId: generateClientWriterId(),
       ...(options.expectedNextSeqNum === undefined
         ? {}
         : {
@@ -133,10 +130,10 @@ export class TsfClient extends BaseTsfClient {
     };
     const connect = () => this.#connectAppendSocket(normalized);
     return new DefaultTsfWriter(
-      normalized.writerStartSeqNum,
       await connectInitialSocket(connect, this.#socketPolicy),
       connect,
       this.#socketPolicy,
+      normalizedConfig,
     );
   }
 

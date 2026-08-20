@@ -58,9 +58,13 @@ The session reconnects from the latest record or caught-up position after transi
 
 ## Write
 
-`TsfWriter` retains unacknowledged records across bounded reconnects. Records are submitted as a non-empty `AppendBatch`. The writer assigns writer sequence numbers in submission order, so cloned `TsfProducer` handles can submit concurrently without interleaving. `AppendBatch::split_logical` keeps the parts of an oversized logical record contiguous.
+`TsfWriter` creates a fresh writer identity and starts its sequence at zero. It retains that identity, acknowledged progress, and unacknowledged records across bounded reconnects. It resends only the unacknowledged suffix.
+
+Records are submitted as a non-empty `AppendBatch`. The writer assigns writer sequence numbers in submission order, so cloned `TsfProducer` handles can submit concurrently without interleaving. `AppendBatch::split_logical` keeps the parts of an oversized logical record contiguous.
 
 An `AppendBatch` is one sequencing and ticket unit, not an atomic service append. The writer may split it across frames. A terminal failure may leave a durable prefix while its ticket returns an error.
+
+The writer retains at most 128 records and 5 MiB by default. Use `connect_writer_with_config` and `TsfWriterConfig` when one submission needs a larger retained backlog.
 
 Await each `AppendTicket` when you need its durable sequence numbers. `close` stops new submissions and waits for accepted records to settle. A terminal `AppendDurabilityUnknown` means an append may be durable but its acknowledgement could not be recovered.
 

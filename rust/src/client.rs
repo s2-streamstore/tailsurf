@@ -1045,24 +1045,25 @@ impl DurableWriterOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TsfWriterConfig {
     /// Maximum total payload bytes retained until durability acknowledgement.
-    pub max_unacked_bytes: usize,
+    pub max_retained_bytes: usize,
     /// Maximum number of records retained until durability acknowledgement.
-    pub max_unacked_records: usize,
+    pub max_retained_records: usize,
 }
 
 impl TsfWriterConfig {
     fn validate(self) -> Result<Self, TsfClientError> {
-        if self.max_unacked_bytes == 0 || self.max_unacked_bytes > Semaphore::MAX_PERMITS {
+        if self.max_retained_bytes == 0 || self.max_retained_bytes > Semaphore::MAX_PERMITS {
             return Err(TsfClientError::InvalidWriterConfig(format!(
-                "max_unacked_bytes must be between 1 and {}",
+                "max_retained_bytes must be between 1 and {}",
                 Semaphore::MAX_PERMITS
             )));
         }
         // The command channel holds one slot per backlog record plus one for Close, and Tokio
         // panics on a capacity above MAX_PERMITS, so the record bound stops one short.
-        if self.max_unacked_records == 0 || self.max_unacked_records > Semaphore::MAX_PERMITS - 1 {
+        if self.max_retained_records == 0 || self.max_retained_records > Semaphore::MAX_PERMITS - 1
+        {
             return Err(TsfClientError::InvalidWriterConfig(format!(
-                "max_unacked_records must be between 1 and {}",
+                "max_retained_records must be between 1 and {}",
                 Semaphore::MAX_PERMITS - 1
             )));
         }
@@ -1073,8 +1074,8 @@ impl TsfWriterConfig {
 impl Default for TsfWriterConfig {
     fn default() -> Self {
         Self {
-            max_unacked_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-            max_unacked_records: MAX_WRITER_UNACKED_RECORDS,
+            max_retained_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+            max_retained_records: MAX_WRITER_UNACKED_RECORDS,
         }
     }
 }
@@ -1193,7 +1194,7 @@ struct WriterShared {
 }
 
 impl WriterShared {
-    /// Marks the writer finished and closes both windows, waking producers blocked in a
+    /// Marks the writer finished and closes both backlog semaphores, waking producers blocked in a
     /// reservation on every actor exit path, including abort before the task's first poll.
     fn shutdown(&self) {
         self.state.store(WRITER_DONE, Ordering::SeqCst);
@@ -1247,15 +1248,15 @@ impl TsfProducer {
     /// The returned permit owns capacity until it is dropped or submitted.
     pub async fn reserve(&self, batch: &AppendBatch) -> Result<WritePermit, TsfClientError> {
         let records = batch.record_count();
-        let bytes = batch_unacked_bytes(batch);
-        if records > self.shared.config.max_unacked_records
-            || bytes > self.shared.config.max_unacked_bytes
+        let bytes = batch_retained_bytes(batch);
+        if records > self.shared.config.max_retained_records
+            || bytes > self.shared.config.max_retained_bytes
         {
-            return Err(TsfClientError::AppendBatchExceedsWriterWindow {
+            return Err(TsfClientError::AppendBatchExceedsRetainedBacklog {
                 records,
                 bytes,
-                max_unacked_records: self.shared.config.max_unacked_records,
-                max_unacked_bytes: self.shared.config.max_unacked_bytes,
+                max_retained_records: self.shared.config.max_retained_records,
+                max_retained_bytes: self.shared.config.max_retained_bytes,
             });
         }
         if !self.shared.is_open() {
@@ -1305,7 +1306,7 @@ fn wire_bytes(data: &Bytes) -> usize {
     data.len().max(1)
 }
 
-fn batch_unacked_bytes(batch: &AppendBatch) -> usize {
+fn batch_retained_bytes(batch: &AppendBatch) -> usize {
     batch
         .payloads()
         .iter()
@@ -1340,11 +1341,11 @@ impl TsfWriter {
     ) -> Self {
         // Validated bounds stop one short of MAX_PERMITS, so the Close slot cannot exceed the
         // channel capacity Tokio accepts.
-        let command_capacity = config.max_unacked_records + 1;
+        let command_capacity = config.max_retained_records + 1;
         let (cmd_tx, cmd_rx) = mpsc::channel(command_capacity);
         let shared = Arc::new(WriterShared {
-            byte_permits: Arc::new(Semaphore::new(config.max_unacked_bytes)),
-            record_permits: Arc::new(Semaphore::new(config.max_unacked_records)),
+            byte_permits: Arc::new(Semaphore::new(config.max_retained_bytes)),
+            record_permits: Arc::new(Semaphore::new(config.max_retained_records)),
             terminal_error: Arc::new(OnceLock::new()),
             config,
             state: AtomicU8::new(WRITER_OPEN),
@@ -1482,9 +1483,9 @@ impl WritePermit {
             return Err(error);
         }
         let records = batch.record_count();
-        let bytes = batch_unacked_bytes(&batch);
+        let bytes = batch_retained_bytes(&batch);
         if records > self.reserved_records || bytes > self.reserved_bytes {
-            return Err(TsfClientError::AppendBatchExceedsReservedWindow {
+            return Err(TsfClientError::AppendBatchExceedsReservation {
                 records,
                 bytes,
                 reserved_records: self.reserved_records,
@@ -3371,28 +3372,28 @@ pub enum TsfClientError {
     /// Writer bounds are zero or not representable by the semaphore implementation.
     #[error("invalid append writer config: {0}")]
     InvalidWriterConfig(String),
-    /// A requested reservation is larger than the entire writer window.
+    /// A requested reservation is larger than the entire retained backlog.
     #[error(
-        "append batch uses {records} records and {bytes} bytes, above writer window {max_unacked_records} records and {max_unacked_bytes} bytes"
+        "append batch uses {records} records and {bytes} bytes, above retained backlog {max_retained_records} records and {max_retained_bytes} bytes"
     )]
-    AppendBatchExceedsWriterWindow {
+    AppendBatchExceedsRetainedBacklog {
         /// Batch record count.
         records: usize,
-        /// Batch window-accounted payload size.
+        /// Batch backlog-accounted payload size.
         bytes: usize,
-        /// Configured writer record window.
-        max_unacked_records: usize,
-        /// Configured writer byte window.
-        max_unacked_bytes: usize,
+        /// Configured retained record limit.
+        max_retained_records: usize,
+        /// Configured retained byte limit.
+        max_retained_bytes: usize,
     },
     /// A batch is larger than its previously acquired reservation.
     #[error(
         "append batch uses {records} records and {bytes} bytes, above reserved capacity {reserved_records} records and {reserved_bytes} bytes"
     )]
-    AppendBatchExceedsReservedWindow {
+    AppendBatchExceedsReservation {
         /// Batch record count.
         records: usize,
-        /// Batch window-accounted payload size.
+        /// Batch backlog-accounted payload size.
         bytes: usize,
         /// Record capacity owned by the permit.
         reserved_records: usize,
@@ -3976,16 +3977,16 @@ mod tests {
     #[test]
     fn writer_backlog_defaults_match_the_server_window_and_reject_out_of_range_bounds() {
         let default = TsfWriterConfig::default();
-        assert_eq!(default.max_unacked_bytes, MAX_WRITER_UNACKED_PAYLOAD_BYTES);
-        assert_eq!(default.max_unacked_records, MAX_WRITER_UNACKED_RECORDS);
+        assert_eq!(default.max_retained_bytes, MAX_WRITER_UNACKED_PAYLOAD_BYTES);
+        assert_eq!(default.max_retained_records, MAX_WRITER_UNACKED_RECORDS);
         assert!(default.validate().is_ok());
 
         // The retained backlog is client-local memory: batches larger than the wire window are
         // legitimate, so any semaphore-representable bound is accepted.
         assert!(
             TsfWriterConfig {
-                max_unacked_bytes: 4 * MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-                max_unacked_records: 4 * MAX_WRITER_UNACKED_RECORDS,
+                max_retained_bytes: 4 * MAX_WRITER_UNACKED_PAYLOAD_BYTES,
+                max_retained_records: 4 * MAX_WRITER_UNACKED_RECORDS,
             }
             .validate()
             .is_ok()
@@ -3995,8 +3996,8 @@ mod tests {
         // record backlog must leave one command-channel slot for Close.
         assert!(
             TsfWriterConfig {
-                max_unacked_bytes: Semaphore::MAX_PERMITS,
-                max_unacked_records: Semaphore::MAX_PERMITS - 1,
+                max_retained_bytes: Semaphore::MAX_PERMITS,
+                max_retained_records: Semaphore::MAX_PERMITS - 1,
             }
             .validate()
             .is_ok()
@@ -4004,23 +4005,23 @@ mod tests {
 
         for config in [
             TsfWriterConfig {
-                max_unacked_bytes: 0,
+                max_retained_bytes: 0,
                 ..TsfWriterConfig::default()
             },
             TsfWriterConfig {
-                max_unacked_records: 0,
+                max_retained_records: 0,
                 ..TsfWriterConfig::default()
             },
             TsfWriterConfig {
-                max_unacked_bytes: Semaphore::MAX_PERMITS + 1,
+                max_retained_bytes: Semaphore::MAX_PERMITS + 1,
                 ..TsfWriterConfig::default()
             },
             TsfWriterConfig {
-                max_unacked_records: Semaphore::MAX_PERMITS,
+                max_retained_records: Semaphore::MAX_PERMITS,
                 ..TsfWriterConfig::default()
             },
             TsfWriterConfig {
-                max_unacked_records: usize::MAX,
+                max_retained_records: usize::MAX,
                 ..TsfWriterConfig::default()
             },
         ] {
@@ -4051,7 +4052,7 @@ mod tests {
             .connect_writer_with_config(
                 options,
                 TsfWriterConfig {
-                    max_unacked_records: 0,
+                    max_retained_records: 0,
                     ..TsfWriterConfig::default()
                 },
             )
@@ -4252,8 +4253,8 @@ mod tests {
             record_permits: Arc::new(Semaphore::new(1)),
             terminal_error: Arc::new(OnceLock::new()),
             config: TsfWriterConfig {
-                max_unacked_bytes: 1,
-                max_unacked_records: 1,
+                max_retained_bytes: 1,
+                max_retained_records: 1,
             },
             state: AtomicU8::new(WRITER_OPEN),
             submit_lock: RwLock::new(()),
@@ -4373,8 +4374,8 @@ mod tests {
             record_permits: Arc::new(Semaphore::new(8)),
             terminal_error: Arc::new(OnceLock::new()),
             config: TsfWriterConfig {
-                max_unacked_bytes: 8,
-                max_unacked_records: 8,
+                max_retained_bytes: 8,
+                max_retained_records: 8,
             },
             state: AtomicU8::new(WRITER_OPEN),
             submit_lock: RwLock::new(()),

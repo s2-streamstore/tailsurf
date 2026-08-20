@@ -917,12 +917,12 @@ async fn writer_preserves_its_terminal_failure_for_later_submissions() {
 }
 
 #[tokio::test]
-async fn default_writer_enforces_record_and_byte_windows() {
-    assert_default_writer_window(128, Bytes::from_static(b"x")).await;
-    assert_default_writer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
+async fn default_writer_enforces_record_and_byte_backlog_limits() {
+    assert_default_writer_backlog(128, Bytes::from_static(b"x")).await;
+    assert_default_writer_backlog(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
 }
 
-async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
+async fn assert_default_writer_backlog(capacity: usize, payload: Bytes) {
     let server = HoldingWriteServer::start(capacity).await;
     let writer = connect_default_writer(&server.api_url).await;
     let mut tickets = Vec::new();
@@ -931,7 +931,7 @@ async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
             writer
                 .submit(test_write_batch(payload.clone()))
                 .await
-                .expect("submit within writer window"),
+                .expect("submit within retained backlog"),
         );
     }
     server.wait_for_records(capacity).await;
@@ -943,7 +943,7 @@ async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
         )
         .await
         .is_err(),
-        "submit beyond the writer window must wait for an acknowledgement"
+        "submit beyond the retained backlog must wait for an acknowledgement"
     );
 
     server.release_acknowledgements();
@@ -955,7 +955,7 @@ async fn assert_default_writer_window(capacity: usize, payload: Bytes) {
         writer.submit(test_write_batch(Bytes::from_static(b"x"))),
     )
     .await
-    .expect("writer window reopened")
+    .expect("retained backlog reopened")
     .expect("final submit");
     final_ticket.await.expect("final acknowledgement");
     writer.close().await.expect("writer close");
@@ -1064,8 +1064,8 @@ async fn blocked_reservation_wakes_when_the_writer_closes() {
         .connect_writer_with_config(
             tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
             TsfWriterConfig {
-                max_unacked_bytes: 8,
-                max_unacked_records: 1,
+                max_retained_bytes: 8,
+                max_retained_records: 1,
             },
         )
         .await
@@ -1113,8 +1113,8 @@ async fn writer_paces_an_oversized_batch_under_the_wire_window() {
         .connect_writer_with_config(
             tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
             TsfWriterConfig {
-                max_unacked_bytes: 8 * 1024 * 1024,
-                max_unacked_records: 16,
+                max_retained_bytes: 8 * 1024 * 1024,
+                max_retained_records: 16,
             },
         )
         .await
@@ -1298,8 +1298,8 @@ async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
         .connect_writer_with_config(
             tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
             TsfWriterConfig {
-                max_unacked_bytes: 1024 * 1024,
-                max_unacked_records: 4 * MAX_WRITER_UNACKED_RECORDS,
+                max_retained_bytes: 1024 * 1024,
+                max_retained_records: 4 * MAX_WRITER_UNACKED_RECORDS,
             },
         )
         .await

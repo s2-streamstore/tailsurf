@@ -567,7 +567,7 @@ pub(crate) fn split_record_payloads(
 ///
 /// The writer actor assigns each batch one contiguous writer-sequence range in submission order,
 /// so the split parts of a logical record never interleave with another producer's records.
-/// Construction upholds the wire bounds: 1 to [`MAX_APPEND_BATCH_RECORDS`] records, each at most
+/// Construction upholds the record bounds: 1 to [`MAX_APPEND_BATCH_RECORDS`] records, each at most
 /// [`MAX_RECORD_BYTES`]. This is not an atomic service append: the actor may split a batch across
 /// wire frames, and a terminal failure may leave a durable prefix while its ticket returns an
 /// error. Submission additionally requires the whole batch to fit the writer's configured
