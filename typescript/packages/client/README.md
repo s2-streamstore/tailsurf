@@ -1,6 +1,6 @@
-# `@tailsurf/client`
+# `@s2-dev/tailsurf-client`
 
-`@tailsurf/client` is the supported TypeScript API for tail.surf. It works in modern browsers and Node.js 22 or newer.
+`@s2-dev/tailsurf-client` is the supported TypeScript API for tail.surf. It works in modern browsers and Node.js 22 or newer.
 
 It includes REST operations, resumable SSE reads, and reconnecting WebSocket readers and writers.
 
@@ -9,13 +9,13 @@ The package is ESM-only.
 ## Install
 
 ```sh
-npm install @tailsurf/client
+npm install @s2-dev/tailsurf-client
 ```
 
 ## Quickstart
 
 ```ts
-import { TsfClient, buildStreamLink } from "@tailsurf/client";
+import { TsfClient, buildStreamLink } from "@s2-dev/tailsurf-client";
 
 const client = new TsfClient();
 const stream = await client.createStream({
@@ -102,7 +102,7 @@ Transient REST and connection failures use the configured bounded `retryPolicy`.
 
 The client uses global `fetch`, `crypto`, and `WebSocket` implementations. Override `fetch` or `webSocketFactory` for tests and custom runtimes.
 
-Common IDs, permissions, stream-link helpers, record types, and transcript reconstruction are re-exported from this package. Use `@tailsurf/protocol` directly for raw frame codecs, wire schemas, or compatibility fixtures.
+Common IDs, permissions, stream-link helpers, record types, and transcript reconstruction are re-exported from this package. Use `@s2-dev/tailsurf-protocol` directly for raw frame codecs, wire schemas, or compatibility fixtures.
 
 ## License
 

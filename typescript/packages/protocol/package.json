@@ -1,5 +1,5 @@
 {
-  "name": "@tailsurf/protocol",
+  "name": "@s2-dev/tailsurf-protocol",
   "version": "0.1.0",
   "description": "TypeScript codecs and schemas for the tail.surf public protocol",
   "type": "module",

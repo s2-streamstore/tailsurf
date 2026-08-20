@@ -5,10 +5,10 @@ import {
   RecordFormat,
   UNSPLIT_PART,
   type PartHeader,
-} from "@tailsurf/protocol";
+} from "@s2-dev/tailsurf-protocol";
 
 import { TsfClientError, TsfWebSocketClosedError } from "./errors.js";
-import { MAX_U64 } from "@tailsurf/protocol";
+import { MAX_U64 } from "@s2-dev/tailsurf-protocol";
 
 import {
   type FrameSocket,

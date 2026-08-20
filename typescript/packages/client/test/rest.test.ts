@@ -9,7 +9,7 @@ import {
   parseLinkId,
   parseClientWriterId,
   RecordFormat,
-} from "@tailsurf/protocol";
+} from "@s2-dev/tailsurf-protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import {

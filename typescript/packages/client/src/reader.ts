@@ -14,7 +14,7 @@ import {
   type CaughtUpPosition,
   type ServerFrame,
   type StreamId,
-} from "@tailsurf/protocol";
+} from "@s2-dev/tailsurf-protocol";
 
 export type ReadStart = ProtocolReadStart;
 export type ReadStop = ProtocolReadStop;
