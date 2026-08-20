@@ -600,12 +600,23 @@ async fn write_defaults_to_lines_and_splits_large_records() {
 }
 
 #[tokio::test]
-async fn write_line_at_the_default_logical_limit_round_trips() {
+async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it() {
     let server = TestServer::start().await;
-    let mut input = "x".repeat(DEFAULT_MAX_LOGICAL_RECORD_BYTES - 1);
+    let configured_limit = DEFAULT_MAX_LOGICAL_RECORD_BYTES + 1;
+    let configured_limit_arg = configured_limit.to_string();
+    let mut input = "x".repeat(configured_limit - 1);
     input.push('\n');
 
-    let output = run_tsf(&server, [], Some(input.as_str())).await;
+    let output = run_tsf(
+        &server,
+        [
+            "new",
+            "--max-logical-record-bytes",
+            configured_limit_arg.as_str(),
+        ],
+        Some(input.as_str()),
+    )
+    .await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_link = output
         .stdout
@@ -613,7 +624,17 @@ async fn write_line_at_the_default_logical_limit_round_trips() {
         .find_map(|line| extract_link_line(line, "reader"))
         .expect("read link");
 
-    let replay = run_tsf(&server, ["replay", read_link], None).await;
+    let replay = run_tsf(
+        &server,
+        [
+            "replay",
+            "--max-logical-record-bytes",
+            configured_limit_arg.as_str(),
+            read_link,
+        ],
+        None,
+    )
+    .await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
     assert_eq!(replay.stdout, input);
 }
@@ -1219,6 +1240,40 @@ async fn cloned_producers_share_one_contiguous_writer_sequence() {
     assert_eq!(attempted, (0..total as u64).collect::<Vec<_>>());
 
     writer.close().await.expect("writer close");
+}
+
+#[tokio::test]
+async fn separate_durable_writers_use_fresh_writer_ids() {
+    let server = TestServer::start().await;
+    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let created = client
+        .create_stream(&CreateStreamRequest::default())
+        .await
+        .expect("create stream");
+
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        let writer = client
+            .connect_writer(tailsurf::DurableWriterOptions::new(
+                created.stream_id,
+                created.links[0].secret.clone(),
+            ))
+            .await
+            .expect("writer");
+        let receipts = writer
+            .submit(test_write_batch(Bytes::copy_from_slice(payload)))
+            .await
+            .expect("submit")
+            .await
+            .expect("durability");
+        assert_eq!(receipts[0].writer_seq_num, 0);
+        writer.close().await.expect("writer close");
+    }
+
+    server.wait_for_records(&created.stream_id, 2).await;
+    assert_eq!(server.writer_seq_nums(&created.stream_id), vec![0, 0]);
+    let writer_ids = server.writer_ids(&created.stream_id);
+    assert_eq!(writer_ids.len(), 2);
+    assert_ne!(writer_ids[0], writer_ids[1]);
 }
 
 #[tokio::test]
@@ -2090,6 +2145,22 @@ impl TestServer {
                     .records
                     .iter()
                     .map(|record| record.writer_seq_num)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn writer_ids(&self, stream_id: &StreamId) -> Vec<WriterId> {
+        self.state
+            .streams
+            .lock()
+            .expect("streams lock")
+            .get(&stream_id.to_string())
+            .map(|stream| {
+                stream
+                    .records
+                    .iter()
+                    .map(|record| record.writer_id)
                     .collect()
             })
             .unwrap_or_default()

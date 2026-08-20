@@ -587,7 +587,7 @@ impl TsfClient {
             .await
     }
 
-    /// Connects a durable writer with explicit in-flight and reconnect bounds.
+    /// Connects a durable writer with explicit retained-backlog bounds.
     pub async fn connect_writer_with_config(
         &self,
         options: DurableWriterOptions,

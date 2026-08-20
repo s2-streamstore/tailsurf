@@ -19,7 +19,7 @@ use crate::{
 pub const DEFAULT_MAX_LOGICAL_RECORD_BYTES: usize = MAX_RECORD_BYTES * 32;
 /// Default maximum writer identities retained for deduplication and reassembly.
 pub const DEFAULT_MAX_WRITER_STATES: usize = 4_096;
-/// SDK memory-safety limit across all unfinished split records: 16 MiB.
+/// Default SDK memory-safety limit across all unfinished split records: 16 MiB.
 pub const DEFAULT_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum physical parts retained across all unfinished split records.
 pub const DEFAULT_MAX_PENDING_PARTS: usize = 16_384;
@@ -85,9 +85,12 @@ impl LogicalTranscript {
     }
 
     /// Creates transcript state with an explicit logical-record byte limit.
+    ///
+    /// The aggregate pending-byte limit is raised as needed to hold one record at this limit.
     pub fn with_max_logical_record_bytes(max_logical_record_bytes: usize) -> Self {
         Self::with_limits(TranscriptLimits {
             max_logical_record_bytes,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES.max(max_logical_record_bytes),
             ..TranscriptLimits::default()
         })
     }
@@ -965,6 +968,16 @@ mod tests {
             error,
             TranscriptError::LogicalRecordTooLarge { len: 5, max: 4 }
         );
+    }
+
+    #[test]
+    fn explicit_logical_limit_can_hold_one_record_at_that_limit() {
+        let raised_limit = DEFAULT_MAX_PENDING_BYTES + 1;
+        let raised = LogicalTranscript::with_max_logical_record_bytes(raised_limit);
+        assert_eq!(raised.limits.max_pending_bytes, raised_limit);
+
+        let lowered = LogicalTranscript::with_max_logical_record_bytes(4);
+        assert_eq!(lowered.limits.max_pending_bytes, DEFAULT_MAX_PENDING_BYTES);
     }
 
     #[test]

@@ -163,7 +163,7 @@ struct WriteArgs {
     input: InputArgs,
 }
 
-/// `--max-logical-record-bytes`, bounded at parse time to what the wire can represent.
+/// `--max-logical-record-bytes`, bounded at parse time to what one writer submission can hold.
 ///
 /// [`AppendBatch::split_logical`] encodes one logical record as at most
 /// [`MAX_APPEND_BATCH_RECORDS`] parts of [`MAX_RECORD_BYTES`], so anything above that product could
@@ -197,7 +197,7 @@ impl FromStr for MaxLogicalRecordBytes {
         }
         if bytes > Self::MAX {
             return Err(format!(
-                "exceeds the {}-byte maximum one logical record can occupy on the wire ({} parts of {} bytes)",
+                "exceeds the {}-byte maximum one durable-writer batch can carry ({} parts of {} bytes)",
                 Self::MAX,
                 MAX_APPEND_BATCH_RECORDS,
                 MAX_RECORD_BYTES,
@@ -2128,7 +2128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_logical_record_bytes_parsing_enforces_the_wire_bound() {
+    fn max_logical_record_bytes_parsing_enforces_the_writer_batch_bound() {
         assert_eq!(
             "1048576".parse::<MaxLogicalRecordBytes>(),
             Ok(MaxLogicalRecordBytes(1024 * 1024))

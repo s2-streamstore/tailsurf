@@ -562,13 +562,16 @@ pub(crate) fn split_record_payloads(
     Ok(records)
 }
 
-/// A non-empty set of physical records submitted to a durable writer as one logical unit.
+/// A non-empty set of physical records submitted to a durable writer as one sequencing and ticket
+/// unit.
 ///
 /// The writer actor assigns each batch one contiguous writer-sequence range in submission order,
 /// so the split parts of a logical record never interleave with another producer's records.
 /// Construction upholds the wire bounds: 1 to [`MAX_APPEND_BATCH_RECORDS`] records, each at most
-/// [`MAX_RECORD_BYTES`]. Submission additionally requires the whole batch to fit the writer's
-/// configured retained backlog; the actor streams oversized batches under the server's
+/// [`MAX_RECORD_BYTES`]. This is not an atomic service append: the actor may split a batch across
+/// wire frames, and a terminal failure may leave a durable prefix while its ticket returns an
+/// error. Submission additionally requires the whole batch to fit the writer's configured
+/// retained backlog; the actor streams oversized batches under the server's
 /// sent-but-unacknowledged socket window either way.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppendBatch {
