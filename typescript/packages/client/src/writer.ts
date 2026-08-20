@@ -1,7 +1,7 @@
 import {
-  MAX_APPEND_BATCH_RECORDS,
-  MAX_BATCH_PAYLOAD_BYTES,
-  MAX_RECORD_BYTES,
+  MAX_APPEND_FRAME_RECORDS,
+  MAX_FRAME_PAYLOAD_BYTES,
+  MAX_RECORD_PAYLOAD_BYTES,
   MAX_U64,
   partHeader,
   RecordFormat,
@@ -44,17 +44,24 @@ export interface TsfWriter {
   close(): Promise<void>;
 }
 
-/** Maximum sent-but-unacknowledged physical records on one writer socket. */
-export const MAX_WRITER_UNACKED_RECORDS = 128;
-/** Maximum sent-but-unacknowledged payload bytes on one writer socket. */
-export const MAX_WRITER_UNACKED_PAYLOAD_BYTES = 5 * 1024 * 1024;
-/** Default number of physical records retained until durability acknowledgement. */
-export const DEFAULT_WRITER_RETAINED_RECORDS = MAX_WRITER_UNACKED_RECORDS;
-/** Default payload bytes retained until durability acknowledgement. */
-export const DEFAULT_WRITER_RETAINED_BYTES = MAX_WRITER_UNACKED_PAYLOAD_BYTES;
+/** Maximum physical records that one writer socket may keep in flight. */
+export const MAX_WRITER_IN_FLIGHT_RECORDS = 128;
+/** Maximum accounted bytes that one writer socket may keep in flight. Empty payloads count as one byte. */
+export const MAX_WRITER_IN_FLIGHT_BYTES = 5 * 1024 * 1024;
+/** Default maximum physical records retained until durability acknowledgement. */
+export const DEFAULT_MAX_WRITER_RETAINED_RECORDS = MAX_WRITER_IN_FLIGHT_RECORDS;
+/** Default maximum accounted bytes retained until durability acknowledgement. */
+export const DEFAULT_MAX_WRITER_RETAINED_BYTES = MAX_WRITER_IN_FLIGHT_BYTES;
+/** Maximum physical records accepted as one writer submission. */
+export const MAX_APPEND_SUBMISSION_RECORDS = MAX_APPEND_FRAME_RECORDS;
+/** Structural payload maximum for one writer submission. */
+export const MAX_APPEND_SUBMISSION_PAYLOAD_BYTES =
+  MAX_APPEND_SUBMISSION_RECORDS * MAX_RECORD_PAYLOAD_BYTES;
 
 export interface TsfWriterConfig {
+  /** Maximum physical records retained until durability acknowledgement. */
   readonly maxRetainedRecords?: number;
+  /** Maximum accounted bytes retained until durability acknowledgement. Empty payloads count as one byte. */
   readonly maxRetainedBytes?: number;
 }
 
@@ -68,11 +75,11 @@ export function normalizeWriterConfig(
 ): NormalizedTsfWriterConfig {
   return {
     maxRetainedRecords: positiveSafeInteger(
-      config.maxRetainedRecords ?? DEFAULT_WRITER_RETAINED_RECORDS,
+      config.maxRetainedRecords ?? DEFAULT_MAX_WRITER_RETAINED_RECORDS,
       "maxRetainedRecords",
     ),
     maxRetainedBytes: positiveSafeInteger(
-      config.maxRetainedBytes ?? DEFAULT_WRITER_RETAINED_BYTES,
+      config.maxRetainedBytes ?? DEFAULT_MAX_WRITER_RETAINED_BYTES,
       "maxRetainedBytes",
     ),
   };
@@ -85,8 +92,8 @@ export class DefaultTsfWriter implements TsfWriter {
   #drain: Promise<void> | undefined;
   #retainedRecords = 0;
   #retainedBytes = 0;
-  #unacknowledgedRecords = 0;
-  #unacknowledgedBytes = 0;
+  #inFlightRecords = 0;
+  #inFlightBytes = 0;
   #closing = false;
   #closed = false;
   #terminalError: TsfClientError | undefined;
@@ -117,11 +124,11 @@ export class DefaultTsfWriter implements TsfWriter {
     if (unavailable !== undefined) {
       return Promise.reject(unavailable);
     }
-    if (inputs.length === 0 || inputs.length > MAX_APPEND_BATCH_RECORDS) {
+    if (inputs.length === 0 || inputs.length > MAX_APPEND_SUBMISSION_RECORDS) {
       return Promise.reject(
         new TsfClientError(
           "invalid_append_batch",
-          `append batch must contain 1 to ${MAX_APPEND_BATCH_RECORDS} records`,
+          `append batch must contain 1 to ${MAX_APPEND_SUBMISSION_RECORDS} records`,
         ),
       );
     }
@@ -182,7 +189,7 @@ export class DefaultTsfWriter implements TsfWriter {
     if (unavailable !== undefined) {
       return Promise.reject(unavailable);
     }
-    const maximumBytes = MAX_APPEND_BATCH_RECORDS * MAX_RECORD_BYTES;
+    const maximumBytes = MAX_APPEND_SUBMISSION_PAYLOAD_BYTES;
     if (
       (typeof input.data === "string" && input.data.length > maximumBytes) ||
       (typeof input.data !== "string" && input.data.byteLength > maximumBytes)
@@ -197,8 +204,8 @@ export class DefaultTsfWriter implements TsfWriter {
     } catch (error) {
       return Promise.reject(asAppendInputError(error));
     }
-    const partCount = Math.max(1, Math.ceil(data.byteLength / MAX_RECORD_BYTES));
-    if (partCount > MAX_APPEND_BATCH_RECORDS) {
+    const partCount = Math.max(1, Math.ceil(data.byteLength / MAX_RECORD_PAYLOAD_BYTES));
+    if (partCount > MAX_APPEND_SUBMISSION_RECORDS) {
       return Promise.reject(logicalRecordTooLarge());
     }
     const format = input.format ??
@@ -208,8 +215,8 @@ export class DefaultTsfWriter implements TsfWriter {
     }
     return this.appendBatch(Array.from({ length: partCount }, (_, index) => ({
       data: data.subarray(
-        index * MAX_RECORD_BYTES,
-        Math.min((index + 1) * MAX_RECORD_BYTES, data.byteLength),
+        index * MAX_RECORD_PAYLOAD_BYTES,
+        Math.min((index + 1) * MAX_RECORD_PAYLOAD_BYTES, data.byteLength),
       ),
       format,
       part: partHeader(index, index + 1 === partCount),
@@ -322,9 +329,9 @@ export class DefaultTsfWriter implements TsfWriter {
     const selected: { readonly call: PendingAppendCall; readonly index: number }[] = [];
     let payloadBytes = 0;
     let chargedBytes = 0;
-    const availableRecords = MAX_WRITER_UNACKED_RECORDS - this.#unacknowledgedRecords;
+    const availableRecords = MAX_WRITER_IN_FLIGHT_RECORDS - this.#inFlightRecords;
     const availableBytes =
-      MAX_WRITER_UNACKED_PAYLOAD_BYTES - this.#unacknowledgedBytes;
+      MAX_WRITER_IN_FLIGHT_BYTES - this.#inFlightBytes;
     if (availableRecords === 0 || availableBytes === 0) {
       return false;
     }
@@ -335,10 +342,10 @@ export class DefaultTsfWriter implements TsfWriter {
           throw new TsfClientError("invalid_writer_state", "writer record is missing");
         }
         if (
-          selected.length >= Math.min(MAX_APPEND_BATCH_RECORDS, availableRecords) ||
+          selected.length >= Math.min(MAX_APPEND_FRAME_RECORDS, availableRecords) ||
           record.retainedBytes > availableBytes - chargedBytes ||
           (selected.length > 0 &&
-            record.data.byteLength > MAX_BATCH_PAYLOAD_BYTES - payloadBytes)
+            record.data.byteLength > MAX_FRAME_PAYLOAD_BYTES - payloadBytes)
         ) {
           break outer;
         }
@@ -369,8 +376,8 @@ export class DefaultTsfWriter implements TsfWriter {
     for (const { call } of selected) {
       call.sent += 1;
     }
-    this.#unacknowledgedRecords += selected.length;
-    this.#unacknowledgedBytes += chargedBytes;
+    this.#inFlightRecords += selected.length;
+    this.#inFlightBytes += chargedBytes;
     return true;
   }
 
@@ -410,9 +417,9 @@ export class DefaultTsfWriter implements TsfWriter {
           writerSeqNum: call.writerStartSeqNum + BigInt(call.acknowledged + offset),
           seqNum: streamSeqNum + BigInt(offset),
         });
-        this.#unacknowledgedBytes -= record.retainedBytes;
+        this.#inFlightBytes -= record.retainedBytes;
       }
-      this.#unacknowledgedRecords -= acknowledged;
+      this.#inFlightRecords -= acknowledged;
       call.acknowledged += acknowledged;
       remaining -= acknowledged;
       streamSeqNum += BigInt(acknowledged);
@@ -439,15 +446,15 @@ export class DefaultTsfWriter implements TsfWriter {
   }
 
   #hasInFlightRecords(): boolean {
-    return this.#unacknowledgedRecords > 0;
+    return this.#inFlightRecords > 0;
   }
 
   #resetSentToAcknowledged(): void {
     for (const call of this.#queue) {
       call.sent = call.acknowledged;
     }
-    this.#unacknowledgedRecords = 0;
-    this.#unacknowledgedBytes = 0;
+    this.#inFlightRecords = 0;
+    this.#inFlightBytes = 0;
   }
 
   #finish(error: TsfClientError): void {
@@ -544,15 +551,15 @@ interface AppendAckFrame {
 
 function prepareAppend(input: AppendInput): PendingAppend {
   if (
-    (typeof input.data === "string" && input.data.length > MAX_RECORD_BYTES) ||
-    (typeof input.data !== "string" && input.data.byteLength > MAX_RECORD_BYTES)
+    (typeof input.data === "string" && input.data.length > MAX_RECORD_PAYLOAD_BYTES) ||
+    (typeof input.data !== "string" && input.data.byteLength > MAX_RECORD_PAYLOAD_BYTES)
   ) {
     throw recordTooLarge();
   }
   const data = typeof input.data === "string"
     ? textEncoder.encode(input.data)
     : new Uint8Array(input.data);
-  if (data.byteLength > MAX_RECORD_BYTES) {
+  if (data.byteLength > MAX_RECORD_PAYLOAD_BYTES) {
     throw recordTooLarge();
   }
   return {
@@ -590,14 +597,14 @@ function positiveSafeInteger(value: number, name: string): number {
 function logicalRecordTooLarge(): TsfClientError {
   return new TsfClientError(
     "logical_record_too_large",
-    `logical record exceeds the ${MAX_APPEND_BATCH_RECORDS * MAX_RECORD_BYTES}-byte maximum`,
+    `logical record exceeds the ${MAX_APPEND_SUBMISSION_PAYLOAD_BYTES}-byte maximum`,
   );
 }
 
 function recordTooLarge(): TsfClientError {
   return new TsfClientError(
     "record_too_large",
-    `record exceeds the ${MAX_RECORD_BYTES}-byte maximum`,
+    `record exceeds the ${MAX_RECORD_PAYLOAD_BYTES}-byte maximum`,
   );
 }
 

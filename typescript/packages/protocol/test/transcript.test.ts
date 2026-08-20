@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_MAX_LOGICAL_RECORD_BYTES,
+  DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES,
   LogicalTranscript,
   partHeader,
   parseWriterId,
@@ -67,7 +67,7 @@ describe("logical transcript", () => {
   });
 
   it("bounds writer cardinality without disturbing known writers", () => {
-    const transcript = new LogicalTranscript({ maxWriters: 2 });
+    const transcript = new LogicalTranscript({ maxWriterStates: 2 });
 
     expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "one", 1)))).toBe(
       "one",
@@ -82,10 +82,10 @@ describe("logical transcript", () => {
     );
   });
 
-  it("bounds aggregate pending bytes and releases them on resynchronization", () => {
+  it("bounds total pending bytes and releases them on resynchronization", () => {
     const transcript = new LogicalTranscript({
       maxLogicalRecordBytes: 4,
-      maxPendingBytes: 4,
+      maxTotalPendingBytes: 4,
     });
 
     expect(
@@ -94,7 +94,7 @@ describe("logical transcript", () => {
     expect(() =>
       transcript.pushRecord(record(0n, partHeader(0, false), "de", 2))
     ).toThrowError(
-      expect.objectContaining({ code: "transcript_pending_bytes_limit" }),
+      expect.objectContaining({ code: "transcript_total_pending_bytes_limit" }),
     );
     expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "done", 1)))).toBe(
       "done",
@@ -104,11 +104,11 @@ describe("logical transcript", () => {
     ).toBeUndefined();
   });
 
-  it("bounds aggregate pending parts independently of payload bytes", () => {
+  it("bounds total pending parts independently of payload bytes", () => {
     const transcript = new LogicalTranscript({
       maxLogicalRecordBytes: 10,
-      maxPendingBytes: 10,
-      maxPendingParts: 2,
+      maxTotalPendingBytes: 10,
+      maxTotalPendingParts: 2,
     });
 
     expect(
@@ -120,32 +120,32 @@ describe("logical transcript", () => {
     expect(() =>
       transcript.pushRecord(record(2n, partHeader(2, false), "", 1))
     ).toThrowError(
-      expect.objectContaining({ code: "transcript_pending_parts_limit" }),
+      expect.objectContaining({ code: "transcript_total_pending_parts_limit" }),
     );
   });
 
   it("raises the implicit pending budget with the logical record limit", () => {
     const transcript = new LogicalTranscript({
-      maxLogicalRecordBytes: DEFAULT_MAX_LOGICAL_RECORD_BYTES + 1,
+      maxLogicalRecordBytes: DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES + 1,
     });
 
-    expect(transcript.maxPendingBytes).toBe(DEFAULT_MAX_LOGICAL_RECORD_BYTES + 1);
+    expect(transcript.maxTotalPendingBytes).toBe(DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES + 1);
   });
 
   it("rejects a pending budget below the logical record limit", () => {
     expect(() => new LogicalTranscript({
       maxLogicalRecordBytes: 5,
-      maxPendingBytes: 4,
+      maxTotalPendingBytes: 4,
     })).toThrowError(expect.objectContaining({ code: "invalid_transcript_limit" }));
   });
 
   it("accepts a pending budget above the logical record limit", () => {
     const transcript = new LogicalTranscript({
       maxLogicalRecordBytes: 4,
-      maxPendingBytes: 8,
+      maxTotalPendingBytes: 8,
     });
 
-    expect(transcript.maxPendingBytes).toBe(8);
+    expect(transcript.maxTotalPendingBytes).toBe(8);
   });
 });
 

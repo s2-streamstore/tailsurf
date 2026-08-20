@@ -72,7 +72,7 @@ Management methods require an owner link secret. `listLinks` returns one page. `
 
 `connectWriter` creates a fresh writer identity and starts its sequence at zero. It keeps that identity and sequence progress across reconnects.
 
-Concurrent append calls receive contiguous sequence ranges in call order. The writer coalesces them into bounded wire frames. It retains acknowledged progress and resends only the unacknowledged suffix after a reconnect.
+Concurrent append calls receive contiguous sequence ranges in call order. The writer coalesces them into bounded protocol frames. It retains acknowledged progress and resends only the unacknowledged suffix after a reconnect.
 
 ```ts
 const writer = await client.connectWriter({
@@ -90,11 +90,11 @@ try {
 }
 ```
 
-`appendBatch` is one sequencing and Promise unit. It may span several wire frames. It is not an atomic service append. A terminal failure can leave a durable prefix even when the Promise rejects.
+`appendBatch` is one sequencing and Promise unit. It may span several protocol frames. It is not an atomic service append. A terminal failure can leave a durable prefix even when the Promise rejects.
 
 `appendLogical` splits data above the 512 KiB physical-record limit into contiguous parts.
 
-The writer retains at most 128 records and 5 MiB by default. Configure a larger retained backlog when one submission can exceed those bounds. Wire sends remain capped at 128 unacknowledged records and 5 MiB per socket.
+The writer retains at most 128 records and 5 MiB by default. Configure a larger retained backlog when one submission can exceed those bounds. Each socket keeps at most 128 records and 5 MiB in flight.
 
 ```ts
 const writer = await client.connectWriter({

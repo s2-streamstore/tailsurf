@@ -6,7 +6,7 @@ import {
   MAX_SSE_EVENT_BYTES,
   MAX_SSE_UNTERMINATED_EVENT_BYTES,
   MAX_SSE_READ_BATCH_PAYLOAD_BYTES,
-  MAX_RECORD_BYTES,
+  MAX_RECORD_PAYLOAD_BYTES,
   RecordFormat,
   decodeBase64url,
   parseWriterId,
@@ -620,7 +620,7 @@ function validateReadBatch(
   let payloadBytes = 0;
   let previousSeqNum: bigint | undefined;
   for (const record of records) {
-    if (record.data.byteLength > MAX_RECORD_BYTES) {
+    if (record.data.byteLength > MAX_RECORD_PAYLOAD_BYTES) {
       throw invalidSseContract("read_batch contains an oversized record");
     }
     payloadBytes += record.data.byteLength;

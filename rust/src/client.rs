@@ -61,7 +61,7 @@ use crate::{
             WriteStreamOptions,
             frame::{
                 AppendBatch, AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
-                MAX_APPEND_BATCH_RECORDS, MAX_BATCH_PAYLOAD_BYTES, OwnedReadRecord, PartHeader,
+                MAX_APPEND_FRAME_RECORDS, MAX_FRAME_PAYLOAD_BYTES, OwnedReadRecord, PartHeader,
                 ReadBatch, RecordPayload, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
             },
         },
@@ -575,8 +575,8 @@ impl TsfClient {
 
     /// Connects the standard bounded, reconnecting durable writer.
     ///
-    /// The default retained backlog matches the server's sent-but-unacknowledged window
-    /// ([`MAX_WRITER_UNACKED_PAYLOAD_BYTES`] / [`MAX_WRITER_UNACKED_RECORDS`]), so a submitted
+    /// The default retained backlog matches the server's per-socket in-flight window
+    /// ([`MAX_WRITER_IN_FLIGHT_BYTES`] / [`MAX_WRITER_IN_FLIGHT_RECORDS`]), so a submitted
     /// batch larger than 5 MiB is rejected at submission. Use [`Self::connect_writer_with_config`]
     /// with a backlog sized to the largest submitted batch for bigger logical records.
     pub async fn connect_writer(
@@ -990,16 +990,19 @@ pub struct TsfWriteSession {
     operation_timeout: Duration,
 }
 
-/// Maximum payload bytes one writer socket may carry as sent but unacknowledged.
+/// Maximum accounted bytes that one writer socket may keep in flight.
 ///
-/// This is the TSF writer socket's hard queued-payload bound. [`TsfWriter`] paces sends to stay
-/// within it regardless of the configured backlog.
-pub const MAX_WRITER_UNACKED_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
-/// Maximum records one writer socket may carry as sent but unacknowledged.
+/// Empty payloads count as one byte. [`TsfWriter`] paces sends to stay within this server-enforced
+/// bound regardless of the configured retained backlog.
+pub const MAX_WRITER_IN_FLIGHT_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum physical records that one writer socket may keep in flight.
 ///
-/// This is the TSF writer socket's hard queued-record bound. [`TsfWriter`] paces sends to stay
-/// within it regardless of the configured backlog.
-pub const MAX_WRITER_UNACKED_RECORDS: usize = 128;
+/// This is a server-enforced bound independent of the configured retained backlog.
+pub const MAX_WRITER_IN_FLIGHT_RECORDS: usize = 128;
+/// Default maximum accounted bytes retained until durability acknowledgement.
+pub const DEFAULT_MAX_WRITER_RETAINED_BYTES: usize = MAX_WRITER_IN_FLIGHT_BYTES;
+/// Default maximum physical records retained until durability acknowledgement.
+pub const DEFAULT_MAX_WRITER_RETAINED_RECORDS: usize = MAX_WRITER_IN_FLIGHT_RECORDS;
 
 /// Stream, credentials, and sequence precondition for one durable [`TsfWriter`].
 ///
@@ -1040,11 +1043,13 @@ impl DurableWriterOptions {
 /// Every submitted batch is retained until durability acknowledgement, so a batch larger than
 /// these bounds can never be admitted and is rejected at submission; size the backlog at least to
 /// the largest submitted batch. Capacity is accounted per batch and released when the whole batch
-/// is acknowledged. The writer paces wire sends within [`MAX_WRITER_UNACKED_PAYLOAD_BYTES`] and
-/// [`MAX_WRITER_UNACKED_RECORDS`] independently of this backlog.
+/// is acknowledged. The writer paces wire sends within [`MAX_WRITER_IN_FLIGHT_BYTES`] and
+/// [`MAX_WRITER_IN_FLIGHT_RECORDS`] independently of this backlog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TsfWriterConfig {
-    /// Maximum total payload bytes retained until durability acknowledgement.
+    /// Maximum accounted bytes retained until durability acknowledgement.
+    ///
+    /// Empty payloads count as one byte.
     pub max_retained_bytes: usize,
     /// Maximum number of records retained until durability acknowledgement.
     pub max_retained_records: usize,
@@ -1074,8 +1079,8 @@ impl TsfWriterConfig {
 impl Default for TsfWriterConfig {
     fn default() -> Self {
         Self {
-            max_retained_bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-            max_retained_records: MAX_WRITER_UNACKED_RECORDS,
+            max_retained_bytes: DEFAULT_MAX_WRITER_RETAINED_BYTES,
+            max_retained_records: DEFAULT_MAX_WRITER_RETAINED_RECORDS,
         }
     }
 }
@@ -1134,7 +1139,7 @@ pub struct AppendReceipt {
 /// permanently fails.
 ///
 /// The resolved receipts match the submitted batch one-to-one in submission order; because one
-/// batch may span several wire batches, the receipts may reference multiple acknowledgement
+/// batch may span several protocol frames, the receipts may reference multiple acknowledgement
 /// ranges.
 pub struct AppendTicket {
     rx: oneshot::Receiver<Result<Vec<AppendReceipt>, TsfClientError>>,
@@ -1248,7 +1253,7 @@ impl TsfProducer {
     /// The returned permit owns capacity until it is dropped or submitted.
     pub async fn reserve(&self, batch: &AppendBatch) -> Result<WritePermit, TsfClientError> {
         let records = batch.record_count();
-        let bytes = batch_retained_bytes(batch);
+        let bytes = submission_retained_bytes(batch);
         if records > self.shared.config.max_retained_records
             || bytes > self.shared.config.max_retained_bytes
         {
@@ -1302,15 +1307,15 @@ impl TsfProducer {
 }
 
 /// The server's queued-payload bound counts every record as at least one byte.
-fn wire_bytes(data: &Bytes) -> usize {
+fn accounted_record_bytes(data: &Bytes) -> usize {
     data.len().max(1)
 }
 
-fn batch_retained_bytes(batch: &AppendBatch) -> usize {
+fn submission_retained_bytes(batch: &AppendBatch) -> usize {
     batch
         .payloads()
         .iter()
-        .map(|record| wire_bytes(&record.data))
+        .map(|record| accounted_record_bytes(&record.data))
         .sum()
 }
 
@@ -1483,7 +1488,7 @@ impl WritePermit {
             return Err(error);
         }
         let records = batch.record_count();
-        let bytes = batch_retained_bytes(&batch);
+        let bytes = submission_retained_bytes(&batch);
         if records > self.reserved_records || bytes > self.reserved_bytes {
             return Err(TsfClientError::AppendBatchExceedsReservation {
                 records,
@@ -1618,7 +1623,7 @@ struct PendingSubmission {
 
 impl PendingSubmission {
     /// Writer sequence numbers still awaiting acknowledgement, in order.
-    fn unacked(&self) -> Range<u64> {
+    fn unacknowledged_range(&self) -> Range<u64> {
         self.start_seq_num + self.acked as u64..self.start_seq_num + self.payloads.len() as u64
     }
 
@@ -1634,13 +1639,13 @@ impl PendingSubmission {
     }
 }
 
-/// Sent-but-unacknowledged wire state for one connection: the window hard-bounded by the server
+/// Sent-but-unacknowledged state for one connection: the window hard-bounded by the server
 /// socket limits, plus the deadline for the acknowledgement that reopens it.
 ///
 /// A reconnect replaces the whole value, so a deadline can never outlive the socket it was armed
 /// for.
 #[derive(Default)]
-struct WireWindow {
+struct InFlightWindow {
     bytes: usize,
     records: usize,
     /// Absolute: submissions can fill the backlog but never postpone it, so it measures time
@@ -1648,7 +1653,7 @@ struct WireWindow {
     ack_deadline: Option<Instant>,
 }
 
-impl WireWindow {
+impl InFlightWindow {
     /// Arms the deadline for the first records to reach the wire; an armed deadline is never
     /// pushed back by later sends.
     fn arm(&mut self, operation_timeout: Duration) {
@@ -1696,8 +1701,8 @@ async fn run_writer(
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
     let mut reconnect_attempts = 0;
     let mut cursor = WriterCursor::default();
-    let mut in_flight = WireWindow::default();
-    // Reused across frames; one frame holds at most MAX_APPEND_BATCH_RECORDS records.
+    let mut in_flight = InFlightWindow::default();
+    // Reused across frames; one frame holds at most MAX_APPEND_FRAME_RECORDS records.
     let mut frame: Vec<AppendRecord> = Vec::new();
 
     loop {
@@ -1800,7 +1805,7 @@ async fn run_writer(
     }
 }
 
-/// Waits for the next acknowledgement, failing at the wire window's absolute deadline.
+/// Waits for the next acknowledgement, failing at the in-flight window's absolute deadline.
 ///
 /// The actor loop drops this future whenever another `select!` branch wins; a `WebSocketStream`
 /// buffers partial frames internally, so cancelling the read cannot lose an acknowledgement.
@@ -1860,14 +1865,14 @@ fn drain_submissions(
     Ok(())
 }
 
-/// Fills `frame` with the leading unsent records and charges the wire window for them, bounded by
-/// that window and by the wire batch limits.
+/// Fills `frame` with the leading unsent records and charges the in-flight window for them, bounded by
+/// that window and by the protocol-frame limits.
 ///
 /// Payloads are reference-counted, so framing clones only handles. Charging before the write is
 /// safe: a failed send is followed by a reconnect that resets every marker.
 fn take_frame(
     pending: &mut VecDeque<PendingSubmission>,
-    in_flight: &mut WireWindow,
+    in_flight: &mut InFlightWindow,
     frame: &mut Vec<AppendRecord>,
 ) {
     frame.clear();
@@ -1878,11 +1883,11 @@ fn take_frame(
             let Some(payload) = submission.payloads.get(sent) else {
                 break false;
             };
-            let accounted = wire_bytes(&payload.data);
-            if in_flight.records == MAX_WRITER_UNACKED_RECORDS
-                || in_flight.bytes + accounted > MAX_WRITER_UNACKED_PAYLOAD_BYTES
-                || frame.len() == MAX_APPEND_BATCH_RECORDS
-                || (!frame.is_empty() && payload.data.len() > MAX_BATCH_PAYLOAD_BYTES - frame_bytes)
+            let accounted = accounted_record_bytes(&payload.data);
+            if in_flight.records == MAX_WRITER_IN_FLIGHT_RECORDS
+                || in_flight.bytes + accounted > MAX_WRITER_IN_FLIGHT_BYTES
+                || frame.len() == MAX_APPEND_FRAME_RECORDS
+                || (!frame.is_empty() && payload.data.len() > MAX_FRAME_PAYLOAD_BYTES - frame_bytes)
             {
                 break true;
             }
@@ -1899,12 +1904,12 @@ fn take_frame(
     }
 }
 
-/// Sends unsent retained records under the wire window, pacing around full windows; acks observed
+/// Sends unsent retained records under the in-flight window, pacing around full windows; acks observed
 /// by the actor loop reopen capacity.
 async fn send_pending(
     session: &mut TsfWriteSession,
     pending: &mut VecDeque<PendingSubmission>,
-    in_flight: &mut WireWindow,
+    in_flight: &mut InFlightWindow,
     frame: &mut Vec<AppendRecord>,
 ) -> Result<(), TsfClientError> {
     if !pending
@@ -1936,7 +1941,7 @@ async fn send_pending(
 
 /// Reconnects the write session and marks every unacked record for paced resend.
 ///
-/// The fresh socket carries no in-flight records, so the whole wire window is replaced —
+/// The fresh socket carries no in-flight records, so the whole in-flight window is replaced —
 /// including the acknowledgement deadline armed for the dead socket — and every sent marker
 /// rewinds to its acknowledged prefix; the loop top resends the backlog under the window.
 async fn recover_pending_appends(
@@ -1944,7 +1949,7 @@ async fn recover_pending_appends(
     client: &TsfClient,
     options: &WriteStreamOptions,
     pending: &mut VecDeque<PendingSubmission>,
-    in_flight: &mut WireWindow,
+    in_flight: &mut InFlightWindow,
     reconnect_attempts: &mut usize,
     mut error: TsfClientError,
 ) -> Result<(), TsfClientError> {
@@ -1966,7 +1971,7 @@ async fn recover_pending_appends(
                 for submission in pending.iter_mut() {
                     submission.sent = submission.acked;
                 }
-                *in_flight = WireWindow::default();
+                *in_flight = InFlightWindow::default();
                 return Ok(());
             }
             Err(next_error) if next_error.is_retryable() => error = next_error,
@@ -1980,7 +1985,7 @@ async fn recover_pending_appends(
 fn dispatch_ack(
     ack: AppendAck,
     pending: &mut VecDeque<PendingSubmission>,
-    in_flight: &mut WireWindow,
+    in_flight: &mut InFlightWindow,
 ) -> Result<(), TsfClientError> {
     let record_count =
         usize::try_from(ack.record_count()?).map_err(|_| TsfClientError::InvalidAppendAck(ack))?;
@@ -1990,7 +1995,9 @@ fn dispatch_ack(
     }
 
     // Validate the whole ack against the leading unacked records before mutating anything.
-    let mut pending_seq_nums = pending.iter().flat_map(PendingSubmission::unacked);
+    let mut pending_seq_nums = pending
+        .iter()
+        .flat_map(PendingSubmission::unacknowledged_range);
     for writer_seq_num in ack.writer_start_seq_num..ack.writer_end_seq_num {
         let Some(pending_seq_num) = pending_seq_nums.next() else {
             return Err(TsfClientError::InvalidAppendAck(ack));
@@ -2012,7 +2019,7 @@ fn dispatch_ack(
     while remaining > 0 {
         let submission = pending.front_mut().expect("ack validated against pending");
         while submission.acked < submission.payloads.len() && remaining > 0 {
-            in_flight.bytes -= wire_bytes(&submission.payloads[submission.acked].data);
+            in_flight.bytes -= accounted_record_bytes(&submission.payloads[submission.acked].data);
             in_flight.records -= 1;
             submission.receipts.push(AppendReceipt {
                 writer_seq_num: writer_seq_nums.next().expect("ack validated"),
@@ -2022,7 +2029,7 @@ fn dispatch_ack(
             submission.acked += 1;
             remaining -= 1;
         }
-        // The wire window bounds the ack to records this connection sent, so an acknowledged
+        // The in-flight window bounds the ack to records this connection sent, so an acknowledged
         // prefix can never outrun the sent prefix.
         debug_assert!(submission.acked <= submission.sent);
         if submission.acked == submission.payloads.len() {
@@ -3582,7 +3589,7 @@ mod tests {
     use crate::protocol::{
         read::ReadStop,
         rest::SseReadRecord,
-        ws::frame::{MAX_RECORD_BYTES, OwnedReadRecord, RecordFormat},
+        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, RecordFormat},
     };
 
     #[test]
@@ -3977,16 +3984,22 @@ mod tests {
     #[test]
     fn writer_backlog_defaults_match_the_server_window_and_reject_out_of_range_bounds() {
         let default = TsfWriterConfig::default();
-        assert_eq!(default.max_retained_bytes, MAX_WRITER_UNACKED_PAYLOAD_BYTES);
-        assert_eq!(default.max_retained_records, MAX_WRITER_UNACKED_RECORDS);
+        assert_eq!(
+            default.max_retained_bytes,
+            DEFAULT_MAX_WRITER_RETAINED_BYTES
+        );
+        assert_eq!(
+            default.max_retained_records,
+            DEFAULT_MAX_WRITER_RETAINED_RECORDS
+        );
         assert!(default.validate().is_ok());
 
-        // The retained backlog is client-local memory: batches larger than the wire window are
+        // The retained backlog is client-local memory: batches larger than the in-flight window are
         // legitimate, so any semaphore-representable bound is accepted.
         assert!(
             TsfWriterConfig {
-                max_retained_bytes: 4 * MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-                max_retained_records: 4 * MAX_WRITER_UNACKED_RECORDS,
+                max_retained_bytes: 4 * MAX_WRITER_IN_FLIGHT_BYTES,
+                max_retained_records: 4 * MAX_WRITER_IN_FLIGHT_RECORDS,
             }
             .validate()
             .is_ok()
@@ -4358,9 +4371,9 @@ mod tests {
         (submission, ack_rx)
     }
 
-    /// Wire window state matching fully sent submissions of empty records.
-    fn sent_window(pending: &VecDeque<PendingSubmission>) -> WireWindow {
-        WireWindow {
+    /// In-flight window state matching fully sent submissions of empty records.
+    fn in_flight_window(pending: &VecDeque<PendingSubmission>) -> InFlightWindow {
+        InFlightWindow {
             records: pending.iter().map(|s| s.payloads.len()).sum(),
             bytes: pending.iter().map(|s| s.payloads.len()).sum(),
             ack_deadline: None,
@@ -4482,10 +4495,10 @@ mod tests {
         for submission in &mut pending {
             submission.sent = 0;
             for payload in &mut submission.payloads {
-                payload.data = Bytes::from(vec![0_u8; MAX_RECORD_BYTES]);
+                payload.data = Bytes::from(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES]);
             }
         }
-        let mut in_flight = WireWindow::default();
+        let mut in_flight = InFlightWindow::default();
         let mut frame = Vec::new();
 
         // Two 512 KiB records per 1 MiB frame; six records fit the 5 MiB window.
@@ -4505,7 +4518,7 @@ mod tests {
 
         assert_eq!(planned, [vec![0, 1], vec![2, 3], vec![4, 5]]);
         assert_eq!(in_flight.records, 6);
-        assert_eq!(in_flight.bytes, 6 * MAX_RECORD_BYTES);
+        assert_eq!(in_flight.bytes, 6 * MAX_RECORD_PAYLOAD_BYTES);
         assert!(
             pending
                 .iter()
@@ -4514,18 +4527,18 @@ mod tests {
     }
 
     #[test]
-    fn take_frame_stops_at_the_wire_window() {
+    fn take_frame_stops_at_the_in_flight_window() {
         let permits = Arc::new(Semaphore::new(4));
         let (submission, _ack_rx) = pending_submission(0, 2, &permits);
         let mut pending = VecDeque::from([submission]);
         pending[0].sent = 0;
         for payload in &mut pending[0].payloads {
-            payload.data = Bytes::from(vec![0_u8; MAX_RECORD_BYTES]);
+            payload.data = Bytes::from(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES]);
         }
         // One record fits the remaining window exactly; the second must wait for acks.
-        let mut in_flight = WireWindow {
-            bytes: MAX_WRITER_UNACKED_PAYLOAD_BYTES - MAX_RECORD_BYTES,
-            records: MAX_WRITER_UNACKED_RECORDS - 2,
+        let mut in_flight = InFlightWindow {
+            bytes: MAX_WRITER_IN_FLIGHT_BYTES - MAX_RECORD_PAYLOAD_BYTES,
+            records: MAX_WRITER_IN_FLIGHT_RECORDS - 2,
             ack_deadline: None,
         };
         let mut frame = Vec::new();
@@ -4533,15 +4546,15 @@ mod tests {
         take_frame(&mut pending, &mut in_flight, &mut frame);
         assert_eq!(frame.len(), 1);
         assert_eq!(frame[0].writer_seq_num, 0);
-        assert_eq!(in_flight.bytes, MAX_WRITER_UNACKED_PAYLOAD_BYTES);
+        assert_eq!(in_flight.bytes, MAX_WRITER_IN_FLIGHT_BYTES);
         assert_eq!(pending[0].sent, 1);
         take_frame(&mut pending, &mut in_flight, &mut frame);
         assert!(frame.is_empty());
 
         // The record-count bound stops framing even with byte capacity left.
-        let mut record_full = WireWindow {
+        let mut record_full = InFlightWindow {
             bytes: 0,
-            records: MAX_WRITER_UNACKED_RECORDS,
+            records: MAX_WRITER_IN_FLIGHT_RECORDS,
             ack_deadline: None,
         };
         let other_permits = Arc::new(Semaphore::new(2));
@@ -4557,7 +4570,7 @@ mod tests {
         let permits = Arc::new(Semaphore::new(2));
         let (submission, _ack_rx) = pending_submission(7, 1, &permits);
         let mut pending = VecDeque::from([submission]);
-        let mut in_flight = sent_window(&pending);
+        let mut in_flight = in_flight_window(&pending);
         let ack = AppendAck {
             writer_start_seq_num: 7,
             writer_end_seq_num: 9,
@@ -4579,7 +4592,7 @@ mod tests {
         let (first, _first_rx) = pending_submission(7, 1, &permits);
         let (second, _second_rx) = pending_submission(9, 1, &permits);
         let mut pending = VecDeque::from([first, second]);
-        let mut in_flight = sent_window(&pending);
+        let mut in_flight = in_flight_window(&pending);
         let ack = AppendAck {
             writer_start_seq_num: 7,
             writer_end_seq_num: 9,
@@ -4607,7 +4620,7 @@ mod tests {
         let (first, mut first_rx) = pending_submission(7, 2, &permits);
         let (second, mut second_rx) = pending_submission(9, 1, &permits);
         let mut pending = VecDeque::from([first, second]);
-        let mut in_flight = sent_window(&pending);
+        let mut in_flight = in_flight_window(&pending);
         let first_ack = AppendAck {
             writer_start_seq_num: 7,
             writer_end_seq_num: 8,
@@ -4967,7 +4980,7 @@ mod tests {
 
         wire_record.writer_id = URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]);
         wire_record.data =
-            RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_BYTES + 1]));
+            RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES + 1]));
         assert!(
             sse_read_batch(SseReadBatchData {
                 records: vec![wire_record],
@@ -5097,7 +5110,7 @@ mod tests {
 
     #[test]
     fn stateless_append_compacts_an_escape_heavy_maximum_record() {
-        let data = vec![0_u8; MAX_RECORD_BYTES];
+        let data = vec![0_u8; MAX_RECORD_PAYLOAD_BYTES];
         let encoded = compact_record_data(&data);
         assert!(matches!(encoded, RecordData::Base64url(_)));
         let request = AppendRecordsRequest {

@@ -19,8 +19,8 @@ import { jitteredBackoffMs } from "./retry.js";
 export const NORMAL_CLOSE_CODE = 1000;
 const CONNECTING_READY_STATE = 0;
 const OPEN_READY_STATE = 1;
-const MAX_QUEUED_PHYSICAL_RECORD_SLOTS = 1_024;
-const MAX_QUEUED_SERVER_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_RECEIVE_QUEUE_UNITS = 1_024;
+const DEFAULT_MAX_RECEIVE_QUEUE_BYTES = 16 * 1024 * 1024;
 const RETRYABLE_CLOSE_CODES = new Set([
   NORMAL_CLOSE_CODE,
   1001,
@@ -49,15 +49,17 @@ export type WebSocketFactory = (
   protocol: string,
 ) => WebSocketLike;
 
-export interface FrameQueueLimits {
-  readonly maxPhysicalRecordSlots: number;
+export interface ReceiveQueueLimits {
+  /** Maximum queued physical records. A control frame consumes one unit. */
+  readonly maxUnits: number;
+  /** Maximum estimated encoded bytes across queued server frames. */
   readonly maxBytes: number;
 }
 
 interface QueuedServerFrame {
   readonly frame: ServerFrame;
   readonly bytes: number;
-  readonly physicalRecordSlots: number;
+  readonly units: number;
 }
 
 export interface SocketPolicy {
@@ -112,9 +114,9 @@ export async function connectSocket(
 export class FrameSocket {
   public readonly opened: Promise<void>;
   readonly #queue: QueuedServerFrame[] = [];
-  readonly #limits: FrameQueueLimits;
+  readonly #limits: ReceiveQueueLimits;
   #queuedBytes = 0;
-  #queuedPhysicalRecordSlots = 0;
+  #queuedUnits = 0;
   #waiting:
     | {
         readonly resolve: (frame: ServerFrame) => void;
@@ -126,15 +128,15 @@ export class FrameSocket {
 
   public constructor(
     private readonly websocket: WebSocketLike,
-    limits: FrameQueueLimits = {
-      maxPhysicalRecordSlots: MAX_QUEUED_PHYSICAL_RECORD_SLOTS,
-      maxBytes: MAX_QUEUED_SERVER_BYTES,
+    limits: ReceiveQueueLimits = {
+      maxUnits: DEFAULT_MAX_RECEIVE_QUEUE_UNITS,
+      maxBytes: DEFAULT_MAX_RECEIVE_QUEUE_BYTES,
     },
     openingMessage?: Uint8Array<ArrayBuffer>,
   ) {
     if (
-      !Number.isSafeInteger(limits.maxPhysicalRecordSlots) ||
-      limits.maxPhysicalRecordSlots <= 0 ||
+      !Number.isSafeInteger(limits.maxUnits) ||
+      limits.maxUnits <= 0 ||
       !Number.isSafeInteger(limits.maxBytes) ||
       limits.maxBytes <= 0
     ) {
@@ -182,7 +184,7 @@ export class FrameSocket {
     const queued = this.#queue.shift();
     if (queued !== undefined) {
       this.#queuedBytes -= queued.bytes;
-      this.#queuedPhysicalRecordSlots -= queued.physicalRecordSlots;
+      this.#queuedUnits -= queued.units;
       return Promise.resolve(queued.frame);
     }
     if (this.#terminalError !== undefined) {
@@ -226,10 +228,9 @@ export class FrameSocket {
       waiting.resolve(frame);
     } else {
       const bytes = serverFrameBytes(frame);
-      const physicalRecordSlots = serverFramePhysicalRecordSlots(frame);
+      const units = serverFrameQueueUnits(frame);
       if (
-        physicalRecordSlots >
-          this.#limits.maxPhysicalRecordSlots - this.#queuedPhysicalRecordSlots ||
+        units > this.#limits.maxUnits - this.#queuedUnits ||
         bytes > this.#limits.maxBytes - this.#queuedBytes
       ) {
         this.#finish(
@@ -245,9 +246,9 @@ export class FrameSocket {
         }
         return;
       }
-      this.#queue.push({ frame, bytes, physicalRecordSlots });
+      this.#queue.push({ frame, bytes, units });
       this.#queuedBytes += bytes;
-      this.#queuedPhysicalRecordSlots += physicalRecordSlots;
+      this.#queuedUnits += units;
     }
   }
 
@@ -571,7 +572,7 @@ function serverFrameBytes(frame: ServerFrame): number {
   return 64;
 }
 
-function serverFramePhysicalRecordSlots(frame: ServerFrame): number {
+function serverFrameQueueUnits(frame: ServerFrame): number {
   return frame.type === "readBatch" ? frame.records.length : 1;
 }
 

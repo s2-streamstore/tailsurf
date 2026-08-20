@@ -2,7 +2,7 @@ import {
   appendRecordsRequestSchema,
   createStreamRequestSchema,
   generateStreamId,
-  MAX_RECORD_BYTES,
+  MAX_RECORD_PAYLOAD_BYTES,
   MAX_REST_ERROR_RESPONSE_BYTES,
   MAX_REST_RESPONSE_BYTES,
   MAX_STATELESS_APPEND_JSON_BYTES,
@@ -192,7 +192,7 @@ describe("TsfClient REST API", () => {
       writerStartSeqNum: 0n,
       records: [{
         format: RecordFormat.Transcript,
-        data: new Uint8Array(MAX_RECORD_BYTES),
+        data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES),
       }],
     }, { linkSecret: LINK_SECRET });
 
@@ -203,7 +203,7 @@ describe("TsfClient REST API", () => {
     const parsed = appendRecordsRequestSchema.parse(JSON.parse(body as string));
     expect(parsed.records[0]!.data.encoding).toBe("base64url");
     expect(Buffer.from(parsed.records[0]!.data.value, "base64url")).toHaveLength(
-      MAX_RECORD_BYTES,
+      MAX_RECORD_PAYLOAD_BYTES,
     );
   });
 

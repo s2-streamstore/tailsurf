@@ -3,9 +3,9 @@ import {
   encodeServerFrame,
   generateStreamId,
   parseWriterId,
-  MAX_BATCH_PAYLOAD_BYTES,
-  MAX_READ_BATCH_RECORDS,
-  MAX_RECORD_BYTES,
+  MAX_FRAME_PAYLOAD_BYTES,
+  MAX_READ_FRAME_RECORDS,
+  MAX_RECORD_PAYLOAD_BYTES,
   RecordFormat,
   TSF_WEBSOCKET_PROTOCOL,
   UNSPLIT_PART,
@@ -18,8 +18,8 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  DEFAULT_WRITER_RETAINED_BYTES,
-  DEFAULT_WRITER_RETAINED_RECORDS,
+  DEFAULT_MAX_WRITER_RETAINED_BYTES,
+  DEFAULT_MAX_WRITER_RETAINED_RECORDS,
   TsfClient,
   type WebSocketFactory,
 } from "../src/index.js";
@@ -49,7 +49,7 @@ describe("FrameSocket", () => {
         ],
         1000,
       ),
-      { maxPhysicalRecordSlots: 2, maxBytes: 1_024 },
+      { maxUnits: 2, maxBytes: 1_024 },
     );
     await frameBounded.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -67,7 +67,7 @@ describe("FrameSocket", () => {
         ],
         1000,
       ),
-      { maxPhysicalRecordSlots: 10, maxBytes: 100 },
+      { maxUnits: 10, maxBytes: 100 },
     );
     await byteBounded.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -79,7 +79,7 @@ describe("FrameSocket", () => {
 
   it("accounts for every physical record in a queued read batch", async () => {
     const records = Array.from(
-      { length: MAX_READ_BATCH_RECORDS },
+      { length: MAX_READ_FRAME_RECORDS },
       (_unused, index) => record(BigInt(index), ""),
     );
     const socket = new FrameSocket(
@@ -92,13 +92,13 @@ describe("FrameSocket", () => {
             records: Array.from(
               { length: 25 },
               (_unused, index) =>
-                record(BigInt(MAX_READ_BATCH_RECORDS + index), ""),
+                record(BigInt(MAX_READ_FRAME_RECORDS + index), ""),
             ),
           },
         ],
         1000,
       ),
-      { maxPhysicalRecordSlots: 1_024, maxBytes: 16 * 1024 * 1024 },
+      { maxUnits: 1_024, maxBytes: 16 * 1024 * 1024 },
     );
     await socket.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -106,7 +106,7 @@ describe("FrameSocket", () => {
     await expect(socket.nextFrame()).resolves.toMatchObject({ type: "ready" });
     await expect(socket.nextFrame()).resolves.toMatchObject({
       type: "readBatch",
-      records: { length: MAX_READ_BATCH_RECORDS },
+      records: { length: MAX_READ_FRAME_RECORDS },
     });
     await expect(socket.nextFrame()).rejects.toMatchObject({
       code: "client_receive_overload",
@@ -126,7 +126,7 @@ describe("TsfReadSession", () => {
   it("drains a maximum read batch in order", async () => {
     const streamId = generateStreamId();
     const records = Array.from(
-      { length: MAX_READ_BATCH_RECORDS },
+      { length: MAX_READ_FRAME_RECORDS },
       (_unused, index) => record(BigInt(index), ""),
     );
     const client = new TsfClient({
@@ -143,10 +143,10 @@ describe("TsfReadSession", () => {
     const reader = await client.connectReader({
       streamId,
       start: { type: "seqNum", seqNum: 0n },
-      stop: { count: BigInt(MAX_READ_BATCH_RECORDS) },
+      stop: { count: BigInt(MAX_READ_FRAME_RECORDS) },
     });
 
-    for (let index = 0; index < MAX_READ_BATCH_RECORDS; index += 1) {
+    for (let index = 0; index < MAX_READ_FRAME_RECORDS; index += 1) {
       await expect(reader.nextRecord()).resolves.toMatchObject({
         seqNum: BigInt(index),
       });
@@ -896,7 +896,7 @@ describe("TsfWriter", () => {
     await writer.close();
   });
 
-  it("coalesces append calls made in one turn into one wire batch", async () => {
+  it("coalesces append calls made in one turn into one protocol frame", async () => {
     const socket = new ControlledWriterWebSocket();
     const client = new TsfClient({
       webSocketFactory: () => socket,
@@ -957,7 +957,7 @@ describe("TsfWriter", () => {
     });
 
     const recordCalls = Array.from(
-      { length: DEFAULT_WRITER_RETAINED_RECORDS },
+      { length: DEFAULT_MAX_WRITER_RETAINED_RECORDS },
       () => writer.append({ data: new Uint8Array() }),
     );
     await expect(writer.append({ data: new Uint8Array() })).rejects.toMatchObject({
@@ -972,11 +972,11 @@ describe("TsfWriter", () => {
 
     socket.setAutoAck(false);
     const payloadRecordCount =
-      DEFAULT_WRITER_RETAINED_BYTES / MAX_RECORD_BYTES;
+      DEFAULT_MAX_WRITER_RETAINED_BYTES / MAX_RECORD_PAYLOAD_BYTES;
     if (!Number.isInteger(payloadRecordCount)) {
       throw new TypeError("writer payload limit must compose from whole records");
     }
-    const maxRecord = new Uint8Array(MAX_RECORD_BYTES);
+    const maxRecord = new Uint8Array(MAX_RECORD_PAYLOAD_BYTES);
     const payloadCalls = Array.from(
       { length: payloadRecordCount },
       () => writer.append({ data: maxRecord }),
@@ -993,7 +993,7 @@ describe("TsfWriter", () => {
 
     expect(socket.appendCount).toBe(
       2 +
-        Math.ceil(DEFAULT_WRITER_RETAINED_BYTES / MAX_BATCH_PAYLOAD_BYTES) +
+        Math.ceil(DEFAULT_MAX_WRITER_RETAINED_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
         1,
     );
     await writer.close();
@@ -1140,7 +1140,7 @@ describe("TsfWriter", () => {
 
     const submission = writer.appendBatch(Array.from(
       { length: 3 },
-      () => ({ data: new Uint8Array(MAX_RECORD_BYTES) }),
+      () => ({ data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES) }),
     ));
     await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(3));
     expect(socket.appendCount).toBe(2);
@@ -1166,7 +1166,7 @@ describe("TsfWriter", () => {
 
     const submission = writer.appendBatch(Array.from(
       { length: 16 },
-      () => ({ data: new Uint8Array(MAX_RECORD_BYTES) }),
+      () => ({ data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES) }),
     ));
     await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(10));
     expect(socket.appendCount).toBe(5);
@@ -1187,7 +1187,7 @@ describe("TsfWriter", () => {
     });
 
     await expect(writer.appendLogical({
-      data: new Uint8Array(MAX_RECORD_BYTES + 1),
+      data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES + 1),
     })).resolves.toHaveLength(2);
     expect(appends.map(({ writerSeqNum, part, data }) => ({
       writerSeqNum,
@@ -1197,7 +1197,7 @@ describe("TsfWriter", () => {
       {
         writerSeqNum: 0n,
         part: { index: 0, isFinal: false },
-        bytes: MAX_RECORD_BYTES,
+        bytes: MAX_RECORD_PAYLOAD_BYTES,
       },
       {
         writerSeqNum: 1n,
