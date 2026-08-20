@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_MAX_LOGICAL_RECORD_BYTES,
   LogicalTranscript,
   partHeader,
   parseWriterId,
@@ -82,7 +83,10 @@ describe("logical transcript", () => {
   });
 
   it("bounds aggregate pending bytes and releases them on resynchronization", () => {
-    const transcript = new LogicalTranscript({ maxPendingBytes: 4 });
+    const transcript = new LogicalTranscript({
+      maxLogicalRecordBytes: 4,
+      maxPendingBytes: 4,
+    });
 
     expect(
       transcript.pushRecord(record(0n, partHeader(0, false), "abc", 1)),
@@ -102,6 +106,7 @@ describe("logical transcript", () => {
 
   it("bounds aggregate pending parts independently of payload bytes", () => {
     const transcript = new LogicalTranscript({
+      maxLogicalRecordBytes: 10,
       maxPendingBytes: 10,
       maxPendingParts: 2,
     });
@@ -117,6 +122,30 @@ describe("logical transcript", () => {
     ).toThrowError(
       expect.objectContaining({ code: "transcript_pending_parts_limit" }),
     );
+  });
+
+  it("raises the implicit pending budget with the logical record limit", () => {
+    const transcript = new LogicalTranscript({
+      maxLogicalRecordBytes: DEFAULT_MAX_LOGICAL_RECORD_BYTES + 1,
+    });
+
+    expect(transcript.maxPendingBytes).toBe(DEFAULT_MAX_LOGICAL_RECORD_BYTES + 1);
+  });
+
+  it("rejects a pending budget below the logical record limit", () => {
+    expect(() => new LogicalTranscript({
+      maxLogicalRecordBytes: 5,
+      maxPendingBytes: 4,
+    })).toThrowError(expect.objectContaining({ code: "invalid_transcript_limit" }));
+  });
+
+  it("accepts a pending budget above the logical record limit", () => {
+    const transcript = new LogicalTranscript({
+      maxLogicalRecordBytes: 4,
+      maxPendingBytes: 8,
+    });
+
+    expect(transcript.maxPendingBytes).toBe(8);
   });
 });
 

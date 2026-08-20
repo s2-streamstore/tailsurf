@@ -50,18 +50,29 @@ export class LogicalTranscript {
   public readonly maxPendingParts: number;
 
   public constructor(options: LogicalTranscriptOptions = {}) {
-    this.maxLogicalRecordBytes = transcriptLimit(
+    const maxLogicalRecordBytes = transcriptLimit(
       options.maxLogicalRecordBytes ?? DEFAULT_MAX_LOGICAL_RECORD_BYTES,
       "logical record bytes",
     );
+    const maxPendingBytes = transcriptLimit(
+      options.maxPendingBytes ?? Math.max(
+        DEFAULT_MAX_TRANSCRIPT_PENDING_BYTES,
+        maxLogicalRecordBytes,
+      ),
+      "pending bytes",
+    );
+    if (maxPendingBytes < maxLogicalRecordBytes) {
+      throw new ProtocolError(
+        "invalid_transcript_limit",
+        `pending bytes limit (${maxPendingBytes}) must be at least logical record bytes limit (${maxLogicalRecordBytes})`,
+      );
+    }
+    this.maxLogicalRecordBytes = maxLogicalRecordBytes;
     this.maxWriters = transcriptLimit(
       options.maxWriters ?? DEFAULT_MAX_TRANSCRIPT_WRITERS,
       "writers",
     );
-    this.maxPendingBytes = transcriptLimit(
-      options.maxPendingBytes ?? DEFAULT_MAX_TRANSCRIPT_PENDING_BYTES,
-      "pending bytes",
-    );
+    this.maxPendingBytes = maxPendingBytes;
     this.maxPendingParts = transcriptLimit(
       options.maxPendingParts ?? DEFAULT_MAX_TRANSCRIPT_PENDING_PARTS,
       "pending parts",

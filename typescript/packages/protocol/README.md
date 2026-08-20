@@ -27,6 +27,8 @@ function readLink(rawStreamId: string, linkSecret: string): URL {
 
 The package also exports its language-neutral fixtures at `@tailsurf/protocol/fixtures/v1.json` and `@tailsurf/protocol/fixtures/rest-v1.json`.
 
+`LogicalTranscript` defaults its per-record and aggregate pending-byte limits to 16 MiB. Raising only `maxLogicalRecordBytes` raises `maxPendingBytes` to match. An explicit pending-byte limit can be larger but cannot be smaller than the logical-record limit.
+
 ## Compatibility
 
 Protocol fixtures are shared with the Rust implementation in the `tailsurf` repository. CI rejects any byte-level drift between the two copies.

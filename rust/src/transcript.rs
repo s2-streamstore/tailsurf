@@ -20,7 +20,7 @@ pub const DEFAULT_MAX_LOGICAL_RECORD_BYTES: usize = MAX_RECORD_BYTES * 32;
 /// Default maximum writer identities retained for deduplication and reassembly.
 pub const DEFAULT_MAX_WRITER_STATES: usize = 4_096;
 /// Default SDK memory-safety limit across all unfinished split records: 16 MiB.
-pub const DEFAULT_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_PENDING_BYTES: usize = DEFAULT_MAX_LOGICAL_RECORD_BYTES;
 /// Default maximum physical parts retained across all unfinished split records.
 pub const DEFAULT_MAX_PENDING_PARTS: usize = 16_384;
 
@@ -52,6 +52,31 @@ impl TranscriptLimits {
             max_pending_parts,
         }
     }
+
+    fn validate(self) -> Result<Self, TranscriptLimitsError> {
+        if self.max_pending_bytes < self.max_logical_record_bytes {
+            return Err(TranscriptLimitsError::PendingBytesBelowLogicalRecord {
+                max_logical_record_bytes: self.max_logical_record_bytes,
+                max_pending_bytes: self.max_pending_bytes,
+            });
+        }
+        Ok(self)
+    }
+}
+
+/// Invalid relationship between logical transcript limits.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TranscriptLimitsError {
+    /// The aggregate pending-byte budget cannot retain one maximum-size logical record.
+    #[error(
+        "max_pending_bytes ({max_pending_bytes}) must be at least max_logical_record_bytes ({max_logical_record_bytes})"
+    )]
+    PendingBytesBelowLogicalRecord {
+        /// Configured per-record byte limit.
+        max_logical_record_bytes: usize,
+        /// Configured aggregate pending-byte limit.
+        max_pending_bytes: usize,
+    },
 }
 
 impl Default for TranscriptLimits {
@@ -88,7 +113,7 @@ impl LogicalTranscript {
     ///
     /// The aggregate pending-byte limit is raised as needed to hold one record at this limit.
     pub fn with_max_logical_record_bytes(max_logical_record_bytes: usize) -> Self {
-        Self::with_limits(TranscriptLimits {
+        Self::from_valid_limits(TranscriptLimits {
             max_logical_record_bytes,
             max_pending_bytes: DEFAULT_MAX_PENDING_BYTES.max(max_logical_record_bytes),
             ..TranscriptLimits::default()
@@ -97,7 +122,11 @@ impl LogicalTranscript {
 
     /// Creates transcript state with explicit record, writer, pending-byte, and pending-part
     /// limits.
-    pub fn with_limits(limits: TranscriptLimits) -> Self {
+    pub fn with_limits(limits: TranscriptLimits) -> Result<Self, TranscriptLimitsError> {
+        Ok(Self::from_valid_limits(limits.validate()?))
+    }
+
+    fn from_valid_limits(limits: TranscriptLimits) -> Self {
         Self {
             limits,
             writers: HashMap::new(),
@@ -232,7 +261,7 @@ impl LogicalTranscript {
 
 impl Default for LogicalTranscript {
     fn default() -> Self {
-        Self::with_limits(TranscriptLimits::default())
+        Self::from_valid_limits(TranscriptLimits::default())
     }
 }
 
@@ -981,6 +1010,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_pending_byte_limit_below_logical_record_limit() {
+        let error = match LogicalTranscript::with_limits(TranscriptLimits::new(5, 1, 4, 1)) {
+            Ok(_) => panic!("pending bytes must hold one logical record"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            TranscriptLimitsError::PendingBytesBelowLogicalRecord {
+                max_logical_record_bytes: 5,
+                max_pending_bytes: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_pending_byte_limit_above_logical_record_limit() {
+        let transcript = LogicalTranscript::with_limits(TranscriptLimits::new(4, 1, 8, 1))
+            .expect("larger aggregate pending budget");
+
+        assert_eq!(transcript.limits.max_logical_record_bytes, 4);
+        assert_eq!(transcript.limits.max_pending_bytes, 8);
+    }
+
+    #[test]
     fn rejects_split_records_above_the_logical_limit_and_resyncs() {
         let mut transcript = LogicalTranscript::with_max_logical_record_bytes(4);
 
@@ -1009,7 +1063,8 @@ mod tests {
 
     #[test]
     fn rejects_new_writer_identities_above_the_configured_limit() {
-        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 16, 16));
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 16, 16))
+            .expect("valid limits");
 
         for writer_byte in [1, 2] {
             assert!(
@@ -1043,7 +1098,8 @@ mod tests {
 
     #[test]
     fn bounds_aggregate_pending_bytes_across_writers_and_releases_completed_state() {
-        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 4, 4, 16));
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(4, 4, 4, 16))
+            .expect("valid limits");
         let first_writer = WriterId::from_bytes([1; WriterId::BYTE_LEN]);
         let second_writer = WriterId::from_bytes([2; WriterId::BYTE_LEN]);
 
@@ -1109,7 +1165,8 @@ mod tests {
 
     #[test]
     fn bounds_aggregate_pending_parts_including_empty_parts() {
-        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 16, 2));
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 16, 2))
+            .expect("valid limits");
         let first_writer = WriterId::from_bytes([1; WriterId::BYTE_LEN]);
         let second_writer = WriterId::from_bytes([2; WriterId::BYTE_LEN]);
 
@@ -1175,7 +1232,8 @@ mod tests {
 
     #[test]
     fn pending_part_limit_does_not_prevent_completion_at_the_boundary() {
-        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 1, 16, 1));
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 1, 16, 1))
+            .expect("valid limits");
 
         assert_eq!(
             push(
@@ -1197,7 +1255,8 @@ mod tests {
 
     #[test]
     fn malformed_sequence_releases_its_aggregate_pending_bytes() {
-        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(16, 2, 4, 16));
+        let mut transcript = LogicalTranscript::with_limits(TranscriptLimits::new(4, 2, 4, 16))
+            .expect("valid limits");
 
         assert_eq!(
             push(
