@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   rust:
+    name: Rust SDK and CLI (stable)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -29,6 +30,7 @@ jobs:
       - run: scripts/verify-packages.sh
 
   typescript:
+    name: TypeScript SDK (Node and browser)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -49,6 +51,7 @@ jobs:
       - run: pnpm check
 
   msrv:
+    name: Rust SDK and CLI (MSRV 1.95)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:

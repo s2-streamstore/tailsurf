@@ -41,8 +41,18 @@ try {
     clientTarball,
   ], consumer);
 
-  const installedProtocol = join(consumer, "node_modules", "@tailsurf", "protocol");
-  const installedClient = join(consumer, "node_modules", "@tailsurf", "client");
+  const installedProtocol = join(
+    consumer,
+    "node_modules",
+    "@s2-dev",
+    "tailsurf-protocol",
+  );
+  const installedClient = join(
+    consumer,
+    "node_modules",
+    "@s2-dev",
+    "tailsurf-client",
+  );
   const [protocolManifest, clientManifest] = await Promise.all([
     readManifest(installedProtocol),
     readManifest(installedClient),
@@ -51,7 +61,7 @@ try {
   assert.equal(clientManifest.private, undefined);
   assert.equal(protocolManifest.engines?.node, ">=22");
   assert.equal(clientManifest.engines?.node, ">=22");
-  assert.equal(clientManifest.dependencies?.["@tailsurf/protocol"], "^0.1.0");
+  assert.equal(clientManifest.dependencies?.["@s2-dev/tailsurf-protocol"], "^0.1.0");
   await Promise.all([
     access(join(installedProtocol, "LICENSE")),
     access(join(installedProtocol, "README.md")),
@@ -75,7 +85,7 @@ try {
 
   await writeFile(join(consumer, "node-smoke.mjs"), `
 import assert from "node:assert/strict";
-import { TsfClient, parseStreamId } from "@tailsurf/client";
+import { TsfClient, parseStreamId } from "@s2-dev/tailsurf-client";
 
 const id = parseStreamId("0123456789abcdefghjkmnpqrstvwxyz");
 const client = new TsfClient({ apiOrigin: "https://tail.surf" });
@@ -92,7 +102,7 @@ import {
   type ReadRecord,
   type StreamId,
   type WebSocketFactory,
-} from "@tailsurf/client";
+} from "@s2-dev/tailsurf-client";
 
 const streamId: StreamId = parseStreamId("0123456789abcdefghjkmnpqrstvwxyz");
 const client = new TsfClient({ apiOrigin: "https://tail.surf" });
@@ -154,7 +164,7 @@ void collect;
     write: false,
     stdin: {
       contents: `
-import { TsfClient, parseStreamId } from "@tailsurf/client";
+import { TsfClient, parseStreamId } from "@s2-dev/tailsurf-client";
 
 const client = new TsfClient({ apiOrigin: "https://tail.surf" });
 globalThis.__tailsurfPackageSmoke = {

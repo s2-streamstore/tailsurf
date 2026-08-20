@@ -171,9 +171,9 @@ Commands with structured output accept `--json`.
 The repository also contains public Rust and TypeScript SDKs.
 
 - [`rust`](rust/README.md) is the `tailsurf` Rust SDK crate.
-- [`typescript`](typescript/README.md) contains `@tailsurf/client` and the lower-level `@tailsurf/protocol` package.
+- [`typescript`](typescript/README.md) contains `@s2-dev/tailsurf-client` and the lower-level `@s2-dev/tailsurf-protocol` package.
 
-Install the TypeScript client with `npm install @tailsurf/client`. Rust API documentation is available on [docs.rs](https://docs.rs/tailsurf).
+Install the TypeScript client with `npm install @s2-dev/tailsurf-client`. Rust API documentation is available on [docs.rs](https://docs.rs/tailsurf).
 
 ## Development
 

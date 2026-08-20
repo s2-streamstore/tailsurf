@@ -92,7 +92,7 @@ export {
   permissionsAllowRead,
   permissionsAllowWrite,
   writerIdKey,
-} from "@tailsurf/protocol";
+} from "@s2-dev/tailsurf-protocol";
 export type {
   CaughtUpPosition,
   ClientWriterId,
@@ -109,4 +109,4 @@ export type {
   TranscriptRecord,
   Visibility,
   WriterId,
-} from "@tailsurf/protocol";
+} from "@s2-dev/tailsurf-protocol";

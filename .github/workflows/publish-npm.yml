@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   publish:
+    name: Publish @s2-dev/tailsurf-${{ inputs.package }}
     if: github.repository == 's2-streamstore/tailsurf'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -52,7 +53,7 @@ jobs:
         env:
           PACKAGE_INPUT: ${{ inputs.package }}
         run: |
-          package_name="@tailsurf/$PACKAGE_INPUT"
+          package_name="@s2-dev/tailsurf-$PACKAGE_INPUT"
           package_version="$(node -p "require('./packages/$PACKAGE_INPUT/package.json').version")"
           if npm view "$package_name@$package_version" version >/dev/null 2>&1; then
             echo "$package_name@$package_version is already published." >&2
@@ -60,10 +61,12 @@ jobs:
           fi
           if [[ "$PACKAGE_INPUT" == "client" ]]; then
             protocol_version="$(node -p "require('./packages/protocol/package.json').version")"
-            npm view "@tailsurf/protocol@$protocol_version" version >/dev/null
+            npm view "@s2-dev/tailsurf-protocol@$protocol_version" version >/dev/null
           fi
           pnpm --filter "$package_name" pack --pack-destination "$RUNNER_TEMP"
-          echo "tarball=$RUNNER_TEMP/tailsurf-$PACKAGE_INPUT-$package_version.tgz" >> "$GITHUB_OUTPUT"
+          tarball_name="${package_name#@}"
+          tarball_name="${tarball_name//\//-}-$package_version.tgz"
+          echo "tarball=$RUNNER_TEMP/$tarball_name" >> "$GITHUB_OUTPUT"
       - name: Publish package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

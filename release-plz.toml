@@ -2,6 +2,7 @@
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
+pr_name = "chore(release): release Rust SDK and CLI{% if version %} v{{ version }}{% endif %}"
 release_always = false
 
 [[package]]

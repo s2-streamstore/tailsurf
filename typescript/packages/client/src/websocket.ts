@@ -4,7 +4,7 @@ import {
   parseStreamId,
   type ClientWriterId,
   type StreamId,
-} from "@tailsurf/protocol";
+} from "@s2-dev/tailsurf-protocol";
 
 import { TsfClientError } from "./errors.js";
 import {

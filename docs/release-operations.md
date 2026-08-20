@@ -4,7 +4,7 @@ The Rust SDK and CLI share one version. The TypeScript packages use independent 
 
 ## Release flow
 
-Release-plz opens or updates a release PR after changes reach `main`. It derives the next workspace version from conventional commits and checks SDK API compatibility.
+Release-plz opens or updates a Rust SDK and CLI release PR after relevant changes reach `main`. Pushes that only change `typescript/` do not run Release-plz. It derives the next workspace version from conventional commits and checks SDK API compatibility.
 
 Merging the release PR publishes `tailsurf` first and then `tailsurf-cli`. Release-plz creates one `vX.Y.Z` tag. It sends a repository dispatch for the binary release. Repository dispatch always loads the release workflow from the default branch.
 
@@ -18,7 +18,7 @@ Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamst
 
 ## TypeScript releases
 
-`@tailsurf/protocol` and `@tailsurf/client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
+`@s2-dev/tailsurf-protocol` and `@s2-dev/tailsurf-client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
 
 Change the selected package version in its `package.json`. Run `pnpm check` from `typescript`. Merge the change to `main`, then dispatch `publish-npm.yml` for that package.
 
@@ -34,7 +34,7 @@ Public protocol changes start in this repository. Update the Rust and TypeScript
 
 Additive response fields can ship in the service first when every released client ignores them. Request changes, frame changes, and stricter validation require compatible client releases before the service uses them.
 
-Publish `@tailsurf/protocol` first. Publish `@tailsurf/client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
+Publish `@s2-dev/tailsurf-protocol` first. Publish `@s2-dev/tailsurf-client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
 
 After the required client versions are public, update `tailsurf-web` to exact released versions and run its full check, cross-client test, and browser suite. Deploy the service only after those checks pass.
 
@@ -68,7 +68,9 @@ The `release` environment identifies binary build, signing, notarization, and ho
 
 Both environments accept deployments only from `main`. Both require approval from `shikhar`. Self-approval is allowed because the repository has one maintainer. Administrators cannot bypass approval.
 
-The default branch accepts only squash merges from pull requests. The `rust`, `typescript`, `msrv`, `lint`, and `plan` checks must pass against the latest commit. Review threads must be resolved. Force pushes and deletion are blocked.
+Pull requests run the `Rust SDK and CLI (stable)`, `TypeScript SDK (Node and browser)`, `Rust SDK and CLI (MSRV 1.95)`, `Validate conventional PR title`, and `Plan Rust binary release` checks.
+
+The default branch accepts only squash merges from pull requests. Review threads must be resolved. Force pushes and deletion are blocked.
 
 Release tags matching `v*` cannot be rewritten or deleted.
 
