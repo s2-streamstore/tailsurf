@@ -65,10 +65,7 @@ export interface TsfWriterConfig {
   readonly maxRetainedBytes?: number;
 }
 
-export interface NormalizedTsfWriterConfig {
-  readonly maxRetainedRecords: number;
-  readonly maxRetainedBytes: number;
-}
+export type NormalizedTsfWriterConfig = Required<TsfWriterConfig>;
 
 export function normalizeWriterConfig(
   config: TsfWriterConfig = {},
@@ -260,7 +257,7 @@ export class DefaultTsfWriter implements TsfWriter {
     while (this.#queue.length > 0) {
       try {
         this.#fillSocketWindow();
-        if (!this.#hasInFlightRecords()) {
+        if (this.#inFlightRecords === 0) {
           throw new TsfClientError(
             "invalid_writer_state",
             "writer could not send a retained record",
@@ -278,7 +275,7 @@ export class DefaultTsfWriter implements TsfWriter {
         reconnectAttempts = 0;
         reconnectDelay = this.policy.initialBackoffMs;
       } catch (error) {
-        const durabilityAmbiguous = this.#hasInFlightRecords();
+        const durabilityAmbiguous = this.#inFlightRecords > 0;
         if (isSequenceMismatch(error)) {
           this.#finish(this.#terminateSequenceMismatch(error));
           return;
@@ -326,7 +323,7 @@ export class DefaultTsfWriter implements TsfWriter {
   }
 
   #sendNextFrame(): boolean {
-    const selected: { readonly call: PendingAppendCall; readonly index: number }[] = [];
+    const selected: SelectedAppend[] = [];
     let payloadBytes = 0;
     let chargedBytes = 0;
     const availableRecords = MAX_WRITER_IN_FLIGHT_RECORDS - this.#inFlightRecords;
@@ -337,10 +334,7 @@ export class DefaultTsfWriter implements TsfWriter {
     }
     outer: for (const call of this.#queue) {
       for (let index = call.sent; index < call.records.length; index += 1) {
-        const record = call.records[index];
-        if (record === undefined) {
-          throw new TsfClientError("invalid_writer_state", "writer record is missing");
-        }
+        const record = requiredRecord(call, index);
         if (
           selected.length >= Math.min(MAX_APPEND_FRAME_RECORDS, availableRecords) ||
           record.retainedBytes > availableBytes - chargedBytes ||
@@ -349,7 +343,7 @@ export class DefaultTsfWriter implements TsfWriter {
         ) {
           break outer;
         }
-        selected.push({ call, index });
+        selected.push({ call, index, record });
         payloadBytes += record.data.byteLength;
         chargedBytes += record.retainedBytes;
       }
@@ -360,18 +354,12 @@ export class DefaultTsfWriter implements TsfWriter {
 
     this.#socket.send({
       type: "appendBatch",
-      records: selected.map(({ call, index }) => {
-        const record = call.records[index];
-        if (record === undefined) {
-          throw new TsfClientError("invalid_writer_state", "writer record is missing");
-        }
-        return {
-          writerSeqNum: call.writerStartSeqNum + BigInt(index),
-          part: record.part,
-          format: record.format,
-          data: record.data,
-        };
-      }),
+      records: selected.map(({ call, index, record }) => ({
+        writerSeqNum: call.writerStartSeqNum + BigInt(index),
+        part: record.part,
+        format: record.format,
+        data: record.data,
+      })),
     });
     for (const { call } of selected) {
       call.sent += 1;
@@ -409,10 +397,7 @@ export class DefaultTsfWriter implements TsfWriter {
       }
       const acknowledged = Math.min(remaining, call.sent - call.acknowledged);
       for (let offset = 0; offset < acknowledged; offset += 1) {
-        const record = call.records[call.acknowledged + offset];
-        if (record === undefined) {
-          throw new TsfClientError("invalid_writer_state", "writer record is missing");
-        }
+        const record = requiredRecord(call, call.acknowledged + offset);
         call.receipts.push({
           writerSeqNum: call.writerStartSeqNum + BigInt(call.acknowledged + offset),
           seqNum: streamSeqNum + BigInt(offset),
@@ -445,10 +430,6 @@ export class DefaultTsfWriter implements TsfWriter {
     return start === undefined || end === undefined ? undefined : { start, end };
   }
 
-  #hasInFlightRecords(): boolean {
-    return this.#inFlightRecords > 0;
-  }
-
   #resetSentToAcknowledged(): void {
     for (const call of this.#queue) {
       call.sent = call.acknowledged;
@@ -458,11 +439,7 @@ export class DefaultTsfWriter implements TsfWriter {
   }
 
   #finish(error: TsfClientError): void {
-    while (this.#queue.length > 0) {
-      const call = this.#queue.shift();
-      if (call === undefined) {
-        break;
-      }
+    for (const call of this.#queue.splice(0)) {
       this.#releaseCall(call);
       call.reject(error);
     }
@@ -493,31 +470,36 @@ export class DefaultTsfWriter implements TsfWriter {
   }
 
   #terminate(error: unknown): TsfClientError {
-    this.#terminalError ??= error instanceof TsfClientError
+    const terminal = error instanceof TsfClientError
       ? error
-      : new TsfClientError("writer_failed", "TSF writer failed", { cause: error });
-    this.#closed = true;
-    this.#socket.close();
-    return this.#terminalError;
+      : new TsfClientError("writer_failed", "TSF writer failed", {
+        cause: error,
+      });
+    return this.#setTerminal(terminal);
   }
 
   #terminateAmbiguous(cause: unknown): TsfClientError {
-    this.#terminalError ??= new TsfClientError(
-      "writer_durability_unknown",
-      "append durability is unknown; this writer cannot safely continue",
-      { cause },
+    return this.#setTerminal(
+      new TsfClientError(
+        "writer_durability_unknown",
+        "append durability is unknown; this writer cannot safely continue",
+        { cause },
+      ),
     );
-    this.#closed = true;
-    this.#socket.close();
-    return this.#terminalError;
   }
 
   #terminateSequenceMismatch(cause: unknown): TsfClientError {
-    this.#terminalError ??= new TsfClientError(
-      "sequence_mismatch",
-      "stream next sequence did not match the writer session precondition",
-      { cause },
+    return this.#setTerminal(
+      new TsfClientError(
+        "sequence_mismatch",
+        "stream next sequence did not match the writer session precondition",
+        { cause },
+      ),
     );
+  }
+
+  #setTerminal(error: TsfClientError): TsfClientError {
+    this.#terminalError ??= error;
     this.#closed = true;
     this.#socket.close();
     return this.#terminalError;
@@ -540,6 +522,12 @@ interface PendingAppendCall {
   readonly receipts: AppendReceipt[];
   readonly resolve: (receipts: readonly AppendReceipt[]) => void;
   readonly reject: (reason: unknown) => void;
+}
+
+interface SelectedAppend {
+  readonly call: PendingAppendCall;
+  readonly index: number;
+  readonly record: PendingAppend;
 }
 
 interface AppendAckFrame {
@@ -571,6 +559,14 @@ function prepareAppend(input: AppendInput): PendingAppend {
       : partHeader(input.part.index, input.part.isFinal),
     retainedBytes: Math.max(data.byteLength, 1),
   };
+}
+
+function requiredRecord(call: PendingAppendCall, index: number): PendingAppend {
+  const record = call.records[index];
+  if (record === undefined) {
+    throw new TsfClientError("invalid_writer_state", "writer record is missing");
+  }
+  return record;
 }
 
 function writerAdmissionError(

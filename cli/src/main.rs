@@ -19,9 +19,10 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::Serialize;
 use tailsurf::{
-    AppendBatch, AppendTicket, DurableWriterOptions, LinkId, LinkPermissions, LinkSecret,
-    MAX_WRITER_UNACKED_PAYLOAD_BYTES, MAX_WRITER_UNACKED_RECORDS, ReadOptions, ReadStart, ReadStop,
-    StreamId, StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter,
+    AppendBatch, AppendTicket, DEFAULT_MAX_WRITER_RETAINED_BYTES,
+    DEFAULT_MAX_WRITER_RETAINED_RECORDS, DurableWriterOptions, LinkId, LinkPermissions, LinkSecret,
+    MAX_APPEND_SUBMISSION_PAYLOAD_BYTES, MAX_APPEND_SUBMISSION_RECORDS, ReadOptions, ReadStart,
+    ReadStop, StreamId, StreamTitle, TsfClient, TsfReadSession, TsfSseReadSession, TsfWriter,
     TsfWriterConfig, default_api_origin,
     protocol::{
         rest::{
@@ -29,10 +30,10 @@ use tailsurf::{
             MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamMetadata, StreamTitleUpdate,
             UpdateStreamRequest, Visibility,
         },
-        ws::frame::{MAX_APPEND_BATCH_RECORDS, MAX_RECORD_BYTES, PartHeader, RecordFormat},
+        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, PartHeader, RecordFormat},
     },
     stream_url::{DEFAULT_WEB_BASE_URL, StreamLocator, public_stream_url, stream_link},
-    transcript::{DEFAULT_MAX_LOGICAL_RECORD_BYTES, LogicalTranscript},
+    transcript::{DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES, LogicalTranscript},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
@@ -46,7 +47,7 @@ const INTERRUPT_EXIT_CODE: i32 = 130;
 const RAW_LINGER: Duration = Duration::from_millis(10);
 /// Stdout batching window for `tail` and `replay`.
 const TRANSCRIPT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
-/// Read batches held while stdout drains. Each frame carries at most MAX_READ_BATCH_RECORDS
+/// Read batches held while stdout drains. Each frame carries at most MAX_READ_FRAME_RECORDS
 /// records and about 1 MiB of payload backing, so the queue bounds in-flight output to roughly
 /// 8 MiB plus the batch being printed and transcript split-part pending state.
 const TRANSCRIPT_BATCH_QUEUE: usize = 8;
@@ -166,17 +167,16 @@ struct WriteArgs {
 /// `--max-logical-record-bytes`, bounded at parse time to what one writer submission can hold.
 ///
 /// [`AppendBatch::split_logical`] encodes one logical record as at most
-/// [`MAX_APPEND_BATCH_RECORDS`] parts of [`MAX_RECORD_BYTES`], so anything above that product could
-/// never be written and anything at zero could never hold a record. Rejecting both here keeps every
-/// downstream consumer working with a value that is provably small and nonzero.
+/// [`MAX_APPEND_SUBMISSION_RECORDS`] parts of [`MAX_RECORD_PAYLOAD_BYTES`]. Anything larger cannot
+/// be written. Zero cannot hold a record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MaxLogicalRecordBytes(usize);
 
 impl MaxLogicalRecordBytes {
     /// Largest logical record the append-batch splitter can encode.
-    const MAX: usize = MAX_APPEND_BATCH_RECORDS * MAX_RECORD_BYTES;
-    /// CLI default, shared with readers via [`DEFAULT_MAX_LOGICAL_RECORD_BYTES`].
-    const DEFAULT: Self = Self(DEFAULT_MAX_LOGICAL_RECORD_BYTES);
+    const MAX: usize = MAX_APPEND_SUBMISSION_PAYLOAD_BYTES;
+    /// CLI default, shared with readers via [`DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES`].
+    const DEFAULT: Self = Self(DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES);
 }
 
 impl fmt::Display for MaxLogicalRecordBytes {
@@ -197,10 +197,10 @@ impl FromStr for MaxLogicalRecordBytes {
         }
         if bytes > Self::MAX {
             return Err(format!(
-                "exceeds the {}-byte maximum one durable-writer batch can carry ({} parts of {} bytes)",
+                "exceeds the {}-byte maximum one durable-writer submission can carry ({} parts of {} bytes)",
                 Self::MAX,
-                MAX_APPEND_BATCH_RECORDS,
-                MAX_RECORD_BYTES,
+                MAX_APPEND_SUBMISSION_RECORDS,
+                MAX_RECORD_PAYLOAD_BYTES,
             ));
         }
         Ok(Self(bytes))
@@ -281,7 +281,7 @@ struct ReadArgs {
     #[arg(
         long,
         value_name = "BYTES",
-        default_value_t = DEFAULT_MAX_LOGICAL_RECORD_BYTES,
+        default_value_t = DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES,
         help_heading = "Advanced"
     )]
     max_logical_record_bytes: usize,
@@ -965,13 +965,12 @@ async fn connect_session_writer(
     let client = TsfClient::with_api_origin(api_url)?;
     let mut options = DurableWriterOptions::new(stream_id, link);
     options.expected_next_seq_num = expected_next_seq_num;
-    // One maximum-size logical record must always fit the retained backlog, alongside a full
-    // in-flight window of ordinary records. MaxLogicalRecordBytes caps the value at 64 MiB
-    // during argument parsing, so both sums stay far below usize::MAX on any supported target.
+    // Preserve the default throughput window while ensuring one maximum-size logical record fits.
     let config = TsfWriterConfig {
-        max_retained_bytes: max_logical_record_bytes + MAX_WRITER_UNACKED_PAYLOAD_BYTES,
-        max_retained_records: max_logical_record_bytes.div_ceil(MAX_RECORD_BYTES)
-            + MAX_WRITER_UNACKED_RECORDS,
+        max_retained_bytes: max_logical_record_bytes.max(DEFAULT_MAX_WRITER_RETAINED_BYTES),
+        max_retained_records: max_logical_record_bytes
+            .div_ceil(MAX_RECORD_PAYLOAD_BYTES)
+            .max(DEFAULT_MAX_WRITER_RETAINED_RECORDS),
     };
     client
         .connect_writer_with_config(options, config)
@@ -1182,7 +1181,7 @@ struct RawRecordAppender {
 impl RawRecordAppender {
     fn new(linger: Duration) -> Self {
         Self {
-            pending: BytesMut::with_capacity(MAX_RECORD_BYTES),
+            pending: BytesMut::with_capacity(MAX_RECORD_PAYLOAD_BYTES),
             deadline: None,
             linger,
         }
@@ -1201,10 +1200,10 @@ impl RawRecordAppender {
             if self.pending.is_empty() {
                 self.deadline = Some(Instant::now() + self.linger);
             }
-            let take = (MAX_RECORD_BYTES - self.pending.len()).min(bytes.len());
+            let take = (MAX_RECORD_PAYLOAD_BYTES - self.pending.len()).min(bytes.len());
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
-            if self.pending.len() == MAX_RECORD_BYTES {
+            if self.pending.len() == MAX_RECORD_PAYLOAD_BYTES {
                 self.flush(session).await?;
             }
         }
@@ -2128,7 +2127,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_logical_record_bytes_parsing_enforces_the_writer_batch_bound() {
+    fn max_logical_record_bytes_parsing_enforces_the_submission_bound() {
         assert_eq!(
             "1048576".parse::<MaxLogicalRecordBytes>(),
             Ok(MaxLogicalRecordBytes(1024 * 1024))

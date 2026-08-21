@@ -1797,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn try_from_records_enforces_wire_batch_bounds() {
+    fn try_from_records_enforces_protocol_frame_bounds() {
         assert!(matches!(
             ReadBatch::try_from_records(vec![]),
             Err(FrameCodecError::InvalidBatchRecordCount { actual: 0, .. })

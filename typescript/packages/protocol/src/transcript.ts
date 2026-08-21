@@ -131,8 +131,7 @@ export class LogicalTranscript {
       return undefined;
     }
 
-    const pending = writer.pending;
-    this.#clearPending(writer);
+    const pending = this.#takePending(writer);
     if (
       pending === undefined ||
       pending.startSeqNum !== startSeqNum ||
@@ -189,13 +188,18 @@ export class LogicalTranscript {
   }
 
   #clearPending(writer: WriterState): void {
+    this.#takePending(writer);
+  }
+
+  #takePending(writer: WriterState): PendingRecord | undefined {
     const pending = writer.pending;
     if (pending === undefined) {
-      return;
+      return undefined;
     }
     delete writer.pending;
     this.#totalPendingBytes -= pending.length;
     this.#totalPendingParts -= pending.partCount;
+    return pending;
   }
 }
 

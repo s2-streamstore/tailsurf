@@ -28,7 +28,7 @@ use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
     AppendBatch, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret,
-    MAX_WRITER_UNACKED_RECORDS, RecordPayload, RetryPolicy, StreamId, StreamTitle, TsfClient,
+    MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, RetryPolicy, StreamId, StreamTitle, TsfClient,
     TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
     protocol::{
         read::{ReadOptions, ReadStart, ReadStop},
@@ -38,13 +38,13 @@ use tailsurf::{
             StreamTitleUpdate, UpdateStreamRequest, Visibility,
         },
         ws::frame::{
-            CaughtUpPosition, ClientFrame, MAX_BATCH_PAYLOAD_BYTES, MAX_RECORD_BYTES,
+            CaughtUpPosition, ClientFrame, MAX_FRAME_PAYLOAD_BYTES, MAX_RECORD_PAYLOAD_BYTES,
             OwnedReadRecord, PartHeader, ReadBatch, RecordFormat, ServerFrame,
             TSF_WEBSOCKET_PROTOCOL,
         },
     },
     stream_url::StreamLocator,
-    transcript::DEFAULT_MAX_LOGICAL_RECORD_BYTES,
+    transcript::DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -552,7 +552,7 @@ async fn capture_command_streams_output_and_propagates_exit_status() {
 #[tokio::test]
 async fn write_defaults_to_lines_and_splits_large_records() {
     let server = TestServer::start().await;
-    let mut input = "x".repeat(MAX_RECORD_BYTES + 10);
+    let mut input = "x".repeat(MAX_RECORD_PAYLOAD_BYTES + 10);
     input.push('\n');
     input.push_str("tail\n");
 
@@ -587,7 +587,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     assert_eq!(records[0].writer_seq_num, 0);
     assert_eq!(records[0].part, PartHeader::new(0, false).expect("part"));
     assert_eq!(records[0].format, RecordFormat::Transcript);
-    assert_eq!(records[0].data.len(), MAX_RECORD_BYTES);
+    assert_eq!(records[0].data.len(), MAX_RECORD_PAYLOAD_BYTES);
     assert_eq!(records[1].writer_seq_num, 1);
     assert_eq!(records[1].part, PartHeader::new(1, true).expect("part"));
     assert_eq!(records[1].format, RecordFormat::Transcript);
@@ -602,7 +602,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
 #[tokio::test]
 async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it() {
     let server = TestServer::start().await;
-    let configured_limit = DEFAULT_MAX_LOGICAL_RECORD_BYTES + 1;
+    let configured_limit = DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES + 1;
     let configured_limit_arg = configured_limit.to_string();
     let mut input = "x".repeat(configured_limit - 1);
     input.push('\n');
@@ -642,7 +642,7 @@ async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it
 #[tokio::test]
 async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() {
     let server = TestServer::start().await;
-    let mut input = "x".repeat(DEFAULT_MAX_LOGICAL_RECORD_BYTES);
+    let mut input = "x".repeat(DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES);
     input.push('\n');
 
     let output = run_tsf(&server, [], Some(input.as_str())).await;
@@ -650,7 +650,7 @@ async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() 
     assert!(!output.status.success());
     assert!(
         output.stderr.contains(&format!(
-            "input line exceeds the configured {DEFAULT_MAX_LOGICAL_RECORD_BYTES}-byte logical record limit"
+            "input line exceeds the configured {DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES}-byte logical record limit"
         )),
         "stderr={}",
         output.stderr
@@ -667,7 +667,7 @@ async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() 
 #[tokio::test]
 async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let server = TestServer::start().await;
-    let input = "x".repeat(MAX_RECORD_BYTES + 10);
+    let input = "x".repeat(MAX_RECORD_PAYLOAD_BYTES + 10);
 
     let output = run_tsf(&server, ["new", "--raw"], Some(input.as_str())).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
@@ -717,7 +717,7 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     assert!(
         records
             .iter()
-            .all(|record| record.data.len() <= MAX_RECORD_BYTES)
+            .all(|record| record.data.len() <= MAX_RECORD_PAYLOAD_BYTES)
     );
     for (index, record) in records.iter().enumerate() {
         assert_eq!(record.writer_seq_num, index as u64);
@@ -919,7 +919,7 @@ async fn writer_preserves_its_terminal_failure_for_later_submissions() {
 #[tokio::test]
 async fn default_writer_enforces_record_and_byte_backlog_limits() {
     assert_default_writer_backlog(128, Bytes::from_static(b"x")).await;
-    assert_default_writer_backlog(10, Bytes::from(vec![0_u8; MAX_RECORD_BYTES])).await;
+    assert_default_writer_backlog(10, Bytes::from(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES])).await;
 }
 
 async fn assert_default_writer_backlog(capacity: usize, payload: Bytes) {
@@ -1101,7 +1101,7 @@ async fn blocked_reservation_wakes_when_the_writer_closes() {
 }
 
 #[tokio::test]
-async fn writer_paces_an_oversized_batch_under_the_wire_window() {
+async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
     // One 6 MiB batch (12 x 512 KiB) exceeds the server's 5 MiB sent-but-unacknowledged socket
     // window, so the writer must stop after ten records until acknowledgements arrive.
     let server = HoldingWriteServer::start(10).await;
@@ -1119,7 +1119,7 @@ async fn writer_paces_an_oversized_batch_under_the_wire_window() {
         )
         .await
         .expect("writer");
-    let payload = Bytes::from(vec![7_u8; MAX_RECORD_BYTES]);
+    let payload = Bytes::from(vec![7_u8; MAX_RECORD_PAYLOAD_BYTES]);
     let batch = AppendBatch::from_records(
         (0..12)
             .map(|_| {
@@ -1155,7 +1155,7 @@ async fn writer_paces_an_oversized_batch_under_the_wire_window() {
     // them could not have sat unread in the socket: the overrun flag observes it reliably.
     assert!(
         !server.overrun(),
-        "writer must not send past the wire window before acknowledgements"
+        "writer must not send past the in-flight window before acknowledgements"
     );
     writer.close().await.expect("writer close");
 }
@@ -1279,10 +1279,10 @@ async fn separate_durable_writers_use_fresh_writer_ids() {
 #[tokio::test]
 async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
     // Regression: the acknowledgement deadline is absolute, armed when records go on the wire
-    // and reset only by a valid ack or a reconnect. A backlog larger than the wire window keeps
+    // and reset only by a valid ack or a reconnect. A backlog larger than the in-flight window keeps
     // submission commands flowing to the actor; that traffic must not postpone the deadline,
     // so a silent server still triggers a reconnect.
-    let server = HoldingWriteServer::start(MAX_WRITER_UNACKED_RECORDS).await;
+    let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
@@ -1299,7 +1299,7 @@ async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
             tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
             TsfWriterConfig {
                 max_retained_bytes: 1024 * 1024,
-                max_retained_records: 4 * MAX_WRITER_UNACKED_RECORDS,
+                max_retained_records: 4 * MAX_WRITER_IN_FLIGHT_RECORDS,
             },
         )
         .await
@@ -2766,7 +2766,7 @@ async fn test_read_flow(
         .await
         .expect("send stream metadata");
     if !records.is_empty() {
-        // The wire carries at most MAX_BATCH_PAYLOAD_BYTES per batch; large records force
+        // The wire carries at most MAX_FRAME_PAYLOAD_BYTES per batch; large records force
         // multiple batches, as the real service would send them.
         let records = records
             .into_iter()
@@ -2786,7 +2786,7 @@ async fn test_read_flow(
             let mut payload_bytes = 0;
             while end < records.len()
                 && (end == start
-                    || payload_bytes + records[end].data.len() <= MAX_BATCH_PAYLOAD_BYTES)
+                    || payload_bytes + records[end].data.len() <= MAX_FRAME_PAYLOAD_BYTES)
             {
                 payload_bytes += records[end].data.len();
                 end += 1;
