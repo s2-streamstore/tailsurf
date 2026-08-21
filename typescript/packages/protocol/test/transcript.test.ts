@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES,
+  DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
   LogicalTranscript,
   partHeader,
   parseWriterId,
-  ProtocolError,
   RecordFormat,
   UNSPLIT_PART,
   type ReadRecord,
@@ -54,15 +53,23 @@ describe("logical transcript", () => {
     );
   });
 
-  it("enforces the logical record size limit and resynchronizes", () => {
-    const transcript = new LogicalTranscript({ maxLogicalRecordBytes: 4 });
+  it("enforces the reassembly byte limit and resynchronizes", () => {
+    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
 
     expect(transcript.pushRecord(record(7n, partHeader(0, false), "hel"))).toBeUndefined();
     expect(() =>
       transcript.pushRecord(record(8n, partHeader(1, true), "lo")),
-    ).toThrow(ProtocolError);
+    ).toThrowError(expect.objectContaining({ code: "transcript_reassembly_limit" }));
     expect(text(transcript.pushRecord(record(9n, UNSPLIT_PART, "next")))).toBe(
       "next",
+    );
+  });
+
+  it("does not charge borrowed unsplit records to reassembly", () => {
+    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
+
+    expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "hello")))).toBe(
+      "hello",
     );
   });
 
@@ -82,11 +89,8 @@ describe("logical transcript", () => {
     );
   });
 
-  it("bounds total pending bytes and releases them on resynchronization", () => {
-    const transcript = new LogicalTranscript({
-      maxLogicalRecordBytes: 4,
-      maxTotalPendingBytes: 4,
-    });
+  it("bounds reassembly bytes across writers and releases them", () => {
+    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
 
     expect(
       transcript.pushRecord(record(0n, partHeader(0, false), "abc", 1)),
@@ -94,7 +98,7 @@ describe("logical transcript", () => {
     expect(() =>
       transcript.pushRecord(record(0n, partHeader(0, false), "de", 2))
     ).toThrowError(
-      expect.objectContaining({ code: "transcript_total_pending_bytes_limit" }),
+      expect.objectContaining({ code: "transcript_reassembly_limit" }),
     );
     expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "done", 1)))).toBe(
       "done",
@@ -106,8 +110,6 @@ describe("logical transcript", () => {
 
   it("bounds total pending parts independently of payload bytes", () => {
     const transcript = new LogicalTranscript({
-      maxLogicalRecordBytes: 10,
-      maxTotalPendingBytes: 10,
       maxTotalPendingParts: 2,
     });
 
@@ -124,28 +126,11 @@ describe("logical transcript", () => {
     );
   });
 
-  it("raises the implicit pending budget with the logical record limit", () => {
-    const transcript = new LogicalTranscript({
-      maxLogicalRecordBytes: DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES + 1,
-    });
+  it("uses one shared default reassembly byte limit", () => {
+    const transcript = new LogicalTranscript();
 
-    expect(transcript.maxTotalPendingBytes).toBe(DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES + 1);
-  });
-
-  it("rejects a pending budget below the logical record limit", () => {
-    expect(() => new LogicalTranscript({
-      maxLogicalRecordBytes: 5,
-      maxTotalPendingBytes: 4,
-    })).toThrowError(expect.objectContaining({ code: "invalid_transcript_limit" }));
-  });
-
-  it("accepts a pending budget above the logical record limit", () => {
-    const transcript = new LogicalTranscript({
-      maxLogicalRecordBytes: 4,
-      maxTotalPendingBytes: 8,
-    });
-
-    expect(transcript.maxTotalPendingBytes).toBe(8);
+    expect(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES).toBe(16 * 1024 * 1024);
+    expect(transcript.maxReassemblyBytes).toBe(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES);
   });
 });
 

@@ -27,7 +27,7 @@ function readLink(rawStreamId: string, linkSecret: string): URL {
 
 The package also exports its language-neutral fixtures at `@s2-dev/tailsurf-protocol/fixtures/v1.json` and `@s2-dev/tailsurf-protocol/fixtures/rest-v1.json`.
 
-`LogicalTranscript` defaults its per-record and total pending-byte limits to 16 MiB. Raising only `maxLogicalRecordBytes` raises `maxTotalPendingBytes` to match. The total limit can be larger to allow several unfinished records. It cannot be smaller than the per-record limit.
+`LogicalTranscript` uses one 16 MiB `maxReassemblyBytes` limit. It bounds bytes retained across unfinished split records and the size of one completed split-record assembly. Unsplit records borrow their input payload and do not consume this budget.
 
 ## Compatibility
 

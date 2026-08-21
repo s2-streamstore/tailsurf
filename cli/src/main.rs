@@ -33,7 +33,7 @@ use tailsurf::{
         ws::frame::{MAX_RECORD_PAYLOAD_BYTES, PartHeader, RecordFormat},
     },
     stream_url::{DEFAULT_WEB_BASE_URL, StreamLocator, public_stream_url, stream_link},
-    transcript::{DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES, LogicalTranscript},
+    transcript::{DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES, LogicalTranscript},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
@@ -175,8 +175,8 @@ struct MaxLogicalRecordBytes(usize);
 impl MaxLogicalRecordBytes {
     /// Largest logical record the append-batch splitter can encode.
     const MAX: usize = MAX_APPEND_SUBMISSION_PAYLOAD_BYTES;
-    /// CLI default, shared with readers via [`DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES`].
-    const DEFAULT: Self = Self(DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES);
+    /// CLI default, shared with readers via [`DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES`].
+    const DEFAULT: Self = Self(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES);
 }
 
 impl fmt::Display for MaxLogicalRecordBytes {
@@ -212,7 +212,7 @@ struct InputArgs {
     /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
     #[arg(long)]
     raw: bool,
-    /// Maximum logical line size. Readers use the same default.
+    /// Maximum logical line size. Readers use the same default via `--max-reassembly-bytes`.
     #[arg(
         long,
         value_name = "BYTES",
@@ -277,14 +277,14 @@ struct ReadArgs {
     /// Read at most this many records.
     #[arg(long)]
     count: Option<u64>,
-    /// Maximum assembled transcript record size.
+    /// Maximum bytes used to reassemble split transcript records.
     #[arg(
         long,
         value_name = "BYTES",
-        default_value_t = DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES,
+        default_value_t = DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
         help_heading = "Advanced"
     )]
-    max_logical_record_bytes: usize,
+    max_reassembly_bytes: usize,
 }
 
 #[derive(Debug, Args)]
@@ -1291,7 +1291,7 @@ impl LineRecordAppender {
                 )?;
             if logical_record_bytes > self.max_logical_record_bytes {
                 bail!(
-                    "input line exceeds the configured {}-byte logical record limit; raise --max-logical-record-bytes only when readers use the same limit",
+                    "input line exceeds the configured {}-byte logical record limit; raise --max-logical-record-bytes only when readers use the same --max-reassembly-bytes limit",
                     self.max_logical_record_bytes
                 );
             }
@@ -1413,7 +1413,7 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
     read_transcript(
         api_url,
         request,
-        args.read.max_logical_record_bytes,
+        args.read.max_reassembly_bytes,
         args.read.sse,
     )
     .await
@@ -1430,7 +1430,7 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     read_transcript(
         api_url,
         request,
-        args.read.max_logical_record_bytes,
+        args.read.max_reassembly_bytes,
         args.read.sse,
     )
     .await
@@ -1623,7 +1623,7 @@ async fn revoke_link(api_url: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
 async fn read_transcript(
     api_url: Url,
     options: ReadOptions,
-    max_logical_record_bytes: usize,
+    max_reassembly_bytes: usize,
     sse: bool,
 ) -> eyre::Result<()> {
     if options.stop.is_some_and(|stop| stop.count == Some(0)) {
@@ -1650,7 +1650,7 @@ async fn read_transcript(
     let reader_task = tokio::spawn(forward_read_batches(reader, batch_tx));
 
     let mut stdout = BufWriter::with_capacity(TRANSCRIPT_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
-    let mut transcript = LogicalTranscript::with_max_logical_record_bytes(max_logical_record_bytes);
+    let mut transcript = LogicalTranscript::with_max_reassembly_bytes(max_reassembly_bytes);
     let result = write_transcript_batches(&mut batch_rx, &mut stdout, &mut transcript).await;
     stdout.flush().await.context("failed to flush stdout")?;
     result?;

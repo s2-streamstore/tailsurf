@@ -44,7 +44,7 @@ use tailsurf::{
         },
     },
     stream_url::StreamLocator,
-    transcript::DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES,
+    transcript::DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -602,7 +602,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
 #[tokio::test]
 async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it() {
     let server = TestServer::start().await;
-    let configured_limit = DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES + 1;
+    let configured_limit = DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES + 1;
     let configured_limit_arg = configured_limit.to_string();
     let mut input = "x".repeat(configured_limit - 1);
     input.push('\n');
@@ -628,7 +628,7 @@ async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it
         &server,
         [
             "replay",
-            "--max-logical-record-bytes",
+            "--max-reassembly-bytes",
             configured_limit_arg.as_str(),
             read_link,
         ],
@@ -642,7 +642,7 @@ async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it
 #[tokio::test]
 async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() {
     let server = TestServer::start().await;
-    let mut input = "x".repeat(DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES);
+    let mut input = "x".repeat(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES);
     input.push('\n');
 
     let output = run_tsf(&server, [], Some(input.as_str())).await;
@@ -650,7 +650,7 @@ async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() 
     assert!(!output.status.success());
     assert!(
         output.stderr.contains(&format!(
-            "input line exceeds the configured {DEFAULT_MAX_TRANSCRIPT_LOGICAL_RECORD_BYTES}-byte logical record limit"
+            "input line exceeds the configured {DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES}-byte logical record limit"
         )),
         "stderr={}",
         output.stderr
@@ -1853,7 +1853,7 @@ async fn cli_reports_rest_errors_without_raw_json_body() {
 }
 
 #[tokio::test]
-async fn replay_rejects_logical_records_above_configured_limit() {
+async fn replay_rejects_split_records_above_the_reassembly_limit() {
     let server = FakeReadServer::start(FakeReadMode::ReplaySplitRecord).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -1862,12 +1862,7 @@ async fn replay_rejects_logical_records_above_configured_limit() {
 
     let output = run_tsf_with_api_url(
         server.api_url.clone(),
-        [
-            "replay",
-            "--max-logical-record-bytes",
-            "4",
-            read_link.as_str(),
-        ],
+        ["replay", "--max-reassembly-bytes", "4", read_link.as_str()],
         None,
     )
     .await;
@@ -1883,7 +1878,7 @@ async fn replay_rejects_logical_records_above_configured_limit() {
     assert!(
         output
             .stderr
-            .contains("logical record is 5 bytes; maximum is 4"),
+            .contains("transcript reassembly would use 5 bytes; maximum is 4"),
         "stderr={}",
         output.stderr
     );
