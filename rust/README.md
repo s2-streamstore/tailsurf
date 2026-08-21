@@ -58,7 +58,9 @@ The session reconnects from the latest record or caught-up position after transi
 
 ## Write
 
-`TsfWriter` creates a fresh writer identity and starts its sequence at zero. It retains that identity, acknowledged progress, and unacknowledged records across bounded reconnects. It resends only the unacknowledged suffix.
+`TsfWriter` creates a fresh writer identity and starts its sequence at zero. It retains that identity, acknowledged progress, and unacknowledged records across reconnects. It resends only the unacknowledged suffix.
+
+Retryable interruptions keep recovering until the records are acknowledged. This preserves the exact writer identity, sequence numbers, and payloads needed for logical deduplication. `close` waits through retryable outages. `abort`, dropping the writer, or dropping its close future stops recovery.
 
 Records are submitted as a non-empty `AppendBatch`. The writer assigns writer sequence numbers in submission order, so cloned `TsfProducer` handles can submit concurrently without interleaving. `AppendBatch::split_logical` keeps the parts of an oversized logical record contiguous.
 
@@ -66,7 +68,7 @@ An `AppendBatch` is one sequencing and ticket unit, not an atomic service append
 
 The writer retains at most 128 records and 5 MiB by default. Use `connect_writer_with_config` and `TsfWriterConfig` when one submission needs a larger retained backlog.
 
-Await each `AppendTicket` when you need its durable sequence numbers. `close` stops new submissions and waits for accepted records to settle. A terminal `AppendDurabilityUnknown` means an append may be durable but its acknowledgement could not be recovered.
+Await each `AppendTicket` when you need its durable sequence numbers. A terminal `AppendDurabilityUnknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Do not submit that record under a new writer identity.
 
 ```rust,no_run
 use tailsurf::{AppendBatch, DurableWriterOptions, LinkSecret, RecordFormat, StreamId, TsfClient};
@@ -103,7 +105,7 @@ Management methods require an owner link secret. `list_links` returns one page. 
 
 REST mutations use idempotency keys. Use `create_stream_with_idempotency_key` or `create_link_with_idempotency_key` when a logical creation must survive process restarts.
 
-Transient REST and connection failures use the configured bounded `RetryPolicy`. Operations return `TsfClientError`. HTTP failures expose the status, request ID, retry hint, structured API code, and sequence mismatch details when the server provides them.
+Transient REST failures, initial connections, and readers use the configured bounded `RetryPolicy`. An established durable writer uses its backoff without an attempt limit. Operations return `TsfClientError`. HTTP failures expose the status, request ID, retry hint, structured API code, and sequence mismatch details when the server provides them.
 
 ## Modules
 

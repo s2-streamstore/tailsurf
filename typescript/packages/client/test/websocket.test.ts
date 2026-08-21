@@ -1315,17 +1315,21 @@ describe("TsfWriter", () => {
     expect(appends).toHaveLength(1);
   });
 
-  it("becomes terminal when an acknowledgement is lost and reconnects exhaust", async () => {
+  it("recovers the same records beyond the bounded operation retry count", async () => {
     const appends: AppendRecord[] = [];
     const authFrames: WriterOpenFrame[] = [];
     let connectionCount = 0;
     const client = new TsfClient({
       webSocketFactory: () => {
         connectionCount += 1;
-        return (connectionCount === 1
-          ? new WriterWebSocket(false, authFrames, appends)
-          : new HangingWebSocket(true));
+        if (connectionCount === 1) {
+          return new WriterWebSocket(false, authFrames, appends);
+        }
+        return connectionCount === 2
+          ? new HangingWebSocket(false)
+          : new WriterWebSocket(true, authFrames, appends);
       },
+      webSocketConnectTimeoutMs: 5,
       webSocketOperationTimeoutMs: 5,
       retryPolicy: { maxAttempts: 2, initialBackoffMs: 0, maxBackoffMs: 0 },
     });
@@ -1335,19 +1339,52 @@ describe("TsfWriter", () => {
     });
 
     const uncertain = writer.append({ data: "possibly durable\n" });
-    const queued = writer.append({ data: "must not reuse sequence\n" });
+    const queued = writer.append({ data: "next record\n" });
 
-    await expect(uncertain).rejects.toMatchObject({
-      code: "writer_durability_unknown",
+    await expect(uncertain).resolves.toEqual({
+      writerSeqNum: 0n,
+      seqNum: 42n,
     });
-    await expect(queued).rejects.toMatchObject({
-      code: "writer_durability_unknown",
+    await expect(queued).resolves.toEqual({
+      writerSeqNum: 1n,
+      seqNum: 43n,
     });
-    await expect(writer.append({ data: "still terminal\n" })).rejects.toMatchObject({
-      code: "writer_durability_unknown",
+    await writer.close();
+
+    expect(connectionCount).toBe(3);
+    expect(authFrames).toHaveLength(2);
+    expect(authFrames[0]?.clientWriterId).toEqual(authFrames[1]?.clientWriterId);
+    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([0n, 1n, 0n, 1n]);
+    expect(appends[0]?.data).toEqual(appends[2]?.data);
+    expect(appends[1]?.data).toEqual(appends[3]?.data);
+  });
+
+  it("can explicitly abort ambiguous recovery", async () => {
+    let connectionCount = 0;
+    const client = new TsfClient({
+      webSocketFactory: () => {
+        connectionCount += 1;
+        return connectionCount === 1
+          ? new WriterWebSocket(false, [], [])
+          : new HangingWebSocket(false);
+      },
+      webSocketConnectTimeoutMs: 5,
+      retryPolicy: { maxAttempts: 1, initialBackoffMs: 0, maxBackoffMs: 0 },
     });
-    expect(connectionCount).toBe(2);
-    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([0n, 1n]);
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+    const uncertain = writer.append({ data: "possibly durable\n" });
+    const rejection = expect(uncertain).rejects.toMatchObject({
+      code: "writer_durability_unknown",
+      cause: { code: "writer_aborted" },
+    });
+    await vi.waitFor(() => expect(connectionCount).toBeGreaterThan(1));
+
+    writer.abort();
+
+    await rejection;
   });
 });
 

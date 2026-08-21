@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
-    task::JoinHandle,
+    task::{JoinHandle, yield_now},
     time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_tungstenite::{
@@ -91,7 +91,8 @@ pub struct TsfClientConfig {
     /// `None` waits indefinitely.
     pub websocket_read_idle_timeout: Option<Duration>,
     /// Retry policy for anonymous stream creation, idempotent metadata reads, socket setup, and
-    /// consecutive read connection failures.
+    /// consecutive read connection failures. Durable writers use its backoff without limiting
+    /// reconnect attempts after their initial connection.
     pub retry_policy: RetryPolicy,
 }
 
@@ -119,10 +120,14 @@ impl Default for TsfClientConfig {
     }
 }
 
-/// Exponential-backoff policy for idempotent operations.
+/// Exponential-backoff policy for bounded operations and reconnect delays.
+///
+/// Durable writers keep retrying retryable interruptions until their retained records are
+/// acknowledged or recovery is cancelled. `max_attempts` still bounds their initial connection;
+/// subsequent reconnects use the configured backoff without an attempt limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetryPolicy {
-    /// Total attempts including the initial request.
+    /// Total attempts for bounded operations, including the initial request.
     pub max_attempts: usize,
     /// Base delay before the first retry. Client-controlled delays are jittered.
     pub initial_backoff: Duration,
@@ -131,8 +136,8 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Returns a policy that performs exactly one attempt.
-    pub fn none() -> Self {
+    /// Returns a policy that does not retry bounded operations.
+    pub fn no_bounded_retries() -> Self {
         Self {
             max_attempts: 1,
             initial_backoff: Duration::ZERO,
@@ -573,7 +578,7 @@ impl TsfClient {
         validate_append_range(range, records.len())
     }
 
-    /// Connects the standard bounded, reconnecting durable writer.
+    /// Connects the standard bounded-memory, reconnecting durable writer.
     ///
     /// The default retained backlog matches the server's per-socket in-flight window
     /// ([`MAX_WRITER_IN_FLIGHT_BYTES`] / [`MAX_WRITER_IN_FLIGHT_RECORDS`]), so a submitted
@@ -1132,8 +1137,8 @@ pub struct AppendReceipt {
     pub ack: AppendAck,
 }
 
-/// Future that resolves when every record of one submitted batch is durable or the writer
-/// permanently fails.
+/// Future that resolves when every record of one submitted batch is durable or the writer reaches
+/// a non-retryable failure or is cancelled.
 ///
 /// The resolved receipts match the submitted batch one-to-one in submission order; because one
 /// batch may span several protocol frames, the receipts may reference multiple acknowledgement
@@ -1313,7 +1318,9 @@ fn submission_retained_bytes(batch: &AppendBatch) -> usize {
 /// interruptions.
 ///
 /// This controller owns the writer task and is the only handle that can close the writer. Clone
-/// [`TsfProducer`] handles from [`TsfWriter::producer`] for concurrent submissions.
+/// [`TsfProducer`] handles from [`TsfWriter::producer`] for concurrent submissions. Retryable
+/// interruptions keep the writer alive with the same identity, sequence numbers, and payloads
+/// until acknowledgement, [`TsfWriter::abort`], or drop.
 pub struct TsfWriter {
     producer: TsfProducer,
     task: Option<JoinHandle<()>>,
@@ -1376,6 +1383,10 @@ impl TsfWriter {
 
     /// Stops accepting records, waits for every pending durability acknowledgement, and joins the
     /// writer task.
+    ///
+    /// Retryable interruptions do not make this return early. Use [`TsfWriter::abort`] instead
+    /// when the caller does not want to wait for the service. Dropping the close future also
+    /// cancels recovery.
     pub async fn close(mut self) -> Result<(), TsfClientError> {
         // The write guard waits out every in-flight permit submission, so any permit that still
         // observes the writer open has already enqueued its command ahead of Close.
@@ -1400,13 +1411,33 @@ impl TsfWriter {
         if let Some(task) = self.task.take() {
             // A detached actor would idle on the command channel forever while producer clones
             // keep it open, so a cancelled close still aborts the task.
-            let mut abort_guard = AbortOnDrop(Some(task));
-            let joined = abort_guard.0.as_mut().expect("writer task").await;
-            abort_guard.0 = None;
+            let mut abort_guard = AbortOnDrop {
+                task: Some(task),
+                shared: Arc::clone(&self.producer.shared),
+            };
+            let joined = abort_guard.task.as_mut().expect("writer task").await;
+            abort_guard.task = None;
             joined.map_err(|error| TsfClientError::AppendWriterTaskFailed(error.to_string()))?;
         }
 
         done_rx.try_recv().map_err(|_| self.dropped_error())?
+    }
+
+    /// Immediately stops recovery and rejects pending tickets.
+    ///
+    /// Accepted records may already be durable. Their tickets report
+    /// [`TsfClientError::AppendDurabilityUnknown`].
+    pub fn abort(mut self) {
+        self.abort_task(TsfClientError::AppendWriterAborted);
+    }
+
+    fn abort_task(&mut self, cause: TsfClientError) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let _ = self.producer.shared.terminal_error.set(Arc::new(cause));
+        self.producer.shared.shutdown();
+        task.abort();
     }
 
     fn closed_error(&self) -> TsfClientError {
@@ -1422,11 +1453,19 @@ impl TsfWriter {
 }
 
 /// Aborts the held task unless it was joined first.
-struct AbortOnDrop(Option<JoinHandle<()>>);
+struct AbortOnDrop {
+    task: Option<JoinHandle<()>>,
+    shared: Arc<WriterShared>,
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        if let Some(task) = &self.0 {
+        if let Some(task) = &self.task {
+            let _ = self
+                .shared
+                .terminal_error
+                .set(Arc::new(TsfClientError::AppendWriterDropped));
+            self.shared.shutdown();
             task.abort();
         }
     }
@@ -1449,10 +1488,7 @@ fn retained_terminal_error(
 
 impl Drop for TsfWriter {
     fn drop(&mut self) {
-        self.producer.shared.shutdown();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        self.abort_task(TsfClientError::AppendWriterDropped);
     }
 }
 
@@ -1858,8 +1894,8 @@ fn drain_submissions(
     Ok(())
 }
 
-/// Fills `frame` with the leading unsent records and charges the in-flight window for them, bounded by
-/// that window and by the protocol-frame limits.
+/// Fills `frame` with the leading unsent records and charges the in-flight window for them, bounded
+/// by that window and by the protocol-frame limits.
 ///
 /// Payloads are reference-counted, so framing clones only handles. Charging before the write is
 /// safe: a failed send is followed by a reconnect that resets every marker.
@@ -1889,8 +1925,8 @@ fn take_frame(
     }
 }
 
-/// Sends unsent retained records under the in-flight window, pacing around full windows; acks observed
-/// by the actor loop reopen capacity.
+/// Sends unsent retained records under the in-flight window, pacing around full windows; acks
+/// observed by the actor loop reopen capacity.
 async fn send_pending(
     session: &mut TsfWriteSession,
     pending: &mut VecDeque<PendingSubmission>,
@@ -1923,6 +1959,8 @@ async fn send_pending(
 /// The fresh socket carries no in-flight records, so the whole in-flight window is replaced —
 /// including the acknowledgement deadline armed for the dead socket — and every sent marker
 /// rewinds to its acknowledged prefix; the loop top resends the backlog under the window.
+/// Retryable failures keep the actor here until recovery or task cancellation, preserving the
+/// exact writer identity, sequence ranges, and payloads.
 async fn recover_pending_appends(
     session: &mut TsfWriteSession,
     client: &TsfClient,
@@ -1930,20 +1968,21 @@ async fn recover_pending_appends(
     pending: &mut VecDeque<PendingSubmission>,
     in_flight: &mut InFlightWindow,
     reconnect_attempts: &mut usize,
-    mut error: TsfClientError,
+    error: TsfClientError,
 ) -> Result<(), TsfClientError> {
     if !error.is_retryable() {
         return Err(error);
     }
 
     let retry_policy = client.config.retry_policy;
-    let max_reconnects = retry_policy.max_attempts.saturating_sub(1);
-    while *reconnect_attempts < max_reconnects {
+    loop {
         let delay = retry_policy.reconnect_delay(*reconnect_attempts);
-        if !delay.is_zero() {
+        if delay.is_zero() {
+            yield_now().await;
+        } else {
             sleep(delay).await;
         }
-        *reconnect_attempts += 1;
+        *reconnect_attempts = (*reconnect_attempts).saturating_add(1);
         match client.connect_write_session_once(options).await {
             Ok(connected) => {
                 *session = connected;
@@ -1953,12 +1992,10 @@ async fn recover_pending_appends(
                 *in_flight = InFlightWindow::default();
                 return Ok(());
             }
-            Err(next_error) if next_error.is_retryable() => error = next_error,
+            Err(next_error) if next_error.is_retryable() => {}
             Err(next_error) => return Err(next_error),
         }
     }
-
-    Err(error)
 }
 
 fn dispatch_ack(
@@ -3399,6 +3436,9 @@ pub enum TsfClientError {
     /// The writer task ended before resolving a pending ticket.
     #[error("append writer dropped with unacknowledged records")]
     AppendWriterDropped,
+    /// The writer was explicitly aborted before resolving a pending ticket.
+    #[error("append writer aborted with unacknowledged records")]
+    AppendWriterAborted,
     /// An append may be durable, but its acknowledgement could not be recovered.
     ///
     /// The writer is terminal. The typed first failure is retained for every observer.
@@ -3657,7 +3697,7 @@ mod tests {
             TsfClientConfig::new(Url::parse(&format!("http://{address}")).expect("SSE API origin"))
                 .expect("valid client config");
         config.rest_request_timeout = Duration::from_millis(20);
-        config.retry_policy = RetryPolicy::none();
+        config.retry_policy = RetryPolicy::no_bounded_retries();
         let client = TsfClient::with_config(config).expect("SSE client");
         let stream_id = "00000000000000000000000000000000"
             .parse()
@@ -3700,7 +3740,7 @@ mod tests {
             Url::parse(&format!("http://{address}")).expect("REST API origin"),
         )
         .expect("valid client config");
-        config.retry_policy = RetryPolicy::none();
+        config.retry_policy = RetryPolicy::no_bounded_retries();
         let client = TsfClient::with_config(config).expect("REST client");
         let stream_id = "00000000000000000000000000000000"
             .parse()
@@ -4283,6 +4323,38 @@ mod tests {
         assert_eq!(error.request_id(), Some("request-42"));
     }
 
+    #[tokio::test]
+    async fn abort_preserves_an_explicit_cancellation_error() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
+        let shared = Arc::new(WriterShared {
+            byte_permits: Arc::new(Semaphore::new(1)),
+            record_permits: Arc::new(Semaphore::new(1)),
+            terminal_error: Arc::new(OnceLock::new()),
+            config: TsfWriterConfig {
+                max_retained_bytes: 1,
+                max_retained_records: 1,
+            },
+            state: AtomicU8::new(WRITER_OPEN),
+            submit_lock: RwLock::new(()),
+        });
+        let producer = TsfProducer {
+            cmd_tx: cmd_tx.clone(),
+            shared: Arc::clone(&shared),
+        };
+        let writer = TsfWriter {
+            producer: TsfProducer { cmd_tx, shared },
+            task: Some(tokio::spawn(std::future::pending())),
+        };
+
+        writer.abort();
+
+        assert!(matches!(
+            producer.closed_error(),
+            TsfClientError::AppendDurabilityUnknown(inner)
+                if matches!(*inner, TsfClientError::AppendWriterAborted)
+        ));
+    }
+
     #[test]
     fn read_and_stateless_append_responses_match_the_requested_ranges() {
         assert!(matches!(
@@ -4842,7 +4914,7 @@ mod tests {
             Url::parse(&format!("http://{address}")).expect("REST API origin"),
         )
         .expect("valid client config");
-        config.retry_policy = RetryPolicy::none();
+        config.retry_policy = RetryPolicy::no_bounded_retries();
         let client = TsfClient::with_config(config).expect("REST client");
         let stream_id = "00000000000000000000000000000000"
             .parse()

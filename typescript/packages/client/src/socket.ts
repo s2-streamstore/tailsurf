@@ -325,6 +325,7 @@ export async function reconnectSocket(
   delayMs: number,
   initialError: unknown,
   signal?: AbortSignal,
+  attemptLimit = policy.maxAttempts,
 ): Promise<{
   readonly socket: FrameSocket;
   readonly attempts: number;
@@ -333,7 +334,7 @@ export async function reconnectSocket(
   let lastError = initialError;
   let nextDelayMs = delayMs;
   signal?.throwIfAborted();
-  while (attempts + 1 < policy.maxAttempts) {
+  while (attempts + 1 < attemptLimit) {
     attempts += 1;
     await sleep(jitteredBackoffMs(nextDelayMs), signal);
     nextDelayMs = Math.min(nextDelayMs * 2, policy.maxBackoffMs);

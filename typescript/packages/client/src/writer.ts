@@ -41,6 +41,8 @@ export interface TsfWriter {
   append(input: AppendInput): Promise<AppendReceipt>;
   appendBatch(inputs: readonly AppendInput[]): Promise<readonly AppendReceipt[]>;
   appendLogical(input: LogicalAppendInput): Promise<readonly AppendReceipt[]>;
+  /** Immediately stops recovery. Accepted records may already be durable. */
+  abort(): void;
   close(): Promise<void>;
 }
 
@@ -91,9 +93,11 @@ export class DefaultTsfWriter implements TsfWriter {
   #retainedBytes = 0;
   #inFlightRecords = 0;
   #inFlightBytes = 0;
+  #ambiguousWriterEndSeqNum: bigint | undefined;
   #closing = false;
   #closed = false;
   #terminalError: TsfClientError | undefined;
+  readonly #controller = new AbortController();
 
   public constructor(
     socket: FrameSocket,
@@ -238,6 +242,22 @@ export class DefaultTsfWriter implements TsfWriter {
     }
   }
 
+  public abort(): void {
+    if (this.#closed) {
+      return;
+    }
+    const cause = new TsfClientError(
+      "writer_aborted",
+      "TSF writer recovery was aborted",
+    );
+    const durabilityAmbiguous =
+      this.#ambiguousWriterEndSeqNum !== undefined || this.#inFlightRecords > 0;
+    const terminal = durabilityAmbiguous
+      ? this.#terminateAmbiguous(cause)
+      : this.#terminate(cause);
+    this.#finish(terminal);
+  }
+
   #scheduleDrain(): void {
     if (this.#drain !== undefined) {
       return;
@@ -275,7 +295,15 @@ export class DefaultTsfWriter implements TsfWriter {
         reconnectAttempts = 0;
         reconnectDelay = this.policy.initialBackoffMs;
       } catch (error) {
-        const durabilityAmbiguous = this.#inFlightRecords > 0;
+        const sentRange = this.#sentRange();
+        if (
+          sentRange !== undefined &&
+          (this.#ambiguousWriterEndSeqNum === undefined ||
+            sentRange.end > this.#ambiguousWriterEndSeqNum)
+        ) {
+          this.#ambiguousWriterEndSeqNum = sentRange.end;
+        }
+        const durabilityAmbiguous = this.#ambiguousWriterEndSeqNum !== undefined;
         if (isSequenceMismatch(error)) {
           this.#finish(this.#terminateSequenceMismatch(error));
           return;
@@ -299,6 +327,8 @@ export class DefaultTsfWriter implements TsfWriter {
             reconnectAttempts,
             reconnectDelay,
             error,
+            this.#controller.signal,
+            Number.POSITIVE_INFINITY,
           );
         } catch (reconnectError) {
           const terminal = isSequenceMismatch(reconnectError)
@@ -414,6 +444,15 @@ export class DefaultTsfWriter implements TsfWriter {
         call.resolve(call.receipts);
       }
     }
+    const firstPending = this.#queue[0];
+    if (
+      firstPending === undefined ||
+      (this.#ambiguousWriterEndSeqNum !== undefined &&
+        firstPending.writerStartSeqNum + BigInt(firstPending.acknowledged) >=
+          this.#ambiguousWriterEndSeqNum)
+    ) {
+      this.#ambiguousWriterEndSeqNum = undefined;
+    }
   }
 
   #sentRange(): { readonly start: bigint; readonly end: bigint } | undefined {
@@ -501,6 +540,7 @@ export class DefaultTsfWriter implements TsfWriter {
   #setTerminal(error: TsfClientError): TsfClientError {
     this.#terminalError ??= error;
     this.#closed = true;
+    this.#controller.abort(this.#terminalError);
     this.#socket.close();
     return this.#terminalError;
   }

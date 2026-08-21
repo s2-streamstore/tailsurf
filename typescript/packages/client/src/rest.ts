@@ -78,12 +78,15 @@ export interface RestClientOptions {
   readonly fetch?: typeof globalThis.fetch;
   /** Bounds REST requests and SSE opening handshakes. It does not time out an established SSE body. */
   readonly restRequestTimeoutMs?: number;
-  /** Retry policy shared by REST requests and SSE or WebSocket connections. */
+  /**
+   * Retry policy for bounded operations and reconnect delays.
+   * Established durable writers keep recovering until acknowledged or aborted.
+   */
   readonly retryPolicy?: RetryPolicy;
 }
 
 export interface RetryPolicy {
-  /** Total attempts including the initial attempt. */
+  /** Total attempts for bounded operations, including the initial attempt. */
   readonly maxAttempts?: number;
   /** Base delay before the first retry. Client-controlled delays are jittered. */
   readonly initialBackoffMs?: number;

@@ -880,6 +880,52 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
 }
 
 #[tokio::test]
+async fn durable_writer_recovery_outlives_the_bounded_operation_retry_count() {
+    let server = FakeWriteServer::start_after_failures(3).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
+        .parse::<StreamId>()
+        .expect("stream id");
+    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    config.retry_policy = RetryPolicy {
+        max_attempts: 1,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let writer = TsfClient::with_config(config)
+        .expect("valid client config")
+        .connect_writer(tailsurf::DurableWriterOptions::new(
+            stream_id,
+            canonical_test_link_secret(),
+        ))
+        .await
+        .expect("writer");
+    let ticket = writer
+        .submit(test_write_batch(Bytes::from_static(b"retry me")))
+        .await
+        .expect("submit");
+
+    timeout(Duration::from_secs(5), ticket)
+        .await
+        .expect("writer recovery timed out")
+        .expect("durability acknowledgement");
+    writer.close().await.expect("writer close");
+
+    let attempts = server.append_attempts();
+    assert_eq!(attempts.len(), 4);
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.client_writer_id == attempts[0].client_writer_id)
+    );
+    assert!(attempts.iter().all(|attempt| attempt.writer_seq_num == 0));
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.data.as_ref() == b"retry me")
+    );
+}
+
+#[tokio::test]
 async fn writer_preserves_its_terminal_failure_for_later_submissions() {
     let server = FakeWriteServer::start_terminal().await;
     let writer = connect_default_writer(&server.api_url).await;
@@ -1279,9 +1325,9 @@ async fn separate_durable_writers_use_fresh_writer_ids() {
 #[tokio::test]
 async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
     // Regression: the acknowledgement deadline is absolute, armed when records go on the wire
-    // and reset only by a valid ack or a reconnect. A backlog larger than the in-flight window keeps
-    // submission commands flowing to the actor; that traffic must not postpone the deadline,
-    // so a silent server still triggers a reconnect.
+    // and reset only by a valid ack or a reconnect. A backlog larger than the in-flight window
+    // keeps submission commands flowing to the actor; that traffic must not postpone the
+    // deadline, so a silent server still triggers a reconnect.
     let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
@@ -3546,6 +3592,7 @@ struct AppendAttempt {
 
 struct FakeWriteState {
     append_attempts: Mutex<Vec<AppendAttempt>>,
+    failures_before_ack: usize,
     terminal: bool,
 }
 
@@ -3557,16 +3604,21 @@ struct FakeWriteServer {
 
 impl FakeWriteServer {
     async fn start() -> Self {
-        Self::start_with_mode(false).await
+        Self::start_with_mode(1, false).await
+    }
+
+    async fn start_after_failures(failures_before_ack: usize) -> Self {
+        Self::start_with_mode(failures_before_ack, false).await
     }
 
     async fn start_terminal() -> Self {
-        Self::start_with_mode(true).await
+        Self::start_with_mode(0, true).await
     }
 
-    async fn start_with_mode(terminal: bool) -> Self {
+    async fn start_with_mode(failures_before_ack: usize, terminal: bool) -> Self {
         let state = Arc::new(FakeWriteState {
             append_attempts: Mutex::new(Vec::new()),
+            failures_before_ack,
             terminal,
         });
         let router = Router::new()
@@ -3638,21 +3690,24 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
         attempts.len()
     };
 
-    if attempt_count == 1 {
-        if state.terminal {
-            socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: 1008,
-                    reason: "sequence_mismatch".into(),
-                })))
-                .await
-                .expect("close terminal writer");
-            return;
-        }
+    if state.terminal {
         socket
-            .send(Message::Close(None))
+            .send(Message::Close(Some(CloseFrame {
+                code: 1008,
+                reason: "sequence_mismatch".into(),
+            })))
             .await
-            .expect("close first attempt");
+            .expect("close terminal writer");
+        return;
+    }
+    if attempt_count <= state.failures_before_ack {
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1013,
+                reason: "retry".into(),
+            })))
+            .await
+            .expect("close retryable writer attempt");
         return;
     }
 

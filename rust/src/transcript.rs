@@ -121,8 +121,8 @@ impl LogicalTranscript {
         })
     }
 
-    /// Creates transcript state with explicit record, writer-state, total-pending-byte, and total-pending-part
-    /// limits.
+    /// Creates transcript state with explicit record, writer-state, total-pending-byte, and
+    /// total-pending-part limits.
     pub fn with_limits(limits: TranscriptLimits) -> Result<Self, TranscriptLimitsError> {
         Ok(Self::from_valid_limits(limits.validate()?))
     }
@@ -254,9 +254,10 @@ impl Default for LogicalTranscript {
 ///
 /// Reassembly requires split parts to occupy consecutive writer sequence numbers matching their
 /// part index; the returned records have both baked in, starting at `writer_start_seq_num`, so
-/// submitting them in order upholds the invariant. A record that fits in [`MAX_RECORD_PAYLOAD_BYTES`]
-/// is returned unsplit; larger payloads are sliced without copying. Readers drop logical
-/// records above their configured [`TranscriptLimits::max_logical_record_bytes`].
+/// submitting them in order upholds the invariant. A record that fits in
+/// [`MAX_RECORD_PAYLOAD_BYTES`] is returned unsplit; larger payloads are sliced without copying.
+/// Readers drop logical records above their configured
+/// [`TranscriptLimits::max_logical_record_bytes`].
 ///
 /// This numbers parts for manually sequenced sinks (stateless appends and
 /// [`TsfWriteSession`](crate::TsfWriteSession)); durable writers assign sequences themselves and

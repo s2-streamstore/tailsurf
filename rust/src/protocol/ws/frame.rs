@@ -577,11 +577,11 @@ pub(crate) fn split_record_payloads(
 ///
 /// The writer actor assigns each batch one contiguous writer-sequence range in submission order,
 /// so the split parts of a logical record never interleave with another producer's records.
-/// Construction upholds the record bounds: 1 to [`MAX_APPEND_SUBMISSION_RECORDS`] records, each at most
-/// [`MAX_RECORD_PAYLOAD_BYTES`]. This is not an atomic service append: the actor may split a batch across
-/// protocol frames, and a terminal failure may leave a durable prefix while its ticket returns an
-/// error. Submission additionally requires the whole batch to fit the writer's configured
-/// retained backlog; the actor streams oversized batches under the server's
+/// Construction upholds the record bounds: 1 to [`MAX_APPEND_SUBMISSION_RECORDS`] records, each at
+/// most [`MAX_RECORD_PAYLOAD_BYTES`]. This is not an atomic service append: the actor may split a
+/// batch across protocol frames, and a terminal failure may leave a durable prefix while its ticket
+/// returns an error. Submission additionally requires the whole batch to fit the writer's
+/// configured retained backlog; the actor streams oversized batches under the server's
 /// in-flight socket window either way.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppendBatch {
@@ -609,10 +609,11 @@ impl AppendBatch {
 
     /// Splits one logical record into the physical-part batch logical readers reassemble.
     ///
-    /// A payload that fits in [`MAX_RECORD_PAYLOAD_BYTES`] becomes one unsplit record; larger payloads
-    /// are sliced into parts without further copying once the input is converted to `Bytes`
-    /// (borrowed inputs are copied once by that conversion). A logical record spanning more than
-    /// [`MAX_APPEND_SUBMISSION_RECORDS`] parts exceeds the submission record bound and is rejected.
+    /// A payload that fits in [`MAX_RECORD_PAYLOAD_BYTES`] becomes one unsplit record; larger
+    /// payloads are sliced into parts without further copying once the input is converted to
+    /// `Bytes` (borrowed inputs are copied once by that conversion). A logical record spanning
+    /// more than [`MAX_APPEND_SUBMISSION_RECORDS`] parts exceeds the submission record bound
+    /// and is rejected.
     pub fn split_logical(
         format: RecordFormat,
         data: impl IntoRecordData,
