@@ -14,7 +14,7 @@ import {
   type ClientFrame,
   type ServerFrame,
   type StreamId,
-} from "@s2-dev/tailsurf-protocol";
+} from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import {

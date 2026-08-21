@@ -32,7 +32,7 @@ importers:
 
   packages/client:
     dependencies:
-      '@s2-dev/tailsurf-protocol':
+      '@tailsurf/protocol':
         specifier: workspace:^
         version: link:../protocol
 

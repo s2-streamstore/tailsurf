@@ -18,13 +18,13 @@ Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamst
 
 ## TypeScript releases
 
-`@s2-dev/tailsurf-protocol` and `@s2-dev/tailsurf-client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
+`@tailsurf/protocol` and `@tailsurf/client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
 
 Change the selected package version in its `package.json`. Run `pnpm check` from `typescript`. Merge the change to `main`, then dispatch `publish-npm.yml` for that package.
 
 The workflow rejects versions already present on npm. It packs and tests both packages before publishing the selected tarball from the `npm` GitHub environment.
 
-Each npm package trusts `publish-npm.yml` in `s2-streamstore/tailsurf` with the `npm` environment. Trusted publishing uses GitHub OIDC and creates provenance. A new package name can use the optional `NPM_TOKEN` repository secret for its first publication. Delete that secret after the trusted publisher is configured.
+Each npm package trusts `publish-npm.yml` in `s2-streamstore/tailsurf` with the `npm` environment. Trusted publishing uses GitHub OIDC and creates provenance. A new package name can use the optional `NPM_TOKEN` environment secret for its first publication. Delete that secret after the trusted publisher is configured.
 
 Published npm versions are immutable. Fix a bad release with a new version. Deprecate the bad version on npm when consumers should not select it.
 
@@ -34,7 +34,7 @@ Public protocol changes start in this repository. Update the Rust and TypeScript
 
 Additive response fields can ship in the service first when every released client ignores them. Request changes, frame changes, and stricter validation require compatible client releases before the service uses them.
 
-Publish `@s2-dev/tailsurf-protocol` first. Publish `@s2-dev/tailsurf-client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
+Publish `@tailsurf/protocol` first. Publish `@tailsurf/client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
 
 After the required client versions are public, update `tailsurf-web` to exact released versions and run its full check, cross-client test, and browser suite. Deploy the service only after those checks pass.
 

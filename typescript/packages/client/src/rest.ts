@@ -35,7 +35,7 @@ import {
   type LinkId,
   type LinkPermissions,
   type Visibility,
-} from "@s2-dev/tailsurf-protocol";
+} from "@tailsurf/protocol";
 
 import {
   httpStatusError,

@@ -3,7 +3,7 @@ import {
   MAX_RECORD_PAYLOAD_BYTES,
   MAX_SSE_EVENT_BYTES,
   MAX_SSE_UNTERMINATED_EVENT_BYTES,
-} from "@s2-dev/tailsurf-protocol";
+} from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import { TsfClient } from "../src/index.js";

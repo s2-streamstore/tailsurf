@@ -1,23 +1,23 @@
-# `@s2-dev/tailsurf-protocol`
+# `@tailsurf/protocol`
 
-`@s2-dev/tailsurf-protocol` contains the low-level TypeScript implementation of the public TSF v1 contract.
+`@tailsurf/protocol` contains the low-level TypeScript implementation of the public TSF v1 contract.
 
 It exports IDs, permissions, stream URLs, REST and SSE schemas, read-query helpers, binary WebSocket frames, and transcript reconstruction.
 
-Most applications should use `@s2-dev/tailsurf-client` instead.
+Most applications should use `@tailsurf/client` instead.
 
 The package is ESM-only and supports Node.js 22 or newer.
 
 ## Install
 
 ```sh
-npm install @s2-dev/tailsurf-protocol
+npm install @tailsurf/protocol
 ```
 
 ## Example
 
 ```ts
-import { buildStreamLink, parseStreamId } from "@s2-dev/tailsurf-protocol";
+import { buildStreamLink, parseStreamId } from "@tailsurf/protocol";
 
 function readLink(rawStreamId: string, linkSecret: string): URL {
   const streamId = parseStreamId(rawStreamId);
@@ -25,7 +25,7 @@ function readLink(rawStreamId: string, linkSecret: string): URL {
 }
 ```
 
-The package also exports its language-neutral fixtures at `@s2-dev/tailsurf-protocol/fixtures/v1.json` and `@s2-dev/tailsurf-protocol/fixtures/rest-v1.json`.
+The package also exports its language-neutral fixtures at `@tailsurf/protocol/fixtures/v1.json` and `@tailsurf/protocol/fixtures/rest-v1.json`.
 
 `LogicalTranscript` uses one 16 MiB `maxReassemblyBytes` limit. It bounds bytes retained across unfinished split records and the size of one completed split-record assembly. Unsplit records borrow their input payload and do not consume this budget.
 

@@ -1,7 +1,7 @@
 import {
   decimalSafeU64Schema,
   MAX_REST_ERROR_RESPONSE_BYTES,
-} from "@s2-dev/tailsurf-protocol";
+} from "@tailsurf/protocol";
 
 export class TsfClientError extends Error {
   public constructor(
