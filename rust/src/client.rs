@@ -1569,10 +1569,11 @@ async fn run_writer(
             cmd = cmd_rx.recv(), if close_tx.is_none() => {
                 match cmd {
                     Some(command) => {
-                        if let Err(error) = handle_writer_command(
+                        if let Err(error) = admit_commands(
                             &mut pending,
                             &mut close_tx,
                             &mut cursor,
+                            &mut cmd_rx,
                             command,
                         ) {
                             finish_writer_error(
@@ -1651,34 +1652,50 @@ async fn next_ack(
         })?
 }
 
-/// Moves one submitted batch into `pending`, numbering it from the actor's cursor, or records the
-/// close command.
+/// Admits one command plus whatever is already queued behind it, numbering each submitted batch
+/// from the actor's cursor.
 ///
-/// This never awaits, so a batch is fully retained before any I/O can fail: a failed or timed-out
-/// write leaves every record in `pending` for reconnect resend. Handling one command per actor
-/// turn prevents a continuously filled input channel from starving acknowledgements.
-fn handle_writer_command(
+/// Queued commands were submitted before this turn began, so coalescing them into one protocol
+/// frame adds no latency. Stopping at one socket window keeps a continuously filled channel from
+/// starving acknowledgements. Nothing awaits here, so a batch is retained for reconnect resend
+/// before any I/O can fail.
+fn admit_commands(
     pending: &mut VecDeque<PendingSubmission>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
     cursor: &mut WriterCursor,
-    command: WriterCommand,
+    cmd_rx: &mut mpsc::UnboundedReceiver<WriterCommand>,
+    mut command: WriterCommand,
 ) -> Result<(), TsfClientError> {
-    match command {
-        WriterCommand::Submit { batch, ack_tx } => {
-            let payloads = batch.into_payloads();
-            let start_seq_num = cursor.reserve(payloads.len())?;
-            pending.push_back(PendingSubmission {
-                receipts: Vec::with_capacity(payloads.len()),
-                payloads,
-                start_seq_num,
-                acked: 0,
-                sent: 0,
-                ack_tx,
-            });
+    let mut admitted = 0;
+    loop {
+        match command {
+            WriterCommand::Submit { batch, ack_tx } => {
+                let payloads = batch.into_payloads();
+                let record_count = payloads.len();
+                let start_seq_num = cursor.reserve(record_count)?;
+                pending.push_back(PendingSubmission {
+                    receipts: Vec::with_capacity(record_count),
+                    payloads,
+                    start_seq_num,
+                    acked: 0,
+                    sent: 0,
+                    ack_tx,
+                });
+                admitted += record_count;
+            }
+            WriterCommand::Close { done_tx } => {
+                *close_tx = Some(done_tx);
+                return Ok(());
+            }
         }
-        WriterCommand::Close { done_tx } => *close_tx = Some(done_tx),
+        if admitted >= MAX_WRITER_IN_FLIGHT_RECORDS {
+            return Ok(());
+        }
+        let Ok(next) = cmd_rx.try_recv() else {
+            return Ok(());
+        };
+        command = next;
     }
-    Ok(())
 }
 
 /// Fills `frame` with the leading unsent records and charges the in-flight window for them, bounded
@@ -4123,10 +4140,9 @@ mod tests {
         let mut pending = VecDeque::new();
         let mut close_tx = None;
         let mut cursor = WriterCursor::default();
-        while let Ok(command) = cmd_rx.try_recv() {
-            handle_writer_command(&mut pending, &mut close_tx, &mut cursor, command)
-                .expect("handle submission");
-        }
+        let first = cmd_rx.try_recv().expect("first command");
+        admit_commands(&mut pending, &mut close_tx, &mut cursor, &mut cmd_rx, first)
+            .expect("admit submissions");
 
         assert_eq!(
             pending
