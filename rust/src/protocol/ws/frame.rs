@@ -281,22 +281,14 @@ impl ReadBatch {
     /// non-contiguous sequences; construction is the parse step that upholds the bounded-batch
     /// invariant.
     pub fn try_from_records(records: Vec<OwnedReadRecord>) -> Result<Self, FrameCodecError> {
-        // Count first: an over-count input could otherwise wrap the payload sum on 32-bit
-        // targets before the aggregate bound rejects it.
-        validate_batch_count(records.len(), MAX_READ_FRAME_RECORDS)?;
-        validate_sequence_contiguous(records.iter().map(|record| record.seq_num))?;
+        // Every bound precedes the copy, so a rejected batch never pays for it.
         let mut payload_bytes = 0_usize;
         for record in &records {
             validate_record_len(record.data.len())?;
-            // MAX_READ_FRAME_RECORDS records of MAX_RECORD_PAYLOAD_BYTES each cannot overflow.
-            payload_bytes += record.data.len();
+            payload_bytes = payload_bytes.saturating_add(record.data.len());
         }
-        if payload_bytes > MAX_FRAME_PAYLOAD_BYTES {
-            return Err(FrameCodecError::BatchPayloadTooLarge {
-                actual: payload_bytes,
-                max: MAX_FRAME_PAYLOAD_BYTES,
-            });
-        }
+        validate_batch(records.len(), payload_bytes, MAX_READ_FRAME_RECORDS)?;
+        validate_sequence_contiguous(records.iter().map(|record| record.seq_num))?;
 
         let mut payload = BytesMut::with_capacity(payload_bytes);
         let mut metas = Vec::with_capacity(records.len());
@@ -319,6 +311,29 @@ impl ReadBatch {
         Ok(Self::from_parts(payload.freeze(), metas))
     }
 
+    /// Checked constructor for decoders that lay the payload out themselves, so no record is
+    /// copied a second time to concatenate it.
+    pub(crate) fn try_from_parts(
+        payload: Bytes,
+        records: Vec<RecordMeta>,
+    ) -> Result<Self, FrameCodecError> {
+        let mut payload_bytes = 0_usize;
+        for record in &records {
+            let data_len = record.data_len as usize;
+            validate_record_len(data_len)?;
+            // `record` slices by these bounds, so out-of-range metadata must not reach it.
+            if u64::from(record.data_start) + u64::from(record.data_len) > payload.len() as u64 {
+                return Err(FrameCodecError::InvalidRecordLength);
+            }
+            // Saturating: an over-count input cannot wrap the sum past the aggregate bound.
+            payload_bytes = payload_bytes.saturating_add(data_len);
+        }
+        validate_batch(records.len(), payload_bytes, MAX_READ_FRAME_RECORDS)?;
+        validate_sequence_contiguous(records.iter().map(|record| record.seq_num))?;
+        Ok(Self::from_parts(payload, records))
+    }
+
+    /// Builds a batch from a layout the caller has already established as valid.
     pub(crate) fn from_parts(payload: Bytes, records: Vec<RecordMeta>) -> Self {
         debug_assert!(!records.is_empty());
         Self { payload, records }

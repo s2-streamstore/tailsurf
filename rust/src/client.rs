@@ -61,8 +61,8 @@ use crate::{
             WriteStreamOptions,
             frame::{
                 AppendBatch, AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
-                MAX_APPEND_FRAME_RECORDS, MAX_FRAME_PAYLOAD_BYTES, OwnedReadRecord, PartHeader,
-                ReadBatch, RecordPayload, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
+                MAX_APPEND_FRAME_RECORDS, MAX_FRAME_PAYLOAD_BYTES, PartHeader, ReadBatch,
+                RecordMeta, RecordPayload, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -2651,7 +2651,19 @@ fn compact_record_data(bytes: &[u8]) -> RecordData {
     }
 }
 
+/// Decodes one SSE `read_batch` event, writing each payload straight into the batch's backing
+/// buffer rather than materializing it per record and concatenating afterwards.
 fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> {
+    // Only a reservation: base64 estimates round up, so `try_from_parts` owns the real bounds.
+    let capacity: usize = batch
+        .records
+        .iter()
+        .map(|record| match &record.data {
+            RecordData::Utf8(value) => value.len(),
+            RecordData::Base64url(value) => base64::decoded_len_estimate(value.len()),
+        })
+        .sum();
+    let mut payload = Vec::with_capacity(capacity);
     let mut records = Vec::with_capacity(batch.records.len());
     for record in batch.records {
         let mut writer = [0u8; WriterId::BYTE_LEN];
@@ -2661,27 +2673,26 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
         if decoded_len != WriterId::BYTE_LEN {
             return Err(TsfClientError::InvalidSse("invalid writer_id length"));
         }
-        let data = match record.data {
-            RecordData::Utf8(value) => Bytes::from(value.into_bytes()),
-            RecordData::Base64url(value) => Bytes::from(
-                URL_SAFE_NO_PAD
-                    .decode(value)
-                    .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?,
-            ),
-        };
-        records.push(OwnedReadRecord {
+        let data_start = payload.len();
+        match record.data {
+            RecordData::Utf8(value) => payload.extend_from_slice(value.as_bytes()),
+            RecordData::Base64url(value) => URL_SAFE_NO_PAD
+                .decode_vec(&value, &mut payload)
+                .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?,
+        }
+        // The SSE event bound caps the buffer well inside u32, so these narrows cannot truncate.
+        records.push(RecordMeta {
             seq_num: record.seq_num,
             timestamp_ms: record.timestamp_ms,
             writer_id: WriterId::from_bytes(writer),
             writer_seq_num: record.writer_seq_num,
             part: PartHeader::new(record.part.index, record.part.is_final)?,
             format: record.format,
-            data,
+            data_start: data_start as u32,
+            data_len: (payload.len() - data_start) as u32,
         });
     }
-    // Construction enforces the shared bounded-batch invariant: record count, per-record and
-    // aggregate payload sizes, and contiguous sequence numbers.
-    ReadBatch::try_from_records(records).map_err(|error| match error {
+    ReadBatch::try_from_parts(Bytes::from(payload), records).map_err(|error| match error {
         FrameCodecError::InvalidBatchRecordCount { .. } => {
             TsfClientError::InvalidSse("read_batch record count is outside the protocol limit")
         }
