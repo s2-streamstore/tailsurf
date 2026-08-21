@@ -52,3 +52,16 @@ pnpm check
 ```
 
 The TypeScript package verifier builds the exact npm tarballs, installs them in a temporary consumer, type-checks Node.js and browser consumers, and runs Node.js and Chromium smoke tests.
+
+## TypeScript release notes
+
+Add a changeset to a pull request that changes a published TypeScript package:
+
+```sh
+cd typescript
+pnpm changeset
+```
+
+Select each affected package. Choose its semantic version bump and write a short user-facing summary.
+
+See [Release operations](release-operations.md) for the automated publishing flow.
