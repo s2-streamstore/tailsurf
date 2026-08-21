@@ -25,6 +25,10 @@ export const MAX_APPEND_FRAME_RECORDS = 128;
 export const MAX_READ_FRAME_RECORDS = 1_000;
 /** Maximum aggregate record payload in one append or read protocol frame. */
 export const MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024;
+/** Maximum accounted payload bytes an official writer keeps sent but unacknowledged. Empty payloads count as one byte. */
+export const MAX_WRITER_IN_FLIGHT_BYTES = 5 * 1024 * 1024;
+/** Maximum physical records an official writer keeps sent but unacknowledged. */
+export const MAX_WRITER_IN_FLIGHT_RECORDS = 128;
 /** Maximum encoded size of any TSF protocol frame. */
 export const MAX_ENCODED_FRAME_BYTES =
   1 + MAX_READ_FRAME_RECORDS * (4 + 45) + MAX_FRAME_PAYLOAD_BYTES;

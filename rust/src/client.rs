@@ -58,7 +58,7 @@ use crate::{
             StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
         },
         ws::{
-            WriteStreamOptions,
+            MAX_WRITER_IN_FLIGHT_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteStreamOptions,
             frame::{
                 AppendBatch, AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
                 MAX_APPEND_FRAME_RECORDS, MAX_FRAME_PAYLOAD_BYTES, OwnedReadRecord, PartHeader,
@@ -976,14 +976,6 @@ pub struct TsfWriteSession {
     ws: ClientWebSocket,
     operation_timeout: Duration,
 }
-
-/// Maximum accounted bytes that one writer socket may keep in flight.
-///
-/// Empty payloads count as one byte. [`TsfWriter`] paces sends to stay within this
-/// server-enforced bound.
-pub const MAX_WRITER_IN_FLIGHT_BYTES: usize = 5 * 1024 * 1024;
-/// Maximum physical records that one writer socket may keep in flight.
-pub const MAX_WRITER_IN_FLIGHT_RECORDS: usize = 128;
 
 /// Stream, credentials, and sequence precondition for one durable [`TsfWriter`].
 ///

@@ -2,6 +2,8 @@ import {
   MAX_APPEND_FRAME_RECORDS,
   MAX_FRAME_PAYLOAD_BYTES,
   MAX_RECORD_PAYLOAD_BYTES,
+  MAX_WRITER_IN_FLIGHT_BYTES,
+  MAX_WRITER_IN_FLIGHT_RECORDS,
   MAX_U64,
   partHeader,
   RecordFormat,
@@ -45,11 +47,6 @@ export interface TsfWriter {
   abort(): void;
   close(): Promise<void>;
 }
-
-/** Maximum physical records that one writer socket may keep in flight. */
-export const MAX_WRITER_IN_FLIGHT_RECORDS = 128;
-/** Maximum accounted bytes that one writer socket may keep in flight. Empty payloads count as one byte. */
-export const MAX_WRITER_IN_FLIGHT_BYTES = 5 * 1024 * 1024;
 
 export class DefaultTsfWriter implements TsfWriter {
   #socket: FrameSocket;

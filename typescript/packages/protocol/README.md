@@ -29,6 +29,8 @@ The package also exports its language-neutral fixtures at `@tailsurf/protocol/fi
 
 `LogicalTranscript` uses one 16 MiB `maxReassemblyBytes` limit. It bounds bytes retained across unfinished split records and the size of one completed split-record assembly. Unsplit records borrow their input payload and do not consume this budget.
 
+Official writers use the shared `MAX_WRITER_IN_FLIGHT_RECORDS` and `MAX_WRITER_IN_FLIGHT_BYTES` window. It bounds records that have been sent but not acknowledged.
+
 ## Compatibility
 
 Protocol fixtures are shared with the Rust implementation in the `tailsurf` repository. CI rejects any byte-level drift between the two copies.

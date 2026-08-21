@@ -17,9 +17,9 @@ pub mod transcript;
 
 pub use client::{
     AppendAck, AppendReceipt, AppendTicket, DurableWriterOptions, IdempotencyKey,
-    InvalidIdempotencyKey, ListLinksOptions, MAX_WRITER_IN_FLIGHT_BYTES,
-    MAX_WRITER_IN_FLIGHT_RECORDS, RetryPolicy, TsfClient, TsfClientConfig, TsfClientError,
-    TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, default_api_origin,
+    InvalidIdempotencyKey, ListLinksOptions, RetryPolicy, TsfClient, TsfClientConfig,
+    TsfClientError, TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter,
+    default_api_origin,
 };
 pub use ids::{
     ClientWriterId, LinkId, LinkIdError, LinkSecret, LinkSecretError, MAX_LINK_ID_LEN, StreamId,
@@ -34,7 +34,7 @@ pub use protocol::{
         UpdateStreamRequest, Visibility,
     },
     ws::{
-        WriteStreamOptions,
+        MAX_WRITER_IN_FLIGHT_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteStreamOptions,
         frame::{
             AppendBatch, AppendRecord, CaughtUpPosition, IntoRecordData, OwnedReadRecord,
             PartHeader, ReadBatch, ReadRecord, RecordFormat, RecordPayload,

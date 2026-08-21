@@ -43,10 +43,6 @@ export type {
 } from "./reader.js";
 export { isRetryableSocketError } from "./socket.js";
 export type { WebSocketFactory, WebSocketLike } from "./socket.js";
-export {
-  MAX_WRITER_IN_FLIGHT_BYTES,
-  MAX_WRITER_IN_FLIGHT_RECORDS,
-} from "./writer.js";
 export type {
   AppendInput,
   AppendReceipt,
@@ -64,6 +60,8 @@ export {
   MAX_PART_INDEX,
   MAX_READ_FRAME_RECORDS,
   MAX_RECORD_PAYLOAD_BYTES,
+  MAX_WRITER_IN_FLIGHT_BYTES,
+  MAX_WRITER_IN_FLIGHT_RECORDS,
   MAX_STREAM_TITLE_CODE_POINTS,
   ProtocolError,
   RecordFormat,
