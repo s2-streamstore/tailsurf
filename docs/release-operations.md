@@ -18,13 +18,15 @@ Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamst
 
 ## TypeScript releases
 
-`@tailsurf/protocol` and `@tailsurf/client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
+`@tailsurf/protocol` and `@tailsurf/client` have independent versions. Changesets records which packages change and the semantic version bump for each package.
 
-Change the selected package version in its `package.json`. Run `pnpm check` from `typescript`. Merge the change to `main`, then dispatch `publish-npm.yml` for that package.
+Run `pnpm changeset` from `typescript` in any pull request that changes a published package. Select each affected package and write a short user-facing summary.
 
-The workflow rejects versions already present on npm. It packs and tests both packages before publishing the selected tarball from the `npm` GitHub environment.
+`publish-npm.yml` collects pending changesets into a pull request named `chore: release TypeScript SDK packages`. That pull request updates package versions and changelogs. Changesets updates a dependent package when its `workspace:` range must change.
 
-Each npm package trusts `publish-npm.yml` in `s2-streamstore/tailsurf` with the `npm` environment. Trusted publishing uses GitHub OIDC and creates provenance. A new package name can use the optional `NPM_TOKEN` environment secret for its first publication. Delete that secret after the trusted publisher is configured.
+Merging the release pull request tests both packages and publishes every new version in dependency order. The workflow creates a package tag and GitHub release for each published version.
+
+Each npm package trusts `publish-npm.yml` in `s2-streamstore/tailsurf` with the `npm` environment. Trusted publishing uses GitHub OIDC and creates provenance. The repository stores no npm publishing token.
 
 Published npm versions are immutable. Fix a bad release with a new version. Deprecate the bad version on npm when consumers should not select it.
 

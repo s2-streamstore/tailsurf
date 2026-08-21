@@ -22,3 +22,15 @@ pnpm check
 `pnpm test:packages` packs both packages, installs the tarballs into a temporary consumer, type-checks Node.js and browser consumers, and runs Node.js and Chromium smoke tests.
 
 `pnpm test:fixtures` requires the Rust and TypeScript fixture copies to remain byte-identical.
+
+## Releasing
+
+Add a changeset to a pull request that changes a published package:
+
+```sh
+pnpm changeset
+```
+
+Select the affected packages, their semantic version bumps, and a short user-facing summary.
+
+Changesets maintains a TypeScript release pull request on `main`. Merging that pull request publishes every new package version to npm.

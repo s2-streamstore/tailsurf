@@ -9,14 +9,18 @@
   "packageManager": "pnpm@11.21.0",
   "scripts": {
     "build": "pnpm --recursive build",
+    "changeset": "changeset",
     "check": "pnpm build && pnpm lint && pnpm typecheck && pnpm test && pnpm test:fixtures && pnpm test:packages",
     "lint": "oxlint . --max-warnings 0",
+    "release:publish": "changeset publish",
+    "release:version": "changeset version",
     "test": "vitest run",
     "test:fixtures": "node scripts/verify-fixtures.mjs",
     "test:packages": "node scripts/package-smoke.mjs",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "@changesets/cli": "^3.0.1",
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
     "esbuild": "^0.28.2",
