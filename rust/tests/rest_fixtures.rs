@@ -2,11 +2,12 @@
 
 use serde_json::Value;
 use tailsurf::protocol::rest::{
-    ApiErrorResponse, AppendRange, AppendRecordsRequest, CreateStreamRequest, MAX_LINK_PAGE_ITEMS,
-    MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
-    MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS, MAX_SSE_UNTERMINATED_EVENT_BYTES,
-    MAX_STATELESS_APPEND_JSON_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
-    MAX_STATELESS_APPEND_RECORDS, SseCaughtUpData, SseReadBatchData, StreamMetadata,
+    ApiErrorResponse, AppendRange, AppendRecordsRequest, CreateStreamRequest,
+    MAX_INITIAL_STREAM_LINKS, MAX_LINK_PAGE_ITEMS, MAX_REST_ERROR_RESPONSE_BYTES,
+    MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES, MAX_SSE_READ_BATCH_PAYLOAD_BYTES,
+    MAX_SSE_READ_BATCH_RECORDS, MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_JSON_BYTES,
+    MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, SseCaughtUpData,
+    SseReadBatchData, StreamMetadata,
 };
 
 #[test]
@@ -36,6 +37,10 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     assert_eq!(
         fixture_usize(&fixtures, "max_link_page_items"),
         MAX_LINK_PAGE_ITEMS
+    );
+    assert_eq!(
+        fixture_usize(&fixtures, "max_initial_stream_links"),
+        MAX_INITIAL_STREAM_LINKS
     );
     assert_eq!(
         fixture_usize(&fixtures, "max_sse_read_batch_records"),

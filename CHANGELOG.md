@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - [**breaking**] replace configurable writer retention and submission limits with one fixed 1,024-record and 5 MiB sent-but-unacknowledged window
 - [**breaking**] simplify the Rust writer to immediate queued submission with durability tickets
 - [**breaking**] remove the CLI logical-record write limit and keep only the read-side reassembly safety bound
+- [**breaking**] replace configurable retry schedules with one bounded-operation attempt count, rename the WebSocket operation timeout to progress timeout, and derive silent-read detection from protocol heartbeats
 
 ## [0.11.0](https://github.com/s2-streamstore/tailsurf/compare/v0.10.0...v0.11.0) - 2026-08-17
 

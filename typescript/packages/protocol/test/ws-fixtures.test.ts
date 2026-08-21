@@ -18,6 +18,7 @@ import {
   ProtocolError,
   streamMetadataSchema,
   TSF_WEBSOCKET_PROTOCOL,
+  WEBSOCKET_HEARTBEAT_INTERVAL_MS,
   type ClientFrame,
   type RecordFormat,
   type ServerFrame,
@@ -31,6 +32,7 @@ interface FrameFixture {
 
 interface Fixtures {
   readonly websocket_protocol: string;
+  readonly websocket_heartbeat_interval_ms: number;
   readonly max_record_payload_bytes: number;
   readonly max_append_frame_records: number;
   readonly max_read_frame_records: number;
@@ -47,6 +49,9 @@ const fixtures = JSON.parse(
 describe("TSF v1 wire fixtures", () => {
   it("pins protocol constants", () => {
     expect(TSF_WEBSOCKET_PROTOCOL).toBe(fixtures.websocket_protocol);
+    expect(WEBSOCKET_HEARTBEAT_INTERVAL_MS).toBe(
+      fixtures.websocket_heartbeat_interval_ms,
+    );
     expect(MAX_RECORD_PAYLOAD_BYTES).toBe(fixtures.max_record_payload_bytes);
     expect(MAX_APPEND_FRAME_RECORDS).toBe(fixtures.max_append_frame_records);
     expect(MAX_READ_FRAME_RECORDS).toBe(fixtures.max_read_frame_records);

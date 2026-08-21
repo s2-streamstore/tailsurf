@@ -41,9 +41,7 @@ import { integerOption, MAX_TIMER_DELAY_MS } from "./retry.js";
 export interface TsfClientOptions extends RestClientOptions {
   readonly webSocketFactory?: WebSocketFactory;
   readonly webSocketConnectTimeoutMs?: number;
-  readonly webSocketOperationTimeoutMs?: number;
-  /** Set to null to wait indefinitely for the next read frame. */
-  readonly webSocketReadIdleTimeoutMs?: number | null;
+  readonly webSocketProgressTimeoutMs?: number;
 }
 
 export interface WriteStreamOptions {
@@ -72,21 +70,13 @@ export class TsfClient extends BaseTsfClient {
         1,
         MAX_TIMER_DELAY_MS,
       ),
-      webSocketOperationTimeoutMs: integerOption(
-        options.webSocketOperationTimeoutMs ?? 30_000,
-        "webSocketOperationTimeoutMs",
+      webSocketProgressTimeoutMs: integerOption(
+        options.webSocketProgressTimeoutMs ?? 30_000,
+        "webSocketProgressTimeoutMs",
         1,
         MAX_TIMER_DELAY_MS,
       ),
-      webSocketReadIdleTimeoutMs: options.webSocketReadIdleTimeoutMs === null
-        ? null
-        : integerOption(
-          options.webSocketReadIdleTimeoutMs ?? 60_000,
-          "webSocketReadIdleTimeoutMs",
-          1,
-          MAX_TIMER_DELAY_MS,
-        ),
-      ...this.retryPolicy,
+      boundedOperationAttempts: this.boundedOperationAttempts,
     };
   }
 
@@ -148,7 +138,7 @@ export class TsfClient extends BaseTsfClient {
     try {
       const metadata = await withTimeout(
         expectReadHandshake(socket),
-        this.#socketPolicy.webSocketOperationTimeoutMs,
+        this.#socketPolicy.webSocketProgressTimeoutMs,
         "reader handshake",
         signal,
       );
@@ -182,7 +172,7 @@ export class TsfClient extends BaseTsfClient {
     try {
       await withTimeout(
         expectReady(socket),
-        this.#socketPolicy.webSocketOperationTimeoutMs,
+        this.#socketPolicy.webSocketProgressTimeoutMs,
         "writer authentication",
       );
       delete options.expectedNextSeqNum;

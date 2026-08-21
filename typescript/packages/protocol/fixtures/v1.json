@@ -1,5 +1,6 @@
 {
   "websocket_protocol": "tsf.v1",
+  "websocket_heartbeat_interval_ms": 20000,
   "max_record_payload_bytes": 524288,
   "max_append_frame_records": 128,
   "max_read_frame_records": 1000,

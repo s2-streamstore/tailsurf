@@ -3,6 +3,8 @@
 /// Binary TSF v1 frames and their codec.
 pub mod frame;
 
+/// Interval between WebSocket heartbeats while a reader is otherwise idle.
+pub const WEBSOCKET_HEARTBEAT_INTERVAL_MS: u64 = 20_000;
 /// Maximum accounted payload bytes an SDK durable writer keeps sent but unacknowledged.
 ///
 /// Empty payloads count as one byte.

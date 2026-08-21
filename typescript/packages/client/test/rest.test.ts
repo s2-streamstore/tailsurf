@@ -23,16 +23,10 @@ import {
 const LINK_SECRET = "A".repeat(32);
 
 describe("TsfClient REST API", () => {
-  it("rejects invalid retry policies", () => {
-    for (const retryPolicy of [
-      { initialBackoffMs: 2, maxBackoffMs: 1 },
-      { maxAttempts: 0 },
-      { maxBackoffMs: 2_147_483_648 },
-    ]) {
-      expect(() => new TsfClient({ retryPolicy })).toThrow(
-        expect.objectContaining({ code: "invalid_client_option" }),
-      );
-    }
+  it("rejects an invalid bounded operation attempt count", () => {
+    expect(() => new TsfClient({ boundedOperationAttempts: 0 })).toThrow(
+      expect.objectContaining({ code: "invalid_client_option" }),
+    );
   });
 
   it("rejects declared and streamed REST success bodies above the memory bound", async () => {
@@ -44,7 +38,7 @@ describe("TsfClient REST API", () => {
     ]) {
       const client = new TsfClient({
         fetch: vi.fn<typeof fetch>(async () => response),
-        retryPolicy: { maxAttempts: 1 },
+        boundedOperationAttempts: 1,
       });
 
       await expect(client.getStream(generateStreamId())).rejects.toMatchObject({
@@ -67,7 +61,7 @@ describe("TsfClient REST API", () => {
     });
     const client = new TsfClient({
       fetch: vi.fn<typeof fetch>(async () => response),
-      retryPolicy: { maxAttempts: 1 },
+      boundedOperationAttempts: 1,
     });
 
     await expect(client.getStream(generateStreamId())).rejects.toMatchObject({
@@ -604,7 +598,7 @@ describe("TsfClient REST API", () => {
         authorizing_link_id: "owner",
         ...page,
       })),
-      retryPolicy: { maxAttempts: 1 },
+      boundedOperationAttempts: 1,
     });
 
     await expect(client.listLinks(generateStreamId(), {
@@ -684,7 +678,7 @@ describe("TsfClient REST API", () => {
             }
           : secondPage);
       }),
-      retryPolicy: { maxAttempts: 1 },
+      boundedOperationAttempts: 1,
     });
 
     await expect(client.listAllLinks(generateStreamId(), {
@@ -747,7 +741,7 @@ describe("TsfClient REST API", () => {
     }), { status });
     const client = new TsfClient({
       restRequestTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 1 },
+      boundedOperationAttempts: 1,
       fetch: vi.fn<typeof fetch>(async () => response),
     });
 

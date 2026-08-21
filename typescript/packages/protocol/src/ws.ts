@@ -17,6 +17,8 @@ import {
 } from "./stream-url.js";
 
 export const TSF_WEBSOCKET_PROTOCOL = "tsf.v1";
+/** Interval between WebSocket heartbeats while a reader is otherwise idle. */
+export const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 /** Maximum data payload in one physical record. */
 export const MAX_RECORD_PAYLOAD_BYTES = 512 * 1024;
 /** Maximum physical records in one append protocol frame. */

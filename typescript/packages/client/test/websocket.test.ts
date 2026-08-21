@@ -218,7 +218,6 @@ describe("TsfReadSession", () => {
           1006,
         );
       },
-      retryPolicy: { initialBackoffMs: 20, maxBackoffMs: 20 },
     });
 
     const reader = await client.connectReader({
@@ -261,46 +260,31 @@ describe("TsfReadSession", () => {
     ])).resolves.toBeUndefined();
   });
 
-  it("uses an independent read-idle timeout", async () => {
-    const streamId = generateStreamId();
-    const socket = new HangingWebSocket(
-      true,
-      [{ type: "ready" }, streamMetadataFrame(streamId)],
-      false,
-    );
-    const client = new TsfClient({
-      webSocketFactory: () => socket,
-      webSocketReadIdleTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 1 },
-    });
-    const reader = await client.connectReader({ streamId });
+  it("times out a silent reader after three missed heartbeat intervals", async () => {
+    vi.useFakeTimers();
+    try {
+      const streamId = generateStreamId();
+      const socket = new HangingWebSocket(
+        true,
+        [{ type: "ready" }, streamMetadataFrame(streamId)],
+        false,
+      );
+      const client = new TsfClient({
+        webSocketFactory: () => socket,
+        boundedOperationAttempts: 1,
+      });
+      const reader = await client.connectReader({ streamId });
+      const pending = reader.nextRecord();
+      const timedOut = expect(pending).rejects.toMatchObject({
+        code: "operation_timeout",
+        message: "read stream record timed out after 60000ms",
+      });
 
-    await expect(reader.nextRecord()).rejects.toMatchObject({
-      code: "operation_timeout",
-      message: "read stream record timed out after 5ms",
-    });
-  });
-
-  it("can disable the read-idle timeout", async () => {
-    const streamId = generateStreamId();
-    const socket = new HangingWebSocket(
-      true,
-      [{ type: "ready" }, streamMetadataFrame(streamId)],
-      false,
-    );
-    const client = new TsfClient({
-      webSocketFactory: () => socket,
-      webSocketReadIdleTimeoutMs: null,
-    });
-    const reader = await client.connectReader({ streamId });
-    const pending = reader.nextRecord();
-
-    await expect(Promise.race([
-      pending,
-      new Promise((resolve) => setTimeout(() => resolve("still pending"), 10)),
-    ])).resolves.toBe("still pending");
-    reader.close();
-    await expect(pending).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retries a timed-out initial handshake and closes the abandoned socket", async () => {
@@ -321,8 +305,8 @@ describe("TsfReadSession", () => {
               1000,
             ));
       },
-      webSocketOperationTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 2, initialBackoffMs: 0, maxBackoffMs: 0 },
+      webSocketProgressTimeoutMs: 5,
+      boundedOperationAttempts: 2,
     });
 
     const reader = await client.connectReader({
@@ -349,7 +333,7 @@ describe("TsfReadSession", () => {
           : new HangingWebSocket(false);
       },
       webSocketConnectTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 3, initialBackoffMs: 0, maxBackoffMs: 0 },
+      boundedOperationAttempts: 3,
     });
     const session = await client.connectReader({ streamId });
 
@@ -473,7 +457,6 @@ describe("TsfReadSession", () => {
           clientFrames[index] = [],
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
     const reader = await client.connectReader({
       streamId,
@@ -565,7 +548,6 @@ describe("TsfReadSession", () => {
     const client = new TsfClient({
       apiOrigin: "http://localhost:8787",
       webSocketFactory,
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
 
     const reader = await client.connectReader({
@@ -606,7 +588,6 @@ describe("TsfReadSession", () => {
           clientFrames[connection] = [],
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
 
     const reader = await client.connectReader({
@@ -658,7 +639,6 @@ describe("TsfReadSession", () => {
           clientFrames,
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
 
     const reader = await client.connectReader({
@@ -708,7 +688,6 @@ describe("TsfReadSession", () => {
           clientFrames,
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
 
     const reader = await client.connectReader({
@@ -782,7 +761,7 @@ describe("TsfReadSession", () => {
             connection < 2 ? closeCode : 1000,
           );
         },
-        retryPolicy: { maxAttempts: 2, initialBackoffMs: 0, maxBackoffMs: 0 },
+        boundedOperationAttempts: 2,
       });
 
       const reader = await client.connectReader({
@@ -813,7 +792,6 @@ describe("TsfReadSession", () => {
             closeCode,
           );
         },
-        retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
       });
 
       const reader = await client.connectReader({
@@ -1001,8 +979,8 @@ describe("TsfWriter", () => {
     const stalled = new HangingWebSocket(true);
     const client = new TsfClient({
       webSocketFactory: () => stalled,
-      webSocketOperationTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 1 },
+      webSocketProgressTimeoutMs: 5,
+      boundedOperationAttempts: 1,
     });
 
     await expect(
@@ -1019,7 +997,7 @@ describe("TsfWriter", () => {
     const client = new TsfClient({
       webSocketFactory: () => stalled,
       webSocketConnectTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 1 },
+      boundedOperationAttempts: 1,
     });
 
     await expect(
@@ -1068,7 +1046,6 @@ describe("TsfWriter", () => {
           1013,
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
@@ -1235,7 +1212,6 @@ describe("TsfWriter", () => {
           current === 0 ? 42n : 43n,
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
@@ -1276,7 +1252,6 @@ describe("TsfWriter", () => {
           1008,
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
@@ -1309,7 +1284,6 @@ describe("TsfWriter", () => {
           "sequence_mismatch",
         );
       },
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
@@ -1339,8 +1313,8 @@ describe("TsfWriter", () => {
           : new WriterWebSocket(true, authFrames, appends);
       },
       webSocketConnectTimeoutMs: 5,
-      webSocketOperationTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 2, initialBackoffMs: 0, maxBackoffMs: 0 },
+      webSocketProgressTimeoutMs: 5,
+      boundedOperationAttempts: 2,
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
@@ -1378,7 +1352,7 @@ describe("TsfWriter", () => {
           : new HangingWebSocket(false);
       },
       webSocketConnectTimeoutMs: 5,
-      retryPolicy: { maxAttempts: 1, initialBackoffMs: 0, maxBackoffMs: 0 },
+      boundedOperationAttempts: 1,
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),

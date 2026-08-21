@@ -300,7 +300,7 @@ describe("SSE reader resume", () => {
       .mockResolvedValueOnce(sseResponse(streamId, recordsEvent("v1,2,2", 1)));
     const session = await new TsfClient({
       fetch,
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0, maxAttempts: 3 },
+      boundedOperationAttempts: 3,
     }).connectSseReader({
       streamId,
       start: { type: "seqNum", seqNum: 0n },
@@ -338,14 +338,14 @@ describe("SSE reader resume", () => {
         ));
       const opening = new TsfClient({
         fetch,
-        retryPolicy: { initialBackoffMs: 1, maxBackoffMs: 50, maxAttempts: 2 },
+        boundedOperationAttempts: 2,
       }).connectSseReader({
         streamId,
         start: { type: "seqNum", seqNum: 0n },
         stop: { count: 1n },
       });
 
-      await vi.advanceTimersByTimeAsync(49);
+      await vi.advanceTimersByTimeAsync(1_999);
       expect(fetch).toHaveBeenCalledOnce();
       await vi.advanceTimersByTimeAsync(1);
       const session = await opening;
@@ -372,7 +372,7 @@ describe("SSE reader resume", () => {
 
     await expect(new TsfClient({
       fetch,
-      retryPolicy: { maxAttempts: 1 },
+      boundedOperationAttempts: 1,
     }).connectSseReader({ streamId })).rejects.toMatchObject({
       apiCode: "rate_limited",
       requestId: "request-sse",
@@ -394,7 +394,7 @@ describe("SSE reader resume", () => {
       const opening = new TsfClient({
         fetch,
         restRequestTimeoutMs: 5,
-        retryPolicy: { maxAttempts: 1 },
+        boundedOperationAttempts: 1,
       }).connectSseReader({ streamId });
       const rejected = expect(opening).rejects.toMatchObject({
         code: "http_timeout",
@@ -415,7 +415,7 @@ describe("SSE reader resume", () => {
       .mockResolvedValueOnce(sseResponse(streamId, recordsEvent("v1,1,1", 0)));
     const session = await new TsfClient({
       fetch,
-      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0, maxAttempts: 2 },
+      boundedOperationAttempts: 2,
     }).connectSseReader({
       streamId,
       start: { type: "seqNum", seqNum: 0n },
@@ -571,7 +571,7 @@ describe("SSE reader resume", () => {
     );
     const session = await new TsfClient({
       fetch,
-      retryPolicy: { maxAttempts: 3, initialBackoffMs: 0, maxBackoffMs: 0 },
+      boundedOperationAttempts: 3,
     }).connectSseReader({ streamId });
 
     await expect(session.nextRecord()).rejects.toMatchObject({

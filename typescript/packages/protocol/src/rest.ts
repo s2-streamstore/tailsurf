@@ -25,6 +25,7 @@ export const MAX_STATELESS_APPEND_JSON_BYTES = 1_300_000;
 export const MAX_REST_RESPONSE_BYTES = 2 * 1024 * 1024;
 export const MAX_REST_ERROR_RESPONSE_BYTES = 64 * 1024;
 export const MAX_LINK_PAGE_ITEMS = 100;
+export const MAX_INITIAL_STREAM_LINKS = 3;
 export const IDEMPOTENCY_KEY_BYTES = 32;
 export const MAX_SSE_READ_BATCH_RECORDS = 1_000;
 export const MAX_SSE_READ_BATCH_PAYLOAD_BYTES = 1024 * 1024;
@@ -106,7 +107,10 @@ export const createStreamRequestSchema = z.strictObject({
     z.positive(),
     z.maximum(Number.MAX_SAFE_INTEGER),
   )),
-  links: z.array(initialStreamLinkSchema).check(z.minLength(1), z.maxLength(3)),
+  links: z.array(initialStreamLinkSchema).check(
+    z.minLength(1),
+    z.maxLength(MAX_INITIAL_STREAM_LINKS),
+  ),
 }).check(z.superRefine((request, context) => {
   if (!request.links.some((link) => link.permissions === "o")) {
     context.addIssue({

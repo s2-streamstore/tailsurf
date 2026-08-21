@@ -12,6 +12,7 @@ import {
 } from "@tailsurf/protocol";
 
 import { TsfClientError, TsfWebSocketClosedError } from "./errors.js";
+import { INITIAL_RETRY_BACKOFF_MS } from "./retry.js";
 import {
   type FrameSocket,
   isRetryableSocketError,
@@ -206,7 +207,7 @@ export class DefaultTsfWriter implements TsfWriter {
 
   async #drainQueue(): Promise<void> {
     let reconnectAttempts = 0;
-    let reconnectDelay = this.policy.initialBackoffMs;
+    let reconnectDelay = INITIAL_RETRY_BACKOFF_MS;
     while (this.#queue.length > 0) {
       try {
         this.#fillSocketWindow();
@@ -218,7 +219,7 @@ export class DefaultTsfWriter implements TsfWriter {
         }
         const response = await withTimeout(
           this.#socket.nextFrame(),
-          this.policy.webSocketOperationTimeoutMs,
+          this.policy.webSocketProgressTimeoutMs,
           "append acknowledgement",
         );
         if (response.type !== "appendAck") {
@@ -226,7 +227,7 @@ export class DefaultTsfWriter implements TsfWriter {
         }
         this.#dispatchAck(response);
         reconnectAttempts = 0;
-        reconnectDelay = this.policy.initialBackoffMs;
+        reconnectDelay = INITIAL_RETRY_BACKOFF_MS;
       } catch (error) {
         const sentRange = this.#sentRange();
         if (

@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-/// REST, SSE, and WebSocket clients, retry policy, and durable writer types.
+/// REST, SSE, and WebSocket clients and durable writer types.
 pub mod client;
 /// Stream and link IDs, link secrets, and writer identities.
 pub mod ids;
@@ -17,9 +17,8 @@ pub mod transcript;
 
 pub use client::{
     AppendAck, AppendReceipt, AppendTicket, DurableWriterOptions, IdempotencyKey,
-    InvalidIdempotencyKey, ListLinksOptions, RetryPolicy, TsfClient, TsfClientConfig,
-    TsfClientError, TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter,
-    default_api_origin,
+    InvalidIdempotencyKey, ListLinksOptions, TsfClient, TsfClientConfig, TsfClientError,
+    TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, default_api_origin,
 };
 pub use ids::{
     ClientWriterId, LinkId, LinkIdError, LinkSecret, LinkSecretError, MAX_LINK_ID_LEN, StreamId,
@@ -30,8 +29,8 @@ pub use protocol::{
     read::{ReadOptions, ReadStart, ReadStop},
     rest::{
         AppendRange, CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
-        ListLinksResponse, StreamLinkCredential, StreamLinkSummary, StreamMetadata,
-        UpdateStreamRequest, Visibility,
+        ListLinksResponse, MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamLinkSummary,
+        StreamMetadata, UpdateStreamRequest, Visibility,
     },
     ws::{
         MAX_WRITER_IN_FLIGHT_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteStreamOptions,

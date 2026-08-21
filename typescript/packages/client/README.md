@@ -118,7 +118,7 @@ REST mutations use idempotency keys. Pass a caller-owned key as the second argum
 await client.createStream(request, { idempotencyKey });
 ```
 
-Transient REST failures, initial connections, and readers use the configured bounded `retryPolicy`. An established durable writer uses its backoff without an attempt limit. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
+Transient REST failures, initial connections, and readers use `boundedOperationAttempts`. The SDK owns a jittered exponential backoff with a 200 ms base and a 2 s cap. An established durable writer uses that schedule without an attempt limit. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
 
 ## Runtime configuration
 

@@ -103,7 +103,7 @@ Management methods require an owner link secret. `list_links` returns one page. 
 
 REST mutations use idempotency keys. Use `create_stream_with_idempotency_key` or `create_link_with_idempotency_key` when a logical creation must survive process restarts.
 
-Transient REST failures, initial connections, and readers use the configured bounded `RetryPolicy`. An established durable writer uses its backoff without an attempt limit. Operations return `TsfClientError`. HTTP failures expose the status, request ID, retry hint, structured API code, and sequence mismatch details when the server provides them.
+Transient REST failures, initial connections, and readers use `bounded_operation_attempts`. The SDK owns a jittered exponential backoff with a 200 ms base and a 2 s cap. An established durable writer uses that schedule without an attempt limit. Operations return `TsfClientError`. HTTP failures expose the status, request ID, retry hint, structured API code, and sequence mismatch details when the server provides them.
 
 ## Modules
 
