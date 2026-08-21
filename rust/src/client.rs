@@ -58,7 +58,7 @@ use crate::{
             StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
         },
         ws::{
-            MAX_WRITER_IN_FLIGHT_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
+            MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
             WEBSOCKET_HEARTBEAT_INTERVAL_MS, WriteStreamOptions,
             frame::{
                 AppendBatch, AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
@@ -547,7 +547,7 @@ impl TsfClient {
     /// Connects the reconnecting durable writer.
     ///
     /// Submitted records are queued in memory. The writer sends them through the fixed
-    /// [`MAX_WRITER_IN_FLIGHT_BYTES`] and [`MAX_WRITER_IN_FLIGHT_RECORDS`] socket window.
+    /// [`MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES`] and [`MAX_WRITER_IN_FLIGHT_RECORDS`] socket window.
     pub async fn connect_writer(
         &self,
         options: DurableWriterOptions,
@@ -1157,7 +1157,7 @@ impl TsfProducer {
 }
 
 /// The socket window counts every record as at least one byte.
-fn in_flight_record_bytes(data: &Bytes) -> usize {
+fn in_flight_record_accounted_bytes(data: &Bytes) -> usize {
     data.len().max(1)
 }
 
@@ -1432,7 +1432,7 @@ impl PendingSubmission {
 /// for.
 #[derive(Default)]
 struct InFlightWindow {
-    bytes: usize,
+    accounted_bytes: usize,
     records: usize,
     /// Absolute: submissions can fill the queue but never postpone it, so it measures time
     /// without durability progress rather than command-channel inactivity.
@@ -1651,15 +1651,16 @@ fn take_frame(
     let mut frame_bytes = 0;
     for submission in pending.iter_mut() {
         while let Some(payload) = submission.payloads.get(submission.sent) {
-            let accounted = in_flight_record_bytes(&payload.data);
+            let accounted_bytes = in_flight_record_accounted_bytes(&payload.data);
             if in_flight.records == MAX_WRITER_IN_FLIGHT_RECORDS
-                || in_flight.bytes + accounted > MAX_WRITER_IN_FLIGHT_BYTES
+                || in_flight.accounted_bytes + accounted_bytes
+                    > MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES
                 || frame.len() == MAX_APPEND_FRAME_RECORDS
                 || (!frame.is_empty() && payload.data.len() > MAX_FRAME_PAYLOAD_BYTES - frame_bytes)
             {
                 return;
             }
-            in_flight.bytes += accounted;
+            in_flight.accounted_bytes += accounted_bytes;
             in_flight.records += 1;
             frame_bytes += payload.data.len();
             frame.push(submission.record(submission.sent));
@@ -1780,7 +1781,8 @@ fn dispatch_ack(
     while remaining > 0 {
         let submission = pending.front_mut().expect("ack validated against pending");
         while submission.acked < submission.payloads.len() && remaining > 0 {
-            in_flight.bytes -= in_flight_record_bytes(&submission.payloads[submission.acked].data);
+            in_flight.accounted_bytes -=
+                in_flight_record_accounted_bytes(&submission.payloads[submission.acked].data);
             in_flight.records -= 1;
             submission.receipts.push(AppendReceipt {
                 writer_seq_num: writer_seq_nums.next().expect("ack validated"),
@@ -3978,7 +3980,7 @@ mod tests {
     fn in_flight_window(pending: &VecDeque<PendingSubmission>) -> InFlightWindow {
         InFlightWindow {
             records: pending.iter().map(|s| s.payloads.len()).sum(),
-            bytes: pending.iter().map(|s| s.payloads.len()).sum(),
+            accounted_bytes: pending.iter().map(|s| s.payloads.len()).sum(),
             ack_deadline: None,
         }
     }
@@ -4073,7 +4075,7 @@ mod tests {
 
         assert_eq!(planned, [vec![0, 1], vec![2, 3], vec![4, 5]]);
         assert_eq!(in_flight.records, 6);
-        assert_eq!(in_flight.bytes, 6 * MAX_RECORD_PAYLOAD_BYTES);
+        assert_eq!(in_flight.accounted_bytes, 6 * MAX_RECORD_PAYLOAD_BYTES);
         assert!(
             pending
                 .iter()
@@ -4091,7 +4093,7 @@ mod tests {
         }
         // One record fits the remaining window exactly; the second must wait for acks.
         let mut in_flight = InFlightWindow {
-            bytes: MAX_WRITER_IN_FLIGHT_BYTES - MAX_RECORD_PAYLOAD_BYTES,
+            accounted_bytes: MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES - MAX_RECORD_PAYLOAD_BYTES,
             records: MAX_WRITER_IN_FLIGHT_RECORDS - 2,
             ack_deadline: None,
         };
@@ -4100,14 +4102,17 @@ mod tests {
         take_frame(&mut pending, &mut in_flight, &mut frame);
         assert_eq!(frame.len(), 1);
         assert_eq!(frame[0].writer_seq_num, 0);
-        assert_eq!(in_flight.bytes, MAX_WRITER_IN_FLIGHT_BYTES);
+        assert_eq!(
+            in_flight.accounted_bytes,
+            MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES
+        );
         assert_eq!(pending[0].sent, 1);
         take_frame(&mut pending, &mut in_flight, &mut frame);
         assert!(frame.is_empty());
 
         // The record-count bound stops framing even with byte capacity left.
         let mut record_full = InFlightWindow {
-            bytes: 0,
+            accounted_bytes: 0,
             records: MAX_WRITER_IN_FLIGHT_RECORDS,
             ack_deadline: None,
         };
@@ -4195,7 +4200,7 @@ mod tests {
         dispatch_ack(second_ack, &mut pending, &mut in_flight).expect("spanning ack");
         assert!(pending.is_empty());
         assert_eq!(in_flight.records, 0);
-        assert_eq!(in_flight.bytes, 0);
+        assert_eq!(in_flight.accounted_bytes, 0);
         for (ack_rx, expected) in [
             (&mut first_rx, vec![(7, 42, first_ack), (8, 43, second_ack)]),
             (&mut second_rx, vec![(9, 44, second_ack)]),

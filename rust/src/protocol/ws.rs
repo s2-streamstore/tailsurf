@@ -8,7 +8,7 @@ pub const WEBSOCKET_HEARTBEAT_INTERVAL_MS: u64 = 20_000;
 /// Maximum accounted payload bytes an SDK durable writer keeps sent but unacknowledged.
 ///
 /// Empty payloads count as one byte.
-pub const MAX_WRITER_IN_FLIGHT_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES: usize = 5 * 1024 * 1024;
 /// Maximum physical records an SDK durable writer keeps sent but unacknowledged.
 pub const MAX_WRITER_IN_FLIGHT_RECORDS: usize = 1_024;
 

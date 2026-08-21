@@ -28,7 +28,7 @@ export const MAX_READ_FRAME_RECORDS = 1_000;
 /** Maximum aggregate record payload in one append or read protocol frame. */
 export const MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024;
 /** Maximum accounted payload bytes an SDK durable writer keeps sent but unacknowledged. Empty payloads count as one byte. */
-export const MAX_WRITER_IN_FLIGHT_BYTES = 5 * 1024 * 1024;
+export const MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES = 5 * 1024 * 1024;
 /** Maximum physical records an SDK durable writer keeps sent but unacknowledged. */
 export const MAX_WRITER_IN_FLIGHT_RECORDS = 1_024;
 /** Maximum encoded size of any TSF protocol frame. */

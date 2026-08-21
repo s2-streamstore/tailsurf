@@ -19,7 +19,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  MAX_WRITER_IN_FLIGHT_BYTES,
+  MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES,
   MAX_WRITER_IN_FLIGHT_RECORDS,
   TsfClient,
   type WebSocketFactory,
@@ -950,7 +950,7 @@ describe("TsfWriter", () => {
 
     socket.setAutoAck(false);
     const payloadRecordCount =
-      MAX_WRITER_IN_FLIGHT_BYTES / MAX_RECORD_PAYLOAD_BYTES;
+      MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES / MAX_RECORD_PAYLOAD_BYTES;
     if (!Number.isInteger(payloadRecordCount)) {
       throw new TypeError("writer byte window must compose from whole records");
     }
@@ -969,7 +969,7 @@ describe("TsfWriter", () => {
     expect(socket.appendCount).toBe(
       Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS) +
         1 +
-        Math.ceil(MAX_WRITER_IN_FLIGHT_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
+        Math.ceil(MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
         1,
     );
     await writer.close();
