@@ -3,6 +3,7 @@ import {
   encodeServerFrame,
   generateStreamId,
   parseWriterId,
+  MAX_APPEND_FRAME_RECORDS,
   MAX_FRAME_PAYLOAD_BYTES,
   MAX_READ_FRAME_RECORDS,
   MAX_RECORD_PAYLOAD_BYTES,
@@ -988,7 +989,8 @@ describe("TsfWriter", () => {
     await Promise.all([...payloadCalls.slice(1), queuedPayload]);
 
     expect(socket.appendCount).toBe(
-      2 +
+      Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS) +
+        1 +
         Math.ceil(MAX_WRITER_IN_FLIGHT_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
         1,
     );
@@ -1171,11 +1173,15 @@ describe("TsfWriter", () => {
     await vi.waitFor(() =>
       expect(socket.pendingRecordCount).toBe(MAX_WRITER_IN_FLIGHT_RECORDS)
     );
-    expect(socket.appendCount).toBe(1);
+    expect(socket.appendCount).toBe(
+      Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS),
+    );
 
     socket.setAutoAck(true);
     await expect(submission).resolves.toHaveLength(MAX_WRITER_IN_FLIGHT_RECORDS + 1);
-    expect(socket.appendCount).toBe(2);
+    expect(socket.appendCount).toBe(
+      Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS) + 1,
+    );
     await writer.close();
   });
 

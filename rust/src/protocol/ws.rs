@@ -3,12 +3,12 @@
 /// Binary TSF v1 frames and their codec.
 pub mod frame;
 
-/// Maximum accounted payload bytes an official writer keeps sent but unacknowledged.
+/// Maximum accounted payload bytes an SDK durable writer keeps sent but unacknowledged.
 ///
 /// Empty payloads count as one byte.
 pub const MAX_WRITER_IN_FLIGHT_BYTES: usize = 5 * 1024 * 1024;
-/// Maximum physical records an official writer keeps sent but unacknowledged.
-pub const MAX_WRITER_IN_FLIGHT_RECORDS: usize = 128;
+/// Maximum physical records an SDK durable writer keeps sent but unacknowledged.
+pub const MAX_WRITER_IN_FLIGHT_RECORDS: usize = 1_024;
 
 use crate::{ClientWriterId, LinkSecret, StreamId};
 

@@ -66,7 +66,7 @@ Records are submitted as a non-empty `AppendBatch`. The writer assigns writer se
 
 An `AppendBatch` is one sequencing and ticket unit, not an atomic service append. The writer may split it across frames. A terminal failure may leave a durable prefix while its ticket returns an error.
 
-The writer queues submitted input and sends it through a fixed socket window of 128 records and 5 MiB. An `AppendBatch` may be larger than that window.
+The writer queues submitted input and sends it through a fixed socket window of 1,024 records and 5 MiB. An `AppendBatch` may be larger than that window.
 
 Await each `AppendTicket` when you need its durable sequence numbers. A terminal `AppendDurabilityUnknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Submitting that record under a new writer identity may duplicate it.
 

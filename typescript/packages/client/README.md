@@ -98,7 +98,7 @@ try {
 
 `appendLogical` splits data above the 512 KiB physical-record limit into contiguous parts.
 
-The writer queues submitted input and sends it through a fixed socket window of 128 records and 5 MiB. A submission may be larger than that window.
+The writer queues submitted input and sends it through a fixed socket window of 1,024 records and 5 MiB. A submission may be larger than that window.
 
 ```ts
 const writer = await client.connectWriter({

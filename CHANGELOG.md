@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Changed
 
 - [**breaking**] keep transcript cardinality guards internal and expose only the reassembly-byte limit
-- [**breaking**] replace configurable writer retention and submission limits with one fixed 128-record and 5 MiB sent-but-unacknowledged window
+- [**breaking**] replace configurable writer retention and submission limits with one fixed 1,024-record and 5 MiB sent-but-unacknowledged window
 - [**breaking**] simplify the Rust writer to immediate queued submission with durability tickets
 - [**breaking**] remove the CLI logical-record write limit and keep only the read-side reassembly safety bound
 
