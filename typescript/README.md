@@ -22,3 +22,5 @@ pnpm check
 `pnpm test:packages` packs both packages, installs the tarballs into a temporary consumer, type-checks Node.js and browser consumers, and runs Node.js and Chromium smoke tests.
 
 `pnpm test:fixtures` requires the Rust and TypeScript fixture copies to remain byte-identical.
+
+See [TypeScript releases](RELEASING.md) before changing a published package.

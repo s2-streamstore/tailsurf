@@ -1,37 +1,36 @@
-name: Publish npm package
+name: TypeScript releases
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "typescript/**"
+      - ".github/workflows/publish-npm.yml"
   workflow_dispatch:
-    inputs:
-      package:
-        description: Package to publish
-        required: true
-        type: choice
-        options:
-          - protocol
-          - client
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 concurrency:
-  group: publish-npm-${{ inputs.package }}
+  group: typescript-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish @tailsurf/${{ inputs.package }}
-    if: github.repository == 's2-streamstore/tailsurf'
+  select-mode:
+    name: Plan TypeScript SDK release
+    if: github.repository == 's2-streamstore/tailsurf' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    environment: npm
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.changesets.outputs.mode }}
     defaults:
       run:
         working-directory: typescript
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
@@ -39,38 +38,79 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: typescript/.node-version
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - name: Require main
-        run: |
-          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-            echo "npm packages must be published from main." >&2
-            exit 1
-          fi
+      - run: pnpm install --frozen-lockfile --strict-peer-dependencies
+      - name: Select release mode
+        id: changesets
+        uses: changesets/action/select-mode@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
+        with:
+          cwd: typescript
+
+  version:
+    name: Prepare TypeScript SDK release PR
+    if: needs.select-mode.outputs.mode == 'version'
+    needs: select-mode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: typescript/.node-version
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile --strict-peer-dependencies
+      - name: Create or update release pull request
+        uses: changesets/action/version@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
+        with:
+          cwd: typescript
+          script: pnpm release:version
+          commit-message: "chore: version TypeScript SDK packages"
+          pr-title: "chore: release TypeScript SDK packages"
+
+  publish:
+    name: Publish TypeScript SDK packages
+    if: needs.select-mode.outputs.mode == 'publish'
+    needs: select-mode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: typescript/.node-version
+          package-manager-cache: false
       - run: pnpm install --frozen-lockfile --strict-peer-dependencies
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm check
-      - name: Pack package
-        id: package
-        env:
-          PACKAGE_INPUT: ${{ inputs.package }}
-        run: |
-          package_name="@tailsurf/$PACKAGE_INPUT"
-          package_version="$(node -p "require('./packages/$PACKAGE_INPUT/package.json').version")"
-          if npm view "$package_name@$package_version" version >/dev/null 2>&1; then
-            echo "$package_name@$package_version is already published." >&2
-            exit 1
-          fi
-          if [[ "$PACKAGE_INPUT" == "client" ]]; then
-            protocol_version="$(node -p "require('./packages/protocol/package.json').version")"
-            npm view "@tailsurf/protocol@$protocol_version" version >/dev/null
-          fi
-          pnpm --filter "$package_name" pack --pack-destination "$RUNNER_TEMP"
-          tarball_name="${package_name#@}"
-          tarball_name="${tarball_name//\//-}-$package_version.tgz"
-          echo "tarball=$RUNNER_TEMP/$tarball_name" >> "$GITHUB_OUTPUT"
-      - name: Publish package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          TARBALL: ${{ steps.package.outputs.tarball }}
-        run: npm publish "$TARBALL" --access public
+      - name: Publish packages
+        uses: changesets/action/publish@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
+        with:
+          cwd: typescript
+          script: pnpm release:publish
+          create-github-releases: true
+          push-git-tags: true

@@ -4,8 +4,7 @@ The repository root is a virtual Cargo workspace. The CLI is the default workspa
 
 - `cli`: CLI package and integration tests.
 - `rust`: Rust SDK and common crate with API types, stream URL parsing, permissions, IDs, and binary frame encoding.
-- `typescript/packages/client`: Supported high-level TypeScript API for browsers and Node.js.
-- `typescript/packages/protocol`: Low-level TypeScript schemas, codecs, primitives, and fixtures.
+- `typescript`: TypeScript workspace containing the high-level client and low-level protocol packages.
 
 Language-neutral TSF v1 frame vectors live in both protocol packages. Forward-compatible REST and SSE examples do too. `typescript/scripts/verify-fixtures.mjs` requires the Rust and TypeScript copies to remain byte-identical.
 
@@ -42,13 +41,4 @@ scripts/verify-packages.sh
 
 The package verifier builds the exact SDK and CLI archives that would be published. It extracts both archives, patches the CLI registry dependency to the packaged SDK, and checks every packaged target.
 
-Run the TypeScript checks:
-
-```sh
-cd typescript
-pnpm install --frozen-lockfile --strict-peer-dependencies
-pnpm exec playwright install chromium
-pnpm check
-```
-
-The TypeScript package verifier builds the exact npm tarballs, installs them in a temporary consumer, type-checks Node.js and browser consumers, and runs Node.js and Chromium smoke tests.
+The TypeScript workspace has its own checks and package tests. See [TypeScript SDK development](../typescript/README.md#development).

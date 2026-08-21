@@ -1,8 +1,8 @@
-# Release operations
+# Rust and CLI release operations
 
-The Rust SDK and CLI share one version. The TypeScript packages use independent versions.
+The Rust SDK and CLI share one version. See [TypeScript releases](../typescript/RELEASING.md) for the independently versioned npm packages.
 
-## Release flow
+## Rust and CLI release flow
 
 Release-plz opens or updates a Rust SDK and CLI release PR after relevant changes reach `main`. Pushes that only change `typescript/` do not run Release-plz. It derives the next workspace version from conventional commits and checks SDK API compatibility.
 
@@ -16,25 +16,13 @@ The installer routes on `tail.surf` redirect to the latest public GitHub release
 
 Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamstore/tailsurf` repository, the `release-plz.yml` workflow, and the `crates-io` GitHub environment.
 
-## TypeScript releases
-
-`@tailsurf/protocol` and `@tailsurf/client` are released independently from their package manifests. Publish the protocol before a client version that depends on it.
-
-Change the selected package version in its `package.json`. Run `pnpm check` from `typescript`. Merge the change to `main`, then dispatch `publish-npm.yml` for that package.
-
-The workflow rejects versions already present on npm. It packs and tests both packages before publishing the selected tarball from the `npm` GitHub environment.
-
-Each npm package trusts `publish-npm.yml` in `s2-streamstore/tailsurf` with the `npm` environment. Trusted publishing uses GitHub OIDC and creates provenance. A new package name can use the optional `NPM_TOKEN` environment secret for its first publication. Delete that secret after the trusted publisher is configured.
-
-Published npm versions are immutable. Fix a bad release with a new version. Deprecate the bad version on npm when consumers should not select it.
-
 ## Protocol and service upgrades
 
 Public protocol changes start in this repository. Update the Rust and TypeScript implementations and both fixture copies in one pull request.
 
 Additive response fields can ship in the service first when every released client ignores them. Request changes, frame changes, and stricter validation require compatible client releases before the service uses them.
 
-Publish `@tailsurf/protocol` first. Publish `@tailsurf/client` when its supported protocol range or behavior changes. Publish the Rust SDK and CLI through the Rust release flow when they change.
+The TypeScript release workflow publishes `@tailsurf/protocol` before `@tailsurf/client` when both change. Publish the Rust SDK and CLI through the Rust release flow when they change.
 
 After the required client versions are public, update `tailsurf-web` to exact released versions and run its full check, cross-client test, and browser suite. Deploy the service only after those checks pass.
 
@@ -58,9 +46,9 @@ macOS executables use Developer ID signing with hardened runtime and Apple notar
 
 Windows executables are unsigned. Linux and Windows artifacts rely on SHA-256 checksums and GitHub attestations.
 
-## Release environments
+## Rust and CLI release environments
 
-Release workflows use two GitHub environments.
+Rust and CLI releases use two GitHub environments.
 
 The `crates-io` environment identifies trusted-publisher jobs. Both crates.io trusted-publisher configurations name this environment exactly.
 
@@ -68,15 +56,17 @@ The `release` environment identifies binary build, signing, notarization, and ho
 
 Both environments accept deployments only from `main`. Both require approval from `shikhar`. Self-approval is allowed because the repository has one maintainer. Administrators cannot bypass approval.
 
+## Repository release controls
+
 Pull requests run the `Rust SDK and CLI (stable)`, `TypeScript SDK (Node and browser)`, `Rust SDK and CLI (MSRV 1.95)`, `Validate conventional PR title`, and `Plan Rust binary release` checks.
 
 The default branch accepts only squash merges from pull requests. Review threads must be resolved. Force pushes and deletion are blocked.
 
 Release tags matching `v*` cannot be rewritten or deleted.
 
-GitHub Actions may use GitHub-owned actions and an explicit third-party repository allowlist. The allowlist includes the transitive actions required by Release-plz. Every action must use a full commit SHA. The default workflow token is read-only and cannot approve pull requests.
+GitHub Actions may use GitHub-owned actions and an explicit third-party repository allowlist. The allowlist includes the actions required by Release-plz and Changesets. Every action must use a full commit SHA. The default workflow token is read-only and cannot approve pull requests.
 
-## Required release secrets
+## Required Rust binary release secrets
 
 Repository Actions secrets store these macOS signing credentials:
 
@@ -94,7 +84,7 @@ The reusable notarization workflow receives its three credentials through an exp
 
 The environments store no duplicate secrets. Their approval rules gate the jobs that consume repository credentials.
 
-## Validate without publishing
+## Validate Rust binaries without publishing
 
 Send a repository dispatch with the `dry-run` payload:
 
