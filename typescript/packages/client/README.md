@@ -124,7 +124,7 @@ Transient REST failures, initial connections, and readers use `boundedOperationA
 
 The client uses global `fetch`, `crypto`, and `WebSocket` implementations. Override `fetch` or `webSocketFactory` for tests and custom runtimes.
 
-Common IDs, permissions, stream-link helpers, record types, and transcript reconstruction are re-exported from this package. Use `@tailsurf/protocol` directly for raw frame codecs, wire schemas, or compatibility fixtures.
+Common IDs, permissions, stream-link helpers, record types, and transcript reconstruction are re-exported from this package. Use `@tailsurf/protocol` directly for raw frame codecs, wire schemas, or conformance fixtures.
 
 ## License
 
