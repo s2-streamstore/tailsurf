@@ -94,7 +94,7 @@ try {
 
 `appendBatch` is one sequencing and Promise unit. It may span several protocol frames. It is not an atomic service append. A terminal failure can leave a durable prefix even when the Promise rejects.
 
-`writer_durability_unknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Do not submit that record under a new writer identity.
+`writer_durability_unknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Submitting that record under a new writer identity may duplicate it.
 
 `appendLogical` splits data above the 512 KiB physical-record limit into contiguous parts.
 

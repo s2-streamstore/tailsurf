@@ -68,7 +68,7 @@ An `AppendBatch` is one sequencing and ticket unit, not an atomic service append
 
 The writer queues submitted input and sends it through a fixed socket window of 128 records and 5 MiB. An `AppendBatch` may be larger than that window.
 
-Await each `AppendTicket` when you need its durable sequence numbers. A terminal `AppendDurabilityUnknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Do not submit that record under a new writer identity.
+Await each `AppendTicket` when you need its durable sequence numbers. A terminal `AppendDurabilityUnknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Submitting that record under a new writer identity may duplicate it.
 
 ```rust,no_run
 use tailsurf::{AppendBatch, DurableWriterOptions, LinkSecret, RecordFormat, StreamId, TsfClient};
