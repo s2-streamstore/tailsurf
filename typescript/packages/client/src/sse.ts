@@ -30,7 +30,12 @@ import {
   type ReadOptions,
   type TsfReadSession,
 } from "./reader.js";
-import { isRetryableHttpStatus, jitteredBackoffMs } from "./retry.js";
+import {
+  INITIAL_RETRY_BACKOFF_MS,
+  isRetryableHttpStatus,
+  jitteredBackoffMs,
+  MAX_RETRY_BACKOFF_MS,
+} from "./retry.js";
 import { sleep, withTimeout } from "./socket.js";
 
 const API_PREFIX = "/api/v1";
@@ -41,12 +46,8 @@ const textEncoder = new TextEncoder();
 interface SseConnectOptions {
   readonly fetch: typeof globalThis.fetch;
   readonly apiOrigin: string;
-  readonly restRequestTimeoutMs: number;
-  readonly retryPolicy: {
-    readonly maxAttempts: number;
-    readonly initialBackoffMs: number;
-    readonly maxBackoffMs: number;
-  };
+  readonly httpRequestTimeoutMs: number;
+  readonly boundedOperationAttempts: number;
 }
 
 interface SseConnection {
@@ -154,7 +155,7 @@ class SseReadSession extends BaseTsfReadSession {
         this.#noProgressReconnects += 1;
         if (
           this.#noProgressReconnects >=
-            this.connectionOptions.retryPolicy.maxAttempts
+            this.connectionOptions.boundedOperationAttempts
         ) {
           throw new TsfClientError(
             "read_reconnect_limit_exceeded",
@@ -232,7 +233,7 @@ async function openConnection(
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason);
   signal?.addEventListener("abort", abort, { once: true });
-  const timeoutMs = connectionOptions.restRequestTimeoutMs;
+  const timeoutMs = connectionOptions.httpRequestTimeoutMs;
   const timeoutError = new TsfClientError(
     "http_timeout",
     `SSE handshake timed out after ${timeoutMs}ms`,
@@ -330,9 +331,8 @@ async function openConnectionWithRetry(
   lastEventId?: string,
   delayBeforeFirst = false,
 ): Promise<SseConnection | undefined> {
-  const maximumAttempts = connectionOptions.retryPolicy.maxAttempts;
-  let reconnectDelay = connectionOptions.retryPolicy.initialBackoffMs;
-  const maximumDelay = connectionOptions.retryPolicy.maxBackoffMs;
+  const maximumAttempts = connectionOptions.boundedOperationAttempts;
+  let reconnectDelay = INITIAL_RETRY_BACKOFF_MS;
   let retryAfterMs: number | undefined;
   for (let attempt = 0; ; attempt += 1) {
     if (delayBeforeFirst || attempt > 0) {
@@ -341,7 +341,7 @@ async function openConnectionWithRetry(
         signal,
       );
       retryAfterMs = undefined;
-      reconnectDelay = Math.min(maximumDelay, Math.max(1, reconnectDelay * 2));
+      reconnectDelay = Math.min(MAX_RETRY_BACKOFF_MS, reconnectDelay * 2);
     }
     try {
       return await openConnection(request, connectionOptions, signal, lastEventId);
@@ -350,7 +350,7 @@ async function openConnectionWithRetry(
         throw error;
       }
       if (error instanceof TsfHttpError && error.retryAfterMs !== undefined) {
-        retryAfterMs = Math.min(error.retryAfterMs, maximumDelay);
+        retryAfterMs = Math.min(error.retryAfterMs, MAX_RETRY_BACKOFF_MS);
       }
       if (attempt + 1 >= maximumAttempts) {
         throw error;

@@ -26,15 +26,13 @@ export type {
   IdempotencyOptions,
   PreparedCreateStreamRequest,
   ReadAuthOptions,
-  RetryPolicy,
-  RestClientOptions,
   StatelessAppendRecord,
   StatelessAppendRequest,
   UpdateStreamInput,
   WriteAuthOptions,
 } from "./rest.js";
 export { TsfClient } from "./websocket.js";
-export type { TsfClientOptions, WriteStreamOptions } from "./websocket.js";
+export type { DurableWriterOptions, TsfClientOptions } from "./websocket.js";
 export type {
   ReadStart,
   ReadStop,
@@ -43,10 +41,6 @@ export type {
 } from "./reader.js";
 export { isRetryableSocketError } from "./socket.js";
 export type { WebSocketFactory, WebSocketLike } from "./socket.js";
-export {
-  MAX_WRITER_IN_FLIGHT_BYTES,
-  MAX_WRITER_IN_FLIGHT_RECORDS,
-} from "./writer.js";
 export type {
   AppendInput,
   AppendReceipt,
@@ -58,12 +52,11 @@ export {
   LINK_SECRET_BYTES,
   LINK_SECRET_ENCODED_LENGTH,
   LogicalTranscript,
-  MAX_APPEND_FRAME_RECORDS,
-  MAX_ENCODED_FRAME_BYTES,
-  MAX_FRAME_PAYLOAD_BYTES,
+  MAX_INITIAL_STREAM_LINKS,
   MAX_PART_INDEX,
-  MAX_READ_FRAME_RECORDS,
   MAX_RECORD_PAYLOAD_BYTES,
+  MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES,
+  MAX_WRITER_IN_FLIGHT_RECORDS,
   MAX_STREAM_TITLE_CODE_POINTS,
   ProtocolError,
   RecordFormat,

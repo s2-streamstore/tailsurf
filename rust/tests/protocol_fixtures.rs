@@ -6,11 +6,15 @@ use tailsurf::{
     ClientWriterId, WriterId,
     protocol::{
         rest::{StreamMetadata, Visibility},
-        ws::frame::{
-            AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_FRAME_RECORDS,
-            MAX_ENCODED_FRAME_BYTES, MAX_FRAME_PAYLOAD_BYTES, MAX_READ_FRAME_RECORDS,
-            MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, PartHeader, ReadBatch, RecordFormat,
-            ServerFrame, TSF_WEBSOCKET_PROTOCOL,
+        ws::{
+            MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
+            WEBSOCKET_HEARTBEAT_INTERVAL_MS,
+            frame::{
+                AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_FRAME_RECORDS,
+                MAX_ENCODED_FRAME_BYTES, MAX_FRAME_PAYLOAD_BYTES, MAX_READ_FRAME_RECORDS,
+                MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, PartHeader, ReadBatch, RecordFormat,
+                ServerFrame, TSF_WEBSOCKET_PROTOCOL,
+            },
         },
     },
 };
@@ -20,11 +24,14 @@ const FIXTURES_JSON: &str = include_str!("../fixtures/v1.json");
 #[derive(Deserialize)]
 struct Fixtures {
     websocket_protocol: String,
+    websocket_heartbeat_interval_ms: u64,
     max_record_payload_bytes: usize,
     max_append_frame_records: usize,
     max_read_frame_records: usize,
     max_frame_payload_bytes: usize,
     max_encoded_frame_bytes: usize,
+    max_writer_in_flight_records: usize,
+    max_writer_in_flight_payload_bytes: usize,
     client_frames: Vec<FrameFixture<ClientFixture>>,
     server_frames: Vec<FrameFixture<ServerFixture>>,
 }
@@ -93,11 +100,23 @@ fn protocol_constants_match_v1_fixtures() {
     let fixtures = fixtures();
 
     assert_eq!(fixtures.websocket_protocol, TSF_WEBSOCKET_PROTOCOL);
+    assert_eq!(
+        fixtures.websocket_heartbeat_interval_ms,
+        WEBSOCKET_HEARTBEAT_INTERVAL_MS
+    );
     assert_eq!(fixtures.max_record_payload_bytes, MAX_RECORD_PAYLOAD_BYTES);
     assert_eq!(fixtures.max_append_frame_records, MAX_APPEND_FRAME_RECORDS);
     assert_eq!(fixtures.max_read_frame_records, MAX_READ_FRAME_RECORDS);
     assert_eq!(fixtures.max_frame_payload_bytes, MAX_FRAME_PAYLOAD_BYTES);
     assert_eq!(fixtures.max_encoded_frame_bytes, MAX_ENCODED_FRAME_BYTES);
+    assert_eq!(
+        fixtures.max_writer_in_flight_records,
+        MAX_WRITER_IN_FLIGHT_RECORDS
+    );
+    assert_eq!(
+        fixtures.max_writer_in_flight_payload_bytes,
+        MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES
+    );
 }
 
 #[test]

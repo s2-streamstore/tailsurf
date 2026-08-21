@@ -4,6 +4,7 @@ import {
   MAX_U64,
   parseLinkSecret,
   TSF_WEBSOCKET_PROTOCOL,
+  WEBSOCKET_HEARTBEAT_INTERVAL_MS,
   type ClientFrame,
   type ServerFrame,
   type StreamId,
@@ -14,13 +15,19 @@ import {
   TsfClientError,
   TsfWebSocketClosedError,
 } from "./errors.js";
-import { jitteredBackoffMs } from "./retry.js";
+import {
+  INITIAL_RETRY_BACKOFF_MS,
+  jitteredBackoffMs,
+  MAX_RETRY_BACKOFF_MS,
+} from "./retry.js";
 
 export const NORMAL_CLOSE_CODE = 1000;
 const CONNECTING_READY_STATE = 0;
 const OPEN_READY_STATE = 1;
 const DEFAULT_MAX_RECEIVE_QUEUE_UNITS = 1_024;
 const DEFAULT_MAX_RECEIVE_QUEUE_BYTES = 16 * 1024 * 1024;
+export const WEBSOCKET_READ_IDLE_TIMEOUT_MS =
+  WEBSOCKET_HEARTBEAT_INTERVAL_MS * 3;
 const RETRYABLE_CLOSE_CODES = new Set([
   NORMAL_CLOSE_CODE,
   1001,
@@ -49,7 +56,7 @@ export type WebSocketFactory = (
   protocol: string,
 ) => WebSocketLike;
 
-export interface ReceiveQueueLimits {
+interface ReceiveQueueLimits {
   /** Maximum queued physical records. A control frame consumes one unit. */
   readonly maxUnits: number;
   /** Maximum estimated encoded bytes across queued server frames. */
@@ -65,11 +72,8 @@ interface QueuedServerFrame {
 export interface SocketPolicy {
   readonly webSocketFactory: WebSocketFactory;
   readonly webSocketConnectTimeoutMs: number;
-  readonly webSocketOperationTimeoutMs: number;
-  readonly webSocketReadIdleTimeoutMs: number | null;
-  readonly maxAttempts: number;
-  readonly initialBackoffMs: number;
-  readonly maxBackoffMs: number;
+  readonly webSocketProgressTimeoutMs: number;
+  readonly boundedOperationAttempts: number;
 }
 
 export async function connectSocket(
@@ -325,7 +329,7 @@ export async function reconnectSocket(
   delayMs: number,
   initialError: unknown,
   signal?: AbortSignal,
-  attemptLimit = policy.maxAttempts,
+  attemptLimit = policy.boundedOperationAttempts,
 ): Promise<{
   readonly socket: FrameSocket;
   readonly attempts: number;
@@ -337,7 +341,7 @@ export async function reconnectSocket(
   while (attempts + 1 < attemptLimit) {
     attempts += 1;
     await sleep(jitteredBackoffMs(nextDelayMs), signal);
-    nextDelayMs = Math.min(nextDelayMs * 2, policy.maxBackoffMs);
+    nextDelayMs = Math.min(nextDelayMs * 2, MAX_RETRY_BACKOFF_MS);
     try {
       const socket = await connect();
       if (signal?.aborted) {
@@ -379,7 +383,7 @@ export async function connectInitialSocket(
         connect,
         policy,
         0,
-        policy.initialBackoffMs,
+        INITIAL_RETRY_BACKOFF_MS,
         error,
         signal,
       )

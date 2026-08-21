@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-/// REST, SSE, and WebSocket clients, retry policy, and durable writer types.
+/// REST, SSE, and WebSocket clients and durable writer types.
 pub mod client;
 /// Stream and link IDs, link secrets, and writer identities.
 pub mod ids;
@@ -17,8 +17,7 @@ pub mod transcript;
 
 pub use client::{
     AppendAck, AppendReceipt, AppendTicket, DurableWriterOptions, IdempotencyKey,
-    InvalidIdempotencyKey, ListLinksOptions, MAX_WRITER_IN_FLIGHT_BYTES,
-    MAX_WRITER_IN_FLIGHT_RECORDS, RetryPolicy, TsfClient, TsfClientConfig, TsfClientError,
+    InvalidIdempotencyKey, ListLinksOptions, TsfClient, TsfClientConfig, TsfClientError,
     TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, default_api_origin,
 };
 pub use ids::{
@@ -30,11 +29,11 @@ pub use protocol::{
     read::{ReadOptions, ReadStart, ReadStop},
     rest::{
         AppendRange, CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
-        ListLinksResponse, StreamLinkCredential, StreamLinkSummary, StreamMetadata,
-        UpdateStreamRequest, Visibility,
+        ListLinksResponse, MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamLinkSummary,
+        StreamMetadata, UpdateStreamRequest, Visibility,
     },
     ws::{
-        WriteStreamOptions,
+        MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteSessionOptions,
         frame::{
             AppendBatch, AppendRecord, CaughtUpPosition, IntoRecordData, OwnedReadRecord,
             PartHeader, ReadBatch, ReadRecord, RecordFormat, RecordPayload,

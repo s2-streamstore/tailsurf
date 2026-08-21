@@ -28,8 +28,8 @@ use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
     AppendBatch, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret,
-    MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, RetryPolicy, StreamId, StreamTitle, TsfClient,
-    TsfClientConfig, TsfClientError, WriterId,
+    MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, StreamId, StreamTitle, TsfClient, TsfClientConfig,
+    TsfClientError, WriterId,
     protocol::{
         read::{ReadOptions, ReadStart, ReadStop},
         rest::{
@@ -852,11 +852,7 @@ async fn durable_writer_recovery_outlives_the_bounded_operation_retry_count() {
         .parse::<StreamId>()
         .expect("stream id");
     let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
-    config.retry_policy = RetryPolicy {
-        max_attempts: 1,
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
+    config.bounded_operation_attempts = 1;
     let writer = TsfClient::with_config(config)
         .expect("valid client config")
         .connect_writer(tailsurf::DurableWriterOptions::new(
@@ -1217,12 +1213,7 @@ async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
         .parse::<StreamId>()
         .expect("stream id");
     let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
-    config.websocket_operation_timeout = Duration::from_millis(100);
-    config.retry_policy = RetryPolicy {
-        max_attempts: 100,
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
+    config.websocket_progress_timeout = Duration::from_millis(100);
     let writer = TsfClient::with_config(config)
         .expect("valid client config")
         .connect_writer(tailsurf::DurableWriterOptions::new(
@@ -1270,12 +1261,7 @@ async fn writer_reconnect_arms_a_fresh_acknowledgement_deadline() {
         .parse::<StreamId>()
         .expect("stream id");
     let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
-    config.websocket_operation_timeout = Duration::from_millis(200);
-    config.retry_policy = RetryPolicy {
-        max_attempts: 10,
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
+    config.websocket_progress_timeout = Duration::from_millis(200);
     let writer = TsfClient::with_config(config)
         .expect("valid client config")
         .connect_writer(tailsurf::DurableWriterOptions::new(
@@ -1538,11 +1524,7 @@ async fn reader_restarts_retries_after_established_idle_connections() {
         .parse::<StreamId>()
         .expect("stream id");
     let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
-    config.retry_policy = RetryPolicy {
-        max_attempts: 2,
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
+    config.bounded_operation_attempts = 2;
     let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
@@ -1567,11 +1549,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
         .parse::<StreamId>()
         .expect("stream id");
     let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
-    config.retry_policy = RetryPolicy {
-        max_attempts: 100,
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
+    config.bounded_operation_attempts = 100;
     let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::SeqNum(0));
@@ -1579,7 +1557,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
 
     let error = timeout(
         Duration::from_secs(1),
-        reader.next_batch_with_timeout(Duration::from_millis(100)),
+        reader.next_batch_with_timeout(Duration::from_millis(500)),
     )
     .await
     .expect("absolute read deadline")
@@ -1624,36 +1602,6 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
     let record = batch.first();
     assert_eq!(record.seq_num, 5);
     assert_eq!(record.data, b"stable\n");
-    assert_eq!(server.read_attempts().len(), 2);
-}
-
-#[tokio::test]
-async fn reader_reconnects_after_configured_idle_timeout() {
-    let server = FakeReadServer::start(FakeReadMode::SilentThenRecord).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
-    config.websocket_read_idle_timeout = Some(Duration::from_millis(50));
-    config.retry_policy = RetryPolicy {
-        max_attempts: 3,
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
-    let client = TsfClient::with_config(config).expect("valid client config");
-    let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
-    request.start = Some(ReadStart::SeqNum(0));
-    let mut reader = client.connect_reader(request).await.expect("reader");
-
-    let batch = timeout(Duration::from_secs(2), reader.next_batch())
-        .await
-        .expect("idle reconnect")
-        .expect("read batch")
-        .expect("batch");
-    let record = batch.first();
-
-    assert_eq!(record.seq_num, 0);
-    assert_eq!(record.data, b"after idle\n");
     assert_eq!(server.read_attempts().len(), 2);
 }
 
@@ -3748,7 +3696,6 @@ enum FakeReadMode {
     ReconnectBeforeFirstDefault,
     ReconnectTwiceThenRecord,
     SlowReconnectForever,
-    SilentThenRecord,
     ReplayBinary,
     ReplaySplitRecord,
 }
@@ -3927,13 +3874,6 @@ async fn fake_read_flow(
         FakeReadMode::SlowReconnectForever => {
             sleep(Duration::from_millis(40)).await;
             close_retryable_read(&mut socket).await;
-        }
-        FakeReadMode::SilentThenRecord => {
-            if attempt_count == 1 {
-                sleep(Duration::from_secs(5)).await;
-            } else {
-                send_read_record(&mut socket, 0, 0, b"after idle\n").await;
-            }
         }
         FakeReadMode::ReplayBinary => {
             send_read_record_with_format(

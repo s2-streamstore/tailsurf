@@ -1,6 +1,8 @@
 import { TsfClientError } from "./errors.js";
 
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+export const INITIAL_RETRY_BACKOFF_MS = 200;
+export const MAX_RETRY_BACKOFF_MS = 2_000;
 
 export function integerOption(
   value: number,
@@ -22,7 +24,7 @@ export function jitteredBackoffMs(backoffMs: number): number {
     return 0;
   }
   return Math.min(
-    MAX_TIMER_DELAY_MS,
+    MAX_RETRY_BACKOFF_MS,
     Math.floor(backoffMs * (0.5 + Math.random())),
   );
 }
