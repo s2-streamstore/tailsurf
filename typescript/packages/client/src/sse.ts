@@ -14,7 +14,7 @@ import {
   type CaughtUpPosition,
   type ReadRecord,
   type SseResumeCursor,
-} from "@s2-dev/tailsurf-protocol";
+} from "@tailsurf/protocol";
 
 import {
   httpStatusError,

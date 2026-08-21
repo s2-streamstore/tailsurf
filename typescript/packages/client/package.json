@@ -1,5 +1,5 @@
 {
-  "name": "@s2-dev/tailsurf-client",
+  "name": "@tailsurf/client",
   "version": "0.1.0",
   "description": "TypeScript client for tail.surf live transcript streams",
   "type": "module",
@@ -46,6 +46,6 @@
     "provenance": true
   },
   "dependencies": {
-    "@s2-dev/tailsurf-protocol": "workspace:^"
+    "@tailsurf/protocol": "workspace:^"
   }
 }

@@ -7,7 +7,7 @@ import {
   RecordFormat,
   UNSPLIT_PART,
   type PartHeader,
-} from "@s2-dev/tailsurf-protocol";
+} from "@tailsurf/protocol";
 
 import { TsfClientError, TsfWebSocketClosedError } from "./errors.js";
 import {

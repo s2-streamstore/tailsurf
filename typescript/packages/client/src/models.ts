@@ -9,7 +9,7 @@ import type {
   StreamLinkSummary as WireStreamLinkSummary,
   StreamTitle,
   Visibility,
-} from "@s2-dev/tailsurf-protocol";
+} from "@tailsurf/protocol";
 
 export interface StreamMetadata {
   readonly streamId: StreamId;
