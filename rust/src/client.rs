@@ -24,7 +24,7 @@ use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
 use tokio::{
     net::TcpStream,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     task::{JoinHandle, yield_now},
     time::{Instant, sleep, timeout, timeout_at},
 };
@@ -578,27 +578,14 @@ impl TsfClient {
         validate_append_range(range, records.len())
     }
 
-    /// Connects the standard bounded-memory, reconnecting durable writer.
+    /// Connects the reconnecting durable writer.
     ///
-    /// The default retained backlog matches the server's per-socket in-flight window
-    /// ([`MAX_WRITER_IN_FLIGHT_BYTES`] / [`MAX_WRITER_IN_FLIGHT_RECORDS`]), so a submitted
-    /// batch larger than 5 MiB is rejected at submission. Use [`Self::connect_writer_with_config`]
-    /// with a backlog sized to the largest submitted batch for bigger logical records.
+    /// Submitted records are queued in memory. The writer sends them through the fixed
+    /// [`MAX_WRITER_IN_FLIGHT_BYTES`] and [`MAX_WRITER_IN_FLIGHT_RECORDS`] socket window.
     pub async fn connect_writer(
         &self,
         options: DurableWriterOptions,
     ) -> Result<TsfWriter, TsfClientError> {
-        self.connect_writer_with_config(options, TsfWriterConfig::default())
-            .await
-    }
-
-    /// Connects a durable writer with explicit retained-backlog bounds.
-    pub async fn connect_writer_with_config(
-        &self,
-        options: DurableWriterOptions,
-        config: TsfWriterConfig,
-    ) -> Result<TsfWriter, TsfClientError> {
-        let config = config.validate()?;
         let mut session_options = WriteStreamOptions::new(
             options.stream_id,
             ClientWriterId::new_random(),
@@ -607,12 +594,7 @@ impl TsfClient {
         session_options.expected_next_seq_num = options.expected_next_seq_num;
         let session = self.open_write_session(&session_options).await?;
         session_options.expected_next_seq_num = None;
-        Ok(TsfWriter::new(
-            self.clone(),
-            session_options,
-            session,
-            config,
-        ))
+        Ok(TsfWriter::new(self.clone(), session_options, session))
     }
 
     /// Connects a low-level write session that sends records and receives ack ranges directly.
@@ -997,17 +979,11 @@ pub struct TsfWriteSession {
 
 /// Maximum accounted bytes that one writer socket may keep in flight.
 ///
-/// Empty payloads count as one byte. [`TsfWriter`] paces sends to stay within this server-enforced
-/// bound regardless of the configured retained backlog.
+/// Empty payloads count as one byte. [`TsfWriter`] paces sends to stay within this
+/// server-enforced bound.
 pub const MAX_WRITER_IN_FLIGHT_BYTES: usize = 5 * 1024 * 1024;
 /// Maximum physical records that one writer socket may keep in flight.
-///
-/// This is a server-enforced bound independent of the configured retained backlog.
 pub const MAX_WRITER_IN_FLIGHT_RECORDS: usize = 128;
-/// Default maximum accounted bytes retained until durability acknowledgement.
-pub const DEFAULT_MAX_WRITER_RETAINED_BYTES: usize = MAX_WRITER_IN_FLIGHT_BYTES;
-/// Default maximum physical records retained until durability acknowledgement.
-pub const DEFAULT_MAX_WRITER_RETAINED_RECORDS: usize = MAX_WRITER_IN_FLIGHT_RECORDS;
 
 /// Stream, credentials, and sequence precondition for one durable [`TsfWriter`].
 ///
@@ -1040,50 +1016,6 @@ impl DurableWriterOptions {
     pub fn with_expected_next_seq_num(mut self, expected_next_seq_num: u64) -> Self {
         self.expected_next_seq_num = Some(expected_next_seq_num);
         self
-    }
-}
-
-/// Memory and concurrency bounds for [`TsfWriter`]'s retained backlog.
-///
-/// Every submitted batch is retained until durability acknowledgement, so a batch larger than
-/// these bounds can never be admitted and is rejected at submission; size the backlog at least to
-/// the largest submitted batch. Capacity is accounted per batch and released when the whole batch
-/// is acknowledged. The writer paces protocol frames within [`MAX_WRITER_IN_FLIGHT_BYTES`] and
-/// [`MAX_WRITER_IN_FLIGHT_RECORDS`] independently of this backlog.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TsfWriterConfig {
-    /// Maximum accounted bytes retained until durability acknowledgement.
-    ///
-    /// Empty payloads count as one byte.
-    pub max_retained_bytes: usize,
-    /// Maximum number of records retained until durability acknowledgement.
-    pub max_retained_records: usize,
-}
-
-impl TsfWriterConfig {
-    fn validate(self) -> Result<Self, TsfClientError> {
-        if self.max_retained_bytes == 0 || self.max_retained_bytes > Semaphore::MAX_PERMITS {
-            return Err(TsfClientError::InvalidWriterConfig(format!(
-                "max_retained_bytes must be between 1 and {}",
-                Semaphore::MAX_PERMITS
-            )));
-        }
-        if self.max_retained_records == 0 || self.max_retained_records > Semaphore::MAX_PERMITS {
-            return Err(TsfClientError::InvalidWriterConfig(format!(
-                "max_retained_records must be between 1 and {}",
-                Semaphore::MAX_PERMITS
-            )));
-        }
-        Ok(self)
-    }
-}
-
-impl Default for TsfWriterConfig {
-    fn default() -> Self {
-        Self {
-            max_retained_bytes: DEFAULT_MAX_WRITER_RETAINED_BYTES,
-            max_retained_records: DEFAULT_MAX_WRITER_RETAINED_RECORDS,
-        }
     }
 }
 
@@ -1188,25 +1120,20 @@ const WRITER_DONE: u8 = 2;
 
 /// State shared by the writer controller, producer handles, and the writer actor.
 struct WriterShared {
-    byte_permits: Arc<Semaphore>,
-    record_permits: Arc<Semaphore>,
     terminal_error: Arc<OnceLock<Arc<TsfClientError>>>,
-    config: TsfWriterConfig,
     state: AtomicU8,
-    /// Serializes a permit's open check plus command send against the close transition, making
-    /// that transition the single linearization point: a permit either enqueues its submission
+    /// Serializes a submission's open check plus command send against the close transition, making
+    /// that transition the single linearization point: a submission either enters the queue
     /// before the close command or observes the writer closed. Held only across synchronous
     /// sections, so the lock never crosses an await.
     submit_lock: RwLock<()>,
 }
 
 impl WriterShared {
-    /// Marks the writer finished and closes both backlog semaphores, waking producers blocked in a
-    /// reservation on every actor exit path, including abort before the task's first poll.
+    /// Marks the writer finished on every actor exit path, including abort before the task's first
+    /// poll.
     fn shutdown(&self) {
         self.state.store(WRITER_DONE, Ordering::SeqCst);
-        self.byte_permits.close();
-        self.record_permits.close();
     }
 
     fn is_open(&self) -> bool {
@@ -1236,60 +1163,32 @@ pub struct TsfProducer {
 impl fmt::Debug for TsfProducer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TsfProducer")
-            .field("config", &self.shared.config)
             .field("open", &self.shared.is_open())
             .finish()
     }
 }
 
 impl TsfProducer {
-    /// Waits for backlog capacity, submits the batch as one command, and returns its durability
-    /// ticket.
-    pub async fn submit(&self, batch: AppendBatch) -> Result<AppendTicket, TsfClientError> {
-        let permit = self.reserve(&batch).await?;
-        permit.submit(batch)
-    }
-
-    /// Reserves the batch's record slots and payload bytes in the retained backlog.
-    ///
-    /// The returned permit owns capacity until it is dropped or submitted.
-    pub async fn reserve(&self, batch: &AppendBatch) -> Result<WritePermit, TsfClientError> {
-        let records = batch.record_count();
-        let bytes = submission_retained_bytes(batch);
-        if records > self.shared.config.max_retained_records
-            || bytes > self.shared.config.max_retained_bytes
+    /// Queues the batch as one contiguous writer-sequence range and returns its durability ticket.
+    pub fn submit(&self, batch: AppendBatch) -> Result<AppendTicket, TsfClientError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let terminal_error = Arc::clone(&self.shared.terminal_error);
         {
-            return Err(TsfClientError::AppendBatchExceedsRetainedBacklog {
-                records,
-                bytes,
-                max_retained_records: self.shared.config.max_retained_records,
-                max_retained_bytes: self.shared.config.max_retained_bytes,
-            });
+            let _guard = self
+                .shared
+                .submit_lock
+                .read()
+                .expect("writer submit lock poisoned");
+            if !self.shared.is_open() {
+                return Err(self.closed_error());
+            }
+            self.cmd_tx
+                .send(WriterCommand::Submit { batch, ack_tx })
+                .map_err(|_| self.closed_error())?;
         }
-        if !self.shared.is_open() {
-            return Err(self.closed_error());
-        }
-
-        let shared = Arc::clone(&self.shared);
-        let record_permit = shared
-            .record_permits
-            .clone()
-            .acquire_many_owned(records as u32)
-            .await
-            .map_err(|_| self.closed_error())?;
-        let byte_permit = shared
-            .byte_permits
-            .clone()
-            .acquire_many_owned(bytes as u32)
-            .await
-            .map_err(|_| self.closed_error())?;
-        Ok(WritePermit {
-            cmd_tx: self.cmd_tx.clone(),
-            byte_permit,
-            record_permit,
-            shared,
-            reserved_records: records,
-            reserved_bytes: bytes,
+        Ok(AppendTicket {
+            rx: ack_rx,
+            terminal_error,
         })
     }
 
@@ -1301,20 +1200,12 @@ impl TsfProducer {
     }
 }
 
-/// The server's queued-payload bound counts every record as at least one byte.
-fn accounted_record_bytes(data: &Bytes) -> usize {
+/// The socket window counts every record as at least one byte.
+fn in_flight_record_bytes(data: &Bytes) -> usize {
     data.len().max(1)
 }
 
-fn submission_retained_bytes(batch: &AppendBatch) -> usize {
-    batch
-        .payloads()
-        .iter()
-        .map(|record| accounted_record_bytes(&record.data))
-        .sum()
-}
-
-/// Bounded durable writer that retains unacknowledged records and resends them across transient
+/// Durable writer that retains unacknowledged records and resends them across transient
 /// interruptions.
 ///
 /// This controller owns the writer task and is the only handle that can close the writer. Clone
@@ -1335,20 +1226,10 @@ impl fmt::Debug for TsfWriter {
 }
 
 impl TsfWriter {
-    fn new(
-        client: TsfClient,
-        options: WriteStreamOptions,
-        session: TsfWriteSession,
-        config: TsfWriterConfig,
-    ) -> Self {
-        // Submit commands remain bounded by the retained-record semaphore. The unbounded channel
-        // avoids a third, redundant capacity reservation and leaves room for the Close command.
+    fn new(client: TsfClient, options: WriteStreamOptions, session: TsfWriteSession) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(WriterShared {
-            byte_permits: Arc::new(Semaphore::new(config.max_retained_bytes)),
-            record_permits: Arc::new(Semaphore::new(config.max_retained_records)),
             terminal_error: Arc::new(OnceLock::new()),
-            config,
             state: AtomicU8::new(WRITER_OPEN),
             submit_lock: RwLock::new(()),
         });
@@ -1371,14 +1252,9 @@ impl TsfWriter {
         self.producer.clone()
     }
 
-    /// Waits for backlog capacity, submits the batch, and returns its durability ticket.
-    pub async fn submit(&self, batch: AppendBatch) -> Result<AppendTicket, TsfClientError> {
-        self.producer.submit(batch).await
-    }
-
-    /// Reserves the batch's backlog capacity; see [`TsfProducer::reserve`].
-    pub async fn reserve(&self, batch: &AppendBatch) -> Result<WritePermit, TsfClientError> {
-        self.producer.reserve(batch).await
+    /// Queues the batch and returns its durability ticket.
+    pub fn submit(&self, batch: AppendBatch) -> Result<AppendTicket, TsfClientError> {
+        self.producer.submit(batch)
     }
 
     /// Stops accepting records, waits for every pending durability acknowledgement, and joins the
@@ -1388,7 +1264,7 @@ impl TsfWriter {
     /// when the caller does not want to wait for the service. Dropping the close future also
     /// cancels recovery.
     pub async fn close(mut self) -> Result<(), TsfClientError> {
-        // The write guard waits out every in-flight permit submission, so any permit that still
+        // The write guard waits out every concurrent submission, so any producer that still
         // observes the writer open has already enqueued its command ahead of Close.
         {
             let _guard = self
@@ -1492,76 +1368,6 @@ impl Drop for TsfWriter {
     }
 }
 
-/// Owned capacity in a writer's record and byte backlogs.
-///
-/// Dropping an unused permit releases its capacity.
-pub struct WritePermit {
-    cmd_tx: mpsc::UnboundedSender<WriterCommand>,
-    byte_permit: OwnedSemaphorePermit,
-    record_permit: OwnedSemaphorePermit,
-    shared: Arc<WriterShared>,
-    reserved_records: usize,
-    reserved_bytes: usize,
-}
-
-impl WritePermit {
-    /// Submits a batch no larger than the reserved capacity without awaiting another backlog
-    /// slot. Reservation capacity beyond the batch's size is released immediately.
-    pub fn submit(mut self, batch: AppendBatch) -> Result<AppendTicket, TsfClientError> {
-        if let Some(error) = retained_terminal_error(&self.shared.terminal_error) {
-            return Err(error);
-        }
-        let records = batch.record_count();
-        let bytes = submission_retained_bytes(&batch);
-        if records > self.reserved_records || bytes > self.reserved_bytes {
-            return Err(TsfClientError::AppendBatchExceedsReservation {
-                records,
-                bytes,
-                reserved_records: self.reserved_records,
-                reserved_bytes: self.reserved_bytes,
-            });
-        }
-        if self.reserved_bytes > bytes {
-            // split leaves this permit holding exactly the batch's charge.
-            drop(self.byte_permit.split(self.reserved_bytes - bytes));
-        }
-        if self.reserved_records > records {
-            drop(self.record_permit.split(self.reserved_records - records));
-        }
-
-        let (ack_tx, ack_rx) = oneshot::channel();
-        let terminal_error = Arc::clone(&self.shared.terminal_error);
-        {
-            let _guard = self
-                .shared
-                .submit_lock
-                .read()
-                .expect("writer submit lock poisoned");
-            if !self.shared.is_open() {
-                return Err(terminal_writer_error(
-                    &self.shared.terminal_error,
-                    TsfClientError::AppendWriterClosed,
-                ));
-            }
-            self.cmd_tx
-                .send(WriterCommand::Submit {
-                    batch,
-                    ack_tx,
-                    byte_permit: self.byte_permit,
-                    record_permit: self.record_permit,
-                })
-                .map_err(|_| {
-                    terminal_writer_error(&terminal_error, TsfClientError::AppendWriterClosed)
-                })?;
-        }
-
-        Ok(AppendTicket {
-            rx: ack_rx,
-            terminal_error,
-        })
-    }
-}
-
 impl TsfWriteSession {
     /// Sends one physical record under the operation timeout.
     pub async fn send(&mut self, record: AppendRecord) -> Result<(), TsfClientError> {
@@ -1625,8 +1431,6 @@ enum WriterCommand {
     Submit {
         batch: AppendBatch,
         ack_tx: oneshot::Sender<Result<Vec<AppendReceipt>, TsfClientError>>,
-        byte_permit: OwnedSemaphorePermit,
-        record_permit: OwnedSemaphorePermit,
     },
     Close {
         done_tx: oneshot::Sender<Result<(), TsfClientError>>,
@@ -1634,8 +1438,7 @@ enum WriterCommand {
 }
 
 /// One actor-admitted batch: one contiguous writer-sequence range starting at `start_seq_num`,
-/// receipts accumulated until the whole batch is acknowledged, and the backlog permits released
-/// only at completion.
+/// receipts accumulated until the whole batch is acknowledged.
 struct PendingSubmission {
     payloads: Vec<RecordPayload>,
     /// Writer sequence number of `payloads[0]`; part `index` carries `start_seq_num + index`.
@@ -1646,8 +1449,6 @@ struct PendingSubmission {
     sent: usize,
     receipts: Vec<AppendReceipt>,
     ack_tx: oneshot::Sender<Result<Vec<AppendReceipt>, TsfClientError>>,
-    _byte_permit: OwnedSemaphorePermit,
-    _record_permit: OwnedSemaphorePermit,
 }
 
 impl PendingSubmission {
@@ -1677,7 +1478,7 @@ impl PendingSubmission {
 struct InFlightWindow {
     bytes: usize,
     records: usize,
-    /// Absolute: submissions can fill the backlog but never postpone it, so it measures time
+    /// Absolute: submissions can fill the queue but never postpone it, so it measures time
     /// without durability progress rather than command-channel inactivity.
     ack_deadline: Option<Instant>,
 }
@@ -1724,7 +1525,6 @@ async fn run_writer(
     mut cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
     shared: Arc<WriterShared>,
 ) {
-    // Wakes producers blocked on either backlog semaphore on every exit path, including abort.
     let _shutdown_guard = ShutdownGuard(Arc::clone(&shared));
     let mut pending: VecDeque<PendingSubmission> = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
@@ -1749,7 +1549,7 @@ async fn run_writer(
             )
             .await
             {
-                // Resend the retained backlog on the fresh session at the loop top.
+                // Resend the unacknowledged queue on the fresh session at the loop top.
                 Ok(()) => continue,
                 Err(error) => {
                     finish_writer_error(&mut pending, &mut close_tx, &shared.terminal_error, error);
@@ -1769,9 +1569,8 @@ async fn run_writer(
             cmd = cmd_rx.recv(), if close_tx.is_none() => {
                 match cmd {
                     Some(command) => {
-                        if let Err(error) = drain_submissions(
+                        if let Err(error) = handle_writer_command(
                             &mut pending,
-                            &mut cmd_rx,
                             &mut close_tx,
                             &mut cursor,
                             command,
@@ -1852,44 +1651,32 @@ async fn next_ack(
         })?
 }
 
-/// Moves the submitted batch and every already-queued submission into `pending`, numbering each
-/// from the actor's cursor.
+/// Moves one submitted batch into `pending`, numbering it from the actor's cursor, or records the
+/// close command.
 ///
 /// This never awaits, so a batch is fully retained before any I/O can fail: a failed or timed-out
-/// write leaves every record in `pending` for reconnect resend.
-fn drain_submissions(
+/// write leaves every record in `pending` for reconnect resend. Handling one command per actor
+/// turn prevents a continuously filled input channel from starving acknowledgements.
+fn handle_writer_command(
     pending: &mut VecDeque<PendingSubmission>,
-    cmd_rx: &mut mpsc::UnboundedReceiver<WriterCommand>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
     cursor: &mut WriterCursor,
-    first: WriterCommand,
+    command: WriterCommand,
 ) -> Result<(), TsfClientError> {
-    let mut command = Some(first);
-
-    while let Some(WriterCommand::Submit {
-        batch,
-        ack_tx,
-        byte_permit,
-        record_permit,
-    }) = command
-    {
-        let payloads = batch.into_payloads();
-        let start_seq_num = cursor.reserve(payloads.len())?;
-        pending.push_back(PendingSubmission {
-            receipts: Vec::with_capacity(payloads.len()),
-            payloads,
-            start_seq_num,
-            acked: 0,
-            sent: 0,
-            ack_tx,
-            _byte_permit: byte_permit,
-            _record_permit: record_permit,
-        });
-        command = cmd_rx.try_recv().ok();
-    }
-
-    if let Some(WriterCommand::Close { done_tx }) = command {
-        *close_tx = Some(done_tx);
+    match command {
+        WriterCommand::Submit { batch, ack_tx } => {
+            let payloads = batch.into_payloads();
+            let start_seq_num = cursor.reserve(payloads.len())?;
+            pending.push_back(PendingSubmission {
+                receipts: Vec::with_capacity(payloads.len()),
+                payloads,
+                start_seq_num,
+                acked: 0,
+                sent: 0,
+                ack_tx,
+            });
+        }
+        WriterCommand::Close { done_tx } => *close_tx = Some(done_tx),
     }
     Ok(())
 }
@@ -1908,7 +1695,7 @@ fn take_frame(
     let mut frame_bytes = 0;
     for submission in pending.iter_mut() {
         while let Some(payload) = submission.payloads.get(submission.sent) {
-            let accounted = accounted_record_bytes(&payload.data);
+            let accounted = in_flight_record_bytes(&payload.data);
             if in_flight.records == MAX_WRITER_IN_FLIGHT_RECORDS
                 || in_flight.bytes + accounted > MAX_WRITER_IN_FLIGHT_BYTES
                 || frame.len() == MAX_APPEND_FRAME_RECORDS
@@ -2042,7 +1829,7 @@ fn dispatch_ack(
     while remaining > 0 {
         let submission = pending.front_mut().expect("ack validated against pending");
         while submission.acked < submission.payloads.len() && remaining > 0 {
-            in_flight.bytes -= accounted_record_bytes(&submission.payloads[submission.acked].data);
+            in_flight.bytes -= in_flight_record_bytes(&submission.payloads[submission.acked].data);
             in_flight.records -= 1;
             submission.receipts.push(AppendReceipt {
                 writer_seq_num: writer_seq_nums.next().expect("ack validated"),
@@ -3399,37 +3186,6 @@ pub enum TsfClientError {
         /// Invalid ack that advanced past the pending record.
         ack: AppendAck,
     },
-    /// Writer bounds are zero or not representable by the semaphore implementation.
-    #[error("invalid append writer config: {0}")]
-    InvalidWriterConfig(String),
-    /// A requested reservation is larger than the entire retained backlog.
-    #[error(
-        "append batch uses {records} records and {bytes} bytes, above retained backlog {max_retained_records} records and {max_retained_bytes} bytes"
-    )]
-    AppendBatchExceedsRetainedBacklog {
-        /// Batch record count.
-        records: usize,
-        /// Batch backlog-accounted payload size.
-        bytes: usize,
-        /// Configured retained record limit.
-        max_retained_records: usize,
-        /// Configured retained byte limit.
-        max_retained_bytes: usize,
-    },
-    /// A batch is larger than its previously acquired reservation.
-    #[error(
-        "append batch uses {records} records and {bytes} bytes, above reserved capacity {reserved_records} records and {reserved_bytes} bytes"
-    )]
-    AppendBatchExceedsReservation {
-        /// Batch record count.
-        records: usize,
-        /// Batch backlog-accounted payload size.
-        bytes: usize,
-        /// Record capacity owned by the permit.
-        reserved_records: usize,
-        /// Byte capacity owned by the permit.
-        reserved_bytes: usize,
-    },
     /// The writer command channel is closed.
     #[error("append writer is closed")]
     AppendWriterClosed,
@@ -4008,95 +3764,6 @@ mod tests {
     }
 
     #[test]
-    fn writer_backlog_defaults_match_the_server_window_and_reject_out_of_range_bounds() {
-        let default = TsfWriterConfig::default();
-        assert_eq!(
-            default.max_retained_bytes,
-            DEFAULT_MAX_WRITER_RETAINED_BYTES
-        );
-        assert_eq!(
-            default.max_retained_records,
-            DEFAULT_MAX_WRITER_RETAINED_RECORDS
-        );
-        assert!(default.validate().is_ok());
-
-        // The retained backlog is client-local memory: batches larger than the in-flight window are
-        // legitimate, so any semaphore-representable bound is accepted.
-        assert!(
-            TsfWriterConfig {
-                max_retained_bytes: 4 * MAX_WRITER_IN_FLIGHT_BYTES,
-                max_retained_records: 4 * MAX_WRITER_IN_FLIGHT_RECORDS,
-            }
-            .validate()
-            .is_ok()
-        );
-
-        // Both backlog dimensions accept Tokio's exact semaphore boundary.
-        assert!(
-            TsfWriterConfig {
-                max_retained_bytes: Semaphore::MAX_PERMITS,
-                max_retained_records: Semaphore::MAX_PERMITS,
-            }
-            .validate()
-            .is_ok()
-        );
-
-        for config in [
-            TsfWriterConfig {
-                max_retained_bytes: 0,
-                ..TsfWriterConfig::default()
-            },
-            TsfWriterConfig {
-                max_retained_records: 0,
-                ..TsfWriterConfig::default()
-            },
-            TsfWriterConfig {
-                max_retained_bytes: Semaphore::MAX_PERMITS + 1,
-                ..TsfWriterConfig::default()
-            },
-            TsfWriterConfig {
-                max_retained_records: usize::MAX,
-                ..TsfWriterConfig::default()
-            },
-        ] {
-            assert!(matches!(
-                config.validate(),
-                Err(TsfClientError::InvalidWriterConfig(_))
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn invalid_writer_config_is_rejected_before_connecting() {
-        // Nothing answers on this port, so reaching the handshake would fail differently.
-        let client =
-            TsfClient::with_api_origin(Url::parse("http://127.0.0.1:1").expect("API origin"))
-                .expect("valid API origin");
-        let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-            .parse::<StreamId>()
-            .expect("stream id");
-        let options = DurableWriterOptions::new(
-            stream_id,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                .parse::<LinkSecret>()
-                .expect("canonical link secret"),
-        );
-
-        let error = client
-            .connect_writer_with_config(
-                options,
-                TsfWriterConfig {
-                    max_retained_records: 0,
-                    ..TsfWriterConfig::default()
-                },
-            )
-            .await
-            .expect_err("invalid config must be rejected");
-
-        assert!(matches!(error, TsfClientError::InvalidWriterConfig(_)));
-    }
-
-    #[test]
     fn builds_versioned_rest_and_websocket_base_urls() {
         let client =
             TsfClient::with_api_origin(Url::parse("https://example.com").expect("API origin"))
@@ -4283,13 +3950,7 @@ mod tests {
     async fn close_preserves_terminal_error_when_its_command_is_dropped() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
         let shared = Arc::new(WriterShared {
-            byte_permits: Arc::new(Semaphore::new(1)),
-            record_permits: Arc::new(Semaphore::new(1)),
             terminal_error: Arc::new(OnceLock::new()),
-            config: TsfWriterConfig {
-                max_retained_bytes: 1,
-                max_retained_records: 1,
-            },
             state: AtomicU8::new(WRITER_OPEN),
             submit_lock: RwLock::new(()),
         });
@@ -4327,13 +3988,7 @@ mod tests {
     async fn abort_preserves_an_explicit_cancellation_error() {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
         let shared = Arc::new(WriterShared {
-            byte_permits: Arc::new(Semaphore::new(1)),
-            record_permits: Arc::new(Semaphore::new(1)),
             terminal_error: Arc::new(OnceLock::new()),
-            config: TsfWriterConfig {
-                max_retained_bytes: 1,
-                max_retained_records: 1,
-            },
             state: AtomicU8::new(WRITER_OPEN),
             submit_lock: RwLock::new(()),
         });
@@ -4396,7 +4051,6 @@ mod tests {
     fn pending_submission(
         start_seq_num: u64,
         count: usize,
-        permits: &Arc<Semaphore>,
     ) -> (
         PendingSubmission,
         oneshot::Receiver<Result<Vec<AppendReceipt>, TsfClientError>>,
@@ -4412,14 +4066,6 @@ mod tests {
             receipts: Vec::with_capacity(payloads.len()),
             payloads,
             ack_tx,
-            _byte_permit: permits
-                .clone()
-                .try_acquire_many_owned(count as u32)
-                .expect("byte permits"),
-            _record_permit: permits
-                .clone()
-                .try_acquire_many_owned(count as u32)
-                .expect("record permits"),
         };
         (submission, ack_rx)
     }
@@ -4431,45 +4077,6 @@ mod tests {
             bytes: pending.iter().map(|s| s.payloads.len()).sum(),
             ack_deadline: None,
         }
-    }
-
-    #[tokio::test]
-    async fn permit_submit_releases_over_reserved_capacity() {
-        let shared = Arc::new(WriterShared {
-            byte_permits: Arc::new(Semaphore::new(8)),
-            record_permits: Arc::new(Semaphore::new(8)),
-            terminal_error: Arc::new(OnceLock::new()),
-            config: TsfWriterConfig {
-                max_retained_bytes: 8,
-                max_retained_records: 8,
-            },
-            state: AtomicU8::new(WRITER_OPEN),
-            submit_lock: RwLock::new(()),
-        });
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        let producer = TsfProducer {
-            cmd_tx,
-            shared: Arc::clone(&shared),
-        };
-        let big = AppendBatch::from_records(
-            (0..4)
-                .map(|_| {
-                    RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new())
-                })
-                .collect(),
-        )
-        .expect("four-record batch");
-        let permit = producer.reserve(&big).await.expect("reserve");
-        assert_eq!(shared.byte_permits.available_permits(), 4);
-        assert_eq!(shared.record_permits.available_permits(), 4);
-
-        let small = AppendBatch::single(PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new())
-            .expect("one-record batch");
-        let _ticket = permit.submit(small).expect("submit smaller batch");
-
-        // The unused remainder returns to the windows instead of waiting for the ack.
-        assert_eq!(shared.byte_permits.available_permits(), 7);
-        assert_eq!(shared.record_permits.available_permits(), 7);
     }
 
     #[test]
@@ -4491,9 +4098,8 @@ mod tests {
     }
 
     #[test]
-    fn drain_submissions_numbers_in_channel_order() {
+    fn writer_commands_number_submissions_in_channel_order() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
-        let permits = Arc::new(Semaphore::new(8));
         let batch = |count: usize| {
             AppendBatch::from_records(
                 (0..count)
@@ -4510,14 +4116,6 @@ mod tests {
                 .send(WriterCommand::Submit {
                     batch: batch(count),
                     ack_tx,
-                    byte_permit: permits
-                        .clone()
-                        .try_acquire_many_owned(count as u32)
-                        .expect("byte permits"),
-                    record_permit: permits
-                        .clone()
-                        .try_acquire_many_owned(count as u32)
-                        .expect("record permits"),
                 })
                 .expect("submit command");
         }
@@ -4525,9 +4123,10 @@ mod tests {
         let mut pending = VecDeque::new();
         let mut close_tx = None;
         let mut cursor = WriterCursor::default();
-        let first = cmd_rx.try_recv().expect("first command");
-        drain_submissions(&mut pending, &mut cmd_rx, &mut close_tx, &mut cursor, first)
-            .expect("drain submissions");
+        while let Ok(command) = cmd_rx.try_recv() {
+            handle_writer_command(&mut pending, &mut close_tx, &mut cursor, command)
+                .expect("handle submission");
+        }
 
         assert_eq!(
             pending
@@ -4541,9 +4140,8 @@ mod tests {
 
     #[test]
     fn take_frame_batches_across_submissions_within_frame_bounds() {
-        let permits = Arc::new(Semaphore::new(12));
-        let (first, _first_rx) = pending_submission(0, 3, &permits);
-        let (second, _second_rx) = pending_submission(3, 3, &permits);
+        let (first, _first_rx) = pending_submission(0, 3);
+        let (second, _second_rx) = pending_submission(3, 3);
         let mut pending = VecDeque::from([first, second]);
         for submission in &mut pending {
             submission.sent = 0;
@@ -4581,8 +4179,7 @@ mod tests {
 
     #[test]
     fn take_frame_stops_at_the_in_flight_window() {
-        let permits = Arc::new(Semaphore::new(4));
-        let (submission, _ack_rx) = pending_submission(0, 2, &permits);
+        let (submission, _ack_rx) = pending_submission(0, 2);
         let mut pending = VecDeque::from([submission]);
         pending[0].sent = 0;
         for payload in &mut pending[0].payloads {
@@ -4610,8 +4207,7 @@ mod tests {
             records: MAX_WRITER_IN_FLIGHT_RECORDS,
             ack_deadline: None,
         };
-        let other_permits = Arc::new(Semaphore::new(2));
-        let (mut unsent, _rx) = pending_submission(7, 1, &other_permits);
+        let (mut unsent, _rx) = pending_submission(7, 1);
         unsent.sent = 0;
         let mut pending2 = VecDeque::from([unsent]);
         take_frame(&mut pending2, &mut record_full, &mut frame);
@@ -4620,8 +4216,7 @@ mod tests {
 
     #[test]
     fn dispatch_ack_rejects_more_records_than_are_pending() {
-        let permits = Arc::new(Semaphore::new(2));
-        let (submission, _ack_rx) = pending_submission(7, 1, &permits);
+        let (submission, _ack_rx) = pending_submission(7, 1);
         let mut pending = VecDeque::from([submission]);
         let mut in_flight = in_flight_window(&pending);
         let ack = AppendAck {
@@ -4641,9 +4236,8 @@ mod tests {
 
     #[test]
     fn dispatch_ack_validates_the_full_range_before_draining() {
-        let permits = Arc::new(Semaphore::new(4));
-        let (first, _first_rx) = pending_submission(7, 1, &permits);
-        let (second, _second_rx) = pending_submission(9, 1, &permits);
+        let (first, _first_rx) = pending_submission(7, 1);
+        let (second, _second_rx) = pending_submission(9, 1);
         let mut pending = VecDeque::from([first, second]);
         let mut in_flight = in_flight_window(&pending);
         let ack = AppendAck {
@@ -4669,9 +4263,8 @@ mod tests {
 
     #[test]
     fn dispatch_ack_resolves_completed_submissions_across_boundaries() {
-        let permits = Arc::new(Semaphore::new(6));
-        let (first, mut first_rx) = pending_submission(7, 2, &permits);
-        let (second, mut second_rx) = pending_submission(9, 1, &permits);
+        let (first, mut first_rx) = pending_submission(7, 2);
+        let (second, mut second_rx) = pending_submission(9, 1);
         let mut pending = VecDeque::from([first, second]);
         let mut in_flight = in_flight_window(&pending);
         let first_ack = AppendAck {

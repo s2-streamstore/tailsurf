@@ -33,8 +33,6 @@ import {
 } from "./socket.js";
 import {
   DefaultTsfWriter,
-  normalizeWriterConfig,
-  type TsfWriterConfig,
   type TsfWriter,
 } from "./writer.js";
 import { streamMetadataFromWire } from "./models.js";
@@ -112,9 +110,7 @@ export class TsfClient extends BaseTsfClient {
 
   public async connectWriter(
     options: WriteStreamOptions,
-    config: TsfWriterConfig = {},
   ): Promise<TsfWriter> {
-    const normalizedConfig = normalizeWriterConfig(config);
     const normalized: NormalizedWriteOptions = {
       streamId: parseStreamId(options.streamId),
       linkSecret: requireLinkSecret(options.linkSecret),
@@ -133,7 +129,6 @@ export class TsfClient extends BaseTsfClient {
       await connectInitialSocket(connect, this.#socketPolicy),
       connect,
       this.#socketPolicy,
-      normalizedConfig,
     );
   }
 

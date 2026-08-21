@@ -18,8 +18,8 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  DEFAULT_MAX_WRITER_RETAINED_BYTES,
-  DEFAULT_MAX_WRITER_RETAINED_RECORDS,
+  MAX_WRITER_IN_FLIGHT_BYTES,
+  MAX_WRITER_IN_FLIGHT_RECORDS,
   TsfClient,
   type WebSocketFactory,
 } from "../src/index.js";
@@ -946,7 +946,7 @@ describe("TsfWriter", () => {
     await expect(closing).resolves.toBeUndefined();
   });
 
-  it("bounds pending records and payload while releasing settled capacity", async () => {
+  it("queues records and payload beyond the socket window", async () => {
     const socket = new ControlledWriterWebSocket();
     const client = new TsfClient({
       webSocketFactory: () => socket,
@@ -957,43 +957,39 @@ describe("TsfWriter", () => {
     });
 
     const recordCalls = Array.from(
-      { length: DEFAULT_MAX_WRITER_RETAINED_RECORDS },
+      { length: MAX_WRITER_IN_FLIGHT_RECORDS },
       () => writer.append({ data: new Uint8Array() }),
     );
-    await expect(writer.append({ data: new Uint8Array() })).rejects.toMatchObject({
-      code: "client_write_overload",
-    });
-    await vi.waitFor(() => expect(socket.hasPendingAppend).toBe(true));
+    const queuedRecord = writer.append({ data: new Uint8Array() });
+    await vi.waitFor(() =>
+      expect(socket.pendingRecordCount).toBe(MAX_WRITER_IN_FLIGHT_RECORDS)
+    );
     socket.ackCurrent();
     await expect(recordCalls[0]).resolves.toMatchObject({ writerSeqNum: 0n });
-    const recordReplacement = writer.append({ data: new Uint8Array() });
     socket.setAutoAck(true);
-    await Promise.all([...recordCalls.slice(1), recordReplacement]);
+    await Promise.all([...recordCalls.slice(1), queuedRecord]);
 
     socket.setAutoAck(false);
     const payloadRecordCount =
-      DEFAULT_MAX_WRITER_RETAINED_BYTES / MAX_RECORD_PAYLOAD_BYTES;
+      MAX_WRITER_IN_FLIGHT_BYTES / MAX_RECORD_PAYLOAD_BYTES;
     if (!Number.isInteger(payloadRecordCount)) {
-      throw new TypeError("writer payload limit must compose from whole records");
+      throw new TypeError("writer byte window must compose from whole records");
     }
     const maxRecord = new Uint8Array(MAX_RECORD_PAYLOAD_BYTES);
     const payloadCalls = Array.from(
       { length: payloadRecordCount },
       () => writer.append({ data: maxRecord }),
     );
-    await expect(writer.append({ data: Uint8Array.of(1) })).rejects.toMatchObject({
-      code: "client_write_overload",
-    });
-    await vi.waitFor(() => expect(socket.hasPendingAppend).toBe(true));
+    const queuedPayload = writer.append({ data: Uint8Array.of(1) });
+    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(payloadRecordCount));
     socket.ackCurrent();
     await expect(payloadCalls[0]).resolves.toBeDefined();
-    const payloadReplacement = writer.append({ data: Uint8Array.of(1) });
     socket.setAutoAck(true);
-    await Promise.all([...payloadCalls.slice(1), payloadReplacement]);
+    await Promise.all([...payloadCalls.slice(1), queuedPayload]);
 
     expect(socket.appendCount).toBe(
       2 +
-        Math.ceil(DEFAULT_MAX_WRITER_RETAINED_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
+        Math.ceil(MAX_WRITER_IN_FLIGHT_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
         1,
     );
     await writer.close();
@@ -1031,19 +1027,6 @@ describe("TsfWriter", () => {
       }),
     ).rejects.toMatchObject({ code: "operation_timeout" });
     expect(stalled.closed).toBe(true);
-  });
-
-  it("rejects invalid retained-backlog limits before opening a socket", async () => {
-    const webSocketFactory = vi.fn<WebSocketFactory>();
-    const client = new TsfClient({ webSocketFactory });
-
-    await expect(client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    }, { maxRetainedBytes: 0 })).rejects.toMatchObject({
-      code: "invalid_writer_config",
-    });
-    expect(webSocketFactory).not.toHaveBeenCalled();
   });
 
   it("creates a fresh identity for each durable writer", async () => {
@@ -1153,15 +1136,12 @@ describe("TsfWriter", () => {
     await writer.close();
   });
 
-  it("paces a retained backlog larger than the socket window", async () => {
+  it("paces queued input larger than the socket window", async () => {
     const socket = new ControlledWriterWebSocket();
     const client = new TsfClient({ webSocketFactory: () => socket });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    }, {
-      maxRetainedRecords: 16,
-      maxRetainedBytes: 8 * 1024 * 1024,
     });
 
     const submission = writer.appendBatch(Array.from(
@@ -1173,6 +1153,29 @@ describe("TsfWriter", () => {
 
     socket.setAutoAck(true);
     await expect(submission).resolves.toHaveLength(16);
+    await writer.close();
+  });
+
+  it("accepts one submission larger than a protocol frame", async () => {
+    const socket = new ControlledWriterWebSocket();
+    const client = new TsfClient({ webSocketFactory: () => socket });
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    const submission = writer.appendBatch(Array.from(
+      { length: MAX_WRITER_IN_FLIGHT_RECORDS + 1 },
+      () => ({ data: new Uint8Array() }),
+    ));
+    await vi.waitFor(() =>
+      expect(socket.pendingRecordCount).toBe(MAX_WRITER_IN_FLIGHT_RECORDS)
+    );
+    expect(socket.appendCount).toBe(1);
+
+    socket.setAutoAck(true);
+    await expect(submission).resolves.toHaveLength(MAX_WRITER_IN_FLIGHT_RECORDS + 1);
+    expect(socket.appendCount).toBe(2);
     await writer.close();
   });
 

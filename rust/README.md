@@ -66,7 +66,7 @@ Records are submitted as a non-empty `AppendBatch`. The writer assigns writer se
 
 An `AppendBatch` is one sequencing and ticket unit, not an atomic service append. The writer may split it across frames. A terminal failure may leave a durable prefix while its ticket returns an error.
 
-The writer retains at most 128 records and 5 MiB by default. Use `connect_writer_with_config` and `TsfWriterConfig` when one submission needs a larger retained backlog.
+The writer queues submitted input and sends it through a fixed socket window of 128 records and 5 MiB. An `AppendBatch` may be larger than that window.
 
 Await each `AppendTicket` when you need its durable sequence numbers. A terminal `AppendDurabilityUnknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Do not submit that record under a new writer identity.
 
@@ -81,12 +81,10 @@ async fn write_stream(
     let writer = client
         .connect_writer(DurableWriterOptions::new(stream_id, write_link_secret))
         .await?;
-    let ticket = writer
-        .submit(AppendBatch::split_logical(
-            RecordFormat::Transcript,
-            b"deploy started\n".as_slice(),
-        )?)
-        .await?;
+    let ticket = writer.submit(AppendBatch::split_logical(
+        RecordFormat::Transcript,
+        b"deploy started\n".as_slice(),
+    )?)?;
     let receipts = ticket.await?;
     writer.close().await?;
 

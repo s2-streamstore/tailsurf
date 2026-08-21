@@ -56,12 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_expected_next_seq_num(0),
         )
         .await?;
-    let ticket = writer
-        .submit(tailsurf::AppendBatch::split_logical(
-            RecordFormat::Transcript,
-            b"hello from tailsurf\n".as_slice(),
-        )?)
-        .await?;
+    let ticket = writer.submit(tailsurf::AppendBatch::split_logical(
+        RecordFormat::Transcript,
+        b"hello from tailsurf\n".as_slice(),
+    )?)?;
     let _receipts = ticket.await?;
     writer.close().await?;
 

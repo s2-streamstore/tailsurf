@@ -29,7 +29,7 @@ use secrecy::ExposeSecret;
 use tailsurf::{
     AppendBatch, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret,
     MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, RetryPolicy, StreamId, StreamTitle, TsfClient,
-    TsfClientConfig, TsfClientError, TsfWriterConfig, WriterId,
+    TsfClientConfig, TsfClientError, WriterId,
     protocol::{
         read::{ReadOptions, ReadStart, ReadStop},
         rest::{
@@ -600,23 +600,14 @@ async fn write_defaults_to_lines_and_splits_large_records() {
 }
 
 #[tokio::test]
-async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it() {
+async fn write_line_above_the_default_reader_limit_round_trips_when_the_reader_raises_it() {
     let server = TestServer::start().await;
     let configured_limit = DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES + 1;
     let configured_limit_arg = configured_limit.to_string();
     let mut input = "x".repeat(configured_limit - 1);
     input.push('\n');
 
-    let output = run_tsf(
-        &server,
-        [
-            "new",
-            "--max-logical-record-bytes",
-            configured_limit_arg.as_str(),
-        ],
-        Some(input.as_str()),
-    )
-    .await;
+    let output = run_tsf(&server, ["new"], Some(input.as_str())).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_link = output
         .stdout
@@ -637,31 +628,6 @@ async fn write_line_above_the_default_limit_round_trips_when_both_sides_raise_it
     .await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
     assert_eq!(replay.stdout, input);
-}
-
-#[tokio::test]
-async fn write_rejects_a_line_above_the_default_reader_limit_before_appending() {
-    let server = TestServer::start().await;
-    let mut input = "x".repeat(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES);
-    input.push('\n');
-
-    let output = run_tsf(&server, [], Some(input.as_str())).await;
-
-    assert!(!output.status.success());
-    assert!(
-        output.stderr.contains(&format!(
-            "input line exceeds the configured {DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES}-byte logical record limit"
-        )),
-        "stderr={}",
-        output.stderr
-    );
-    let read_link = output
-        .stdout
-        .lines()
-        .find_map(|line| extract_link_line(line, "reader"))
-        .expect("read link is printed before writing");
-    let locator = StreamLocator::parse(read_link).expect("valid read link");
-    assert_eq!(server.record_count(&locator.stream_id), 0);
 }
 
 #[tokio::test]
@@ -901,7 +867,6 @@ async fn durable_writer_recovery_outlives_the_bounded_operation_retry_count() {
         .expect("writer");
     let ticket = writer
         .submit(test_write_batch(Bytes::from_static(b"retry me")))
-        .await
         .expect("submit");
 
     timeout(Duration::from_secs(5), ticket)
@@ -929,27 +894,13 @@ async fn durable_writer_recovery_outlives_the_bounded_operation_retry_count() {
 async fn writer_preserves_its_terminal_failure_for_later_submissions() {
     let server = FakeWriteServer::start_terminal().await;
     let writer = connect_default_writer(&server.api_url).await;
-    let pre_admitted = writer
-        .reserve(&test_write_batch(Bytes::from_static(b"x")))
-        .await
-        .expect("reserve before failure");
     let first = writer
         .submit(test_write_batch(Bytes::from_static(b"first")))
-        .await
         .expect("submit first record");
     let first_error = first.await.expect_err("first record must fail");
     assert_sequence_mismatch(&first_error);
 
-    let pre_admitted_error = match pre_admitted.submit(test_write_batch(Bytes::from_static(b"x"))) {
-        Ok(_) => panic!("terminal writer accepted a pre-admitted record"),
-        Err(error) => error,
-    };
-    assert_sequence_mismatch(&pre_admitted_error);
-
-    let later_error = match writer
-        .submit(test_write_batch(Bytes::from_static(b"later")))
-        .await
-    {
+    let later_error = match writer.submit(test_write_batch(Bytes::from_static(b"later"))) {
         Ok(_) => panic!("terminal writer accepted a later record"),
         Err(error) => error,
     };
@@ -963,12 +914,12 @@ async fn writer_preserves_its_terminal_failure_for_later_submissions() {
 }
 
 #[tokio::test]
-async fn default_writer_enforces_record_and_byte_backlog_limits() {
-    assert_default_writer_backlog(128, Bytes::from_static(b"x")).await;
-    assert_default_writer_backlog(10, Bytes::from(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES])).await;
+async fn writer_queues_submissions_beyond_the_in_flight_window() {
+    assert_writer_window(128, Bytes::from_static(b"x")).await;
+    assert_writer_window(10, Bytes::from(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES])).await;
 }
 
-async fn assert_default_writer_backlog(capacity: usize, payload: Bytes) {
+async fn assert_writer_window(capacity: usize, payload: Bytes) {
     let server = HoldingWriteServer::start(capacity).await;
     let writer = connect_default_writer(&server.api_url).await;
     let mut tickets = Vec::new();
@@ -976,34 +927,19 @@ async fn assert_default_writer_backlog(capacity: usize, payload: Bytes) {
         tickets.push(
             writer
                 .submit(test_write_batch(payload.clone()))
-                .await
-                .expect("submit within retained backlog"),
+                .expect("queue submission"),
         );
     }
+    let queued = writer
+        .submit(test_write_batch(Bytes::from_static(b"x")))
+        .expect("queue beyond the in-flight window");
     server.wait_for_records(capacity).await;
-
-    assert!(
-        timeout(
-            Duration::from_millis(100),
-            writer.submit(test_write_batch(Bytes::from_static(b"x"))),
-        )
-        .await
-        .is_err(),
-        "submit beyond the retained backlog must wait for an acknowledgement"
-    );
 
     server.release_acknowledgements();
     for ticket in tickets {
         ticket.await.expect("durability acknowledgement");
     }
-    let final_ticket = timeout(
-        Duration::from_secs(1),
-        writer.submit(test_write_batch(Bytes::from_static(b"x"))),
-    )
-    .await
-    .expect("retained backlog reopened")
-    .expect("final submit");
-    final_ticket.await.expect("final acknowledgement");
+    queued.await.expect("queued acknowledgement");
     writer.close().await.expect("writer close");
 }
 
@@ -1016,7 +952,6 @@ async fn writer_reconnect_resends_every_unacknowledged_record_in_order() {
         tickets.push(
             writer
                 .submit(test_write_batch(Bytes::from(format!("record-{record}"))))
-                .await
                 .expect("submit"),
         );
     }
@@ -1065,7 +1000,7 @@ async fn writer_reconnect_resends_only_the_unacknowledged_tail() {
     )
     .expect("batch");
 
-    let ticket = writer.submit(batch).await.expect("submit");
+    let ticket = writer.submit(batch).expect("submit");
     let receipts = ticket.await.expect("acknowledgements across reconnect");
     assert_eq!(
         receipts
@@ -1100,53 +1035,6 @@ async fn writer_reconnect_resends_only_the_unacknowledged_tail() {
 }
 
 #[tokio::test]
-async fn blocked_reservation_wakes_when_the_writer_closes() {
-    let server = HoldingWriteServer::start(1).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let writer = TsfClient::with_api_origin(server.api_url.clone())
-        .expect("valid API origin")
-        .connect_writer_with_config(
-            tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
-            TsfWriterConfig {
-                max_retained_bytes: 8,
-                max_retained_records: 1,
-            },
-        )
-        .await
-        .expect("writer");
-    // The unused permit holds the only record slot; the producer blocks on it.
-    let permit = writer
-        .reserve(&test_write_batch(Bytes::new()))
-        .await
-        .expect("reserve the only slot");
-    let producer = writer.producer();
-    let blocked = tokio::spawn(async move {
-        producer
-            .submit(test_write_batch(Bytes::from_static(b"x")))
-            .await
-    });
-    tokio::task::yield_now().await;
-
-    writer.close().await.expect("writer close");
-
-    let result = blocked.await.expect("join blocked submit");
-    assert!(
-        matches!(result, Err(TsfClientError::AppendWriterClosed)),
-        "blocked reservation must wake with closure: {}",
-        result.err().expect("submit must fail")
-    );
-    assert!(
-        matches!(
-            permit.submit(test_write_batch(Bytes::new())),
-            Err(TsfClientError::AppendWriterClosed)
-        ),
-        "pre-reserved permit must refuse submission after close"
-    );
-}
-
-#[tokio::test]
 async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
     // One 6 MiB batch (12 x 512 KiB) exceeds the server's 5 MiB sent-but-unacknowledged socket
     // window, so the writer must stop after ten records until acknowledgements arrive.
@@ -1156,13 +1044,10 @@ async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
         .expect("stream id");
     let writer = TsfClient::with_api_origin(server.api_url.clone())
         .expect("valid API origin")
-        .connect_writer_with_config(
-            tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
-            TsfWriterConfig {
-                max_retained_bytes: 8 * 1024 * 1024,
-                max_retained_records: 16,
-            },
-        )
+        .connect_writer(tailsurf::DurableWriterOptions::new(
+            stream_id,
+            canonical_test_link_secret(),
+        ))
         .await
         .expect("writer");
     let payload = Bytes::from(vec![7_u8; MAX_RECORD_PAYLOAD_BYTES]);
@@ -1175,7 +1060,7 @@ async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
     )
     .expect("oversized batch");
 
-    let ticket = writer.submit(batch).await.expect("batch admitted");
+    let ticket = writer.submit(batch).expect("batch queued");
 
     server.wait_for_records(10).await;
     server.release_acknowledgements();
@@ -1251,7 +1136,7 @@ async fn cloned_producers_share_one_contiguous_writer_sequence() {
                         .collect(),
                 )
                 .expect("batch");
-                tickets.push(producer.submit(batch).await.expect("submit"));
+                tickets.push(producer.submit(batch).expect("submit"));
             }
             tickets
         }));
@@ -1307,7 +1192,6 @@ async fn separate_durable_writers_use_fresh_writer_ids() {
             .expect("writer");
         let receipts = writer
             .submit(test_write_batch(Bytes::copy_from_slice(payload)))
-            .await
             .expect("submit")
             .await
             .expect("durability");
@@ -1341,13 +1225,10 @@ async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
     };
     let writer = TsfClient::with_config(config)
         .expect("valid client config")
-        .connect_writer_with_config(
-            tailsurf::DurableWriterOptions::new(stream_id, canonical_test_link_secret()),
-            TsfWriterConfig {
-                max_retained_bytes: 1024 * 1024,
-                max_retained_records: 4 * MAX_WRITER_IN_FLIGHT_RECORDS,
-            },
-        )
+        .connect_writer(tailsurf::DurableWriterOptions::new(
+            stream_id,
+            canonical_test_link_secret(),
+        ))
         .await
         .expect("writer");
 
@@ -1358,7 +1239,6 @@ async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
         loop {
             if producer
                 .submit(test_write_batch(Bytes::from_static(b"x")))
-                .await
                 .is_err()
             {
                 break;
@@ -1407,7 +1287,6 @@ async fn writer_reconnect_arms_a_fresh_acknowledgement_deadline() {
 
     let ticket = writer
         .submit(test_write_batch(Bytes::from_static(b"x")))
-        .await
         .expect("submit");
     let receipts = timeout(Duration::from_secs(5), ticket)
         .await
@@ -2164,15 +2043,6 @@ impl TestServer {
 
     fn stream_count(&self) -> usize {
         self.state.streams.lock().expect("streams lock").len()
-    }
-
-    fn record_count(&self, stream_id: &StreamId) -> usize {
-        self.state
-            .streams
-            .lock()
-            .expect("streams lock")
-            .get(&stream_id.to_string())
-            .map_or(0, |stream| stream.records.len())
     }
 
     fn writer_seq_nums(&self, stream_id: &StreamId) -> Vec<u64> {

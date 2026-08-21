@@ -104,7 +104,7 @@ make test | tsf
 make test | tsf write '{write-link}'
 ```
 
-One logical line is limited to 16 MiB by default. This matches the split-record reassembly budget used by `tail` and `replay`. Set `--max-logical-record-bytes` on the writer and `--max-reassembly-bytes` on the reader only when a larger application-specific limit is required.
+The writer splits a logical line into physical records and paces them through its fixed in-flight window. `tail` and `replay` retain a 16 MiB reassembly safety bound by default. Raise `--max-reassembly-bytes` when reading larger logical records.
 
 Use raw mode when you want to send stdin as byte records instead of line-framed transcript records. Raw mode flushes at the physical record size limit, after a short linger, and at EOF:
 

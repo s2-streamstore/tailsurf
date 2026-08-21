@@ -22,13 +22,6 @@ pub const MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Maximum encoded size of any TSF protocol frame.
 pub const MAX_ENCODED_FRAME_BYTES: usize =
     1 + MAX_READ_FRAME_RECORDS * (4 + 45) + MAX_FRAME_PAYLOAD_BYTES;
-/// Maximum physical records accepted as one durable-writer submission.
-pub const MAX_APPEND_SUBMISSION_RECORDS: usize = MAX_APPEND_FRAME_RECORDS;
-/// Structural payload maximum for one durable-writer submission.
-///
-/// The configured retained backlog can impose a smaller limit.
-pub const MAX_APPEND_SUBMISSION_PAYLOAD_BYTES: usize =
-    MAX_APPEND_SUBMISSION_RECORDS * MAX_RECORD_PAYLOAD_BYTES;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -577,21 +570,21 @@ pub(crate) fn split_record_payloads(
 ///
 /// The writer actor assigns each batch one contiguous writer-sequence range in submission order,
 /// so the split parts of a logical record never interleave with another producer's records.
-/// Construction upholds the record bounds: 1 to [`MAX_APPEND_SUBMISSION_RECORDS`] records, each at
-/// most [`MAX_RECORD_PAYLOAD_BYTES`]. This is not an atomic service append: the actor may split a
-/// batch across protocol frames, and a terminal failure may leave a durable prefix while its ticket
-/// returns an error. Submission additionally requires the whole batch to fit the writer's
-/// configured retained backlog; the actor streams oversized batches under the server's
-/// in-flight socket window either way.
+/// Construction requires at least one record and upholds the [`MAX_RECORD_PAYLOAD_BYTES`] physical
+/// record bound. This is not an atomic service append: the actor may split a batch across protocol
+/// frames, and a terminal failure may leave a durable prefix while its ticket returns an error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppendBatch {
     records: Vec<RecordPayload>,
 }
 
 impl AppendBatch {
-    /// Builds a batch from explicit physical records, rejecting an empty or out-of-bounds batch.
+    /// Builds a batch from explicit physical records, rejecting an empty batch or oversized
+    /// physical record.
     pub fn from_records(records: Vec<RecordPayload>) -> Result<Self, FrameCodecError> {
-        validate_batch_count(records.len(), MAX_APPEND_SUBMISSION_RECORDS)?;
+        if records.is_empty() {
+            return Err(FrameCodecError::EmptyAppendBatch);
+        }
         for record in &records {
             validate_record_len(record.data.len())?;
         }
@@ -611,9 +604,7 @@ impl AppendBatch {
     ///
     /// A payload that fits in [`MAX_RECORD_PAYLOAD_BYTES`] becomes one unsplit record; larger
     /// payloads are sliced into parts without further copying once the input is converted to
-    /// `Bytes` (borrowed inputs are copied once by that conversion). A logical record spanning
-    /// more than [`MAX_APPEND_SUBMISSION_RECORDS`] parts exceeds the submission record bound
-    /// and is rejected.
+    /// `Bytes` (borrowed inputs are copied once by that conversion).
     pub fn split_logical(
         format: RecordFormat,
         data: impl IntoRecordData,
@@ -626,7 +617,8 @@ impl AppendBatch {
         self.records.len()
     }
 
-    pub(crate) fn payloads(&self) -> &[RecordPayload] {
+    #[cfg(test)]
+    fn payloads(&self) -> &[RecordPayload] {
         &self.records
     }
 
@@ -1287,6 +1279,9 @@ pub enum FrameCodecError {
     /// A batch record length was zero or extended beyond the message.
     #[error("batch record length is invalid")]
     InvalidRecordLength,
+    /// A durable-writer submission had no records.
+    #[error("append batch must not be empty")]
+    EmptyAppendBatch,
     /// A batch had no records or exceeded its direction-specific record limit.
     #[error("batch has {actual} records; expected 1 to {max}")]
     InvalidBatchRecordCount {
@@ -1752,10 +1747,10 @@ mod tests {
     }
 
     #[test]
-    fn append_submission_construction_enforces_submission_bounds() {
+    fn append_submission_construction_enforces_physical_record_bounds() {
         assert!(matches!(
             AppendBatch::from_records(vec![]),
-            Err(FrameCodecError::InvalidBatchRecordCount { actual: 0, .. })
+            Err(FrameCodecError::EmptyAppendBatch)
         ));
         assert!(matches!(
             AppendBatch::single(
@@ -1785,16 +1780,18 @@ mod tests {
         );
         assert_eq!(batch.payloads()[2].data.len(), 5);
 
-        assert!(matches!(
-            AppendBatch::split_logical(
-                RecordFormat::Bytes,
-                vec![0_u8; MAX_APPEND_SUBMISSION_PAYLOAD_BYTES + 1],
-            ),
-            Err(FrameCodecError::InvalidBatchRecordCount {
-                max: MAX_APPEND_SUBMISSION_RECORDS,
-                ..
-            })
-        ));
+        let oversized_for_one_frame = AppendBatch::from_records(
+            (0..=MAX_APPEND_FRAME_RECORDS)
+                .map(|_| {
+                    RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new())
+                })
+                .collect(),
+        )
+        .expect("writer submissions may span frames");
+        assert_eq!(
+            oversized_for_one_frame.record_count(),
+            MAX_APPEND_FRAME_RECORDS + 1
+        );
     }
 
     #[test]

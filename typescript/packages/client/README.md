@@ -98,15 +98,12 @@ try {
 
 `appendLogical` splits data above the 512 KiB physical-record limit into contiguous parts.
 
-The writer retains at most 128 records and 5 MiB by default. Configure a larger retained backlog when one submission can exceed those bounds. Each socket keeps at most 128 records and 5 MiB in flight.
+The writer queues submitted input and sends it through a fixed socket window of 128 records and 5 MiB. A submission may be larger than that window.
 
 ```ts
 const writer = await client.connectWriter({
   streamId: stream.streamId,
   linkSecret: owner.secret,
-}, {
-  maxRetainedRecords: 128,
-  maxRetainedBytes: 16 * 1024 * 1024,
 });
 
 await writer.appendLogical({ data: largeTranscriptRecord });
