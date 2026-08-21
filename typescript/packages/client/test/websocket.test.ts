@@ -19,7 +19,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES,
+  MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES,
   MAX_WRITER_IN_FLIGHT_RECORDS,
   TsfClient,
   type WebSocketFactory,
@@ -950,7 +950,7 @@ describe("TsfWriter", () => {
 
     socket.setAutoAck(false);
     const payloadRecordCount =
-      MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES / MAX_RECORD_PAYLOAD_BYTES;
+      MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES / MAX_RECORD_PAYLOAD_BYTES;
     if (!Number.isInteger(payloadRecordCount)) {
       throw new TypeError("writer byte window must compose from whole records");
     }
@@ -959,17 +959,24 @@ describe("TsfWriter", () => {
       { length: payloadRecordCount },
       () => writer.append({ data: maxRecord }),
     );
+    const emptyAtFullPayload = writer.append({ data: new Uint8Array() });
     const queuedPayload = writer.append({ data: Uint8Array.of(1) });
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(payloadRecordCount));
+    await vi.waitFor(() =>
+      expect(socket.pendingRecordCount).toBe(payloadRecordCount + 1)
+    );
     socket.ackCurrent();
     await expect(payloadCalls[0]).resolves.toBeDefined();
     socket.setAutoAck(true);
-    await Promise.all([...payloadCalls.slice(1), queuedPayload]);
+    await Promise.all([
+      ...payloadCalls.slice(1),
+      emptyAtFullPayload,
+      queuedPayload,
+    ]);
 
     expect(socket.appendCount).toBe(
       Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS) +
         1 +
-        Math.ceil(MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
+        Math.ceil(MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
         1,
     );
     await writer.close();

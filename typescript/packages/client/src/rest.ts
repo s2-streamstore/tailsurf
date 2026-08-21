@@ -68,18 +68,18 @@ import { sleep, withTimeout } from "./socket.js";
 
 export const DEFAULT_API_ORIGIN = "https://tail.surf";
 const API_PREFIX = "/api/v1";
-const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_HTTP_REQUEST_TIMEOUT_MS = 10_000;
 const textEncoder = new TextEncoder();
 
 interface Schema<T> {
   parse(input: unknown): T;
 }
 
-export interface RestClientOptions {
+export interface HttpClientOptions {
   readonly apiOrigin?: string | URL;
   readonly fetch?: typeof globalThis.fetch;
   /** Bounds REST requests and SSE opening handshakes. It does not time out an established SSE body. */
-  readonly restRequestTimeoutMs?: number;
+  readonly httpRequestTimeoutMs?: number;
   /** Total attempts for bounded operations, including the initial attempt. */
   readonly boundedOperationAttempts?: number;
 }
@@ -164,9 +164,9 @@ export class BaseTsfClient {
   public readonly apiOrigin: string;
   protected readonly boundedOperationAttempts: number;
   readonly #fetch: typeof globalThis.fetch;
-  readonly #restRequestTimeoutMs: number;
+  readonly #httpRequestTimeoutMs: number;
 
-  public constructor(options: RestClientOptions = {}) {
+  public constructor(options: HttpClientOptions = {}) {
     this.apiOrigin = parseApiOrigin(options.apiOrigin ?? DEFAULT_API_ORIGIN);
     const fetchImplementation = options.fetch ?? globalThis.fetch?.bind(globalThis);
     if (fetchImplementation === undefined) {
@@ -176,9 +176,9 @@ export class BaseTsfClient {
       );
     }
     this.#fetch = fetchImplementation;
-    this.#restRequestTimeoutMs = integerOption(
-      options.restRequestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      "restRequestTimeoutMs",
+    this.#httpRequestTimeoutMs = integerOption(
+      options.httpRequestTimeoutMs ?? DEFAULT_HTTP_REQUEST_TIMEOUT_MS,
+      "httpRequestTimeoutMs",
       1,
       MAX_TIMER_DELAY_MS,
     );
@@ -193,7 +193,7 @@ export class BaseTsfClient {
     return openSseReader(options, {
       fetch: this.#fetch,
       apiOrigin: this.apiOrigin,
-      restRequestTimeoutMs: this.#restRequestTimeoutMs,
+      httpRequestTimeoutMs: this.#httpRequestTimeoutMs,
       boundedOperationAttempts: this.boundedOperationAttempts,
     });
   }
@@ -579,7 +579,7 @@ export class BaseTsfClient {
     const controller = new AbortController();
     const timeoutError = new TsfClientError(
       "http_timeout",
-      `${operation} timed out after ${this.#restRequestTimeoutMs}ms`,
+      `${operation} timed out after ${this.#httpRequestTimeoutMs}ms`,
     );
     let timedOut = false;
     const request = (async () => {
@@ -609,7 +609,7 @@ export class BaseTsfClient {
         );
       }
     })();
-    return withTimeout(request, this.#restRequestTimeoutMs, operation, undefined, {
+    return withTimeout(request, this.#httpRequestTimeoutMs, operation, undefined, {
       error: timeoutError,
       onTimeout: () => {
         timedOut = true;

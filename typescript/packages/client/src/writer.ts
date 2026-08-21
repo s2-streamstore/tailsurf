@@ -2,7 +2,7 @@ import {
   MAX_APPEND_FRAME_RECORDS,
   MAX_FRAME_PAYLOAD_BYTES,
   MAX_RECORD_PAYLOAD_BYTES,
-  MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES,
+  MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES,
   MAX_WRITER_IN_FLIGHT_RECORDS,
   MAX_U64,
   partHeader,
@@ -55,7 +55,7 @@ export class DefaultTsfWriter implements TsfWriter {
   readonly #queue: PendingAppendCall[] = [];
   #drain: Promise<void> | undefined;
   #inFlightRecords = 0;
-  #inFlightAccountedBytes = 0;
+  #inFlightPayloadBytes = 0;
   #ambiguousWriterEndSeqNum: bigint | undefined;
   #closing = false;
   #closed = false;
@@ -289,11 +289,10 @@ export class DefaultTsfWriter implements TsfWriter {
   #sendNextFrame(): boolean {
     const selected: SelectedAppend[] = [];
     let payloadBytes = 0;
-    let accountedBytes = 0;
     const availableRecords = MAX_WRITER_IN_FLIGHT_RECORDS - this.#inFlightRecords;
-    const availableAccountedBytes =
-      MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES - this.#inFlightAccountedBytes;
-    if (availableRecords === 0 || availableAccountedBytes === 0) {
+    const availablePayloadBytes =
+      MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES - this.#inFlightPayloadBytes;
+    if (availableRecords === 0) {
       return false;
     }
     outer: for (const call of this.#queue) {
@@ -301,7 +300,7 @@ export class DefaultTsfWriter implements TsfWriter {
         const record = requiredRecord(call, index);
         if (
           selected.length >= Math.min(MAX_APPEND_FRAME_RECORDS, availableRecords) ||
-          record.inFlightAccountedBytes > availableAccountedBytes - accountedBytes ||
+          record.data.byteLength > availablePayloadBytes - payloadBytes ||
           (selected.length > 0 &&
             record.data.byteLength > MAX_FRAME_PAYLOAD_BYTES - payloadBytes)
         ) {
@@ -309,7 +308,6 @@ export class DefaultTsfWriter implements TsfWriter {
         }
         selected.push({ call, index, record });
         payloadBytes += record.data.byteLength;
-        accountedBytes += record.inFlightAccountedBytes;
       }
     }
     if (selected.length === 0) {
@@ -329,7 +327,7 @@ export class DefaultTsfWriter implements TsfWriter {
       call.sent += 1;
     }
     this.#inFlightRecords += selected.length;
-    this.#inFlightAccountedBytes += accountedBytes;
+    this.#inFlightPayloadBytes += payloadBytes;
     return true;
   }
 
@@ -366,7 +364,7 @@ export class DefaultTsfWriter implements TsfWriter {
           writerSeqNum: call.writerStartSeqNum + BigInt(call.acknowledged + offset),
           seqNum: streamSeqNum + BigInt(offset),
         });
-        this.#inFlightAccountedBytes -= record.inFlightAccountedBytes;
+        this.#inFlightPayloadBytes -= record.data.byteLength;
       }
       this.#inFlightRecords -= acknowledged;
       call.acknowledged += acknowledged;
@@ -407,7 +405,7 @@ export class DefaultTsfWriter implements TsfWriter {
       call.sent = call.acknowledged;
     }
     this.#inFlightRecords = 0;
-    this.#inFlightAccountedBytes = 0;
+    this.#inFlightPayloadBytes = 0;
   }
 
   #finish(error: TsfClientError): void {
@@ -477,7 +475,6 @@ interface PendingAppend {
   readonly data: Uint8Array;
   readonly format: RecordFormat;
   readonly part: PartHeader;
-  readonly inFlightAccountedBytes: number;
 }
 
 interface PendingAppendCall {
@@ -523,7 +520,6 @@ function prepareAppend(input: AppendInput): PendingAppend {
     part: input.part === undefined
       ? UNSPLIT_PART
       : partHeader(input.part.index, input.part.isFinal),
-    inFlightAccountedBytes: Math.max(data.byteLength, 1),
   };
 }
 

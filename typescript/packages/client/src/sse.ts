@@ -46,7 +46,7 @@ const textEncoder = new TextEncoder();
 interface SseConnectOptions {
   readonly fetch: typeof globalThis.fetch;
   readonly apiOrigin: string;
-  readonly restRequestTimeoutMs: number;
+  readonly httpRequestTimeoutMs: number;
   readonly boundedOperationAttempts: number;
 }
 
@@ -233,7 +233,7 @@ async function openConnection(
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason);
   signal?.addEventListener("abort", abort, { once: true });
-  const timeoutMs = connectionOptions.restRequestTimeoutMs;
+  const timeoutMs = connectionOptions.httpRequestTimeoutMs;
   const timeoutError = new TsfClientError(
     "http_timeout",
     `SSE handshake timed out after ${timeoutMs}ms`,

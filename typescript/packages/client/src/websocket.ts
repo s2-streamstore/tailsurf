@@ -16,7 +16,7 @@ import {
   type ReadOptions,
   type TsfReadSession,
 } from "./reader.js";
-import { BaseTsfClient, type RestClientOptions } from "./rest.js";
+import { BaseTsfClient, type HttpClientOptions } from "./rest.js";
 import {
   connectInitialSocket,
   connectSocket,
@@ -38,13 +38,13 @@ import {
 import { streamMetadataFromWire } from "./models.js";
 import { integerOption, MAX_TIMER_DELAY_MS } from "./retry.js";
 
-export interface TsfClientOptions extends RestClientOptions {
+export interface TsfClientOptions extends HttpClientOptions {
   readonly webSocketFactory?: WebSocketFactory;
   readonly webSocketConnectTimeoutMs?: number;
   readonly webSocketProgressTimeoutMs?: number;
 }
 
-export interface WriteStreamOptions {
+export interface DurableWriterOptions {
   readonly streamId: StreamId;
   readonly linkSecret: string;
   readonly expectedNextSeqNum?: bigint;
@@ -99,7 +99,7 @@ export class TsfClient extends BaseTsfClient {
   }
 
   public async connectWriter(
-    options: WriteStreamOptions,
+    options: DurableWriterOptions,
   ): Promise<TsfWriter> {
     const normalized: NormalizedWriteOptions = {
       streamId: parseStreamId(options.streamId),

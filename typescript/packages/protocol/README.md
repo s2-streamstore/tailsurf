@@ -29,7 +29,7 @@ The package also exports its language-neutral fixtures at `@tailsurf/protocol/fi
 
 `LogicalTranscript` uses one 16 MiB `maxReassemblyBytes` limit. It bounds bytes retained across unfinished split records and the size of one completed split-record assembly. Unsplit records borrow their input payload and do not consume this budget.
 
-SDK durable writers use the shared `MAX_WRITER_IN_FLIGHT_RECORDS` and `MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES` window. It bounds records that have been sent but not acknowledged.
+SDK durable writers use the shared `MAX_WRITER_IN_FLIGHT_RECORDS` and `MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES` window. It bounds records that have been sent but not acknowledged.
 
 ## Compatibility
 

@@ -58,8 +58,8 @@ use crate::{
             StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
         },
         ws::{
-            MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
-            WEBSOCKET_HEARTBEAT_INTERVAL_MS, WriteStreamOptions,
+            MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
+            WEBSOCKET_HEARTBEAT_INTERVAL_MS, WriteSessionOptions,
             frame::{
                 AppendBatch, AppendRecord, CaughtUpPosition, ClientFrame, FrameCodecError,
                 MAX_APPEND_FRAME_RECORDS, MAX_FRAME_PAYLOAD_BYTES, OwnedReadRecord, PartHeader,
@@ -86,8 +86,8 @@ const WEBSOCKET_READ_IDLE_TIMEOUT: Duration =
 pub struct TsfClientConfig {
     /// Service origin without the `/api/v1` namespace.
     pub api_origin: Url,
-    /// Per-request timeout for REST operations and SSE opening handshakes.
-    pub rest_request_timeout: Duration,
+    /// Per-request timeout for HTTP operations and SSE opening handshakes.
+    pub http_request_timeout: Duration,
     /// Timeout for establishing and upgrading a WebSocket.
     pub websocket_connect_timeout: Duration,
     /// Progress timeout for authentication, frame sends, and append acknowledgements.
@@ -115,7 +115,7 @@ impl Default for TsfClientConfig {
     fn default() -> Self {
         Self {
             api_origin: default_api_origin(),
-            rest_request_timeout: Duration::from_secs(10),
+            http_request_timeout: Duration::from_secs(10),
             websocket_connect_timeout: Duration::from_secs(10),
             websocket_progress_timeout: Duration::from_secs(30),
             bounded_operation_attempts: 3,
@@ -547,12 +547,12 @@ impl TsfClient {
     /// Connects the reconnecting durable writer.
     ///
     /// Submitted records are queued in memory. The writer sends them through the fixed
-    /// [`MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES`] and [`MAX_WRITER_IN_FLIGHT_RECORDS`] socket window.
+    /// [`MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES`] and [`MAX_WRITER_IN_FLIGHT_RECORDS`] socket window.
     pub async fn connect_writer(
         &self,
         options: DurableWriterOptions,
     ) -> Result<TsfWriter, TsfClientError> {
-        let mut session_options = WriteStreamOptions::new(
+        let mut session_options = WriteSessionOptions::new(
             options.stream_id,
             ClientWriterId::new_random(),
             options.link_secret,
@@ -568,14 +568,14 @@ impl TsfClient {
     /// Unlike [`TsfWriter`], this session does not retain or resend unacknowledged records.
     pub async fn connect_write_session(
         &self,
-        options: WriteStreamOptions,
+        options: WriteSessionOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
         self.open_write_session(&options).await
     }
 
     async fn open_write_session(
         &self,
-        options: &WriteStreamOptions,
+        options: &WriteSessionOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
         self.retry_transient(|| self.connect_write_session_once(options))
             .await
@@ -583,7 +583,7 @@ impl TsfClient {
 
     async fn connect_write_session_once(
         &self,
-        options: &WriteStreamOptions,
+        options: &WriteSessionOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
         let url = self.websocket_url(format_args!("/streams/{}/write", options.stream_id))?;
         let connect_timeout = self.config.websocket_connect_timeout;
@@ -625,7 +625,7 @@ impl TsfClient {
     /// Connects a resumable SSE reader.
     ///
     /// Private credentials stay in the bearer header. Reconnects reuse the original URL and send
-    /// the latest versioned event cursor in `Last-Event-ID`. The REST request timeout bounds each
+    /// the latest versioned event cursor in `Last-Event-ID`. The HTTP request timeout bounds each
     /// opening handshake but not the established event body.
     pub async fn connect_sse_reader(
         &self,
@@ -671,7 +671,7 @@ impl TsfClient {
         request: &SseReadRequest,
         last_event: Option<&SseResumeEvent>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
-        let handshake_timeout = self.config.rest_request_timeout;
+        let handshake_timeout = self.config.http_request_timeout;
         self.retry_transient(|| async {
             with_timeout(
                 handshake_timeout,
@@ -824,7 +824,7 @@ impl TsfClient {
     ) -> Result<T, TsfClientError> {
         let response = self
             .apply_rest_auth(request, link_secret)
-            .timeout(self.config.rest_request_timeout)
+            .timeout(self.config.http_request_timeout)
             .send()
             .await?;
         json_response(response, operation).await
@@ -838,7 +838,7 @@ impl TsfClient {
     ) -> Result<(), TsfClientError> {
         let response = self
             .apply_rest_auth(request, link_secret)
-            .timeout(self.config.rest_request_timeout)
+            .timeout(self.config.http_request_timeout)
             .send()
             .await?;
         let status = response.status();
@@ -1156,11 +1156,6 @@ impl TsfProducer {
     }
 }
 
-/// The socket window counts every record as at least one byte.
-fn in_flight_record_accounted_bytes(data: &Bytes) -> usize {
-    data.len().max(1)
-}
-
 /// Durable writer that retains unacknowledged records and resends them across transient
 /// interruptions.
 ///
@@ -1182,7 +1177,7 @@ impl fmt::Debug for TsfWriter {
 }
 
 impl TsfWriter {
-    fn new(client: TsfClient, options: WriteStreamOptions, session: TsfWriteSession) -> Self {
+    fn new(client: TsfClient, options: WriteSessionOptions, session: TsfWriteSession) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(WriterShared {
             terminal_error: Arc::new(OnceLock::new()),
@@ -1432,7 +1427,7 @@ impl PendingSubmission {
 /// for.
 #[derive(Default)]
 struct InFlightWindow {
-    accounted_bytes: usize,
+    payload_bytes: usize,
     records: usize,
     /// Absolute: submissions can fill the queue but never postpone it, so it measures time
     /// without durability progress rather than command-channel inactivity.
@@ -1476,7 +1471,7 @@ impl WriterCursor {
 
 async fn run_writer(
     client: TsfClient,
-    options: WriteStreamOptions,
+    options: WriteSessionOptions,
     mut session: TsfWriteSession,
     mut cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
     shared: Arc<WriterShared>,
@@ -1651,16 +1646,15 @@ fn take_frame(
     let mut frame_bytes = 0;
     for submission in pending.iter_mut() {
         while let Some(payload) = submission.payloads.get(submission.sent) {
-            let accounted_bytes = in_flight_record_accounted_bytes(&payload.data);
+            let payload_bytes = payload.data.len();
             if in_flight.records == MAX_WRITER_IN_FLIGHT_RECORDS
-                || in_flight.accounted_bytes + accounted_bytes
-                    > MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES
+                || in_flight.payload_bytes + payload_bytes > MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES
                 || frame.len() == MAX_APPEND_FRAME_RECORDS
                 || (!frame.is_empty() && payload.data.len() > MAX_FRAME_PAYLOAD_BYTES - frame_bytes)
             {
                 return;
             }
-            in_flight.accounted_bytes += accounted_bytes;
+            in_flight.payload_bytes += payload_bytes;
             in_flight.records += 1;
             frame_bytes += payload.data.len();
             frame.push(submission.record(submission.sent));
@@ -1708,7 +1702,7 @@ async fn send_pending(
 async fn recover_pending_appends(
     session: &mut TsfWriteSession,
     client: &TsfClient,
-    options: &WriteStreamOptions,
+    options: &WriteSessionOptions,
     pending: &mut VecDeque<PendingSubmission>,
     in_flight: &mut InFlightWindow,
     reconnect_attempts: &mut usize,
@@ -1781,8 +1775,7 @@ fn dispatch_ack(
     while remaining > 0 {
         let submission = pending.front_mut().expect("ack validated against pending");
         while submission.acked < submission.payloads.len() && remaining > 0 {
-            in_flight.accounted_bytes -=
-                in_flight_record_accounted_bytes(&submission.payloads[submission.acked].data);
+            in_flight.payload_bytes -= submission.payloads[submission.acked].data.len();
             in_flight.records -= 1;
             submission.receipts.push(AppendReceipt {
                 writer_seq_num: writer_seq_nums.next().expect("ack validated"),
@@ -2970,7 +2963,7 @@ fn validate_link_page(
 fn validate_client_config(config: &TsfClientConfig) -> Result<(), TsfClientError> {
     validate_api_origin(&config.api_origin)?;
     for (name, value) in [
-        ("rest_request_timeout", config.rest_request_timeout),
+        ("http_request_timeout", config.http_request_timeout),
         (
             "websocket_connect_timeout",
             config.websocket_connect_timeout,
@@ -3352,7 +3345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sse_handshake_uses_the_rest_request_timeout() {
+    async fn sse_handshake_uses_the_http_request_timeout() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind SSE listener");
@@ -3372,7 +3365,7 @@ mod tests {
         let mut config =
             TsfClientConfig::new(Url::parse(&format!("http://{address}")).expect("SSE API origin"))
                 .expect("valid client config");
-        config.rest_request_timeout = Duration::from_millis(20);
+        config.http_request_timeout = Duration::from_millis(20);
         config.bounded_operation_attempts = 1;
         let client = TsfClient::with_config(config).expect("SSE client");
         let stream_id = "00000000000000000000000000000000"
@@ -3618,7 +3611,7 @@ mod tests {
             Err(TsfClientError::InvalidClientConfig(_))
         ));
         let config = TsfClientConfig {
-            rest_request_timeout: Duration::ZERO,
+            http_request_timeout: Duration::ZERO,
             ..TsfClientConfig::default()
         };
         assert!(matches!(
@@ -3980,7 +3973,11 @@ mod tests {
     fn in_flight_window(pending: &VecDeque<PendingSubmission>) -> InFlightWindow {
         InFlightWindow {
             records: pending.iter().map(|s| s.payloads.len()).sum(),
-            accounted_bytes: pending.iter().map(|s| s.payloads.len()).sum(),
+            payload_bytes: pending
+                .iter()
+                .flat_map(|submission| &submission.payloads)
+                .map(|payload| payload.data.len())
+                .sum(),
             ack_deadline: None,
         }
     }
@@ -4075,7 +4072,7 @@ mod tests {
 
         assert_eq!(planned, [vec![0, 1], vec![2, 3], vec![4, 5]]);
         assert_eq!(in_flight.records, 6);
-        assert_eq!(in_flight.accounted_bytes, 6 * MAX_RECORD_PAYLOAD_BYTES);
+        assert_eq!(in_flight.payload_bytes, 6 * MAX_RECORD_PAYLOAD_BYTES);
         assert!(
             pending
                 .iter()
@@ -4093,7 +4090,7 @@ mod tests {
         }
         // One record fits the remaining window exactly; the second must wait for acks.
         let mut in_flight = InFlightWindow {
-            accounted_bytes: MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES - MAX_RECORD_PAYLOAD_BYTES,
+            payload_bytes: MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES - MAX_RECORD_PAYLOAD_BYTES,
             records: MAX_WRITER_IN_FLIGHT_RECORDS - 2,
             ack_deadline: None,
         };
@@ -4102,17 +4099,23 @@ mod tests {
         take_frame(&mut pending, &mut in_flight, &mut frame);
         assert_eq!(frame.len(), 1);
         assert_eq!(frame[0].writer_seq_num, 0);
-        assert_eq!(
-            in_flight.accounted_bytes,
-            MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES
-        );
+        assert_eq!(in_flight.payload_bytes, MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES);
         assert_eq!(pending[0].sent, 1);
         take_frame(&mut pending, &mut in_flight, &mut frame);
         assert!(frame.is_empty());
 
+        // Empty payloads consume only record capacity and can use a full byte window.
+        let (mut empty, _rx) = pending_submission(2, 1);
+        empty.sent = 0;
+        let mut empty_pending = VecDeque::from([empty]);
+        take_frame(&mut empty_pending, &mut in_flight, &mut frame);
+        assert_eq!(frame.len(), 1);
+        assert_eq!(frame[0].writer_seq_num, 2);
+        assert_eq!(in_flight.payload_bytes, MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES);
+
         // The record-count bound stops framing even with byte capacity left.
         let mut record_full = InFlightWindow {
-            accounted_bytes: 0,
+            payload_bytes: 0,
             records: MAX_WRITER_IN_FLIGHT_RECORDS,
             ack_deadline: None,
         };
@@ -4200,7 +4203,7 @@ mod tests {
         dispatch_ack(second_ack, &mut pending, &mut in_flight).expect("spanning ack");
         assert!(pending.is_empty());
         assert_eq!(in_flight.records, 0);
-        assert_eq!(in_flight.accounted_bytes, 0);
+        assert_eq!(in_flight.payload_bytes, 0);
         for (ack_rx, expected) in [
             (&mut first_rx, vec![(7, 42, first_ack), (8, 43, second_ack)]),
             (&mut second_rx, vec![(9, 44, second_ack)]),

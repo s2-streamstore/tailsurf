@@ -98,7 +98,7 @@ try {
 
 `appendLogical` splits data above the 512 KiB physical-record limit into contiguous parts.
 
-The writer queues submitted input and sends it through a fixed socket window of 1,024 records and 5 MiB. A submission may be larger than that window.
+The writer queues submitted input and sends it through a fixed socket window of 1,024 records and 5 MiB of payload. A submission may be larger than that window.
 
 ```ts
 const writer = await client.connectWriter({
@@ -119,6 +119,10 @@ await client.createStream(request, { idempotencyKey });
 ```
 
 Transient REST failures, initial connections, and readers use `boundedOperationAttempts`. The SDK owns a jittered exponential backoff with a 200 ms base and a 2 s cap. An established durable writer uses that schedule without an attempt limit. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
+
+`httpRequestTimeoutMs` bounds HTTP requests and SSE opening handshakes. `webSocketConnectTimeoutMs` bounds WebSocket establishment. `webSocketProgressTimeoutMs` bounds authentication, sends, and append acknowledgements. Their defaults are 10 seconds, 10 seconds, and 30 seconds.
+
+Established SSE bodies are not timed out. WebSocket read-idle detection is derived from the protocol heartbeat interval.
 
 ## Runtime configuration
 

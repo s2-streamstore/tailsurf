@@ -12,7 +12,7 @@ import {
   MAX_FRAME_PAYLOAD_BYTES,
   MAX_READ_FRAME_RECORDS,
   MAX_RECORD_PAYLOAD_BYTES,
-  MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES,
+  MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES,
   MAX_WRITER_IN_FLIGHT_RECORDS,
   partHeaderFromRaw,
   parseClientWriterId,
@@ -41,7 +41,7 @@ interface Fixtures {
   readonly max_frame_payload_bytes: number;
   readonly max_encoded_frame_bytes: number;
   readonly max_writer_in_flight_records: number;
-  readonly max_writer_in_flight_accounted_bytes: number;
+  readonly max_writer_in_flight_payload_bytes: number;
   readonly client_frames: readonly FrameFixture[];
   readonly server_frames: readonly FrameFixture[];
 }
@@ -64,8 +64,8 @@ describe("TSF v1 wire fixtures", () => {
     expect(MAX_WRITER_IN_FLIGHT_RECORDS).toBe(
       fixtures.max_writer_in_flight_records,
     );
-    expect(MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES).toBe(
-      fixtures.max_writer_in_flight_accounted_bytes,
+    expect(MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES).toBe(
+      fixtures.max_writer_in_flight_payload_bytes,
     );
   });
 

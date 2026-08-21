@@ -7,7 +7,7 @@ use tailsurf::{
     protocol::{
         rest::{StreamMetadata, Visibility},
         ws::{
-            MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
+            MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
             WEBSOCKET_HEARTBEAT_INTERVAL_MS,
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_FRAME_RECORDS,
@@ -31,7 +31,7 @@ struct Fixtures {
     max_frame_payload_bytes: usize,
     max_encoded_frame_bytes: usize,
     max_writer_in_flight_records: usize,
-    max_writer_in_flight_accounted_bytes: usize,
+    max_writer_in_flight_payload_bytes: usize,
     client_frames: Vec<FrameFixture<ClientFixture>>,
     server_frames: Vec<FrameFixture<ServerFixture>>,
 }
@@ -114,8 +114,8 @@ fn protocol_constants_match_v1_fixtures() {
         MAX_WRITER_IN_FLIGHT_RECORDS
     );
     assert_eq!(
-        fixtures.max_writer_in_flight_accounted_bytes,
-        MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES
+        fixtures.max_writer_in_flight_payload_bytes,
+        MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES
     );
 }
 

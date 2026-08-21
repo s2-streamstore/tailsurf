@@ -33,7 +33,7 @@ pub use protocol::{
         StreamMetadata, UpdateStreamRequest, Visibility,
     },
     ws::{
-        MAX_WRITER_IN_FLIGHT_ACCOUNTED_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteStreamOptions,
+        MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteSessionOptions,
         frame::{
             AppendBatch, AppendRecord, CaughtUpPosition, IntoRecordData, OwnedReadRecord,
             PartHeader, ReadBatch, ReadRecord, RecordFormat, RecordPayload,

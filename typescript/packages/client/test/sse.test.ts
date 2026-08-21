@@ -380,7 +380,7 @@ describe("SSE reader resume", () => {
     });
   });
 
-  it("bounds an SSE handshake with the REST request timeout", async () => {
+  it("bounds an SSE handshake with the HTTP request timeout", async () => {
     vi.useFakeTimers();
     try {
       const streamId = generateStreamId();
@@ -393,7 +393,7 @@ describe("SSE reader resume", () => {
       );
       const opening = new TsfClient({
         fetch,
-        restRequestTimeoutMs: 5,
+        httpRequestTimeoutMs: 5,
         boundedOperationAttempts: 1,
       }).connectSseReader({ streamId });
       const rejected = expect(opening).rejects.toMatchObject({

@@ -367,7 +367,7 @@ describe("TsfClient REST API", () => {
     });
     const client = new TsfClient({
       fetch: request,
-      restRequestTimeoutMs: 5,
+      httpRequestTimeoutMs: 5,
     });
 
     await expect(client.createStream()).resolves.toMatchObject({
@@ -701,7 +701,7 @@ describe("TsfClient REST API", () => {
   it("aborts REST requests at the configured timeout", async () => {
     let aborted = false;
     const client = new TsfClient({
-      restRequestTimeoutMs: 5,
+      httpRequestTimeoutMs: 5,
       fetch: vi.fn<typeof fetch>(
         (_input, init) =>
           new Promise<Response>((_resolve, reject) => {
@@ -740,7 +740,7 @@ describe("TsfClient REST API", () => {
       },
     }), { status });
     const client = new TsfClient({
-      restRequestTimeoutMs: 5,
+      httpRequestTimeoutMs: 5,
       boundedOperationAttempts: 1,
       fetch: vi.fn<typeof fetch>(async () => response),
     });
