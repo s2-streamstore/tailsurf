@@ -3,9 +3,9 @@ import {
   encodeServerFrame,
   generateStreamId,
   parseWriterId,
-  MAX_BATCH_PAYLOAD_BYTES,
-  MAX_READ_BATCH_RECORDS,
-  MAX_RECORD_BYTES,
+  MAX_FRAME_PAYLOAD_BYTES,
+  MAX_READ_FRAME_RECORDS,
+  MAX_RECORD_PAYLOAD_BYTES,
   RecordFormat,
   TSF_WEBSOCKET_PROTOCOL,
   UNSPLIT_PART,
@@ -18,8 +18,8 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  MAX_PENDING_WRITER_PAYLOAD_BYTES,
-  MAX_PENDING_WRITER_RECORDS,
+  MAX_WRITER_IN_FLIGHT_BYTES,
+  MAX_WRITER_IN_FLIGHT_RECORDS,
   TsfClient,
   type WebSocketFactory,
 } from "../src/index.js";
@@ -49,7 +49,7 @@ describe("FrameSocket", () => {
         ],
         1000,
       ),
-      { maxPhysicalRecordSlots: 2, maxBytes: 1_024 },
+      { maxUnits: 2, maxBytes: 1_024 },
     );
     await frameBounded.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -67,7 +67,7 @@ describe("FrameSocket", () => {
         ],
         1000,
       ),
-      { maxPhysicalRecordSlots: 10, maxBytes: 100 },
+      { maxUnits: 10, maxBytes: 100 },
     );
     await byteBounded.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -79,7 +79,7 @@ describe("FrameSocket", () => {
 
   it("accounts for every physical record in a queued read batch", async () => {
     const records = Array.from(
-      { length: MAX_READ_BATCH_RECORDS },
+      { length: MAX_READ_FRAME_RECORDS },
       (_unused, index) => record(BigInt(index), ""),
     );
     const socket = new FrameSocket(
@@ -92,13 +92,13 @@ describe("FrameSocket", () => {
             records: Array.from(
               { length: 25 },
               (_unused, index) =>
-                record(BigInt(MAX_READ_BATCH_RECORDS + index), ""),
+                record(BigInt(MAX_READ_FRAME_RECORDS + index), ""),
             ),
           },
         ],
         1000,
       ),
-      { maxPhysicalRecordSlots: 1_024, maxBytes: 16 * 1024 * 1024 },
+      { maxUnits: 1_024, maxBytes: 16 * 1024 * 1024 },
     );
     await socket.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -106,7 +106,7 @@ describe("FrameSocket", () => {
     await expect(socket.nextFrame()).resolves.toMatchObject({ type: "ready" });
     await expect(socket.nextFrame()).resolves.toMatchObject({
       type: "readBatch",
-      records: { length: MAX_READ_BATCH_RECORDS },
+      records: { length: MAX_READ_FRAME_RECORDS },
     });
     await expect(socket.nextFrame()).rejects.toMatchObject({
       code: "client_receive_overload",
@@ -126,7 +126,7 @@ describe("TsfReadSession", () => {
   it("drains a maximum read batch in order", async () => {
     const streamId = generateStreamId();
     const records = Array.from(
-      { length: MAX_READ_BATCH_RECORDS },
+      { length: MAX_READ_FRAME_RECORDS },
       (_unused, index) => record(BigInt(index), ""),
     );
     const client = new TsfClient({
@@ -143,10 +143,10 @@ describe("TsfReadSession", () => {
     const reader = await client.connectReader({
       streamId,
       start: { type: "seqNum", seqNum: 0n },
-      stop: { count: BigInt(MAX_READ_BATCH_RECORDS) },
+      stop: { count: BigInt(MAX_READ_FRAME_RECORDS) },
     });
 
-    for (let index = 0; index < MAX_READ_BATCH_RECORDS; index += 1) {
+    for (let index = 0; index < MAX_READ_FRAME_RECORDS; index += 1) {
       await expect(reader.nextRecord()).resolves.toMatchObject({
         seqNum: BigInt(index),
       });
@@ -876,7 +876,6 @@ describe("TsfWriter", () => {
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      writerStartSeqNum: 7n,
     });
 
     const first = writer.append({ data: "first" });
@@ -885,19 +884,19 @@ describe("TsfWriter", () => {
     const third = writer.append({ data: "third" });
 
     socket.ackCurrent();
-    await expect(first).resolves.toEqual({ writerSeqNum: 7n, seqNum: 7n });
+    await expect(first).resolves.toEqual({ writerSeqNum: 0n, seqNum: 0n });
     await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(2));
     expect(socket.appendCount).toBe(2);
 
     socket.ackCurrent();
     await expect(Promise.all([second, third])).resolves.toEqual([
-      { writerSeqNum: 8n, seqNum: 8n },
-      { writerSeqNum: 9n, seqNum: 9n },
+      { writerSeqNum: 1n, seqNum: 1n },
+      { writerSeqNum: 2n, seqNum: 2n },
     ]);
     await writer.close();
   });
 
-  it("coalesces append calls made in one turn into one wire batch", async () => {
+  it("coalesces append calls made in one turn into one protocol frame", async () => {
     const socket = new ControlledWriterWebSocket();
     const client = new TsfClient({
       webSocketFactory: () => socket,
@@ -947,7 +946,7 @@ describe("TsfWriter", () => {
     await expect(closing).resolves.toBeUndefined();
   });
 
-  it("bounds pending records and payload while releasing settled capacity", async () => {
+  it("queues records and payload beyond the socket window", async () => {
     const socket = new ControlledWriterWebSocket();
     const client = new TsfClient({
       webSocketFactory: () => socket,
@@ -958,43 +957,39 @@ describe("TsfWriter", () => {
     });
 
     const recordCalls = Array.from(
-      { length: MAX_PENDING_WRITER_RECORDS },
+      { length: MAX_WRITER_IN_FLIGHT_RECORDS },
       () => writer.append({ data: new Uint8Array() }),
     );
-    await expect(writer.append({ data: new Uint8Array() })).rejects.toMatchObject({
-      code: "client_write_overload",
-    });
-    await vi.waitFor(() => expect(socket.hasPendingAppend).toBe(true));
+    const queuedRecord = writer.append({ data: new Uint8Array() });
+    await vi.waitFor(() =>
+      expect(socket.pendingRecordCount).toBe(MAX_WRITER_IN_FLIGHT_RECORDS)
+    );
     socket.ackCurrent();
     await expect(recordCalls[0]).resolves.toMatchObject({ writerSeqNum: 0n });
-    const recordReplacement = writer.append({ data: new Uint8Array() });
     socket.setAutoAck(true);
-    await Promise.all([...recordCalls.slice(1), recordReplacement]);
+    await Promise.all([...recordCalls.slice(1), queuedRecord]);
 
     socket.setAutoAck(false);
     const payloadRecordCount =
-      MAX_PENDING_WRITER_PAYLOAD_BYTES / MAX_RECORD_BYTES;
+      MAX_WRITER_IN_FLIGHT_BYTES / MAX_RECORD_PAYLOAD_BYTES;
     if (!Number.isInteger(payloadRecordCount)) {
-      throw new TypeError("writer payload limit must compose from whole records");
+      throw new TypeError("writer byte window must compose from whole records");
     }
-    const maxRecord = new Uint8Array(MAX_RECORD_BYTES);
+    const maxRecord = new Uint8Array(MAX_RECORD_PAYLOAD_BYTES);
     const payloadCalls = Array.from(
       { length: payloadRecordCount },
       () => writer.append({ data: maxRecord }),
     );
-    await expect(writer.append({ data: Uint8Array.of(1) })).rejects.toMatchObject({
-      code: "client_write_overload",
-    });
-    await vi.waitFor(() => expect(socket.hasPendingAppend).toBe(true));
+    const queuedPayload = writer.append({ data: Uint8Array.of(1) });
+    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(payloadRecordCount));
     socket.ackCurrent();
     await expect(payloadCalls[0]).resolves.toBeDefined();
-    const payloadReplacement = writer.append({ data: Uint8Array.of(1) });
     socket.setAutoAck(true);
-    await Promise.all([...payloadCalls.slice(1), payloadReplacement]);
+    await Promise.all([...payloadCalls.slice(1), queuedPayload]);
 
     expect(socket.appendCount).toBe(
       2 +
-        Math.ceil(MAX_PENDING_WRITER_PAYLOAD_BYTES / MAX_BATCH_PAYLOAD_BYTES) +
+        Math.ceil(MAX_WRITER_IN_FLIGHT_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
         1,
     );
     await writer.close();
@@ -1034,6 +1029,27 @@ describe("TsfWriter", () => {
     expect(stalled.closed).toBe(true);
   });
 
+  it("creates a fresh identity for each durable writer", async () => {
+    const authFrames: WriterOpenFrame[] = [];
+    const client = new TsfClient({
+      webSocketFactory: () => new WriterWebSocket(true, authFrames, []),
+    });
+    const options = {
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    } as const;
+
+    const first = await client.connectWriter(options);
+    await first.close();
+    const second = await client.connectWriter(options);
+    await second.close();
+
+    expect(authFrames).toHaveLength(2);
+    expect(authFrames[0]?.clientWriterId).not.toEqual(
+      authFrames[1]?.clientWriterId,
+    );
+  });
+
   it("reuses its writer identity and sequence when resending after disconnect", async () => {
     const appends: AppendRecord[] = [];
     const authFrames: WriterOpenFrame[] = [];
@@ -1055,12 +1071,11 @@ describe("TsfWriter", () => {
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      writerStartSeqNum: 9n,
       expectedNextSeqNum: 42n,
     });
 
     await expect(writer.append({ data: "durable\n" })).resolves.toEqual({
-      writerSeqNum: 9n,
+      writerSeqNum: 0n,
       seqNum: 42n,
     });
     await writer.close();
@@ -1072,7 +1087,7 @@ describe("TsfWriter", () => {
       42n,
       undefined,
     ]);
-    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([9n, 9n]);
+    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([0n, 0n]);
     expect(appends[0]?.data).toEqual(appends[1]?.data);
   });
 
@@ -1085,17 +1100,159 @@ describe("TsfWriter", () => {
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      writerStartSeqNum: 4n,
     });
 
     await expect(writer.appendBatch([
       { data: "first" },
       { data: "second" },
     ])).resolves.toEqual([
-      { writerSeqNum: 4n, seqNum: 42n },
-      { writerSeqNum: 5n, seqNum: 43n },
+      { writerSeqNum: 0n, seqNum: 42n },
+      { writerSeqNum: 1n, seqNum: 43n },
     ]);
-    expect(appends.map(({ writerSeqNum }) => writerSeqNum)).toEqual([4n, 5n]);
+    expect(appends.map(({ writerSeqNum }) => writerSeqNum)).toEqual([0n, 1n]);
+    await writer.close();
+  });
+
+  it("splits one submission across bounded wire frames", async () => {
+    const socket = new ControlledWriterWebSocket();
+    const client = new TsfClient({ webSocketFactory: () => socket });
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    const submission = writer.appendBatch(Array.from(
+      { length: 3 },
+      () => ({ data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES) }),
+    ));
+    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(3));
+    expect(socket.appendCount).toBe(2);
+    socket.ackCurrent();
+    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(1));
+    socket.ackCurrent();
+
+    await expect(submission).resolves.toHaveLength(3);
+    expect(socket.appendCount).toBe(2);
+    await writer.close();
+  });
+
+  it("paces queued input larger than the socket window", async () => {
+    const socket = new ControlledWriterWebSocket();
+    const client = new TsfClient({ webSocketFactory: () => socket });
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    const submission = writer.appendBatch(Array.from(
+      { length: 16 },
+      () => ({ data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES) }),
+    ));
+    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(10));
+    expect(socket.appendCount).toBe(5);
+
+    socket.setAutoAck(true);
+    await expect(submission).resolves.toHaveLength(16);
+    await writer.close();
+  });
+
+  it("accepts one submission larger than a protocol frame", async () => {
+    const socket = new ControlledWriterWebSocket();
+    const client = new TsfClient({ webSocketFactory: () => socket });
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    const submission = writer.appendBatch(Array.from(
+      { length: MAX_WRITER_IN_FLIGHT_RECORDS + 1 },
+      () => ({ data: new Uint8Array() }),
+    ));
+    await vi.waitFor(() =>
+      expect(socket.pendingRecordCount).toBe(MAX_WRITER_IN_FLIGHT_RECORDS)
+    );
+    expect(socket.appendCount).toBe(1);
+
+    socket.setAutoAck(true);
+    await expect(submission).resolves.toHaveLength(MAX_WRITER_IN_FLIGHT_RECORDS + 1);
+    expect(socket.appendCount).toBe(2);
+    await writer.close();
+  });
+
+  it("splits a logical record into contiguous physical parts", async () => {
+    const appends: AppendRecord[] = [];
+    const client = new TsfClient({
+      webSocketFactory: () => new WriterWebSocket(true, [], appends),
+    });
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    await expect(writer.appendLogical({
+      data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES + 1),
+    })).resolves.toHaveLength(2);
+    expect(appends.map(({ writerSeqNum, part, data }) => ({
+      writerSeqNum,
+      part,
+      bytes: data.byteLength,
+    }))).toEqual([
+      {
+        writerSeqNum: 0n,
+        part: { index: 0, isFinal: false },
+        bytes: MAX_RECORD_PAYLOAD_BYTES,
+      },
+      {
+        writerSeqNum: 1n,
+        part: { index: 1, isFinal: true },
+        bytes: 1,
+      },
+    ]);
+    await writer.close();
+  });
+
+  it("retains acknowledged progress and resends only the unacknowledged suffix", async () => {
+    const appends: AppendRecord[] = [];
+    const authFrames: WriterOpenFrame[] = [];
+    let connection = 0;
+    const client = new TsfClient({
+      webSocketFactory: () => {
+        const current = connection;
+        connection += 1;
+        return new WriterWebSocket(
+          true,
+          authFrames,
+          appends,
+          1013,
+          "interrupted",
+          current === 0 ? 1 : undefined,
+          current === 0 ? 42n : 43n,
+        );
+      },
+      retryPolicy: { initialBackoffMs: 0, maxBackoffMs: 0 },
+    });
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    await expect(writer.appendBatch([
+      { data: "first" },
+      { data: "second" },
+      { data: "third" },
+    ])).resolves.toEqual([
+      { writerSeqNum: 0n, seqNum: 42n },
+      { writerSeqNum: 1n, seqNum: 43n },
+      { writerSeqNum: 2n, seqNum: 44n },
+    ]);
+    expect(appends.map(({ writerSeqNum }) => writerSeqNum)).toEqual([
+      0n,
+      1n,
+      2n,
+      1n,
+      2n,
+    ]);
+    expect(authFrames[0]?.clientWriterId).toEqual(authFrames[1]?.clientWriterId);
     await writer.close();
   });
 
@@ -1161,40 +1318,76 @@ describe("TsfWriter", () => {
     expect(appends).toHaveLength(1);
   });
 
-  it("becomes terminal when an acknowledgement is lost and reconnects exhaust", async () => {
+  it("recovers the same records beyond the bounded operation retry count", async () => {
     const appends: AppendRecord[] = [];
     const authFrames: WriterOpenFrame[] = [];
     let connectionCount = 0;
     const client = new TsfClient({
       webSocketFactory: () => {
         connectionCount += 1;
-        return (connectionCount === 1
-          ? new WriterWebSocket(false, authFrames, appends)
-          : new HangingWebSocket(true));
+        if (connectionCount === 1) {
+          return new WriterWebSocket(false, authFrames, appends);
+        }
+        return connectionCount === 2
+          ? new HangingWebSocket(false)
+          : new WriterWebSocket(true, authFrames, appends);
       },
+      webSocketConnectTimeoutMs: 5,
       webSocketOperationTimeoutMs: 5,
       retryPolicy: { maxAttempts: 2, initialBackoffMs: 0, maxBackoffMs: 0 },
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      writerStartSeqNum: 7n,
     });
 
     const uncertain = writer.append({ data: "possibly durable\n" });
-    const queued = writer.append({ data: "must not reuse sequence\n" });
+    const queued = writer.append({ data: "next record\n" });
 
-    await expect(uncertain).rejects.toMatchObject({
-      code: "writer_durability_unknown",
+    await expect(uncertain).resolves.toEqual({
+      writerSeqNum: 0n,
+      seqNum: 42n,
     });
-    await expect(queued).rejects.toMatchObject({
-      code: "writer_durability_unknown",
+    await expect(queued).resolves.toEqual({
+      writerSeqNum: 1n,
+      seqNum: 43n,
     });
-    await expect(writer.append({ data: "still terminal\n" })).rejects.toMatchObject({
-      code: "writer_durability_unknown",
+    await writer.close();
+
+    expect(connectionCount).toBe(3);
+    expect(authFrames).toHaveLength(2);
+    expect(authFrames[0]?.clientWriterId).toEqual(authFrames[1]?.clientWriterId);
+    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([0n, 1n, 0n, 1n]);
+    expect(appends[0]?.data).toEqual(appends[2]?.data);
+    expect(appends[1]?.data).toEqual(appends[3]?.data);
+  });
+
+  it("can explicitly abort ambiguous recovery", async () => {
+    let connectionCount = 0;
+    const client = new TsfClient({
+      webSocketFactory: () => {
+        connectionCount += 1;
+        return connectionCount === 1
+          ? new WriterWebSocket(false, [], [])
+          : new HangingWebSocket(false);
+      },
+      webSocketConnectTimeoutMs: 5,
+      retryPolicy: { maxAttempts: 1, initialBackoffMs: 0, maxBackoffMs: 0 },
     });
-    expect(connectionCount).toBe(2);
-    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([7n, 8n]);
+    const writer = await client.connectWriter({
+      streamId: generateStreamId(),
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+    const uncertain = writer.append({ data: "possibly durable\n" });
+    const rejection = expect(uncertain).rejects.toMatchObject({
+      code: "writer_durability_unknown",
+      cause: { code: "writer_aborted" },
+    });
+    await vi.waitFor(() => expect(connectionCount).toBeGreaterThan(1));
+
+    writer.abort();
+
+    await rejection;
   });
 });
 
@@ -1329,6 +1522,8 @@ class WriterWebSocket extends EventTarget {
     private readonly appends: AppendRecord[],
     private readonly disconnectCode = 1006,
     private readonly disconnectReason = "interrupted",
+    private readonly acknowledgedRecords?: number,
+    private nextStreamSeqNum = 42n,
   ) {
     super();
     queueMicrotask(() => {
@@ -1354,13 +1549,29 @@ class WriterWebSocket extends EventTarget {
     }
     this.appends.push(...frame.records);
     if (this.shouldAck) {
+      const acknowledgedRecords = Math.min(
+        this.acknowledgedRecords ?? frame.records.length,
+        frame.records.length,
+      );
+      const lastAcknowledged = frame.records[acknowledgedRecords - 1];
+      if (lastAcknowledged === undefined) {
+        throw new Error("writer acknowledgement was empty");
+      }
       this.#emit({
         type: "appendAck",
         writerStartSeqNum: first.writerSeqNum,
-        writerEndSeqNum: last.writerSeqNum + 1n,
-        startSeqNum: 42n,
-        endSeqNum: 42n + BigInt(frame.records.length),
+        writerEndSeqNum: lastAcknowledged.writerSeqNum + 1n,
+        startSeqNum: this.nextStreamSeqNum,
+        endSeqNum: this.nextStreamSeqNum + BigInt(acknowledgedRecords),
       });
+      this.nextStreamSeqNum += BigInt(acknowledgedRecords);
+      if (acknowledgedRecords < frame.records.length) {
+        this.#dispatchClose(
+          this.disconnectCode,
+          this.disconnectReason,
+          this.disconnectCode === 1000,
+        );
+      }
     } else {
       this.#dispatchClose(
         this.disconnectCode,
@@ -1405,7 +1616,7 @@ class ControlledWriterWebSocket extends EventTarget {
   public appendCount = 0;
   #autoAck = false;
   #closed = false;
-  #pendingAppend: readonly AppendRecord[] | undefined;
+  readonly #pendingAppends: (readonly AppendRecord[])[] = [];
 
   public constructor() {
     super();
@@ -1416,11 +1627,14 @@ class ControlledWriterWebSocket extends EventTarget {
   }
 
   public get hasPendingAppend(): boolean {
-    return this.#pendingAppend !== undefined;
+    return this.#pendingAppends.length > 0;
   }
 
   public get pendingRecordCount(): number {
-    return this.#pendingAppend?.length ?? 0;
+    return this.#pendingAppends.reduce(
+      (total, records) => total + records.length,
+      0,
+    );
   }
 
   public send(data: Uint8Array<ArrayBuffer>): void {
@@ -1432,24 +1646,20 @@ class ControlledWriterWebSocket extends EventTarget {
     if (frame.type !== "appendBatch" || frame.records.length === 0) {
       throw new Error(`unexpected ${frame.type} frame`);
     }
-    if (this.#pendingAppend !== undefined) {
-      throw new Error("writer sent concurrent append frames");
-    }
     this.appendCount += 1;
-    this.#pendingAppend = frame.records;
-    if (this.#autoAck) {
+    this.#pendingAppends.push(frame.records);
+    if (this.#autoAck && this.#pendingAppends.length === 1) {
       queueMicrotask(() => this.ackCurrent());
     }
   }
 
   public ackCurrent(): void {
-    const records = this.#pendingAppend;
+    const records = this.#pendingAppends.shift();
     const first = records?.[0];
     const last = records?.at(-1);
     if (first === undefined || last === undefined) {
       throw new Error("writer has no append awaiting acknowledgement");
     }
-    this.#pendingAppend = undefined;
     this.#emit({
       type: "appendAck",
       writerStartSeqNum: first.writerSeqNum,
@@ -1457,11 +1667,14 @@ class ControlledWriterWebSocket extends EventTarget {
       startSeqNum: first.writerSeqNum,
       endSeqNum: last.writerSeqNum + 1n,
     });
+    if (this.#autoAck && this.#pendingAppends.length > 0) {
+      queueMicrotask(() => this.ackCurrent());
+    }
   }
 
   public setAutoAck(enabled: boolean): void {
     this.#autoAck = enabled;
-    if (enabled && this.#pendingAppend !== undefined) {
+    if (enabled && this.#pendingAppends.length > 0) {
       queueMicrotask(() => this.ackCurrent());
     }
   }

@@ -2,23 +2,19 @@ import { ProtocolError } from "./errors.js";
 import { writerIdKey } from "./ids.js";
 import {
   isUnsplitPart,
-  MAX_RECORD_BYTES,
+  MAX_RECORD_PAYLOAD_BYTES,
   type ReadRecord,
   type RecordFormat,
 } from "./ws.js";
 
-export const DEFAULT_MAX_LOGICAL_RECORD_BYTES = MAX_RECORD_BYTES * 32;
-export const DEFAULT_MAX_TRANSCRIPT_WRITERS = 4_096;
-/** SDK memory-safety limit across all unfinished split records. */
-export const DEFAULT_MAX_TRANSCRIPT_PENDING_BYTES =
-  DEFAULT_MAX_LOGICAL_RECORD_BYTES;
-export const DEFAULT_MAX_TRANSCRIPT_PENDING_PARTS = 16_384;
+/** Default maximum bytes used for split-record reassembly. */
+export const DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES = MAX_RECORD_PAYLOAD_BYTES * 32;
+const MAX_TRANSCRIPT_WRITER_STATES = 4_096;
+const MAX_TRANSCRIPT_TOTAL_PENDING_PARTS = 16_384;
 
 export interface LogicalTranscriptOptions {
-  readonly maxLogicalRecordBytes?: number;
-  readonly maxWriters?: number;
-  readonly maxPendingBytes?: number;
-  readonly maxPendingParts?: number;
+  /** Maximum bytes retained across unfinished split records or assembled for one completed split record. */
+  readonly maxReassemblyBytes?: number;
 }
 
 export interface TranscriptRecord {
@@ -42,29 +38,14 @@ interface WriterState {
 
 export class LogicalTranscript {
   readonly #writers = new Map<string, WriterState>();
-  #pendingBytes = 0;
-  #pendingParts = 0;
-  public readonly maxLogicalRecordBytes: number;
-  public readonly maxWriters: number;
-  public readonly maxPendingBytes: number;
-  public readonly maxPendingParts: number;
+  #totalPendingBytes = 0;
+  #totalPendingParts = 0;
+  public readonly maxReassemblyBytes: number;
 
   public constructor(options: LogicalTranscriptOptions = {}) {
-    this.maxLogicalRecordBytes = transcriptLimit(
-      options.maxLogicalRecordBytes ?? DEFAULT_MAX_LOGICAL_RECORD_BYTES,
-      "logical record bytes",
-    );
-    this.maxWriters = transcriptLimit(
-      options.maxWriters ?? DEFAULT_MAX_TRANSCRIPT_WRITERS,
-      "writers",
-    );
-    this.maxPendingBytes = transcriptLimit(
-      options.maxPendingBytes ?? DEFAULT_MAX_TRANSCRIPT_PENDING_BYTES,
-      "pending bytes",
-    );
-    this.maxPendingParts = transcriptLimit(
-      options.maxPendingParts ?? DEFAULT_MAX_TRANSCRIPT_PENDING_PARTS,
-      "pending parts",
+    this.maxReassemblyBytes = transcriptLimit(
+      options.maxReassemblyBytes ?? DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
+      "reassembly bytes",
     );
   }
 
@@ -72,10 +53,10 @@ export class LogicalTranscript {
     const key = writerIdKey(record.writerId);
     let writer = this.#writers.get(key);
     if (writer === undefined) {
-      if (this.#writers.size >= this.maxWriters) {
+      if (this.#writers.size >= MAX_TRANSCRIPT_WRITER_STATES) {
         throw new ProtocolError(
           "transcript_writer_limit",
-          `transcript has reached its ${this.maxWriters} writer limit`,
+          `transcript has reached its ${MAX_TRANSCRIPT_WRITER_STATES} writer-state limit`,
         );
       }
       writer = {};
@@ -89,7 +70,6 @@ export class LogicalTranscript {
 
     if (isUnsplitPart(record.part)) {
       this.#clearPending(writer);
-      this.#checkLength(record.data.byteLength);
       return { format: record.format, data: record.data };
     }
 
@@ -101,7 +81,6 @@ export class LogicalTranscript {
 
     if (record.part.index === 0) {
       this.#clearPending(writer);
-      this.#checkLength(record.data.byteLength);
       this.#setPending(writer, {
         startSeqNum,
         nextPartIndex: 1,
@@ -113,8 +92,7 @@ export class LogicalTranscript {
       return undefined;
     }
 
-    const pending = writer.pending;
-    this.#clearPending(writer);
+    const pending = this.#takePending(writer);
     if (
       pending === undefined ||
       pending.startSeqNum !== startSeqNum ||
@@ -125,7 +103,7 @@ export class LogicalTranscript {
     }
 
     const length = pending.length + record.data.byteLength;
-    this.#checkLength(length);
+    this.#checkReassemblyBytes(length);
     pending.length = length;
     pending.partCount += 1;
     if (record.data.byteLength > 0) {
@@ -143,41 +121,47 @@ export class LogicalTranscript {
     return undefined;
   }
 
-  #checkLength(length: number): void {
-    if (length > this.maxLogicalRecordBytes) {
+  #checkReassemblyBytes(length: number): void {
+    if (length > this.maxReassemblyBytes) {
       throw new ProtocolError(
-        "logical_record_too_large",
-        `logical record is ${length} bytes; maximum is ${this.maxLogicalRecordBytes}`,
+        "transcript_reassembly_limit",
+        `transcript reassembly would use ${length} bytes; maximum is ${this.maxReassemblyBytes}`,
       );
     }
   }
 
   #setPending(writer: WriterState, pending: PendingRecord): void {
-    if (pending.length > this.maxPendingBytes - this.#pendingBytes) {
+    const reassemblyBytes = this.#totalPendingBytes + pending.length;
+    if (reassemblyBytes > this.maxReassemblyBytes) {
       throw new ProtocolError(
-        "transcript_pending_bytes_limit",
-        `transcript has reached its ${this.maxPendingBytes} pending-byte limit`,
+        "transcript_reassembly_limit",
+        `transcript reassembly would use ${reassemblyBytes} bytes; maximum is ${this.maxReassemblyBytes}`,
       );
     }
-    if (pending.partCount > this.maxPendingParts - this.#pendingParts) {
+    if (pending.partCount > MAX_TRANSCRIPT_TOTAL_PENDING_PARTS - this.#totalPendingParts) {
       throw new ProtocolError(
-        "transcript_pending_parts_limit",
-        `transcript has reached its ${this.maxPendingParts} pending-part limit`,
+        "transcript_total_pending_parts_limit",
+        `transcript has reached its ${MAX_TRANSCRIPT_TOTAL_PENDING_PARTS} total pending-part limit`,
       );
     }
     writer.pending = pending;
-    this.#pendingBytes += pending.length;
-    this.#pendingParts += pending.partCount;
+    this.#totalPendingBytes += pending.length;
+    this.#totalPendingParts += pending.partCount;
   }
 
   #clearPending(writer: WriterState): void {
+    this.#takePending(writer);
+  }
+
+  #takePending(writer: WriterState): PendingRecord | undefined {
     const pending = writer.pending;
     if (pending === undefined) {
-      return;
+      return undefined;
     }
     delete writer.pending;
-    this.#pendingBytes -= pending.length;
-    this.#pendingParts -= pending.partCount;
+    this.#totalPendingBytes -= pending.length;
+    this.#totalPendingParts -= pending.partCount;
+    return pending;
   }
 }
 

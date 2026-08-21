@@ -1,6 +1,6 @@
 import {
   generateStreamId,
-  MAX_RECORD_BYTES,
+  MAX_RECORD_PAYLOAD_BYTES,
   MAX_SSE_EVENT_BYTES,
   MAX_SSE_UNTERMINATED_EVENT_BYTES,
 } from "@s2-dev/tailsurf-protocol";
@@ -133,7 +133,7 @@ describe("SSE reader resume", () => {
 
   it("accepts an escape-heavy maximum-size record in its compact encoding", async () => {
     const streamId = generateStreamId();
-    const value = Buffer.alloc(MAX_RECORD_BYTES).toString("base64url");
+    const value = Buffer.alloc(MAX_RECORD_PAYLOAD_BYTES).toString("base64url");
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
       sseResponse(streamId, readBatchEvent("v1,1,1", {
         encoding: "base64url",
@@ -146,7 +146,7 @@ describe("SSE reader resume", () => {
       stop: { count: 1n },
     });
 
-    expect((await session.nextRecord())?.data).toHaveLength(MAX_RECORD_BYTES);
+    expect((await session.nextRecord())?.data).toHaveLength(MAX_RECORD_PAYLOAD_BYTES);
     session.close();
   });
 
@@ -156,7 +156,7 @@ describe("SSE reader resume", () => {
       count: undefined,
       event: () => readBatchEvent("v1,1,1", {
         encoding: "base64url",
-        value: Buffer.alloc(MAX_RECORD_BYTES + 1).toString("base64url"),
+        value: Buffer.alloc(MAX_RECORD_PAYLOAD_BYTES + 1).toString("base64url"),
       }),
     },
     {

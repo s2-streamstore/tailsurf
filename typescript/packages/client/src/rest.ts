@@ -17,7 +17,7 @@ import {
   IDEMPOTENCY_KEY_BYTES,
   MAX_SAFE_INTEGER_U64,
   MAX_LINK_PAGE_ITEMS,
-  MAX_RECORD_BYTES,
+  MAX_RECORD_PAYLOAD_BYTES,
   MAX_REST_RESPONSE_BYTES,
   MAX_STATELESS_APPEND_JSON_BYTES,
   MAX_STATELESS_APPEND_PAYLOAD_BYTES,
@@ -78,12 +78,15 @@ export interface RestClientOptions {
   readonly fetch?: typeof globalThis.fetch;
   /** Bounds REST requests and SSE opening handshakes. It does not time out an established SSE body. */
   readonly restRequestTimeoutMs?: number;
-  /** Retry policy shared by REST requests and SSE or WebSocket connections. */
+  /**
+   * Retry policy for bounded operations and reconnect delays.
+   * Established durable writers keep recovering until acknowledged or aborted.
+   */
   readonly retryPolicy?: RetryPolicy;
 }
 
 export interface RetryPolicy {
-  /** Total attempts including the initial attempt. */
+  /** Total attempts for bounded operations, including the initial attempt. */
   readonly maxAttempts?: number;
   /** Base delay before the first retry. Client-controlled delays are jittered. */
   readonly initialBackoffMs?: number;
@@ -670,10 +673,10 @@ function optionalLinkSecret(value: string | undefined): string | undefined {
 }
 
 function validateStatelessRecordBytes(bytes: number): void {
-  if (bytes > MAX_RECORD_BYTES) {
+  if (bytes > MAX_RECORD_PAYLOAD_BYTES) {
     throw new TsfClientError(
       "invalid_client_option",
-      `each append record must not exceed ${MAX_RECORD_BYTES} bytes`,
+      `each append record must not exceed ${MAX_RECORD_PAYLOAD_BYTES} bytes`,
     );
   }
 }

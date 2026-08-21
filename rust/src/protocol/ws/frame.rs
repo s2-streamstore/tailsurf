@@ -12,13 +12,16 @@ use crate::{
 /// WebSocket subprotocol offered and selected for TSF v1 connections.
 pub const TSF_WEBSOCKET_PROTOCOL: &str = "tsf.v1";
 /// Maximum data payload in one physical record.
-pub const MAX_RECORD_BYTES: usize = 512 * 1024;
-/// Maximum physical records carried by one append batch.
-pub const MAX_APPEND_BATCH_RECORDS: usize = 128;
-/// Maximum physical records carried by one read batch.
-pub const MAX_READ_BATCH_RECORDS: usize = 1_000;
-/// Maximum aggregate record payload carried by one batch frame.
-pub const MAX_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const MAX_RECORD_PAYLOAD_BYTES: usize = 512 * 1024;
+/// Maximum physical records carried by one append protocol frame.
+pub const MAX_APPEND_FRAME_RECORDS: usize = 128;
+/// Maximum physical records carried by one read protocol frame.
+pub const MAX_READ_FRAME_RECORDS: usize = 1_000;
+/// Maximum aggregate record payload carried by one append or read protocol frame.
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum encoded size of any TSF protocol frame.
+pub const MAX_ENCODED_FRAME_BYTES: usize =
+    1 + MAX_READ_FRAME_RECORDS * (4 + 45) + MAX_FRAME_PAYLOAD_BYTES;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,25 +283,25 @@ impl ReadBatch {
     pub fn try_from_records(records: Vec<OwnedReadRecord>) -> Result<Self, FrameCodecError> {
         // Count first: an over-count input could otherwise wrap the payload sum on 32-bit
         // targets before the aggregate bound rejects it.
-        validate_batch_count(records.len(), MAX_READ_BATCH_RECORDS)?;
+        validate_batch_count(records.len(), MAX_READ_FRAME_RECORDS)?;
         validate_sequence_contiguous(records.iter().map(|record| record.seq_num))?;
         let mut payload_bytes = 0_usize;
         for record in &records {
             validate_record_len(record.data.len())?;
-            // MAX_READ_BATCH_RECORDS records of MAX_RECORD_BYTES each cannot overflow.
+            // MAX_READ_FRAME_RECORDS records of MAX_RECORD_PAYLOAD_BYTES each cannot overflow.
             payload_bytes += record.data.len();
         }
-        if payload_bytes > MAX_BATCH_PAYLOAD_BYTES {
+        if payload_bytes > MAX_FRAME_PAYLOAD_BYTES {
             return Err(FrameCodecError::BatchPayloadTooLarge {
                 actual: payload_bytes,
-                max: MAX_BATCH_PAYLOAD_BYTES,
+                max: MAX_FRAME_PAYLOAD_BYTES,
             });
         }
 
         let mut payload = BytesMut::with_capacity(payload_bytes);
         let mut metas = Vec::with_capacity(records.len());
         for record in records {
-            // payload_bytes is capped at MAX_BATCH_PAYLOAD_BYTES, so these narrows cannot
+            // payload_bytes is capped at MAX_FRAME_PAYLOAD_BYTES, so these narrows cannot
             // truncate.
             let data_start = payload.len() as u32;
             payload.extend_from_slice(&record.data);
@@ -422,6 +425,208 @@ pub struct AppendRecord {
     pub data: Bytes,
 }
 
+/// Conversion into payload bytes accepted by record constructors.
+///
+/// Owned buffers are moved without copying; borrowed input is copied once.
+pub trait IntoRecordData {
+    /// Converts this value into reference-counted immutable bytes.
+    fn into_record_data(self) -> Bytes;
+}
+
+impl IntoRecordData for Bytes {
+    fn into_record_data(self) -> Bytes {
+        self
+    }
+}
+
+impl IntoRecordData for Vec<u8> {
+    fn into_record_data(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoRecordData for Box<[u8]> {
+    fn into_record_data(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoRecordData for String {
+    fn into_record_data(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoRecordData for &Bytes {
+    fn into_record_data(self) -> Bytes {
+        self.clone()
+    }
+}
+
+impl IntoRecordData for &[u8] {
+    fn into_record_data(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl<const N: usize> IntoRecordData for &[u8; N] {
+    fn into_record_data(self) -> Bytes {
+        Bytes::copy_from_slice(&self[..])
+    }
+}
+
+impl IntoRecordData for &str {
+    fn into_record_data(self) -> Bytes {
+        Bytes::copy_from_slice(self.as_bytes())
+    }
+}
+
+impl AppendRecord {
+    /// Creates a physical record without allocating when the input already owns compatible bytes.
+    pub fn new(
+        writer_seq_num: u64,
+        part: PartHeader,
+        format: RecordFormat,
+        data: impl IntoRecordData,
+    ) -> Self {
+        Self {
+            writer_seq_num,
+            part,
+            format,
+            data: data.into_record_data(),
+        }
+    }
+
+    /// Checks this record against the wire payload bound.
+    pub(crate) fn validate(&self) -> Result<(), FrameCodecError> {
+        validate_record_len(self.data.len())
+    }
+}
+
+/// One physical record before writer-sequence assignment.
+///
+/// Carries everything but the writer-local sequence number, which a durable writer assigns when
+/// the owning actor admits the record. Use [`AppendRecord`] for manually numbered low-level
+/// sessions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordPayload {
+    /// Logical split-part metadata.
+    pub part: PartHeader,
+    /// Presentation hint for the payload.
+    pub format: RecordFormat,
+    /// Exact record payload bytes.
+    pub data: Bytes,
+}
+
+impl RecordPayload {
+    /// Creates an unsequenced physical record payload.
+    pub fn new(part: PartHeader, format: RecordFormat, data: impl IntoRecordData) -> Self {
+        Self {
+            part,
+            format,
+            data: data.into_record_data(),
+        }
+    }
+}
+
+/// Splits one logical record into unsequenced physical parts at [`MAX_RECORD_PAYLOAD_BYTES`].
+///
+/// Parts carry contiguous zero-based part indices in the layout logical readers reassemble; the
+/// caller assigns writer sequence numbers. An empty payload yields one unsplit empty record.
+pub(crate) fn split_record_payloads(
+    format: RecordFormat,
+    data: Bytes,
+) -> Result<Vec<RecordPayload>, FrameCodecError> {
+    let part_count = data.len().div_ceil(MAX_RECORD_PAYLOAD_BYTES).max(1);
+    if part_count > PartHeader::MAX_INDEX as usize + 1 {
+        return Err(FrameCodecError::PartIndexTooLarge(
+            u32::try_from(part_count - 1).unwrap_or(u32::MAX),
+        ));
+    }
+
+    if part_count == 1 {
+        return Ok(vec![RecordPayload {
+            part: PartHeader::unsplit(),
+            format,
+            data,
+        }]);
+    }
+
+    let mut records = Vec::with_capacity(part_count);
+    for index in 0..part_count {
+        let start = index * MAX_RECORD_PAYLOAD_BYTES;
+        let end = data.len().min(start + MAX_RECORD_PAYLOAD_BYTES);
+        records.push(RecordPayload {
+            part: PartHeader::new(index as u32, index == part_count - 1)?,
+            format,
+            data: data.slice(start..end),
+        });
+    }
+    Ok(records)
+}
+
+/// A non-empty set of physical records submitted to a durable writer as one sequencing and ticket
+/// unit.
+///
+/// The writer actor assigns each batch one contiguous writer-sequence range in submission order,
+/// so the split parts of a logical record never interleave with another producer's records.
+/// Construction requires at least one record and upholds the [`MAX_RECORD_PAYLOAD_BYTES`] physical
+/// record bound. This is not an atomic service append: the actor may split a batch across protocol
+/// frames, and a terminal failure may leave a durable prefix while its ticket returns an error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendBatch {
+    records: Vec<RecordPayload>,
+}
+
+impl AppendBatch {
+    /// Builds a batch from explicit physical records, rejecting an empty batch or oversized
+    /// physical record.
+    pub fn from_records(records: Vec<RecordPayload>) -> Result<Self, FrameCodecError> {
+        if records.is_empty() {
+            return Err(FrameCodecError::EmptyAppendBatch);
+        }
+        for record in &records {
+            validate_record_len(record.data.len())?;
+        }
+        Ok(Self { records })
+    }
+
+    /// Builds a one-record batch.
+    pub fn single(
+        part: PartHeader,
+        format: RecordFormat,
+        data: impl IntoRecordData,
+    ) -> Result<Self, FrameCodecError> {
+        Self::from_records(vec![RecordPayload::new(part, format, data)])
+    }
+
+    /// Splits one logical record into the physical-part batch logical readers reassemble.
+    ///
+    /// A payload that fits in [`MAX_RECORD_PAYLOAD_BYTES`] becomes one unsplit record; larger
+    /// payloads are sliced into parts without further copying once the input is converted to
+    /// `Bytes` (borrowed inputs are copied once by that conversion).
+    pub fn split_logical(
+        format: RecordFormat,
+        data: impl IntoRecordData,
+    ) -> Result<Self, FrameCodecError> {
+        Self::from_records(split_record_payloads(format, data.into_record_data())?)
+    }
+
+    /// Returns the number of physical records in this non-empty batch.
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    #[cfg(test)]
+    fn payloads(&self) -> &[RecordPayload] {
+        &self.records
+    }
+
+    pub(crate) fn into_payloads(self) -> Vec<RecordPayload> {
+        self.records
+    }
+}
+
 /// Reconnect-safe position emitted after all preceding records have been delivered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaughtUpPosition {
@@ -511,7 +716,7 @@ impl ClientFrame {
         batch_encoded_len(
             records.iter().map(|record| record.borrow().data.len()),
             Self::APPEND_BODY_HEADER_LEN,
-            MAX_APPEND_BATCH_RECORDS,
+            MAX_APPEND_FRAME_RECORDS,
         )
     }
 
@@ -721,7 +926,7 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
         ClientOp::AppendBatch => {
             let mut records = Vec::new();
             let mut payload_bytes = 0;
-            for range in record_body_ranges(bytes, MAX_APPEND_BATCH_RECORDS) {
+            for range in record_body_ranges(bytes, MAX_APPEND_FRAME_RECORDS) {
                 let (start, end) = range?;
                 let record_body = &bytes[start..end];
                 let (writer_seq_num, body) = read_u64(record_body)?;
@@ -738,7 +943,7 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
                     data: input.slice(data_start..end),
                 });
             }
-            validate_batch(records.len(), payload_bytes, MAX_APPEND_BATCH_RECORDS)?;
+            validate_batch(records.len(), payload_bytes, MAX_APPEND_FRAME_RECORDS)?;
             Ok(ClientFrame::AppendBatch(records))
         }
     }
@@ -797,10 +1002,10 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
             // Every record costs a 4-byte length prefix plus the fixed header on the wire, so
             // the frame length bounds the record count.
             let max_records =
-                (body.len() / (4 + ServerFrame::READ_BODY_HEADER_LEN)).min(MAX_READ_BATCH_RECORDS);
+                (body.len() / (4 + ServerFrame::READ_BODY_HEADER_LEN)).min(MAX_READ_FRAME_RECORDS);
             let mut records = Vec::with_capacity(max_records);
             let mut payload_bytes = 0;
-            for range in record_body_ranges(bytes, MAX_READ_BATCH_RECORDS) {
+            for range in record_body_ranges(bytes, MAX_READ_FRAME_RECORDS) {
                 let (start, end) = range?;
                 let record_body = &bytes[start..end];
                 let (seq_num, body) = read_u64(record_body)?;
@@ -822,7 +1027,7 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
                     data_len: data.len() as u32,
                 });
             }
-            validate_batch(records.len(), payload_bytes, MAX_READ_BATCH_RECORDS)?;
+            validate_batch(records.len(), payload_bytes, MAX_READ_FRAME_RECORDS)?;
             validate_sequence_contiguous(records.iter().map(|record| record.seq_num))?;
             Ok(ServerFrame::ReadBatch(ReadBatch::from_parts(
                 input, records,
@@ -860,10 +1065,10 @@ fn parse_link_secret(text: &str) -> Result<LinkSecret, FrameCodecError> {
 }
 
 pub(crate) fn validate_record_len(len: usize) -> Result<(), FrameCodecError> {
-    if len > MAX_RECORD_BYTES {
+    if len > MAX_RECORD_PAYLOAD_BYTES {
         return Err(FrameCodecError::RecordTooLarge {
             actual: len,
-            max: MAX_RECORD_BYTES,
+            max: MAX_RECORD_PAYLOAD_BYTES,
         });
     }
     Ok(())
@@ -919,10 +1124,10 @@ fn validate_batch(
     maximum_records: usize,
 ) -> Result<(), FrameCodecError> {
     validate_batch_count(record_count, maximum_records)?;
-    if payload_bytes > MAX_BATCH_PAYLOAD_BYTES {
+    if payload_bytes > MAX_FRAME_PAYLOAD_BYTES {
         return Err(FrameCodecError::BatchPayloadTooLarge {
             actual: payload_bytes,
-            max: MAX_BATCH_PAYLOAD_BYTES,
+            max: MAX_FRAME_PAYLOAD_BYTES,
         });
     }
     Ok(())
@@ -1074,6 +1279,9 @@ pub enum FrameCodecError {
     /// A batch record length was zero or extended beyond the message.
     #[error("batch record length is invalid")]
     InvalidRecordLength,
+    /// A durable-writer submission had no records.
+    #[error("append batch must not be empty")]
+    EmptyAppendBatch,
     /// A batch had no records or exceeded its direction-specific record limit.
     #[error("batch has {actual} records; expected 1 to {max}")]
     InvalidBatchRecordCount {
@@ -1085,7 +1293,7 @@ pub enum FrameCodecError {
     /// A read batch skipped or repeated a physical sequence number.
     #[error("ReadBatch sequence numbers must be contiguous")]
     NonContiguousReadBatch,
-    /// Aggregate record payload exceeded [`MAX_BATCH_PAYLOAD_BYTES`].
+    /// Aggregate record payload exceeded [`MAX_FRAME_PAYLOAD_BYTES`].
     #[error("batch payload is {actual} bytes; maximum is {max}")]
     BatchPayloadTooLarge {
         /// Actual aggregate payload length.
@@ -1115,7 +1323,7 @@ pub enum FrameCodecError {
     /// A stream metadata frame did not contain the expected JSON object.
     #[error("stream metadata frame is invalid: {0}")]
     InvalidStreamMetadata(#[source] serde_json::Error),
-    /// A physical record payload exceeded [`MAX_RECORD_BYTES`].
+    /// A physical record payload exceeded [`MAX_RECORD_PAYLOAD_BYTES`].
     #[error("record is {actual} bytes; maximum is {max}")]
     RecordTooLarge {
         /// Actual payload length.
@@ -1156,8 +1364,8 @@ mod tests {
 
     #[test]
     fn record_byte_limit_is_enforced_at_the_shared_boundary() {
-        let max_data = Bytes::from(vec![0; MAX_RECORD_BYTES]);
-        let oversized_data = Bytes::from(vec![0; MAX_RECORD_BYTES + 1]);
+        let max_data = Bytes::from(vec![0; MAX_RECORD_PAYLOAD_BYTES]);
+        let oversized_data = Bytes::from(vec![0; MAX_RECORD_PAYLOAD_BYTES + 1]);
 
         ClientFrame::AppendBatch(vec![AppendRecord {
             writer_seq_num: 0,
@@ -1177,8 +1385,8 @@ mod tests {
             .encode(),
             Err(FrameCodecError::RecordTooLarge {
                 actual,
-                max: MAX_RECORD_BYTES
-            }) if actual == MAX_RECORD_BYTES + 1
+                max: MAX_RECORD_PAYLOAD_BYTES
+            }) if actual == MAX_RECORD_PAYLOAD_BYTES + 1
         ));
 
         ServerFrame::ReadBatch(
@@ -1188,13 +1396,13 @@ mod tests {
         .encode()
         .expect("server max record encodes");
 
-        let oversized_client_frame = encoded_append_data_with_len(MAX_RECORD_BYTES + 1);
+        let oversized_client_frame = encoded_append_data_with_len(MAX_RECORD_PAYLOAD_BYTES + 1);
         assert!(matches!(
             ClientFrame::decode(&oversized_client_frame),
             Err(FrameCodecError::RecordTooLarge {
                 actual,
-                max: MAX_RECORD_BYTES
-            }) if actual == MAX_RECORD_BYTES + 1
+                max: MAX_RECORD_PAYLOAD_BYTES
+            }) if actual == MAX_RECORD_PAYLOAD_BYTES + 1
         ));
     }
 
@@ -1413,23 +1621,36 @@ mod tests {
 
     #[test]
     fn multi_record_batches_round_trip_and_enforce_bounds() {
-        let append = ClientFrame::AppendBatch(
-            (0..2)
-                .map(|writer_seq_num| AppendRecord {
-                    writer_seq_num,
-                    part: PartHeader::unsplit(),
-                    format: RecordFormat::Bytes,
-                    data: Bytes::from(vec![writer_seq_num as u8]),
-                })
-                .collect(),
-        );
-        let encoded = append.encode().expect("encode append batch");
+        // Varied part headers, formats, and payload lengths so field-for-field equality can
+        // catch any record-boundary or header mix-up in either direction.
+        let records: Vec<AppendRecord> = vec![
+            AppendRecord {
+                writer_seq_num: 41,
+                part: PartHeader::unsplit(),
+                format: RecordFormat::Transcript,
+                data: Bytes::from_static(b"alpha\n"),
+            },
+            AppendRecord {
+                writer_seq_num: 42,
+                part: PartHeader::new(1, true).expect("valid part header"),
+                format: RecordFormat::Bytes,
+                data: Bytes::from(vec![0x00, 0xff, 0x10, 0x7f]),
+            },
+            AppendRecord {
+                writer_seq_num: 43,
+                part: PartHeader::new(2, false).expect("valid part header"),
+                format: RecordFormat::Bytes,
+                data: Bytes::new(),
+            },
+        ];
+        let encoded = ClientFrame::AppendBatch(records.clone())
+            .encode()
+            .expect("encode append batch");
         let ClientFrame::AppendBatch(decoded) = ClientFrame::decode_bytes(encoded).expect("decode")
         else {
             panic!("expected append batch");
         };
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[1].writer_seq_num, 1);
+        assert_eq!(decoded, records);
 
         assert!(matches!(
             ClientFrame::AppendBatch(Vec::new()).encode(),
@@ -1446,7 +1667,7 @@ mod tests {
 
         let maximum_read = ServerFrame::ReadBatch(
             ReadBatch::try_from_records(
-                (0..MAX_READ_BATCH_RECORDS as u64)
+                (0..MAX_READ_FRAME_RECORDS as u64)
                     .map(|seq_num| owned_read_record(seq_num, Bytes::new()))
                     .collect(),
             )
@@ -1467,41 +1688,136 @@ mod tests {
         assert!(matches!(
             ClientFrame::AppendBatch(
                 std::iter::repeat_with(append_record)
-                    .take(MAX_APPEND_BATCH_RECORDS + 1)
+                    .take(MAX_APPEND_FRAME_RECORDS + 1)
                     .collect()
             )
             .encode(),
             Err(FrameCodecError::InvalidBatchRecordCount {
-                max: MAX_APPEND_BATCH_RECORDS,
+                max: MAX_APPEND_FRAME_RECORDS,
                 ..
             })
         ));
     }
 
+    /// Decoding a hand-written wire fixture, so encoder and decoder cannot share a framing
+    /// defect that a round trip would cancel out.
+    ///
+    /// Layout: op byte `0x03` (AppendBatch), then per record a big-endian u32 body length
+    /// (13-byte header plus payload), a big-endian u64 writer sequence number, a big-endian
+    /// u32 packed part header, a one-byte format, and the payload bytes.
     #[test]
-    fn try_from_records_enforces_wire_batch_bounds() {
+    fn append_batch_decodes_a_canonical_wire_fixture() {
+        #[rustfmt::skip]
+        const FRAME: &[u8] = &[
+            0x03, // AppendBatch
+            // Record 1: writer_seq_num 7, unsplit part, Transcript, "hi" (body len 13 + 2).
+            0x00, 0x00, 0x00, 0x0f,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+            0x80, 0x00, 0x00, 0x00,
+            0x01,
+            b'h', b'i',
+            // Record 2: writer_seq_num 8, part index 1 non-final, Bytes, [0x00, 0xff, 0x10]
+            // (body len 13 + 3).
+            0x00, 0x00, 0x00, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+            0x00, 0x00, 0x00, 0x01,
+            0x00,
+            0x00, 0xff, 0x10,
+        ];
+
+        let expected = vec![
+            AppendRecord {
+                writer_seq_num: 7,
+                part: PartHeader::unsplit(),
+                format: RecordFormat::Transcript,
+                data: Bytes::from_static(b"hi"),
+            },
+            AppendRecord {
+                writer_seq_num: 8,
+                part: PartHeader::new(1, false).expect("valid part header"),
+                format: RecordFormat::Bytes,
+                data: Bytes::from_static(&[0x00, 0xff, 0x10]),
+            },
+        ];
+        let ClientFrame::AppendBatch(decoded) = ClientFrame::decode(FRAME).expect("decode fixture")
+        else {
+            panic!("expected append batch");
+        };
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn append_submission_construction_enforces_physical_record_bounds() {
+        assert!(matches!(
+            AppendBatch::from_records(vec![]),
+            Err(FrameCodecError::EmptyAppendBatch)
+        ));
+        assert!(matches!(
+            AppendBatch::single(
+                PartHeader::unsplit(),
+                RecordFormat::Bytes,
+                vec![0_u8; MAX_RECORD_PAYLOAD_BYTES + 1],
+            ),
+            Err(FrameCodecError::RecordTooLarge {
+                max: MAX_RECORD_PAYLOAD_BYTES,
+                ..
+            })
+        ));
+
+        let batch = AppendBatch::split_logical(
+            RecordFormat::Transcript,
+            Bytes::from(vec![7_u8; MAX_RECORD_PAYLOAD_BYTES * 2 + 5]),
+        )
+        .expect("split logical record");
+        assert_eq!(batch.record_count(), 3);
+        assert_eq!(
+            batch.payloads()[0].part,
+            PartHeader::new(0, false).expect("part")
+        );
+        assert_eq!(
+            batch.payloads()[2].part,
+            PartHeader::new(2, true).expect("part")
+        );
+        assert_eq!(batch.payloads()[2].data.len(), 5);
+
+        let oversized_for_one_frame = AppendBatch::from_records(
+            (0..=MAX_APPEND_FRAME_RECORDS)
+                .map(|_| {
+                    RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new())
+                })
+                .collect(),
+        )
+        .expect("writer submissions may span frames");
+        assert_eq!(
+            oversized_for_one_frame.record_count(),
+            MAX_APPEND_FRAME_RECORDS + 1
+        );
+    }
+
+    #[test]
+    fn try_from_records_enforces_protocol_frame_bounds() {
         assert!(matches!(
             ReadBatch::try_from_records(vec![]),
             Err(FrameCodecError::InvalidBatchRecordCount { actual: 0, .. })
         ));
         assert!(matches!(
             ReadBatch::try_from_records(
-                (0..=MAX_READ_BATCH_RECORDS as u64)
+                (0..=MAX_READ_FRAME_RECORDS as u64)
                     .map(|seq_num| owned_read_record(seq_num, Bytes::new()))
                     .collect()
             ),
             Err(FrameCodecError::InvalidBatchRecordCount {
-                max: MAX_READ_BATCH_RECORDS,
+                max: MAX_READ_FRAME_RECORDS,
                 ..
             })
         ));
         assert!(matches!(
             ReadBatch::try_from_records(vec![owned_read_record(
                 0,
-                Bytes::from(vec![0; MAX_RECORD_BYTES + 1])
+                Bytes::from(vec![0; MAX_RECORD_PAYLOAD_BYTES + 1])
             )]),
             Err(FrameCodecError::RecordTooLarge {
-                max: MAX_RECORD_BYTES,
+                max: MAX_RECORD_PAYLOAD_BYTES,
                 ..
             })
         ));
@@ -1512,7 +1828,7 @@ mod tests {
                     .to_vec()
             ),
             Err(FrameCodecError::BatchPayloadTooLarge {
-                max: MAX_BATCH_PAYLOAD_BYTES,
+                max: MAX_FRAME_PAYLOAD_BYTES,
                 ..
             })
         ));

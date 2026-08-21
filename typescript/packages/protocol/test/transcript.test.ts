@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
   LogicalTranscript,
   partHeader,
   parseWriterId,
-  ProtocolError,
   RecordFormat,
   UNSPLIT_PART,
   type ReadRecord,
@@ -53,36 +53,42 @@ describe("logical transcript", () => {
     );
   });
 
-  it("enforces the logical record size limit and resynchronizes", () => {
-    const transcript = new LogicalTranscript({ maxLogicalRecordBytes: 4 });
+  it("enforces the reassembly byte limit and resynchronizes", () => {
+    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
 
     expect(transcript.pushRecord(record(7n, partHeader(0, false), "hel"))).toBeUndefined();
     expect(() =>
       transcript.pushRecord(record(8n, partHeader(1, true), "lo")),
-    ).toThrow(ProtocolError);
+    ).toThrowError(expect.objectContaining({ code: "transcript_reassembly_limit" }));
     expect(text(transcript.pushRecord(record(9n, UNSPLIT_PART, "next")))).toBe(
       "next",
     );
   });
 
-  it("bounds writer cardinality without disturbing known writers", () => {
-    const transcript = new LogicalTranscript({ maxWriters: 2 });
+  it("does not charge borrowed unsplit records to reassembly", () => {
+    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
 
-    expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "one", 1)))).toBe(
-      "one",
+    expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "hello")))).toBe(
+      "hello",
     );
-    expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "two", 2)))).toBe(
-      "two",
-    );
-    expect(() => transcript.pushRecord(record(0n, UNSPLIT_PART, "three", 3)))
+  });
+
+  it("bounds writer cardinality internally without disturbing known writers", () => {
+    const transcript = new LogicalTranscript();
+
+    for (let writer = 0; writer < 4_096; writer += 1) {
+      expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "value", writer))))
+        .toBe("value");
+    }
+    expect(() => transcript.pushRecord(record(0n, UNSPLIT_PART, "overflow", 4_096)))
       .toThrowError(expect.objectContaining({ code: "transcript_writer_limit" }));
-    expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "next", 1)))).toBe(
+    expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "next", 0)))).toBe(
       "next",
     );
   });
 
-  it("bounds aggregate pending bytes and releases them on resynchronization", () => {
-    const transcript = new LogicalTranscript({ maxPendingBytes: 4 });
+  it("bounds reassembly bytes across writers and releases them", () => {
+    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
 
     expect(
       transcript.pushRecord(record(0n, partHeader(0, false), "abc", 1)),
@@ -90,7 +96,7 @@ describe("logical transcript", () => {
     expect(() =>
       transcript.pushRecord(record(0n, partHeader(0, false), "de", 2))
     ).toThrowError(
-      expect.objectContaining({ code: "transcript_pending_bytes_limit" }),
+      expect.objectContaining({ code: "transcript_reassembly_limit" }),
     );
     expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "done", 1)))).toBe(
       "done",
@@ -100,23 +106,26 @@ describe("logical transcript", () => {
     ).toBeUndefined();
   });
 
-  it("bounds aggregate pending parts independently of payload bytes", () => {
-    const transcript = new LogicalTranscript({
-      maxPendingBytes: 10,
-      maxPendingParts: 2,
-    });
+  it("bounds total pending parts independently of payload bytes", () => {
+    const transcript = new LogicalTranscript();
 
-    expect(
-      transcript.pushRecord(record(0n, partHeader(0, false), "", 1)),
-    ).toBeUndefined();
-    expect(
-      transcript.pushRecord(record(1n, partHeader(1, false), "", 1)),
-    ).toBeUndefined();
+    for (let index = 0; index < 16_384; index += 1) {
+      expect(
+        transcript.pushRecord(record(BigInt(index), partHeader(index, false), "", 1)),
+      ).toBeUndefined();
+    }
     expect(() =>
-      transcript.pushRecord(record(2n, partHeader(2, false), "", 1))
+      transcript.pushRecord(record(16_384n, partHeader(16_384, false), "", 1))
     ).toThrowError(
-      expect.objectContaining({ code: "transcript_pending_parts_limit" }),
+      expect.objectContaining({ code: "transcript_total_pending_parts_limit" }),
     );
+  });
+
+  it("uses one shared default reassembly byte limit", () => {
+    const transcript = new LogicalTranscript();
+
+    expect(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES).toBe(16 * 1024 * 1024);
+    expect(transcript.maxReassemblyBytes).toBe(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES);
   });
 });
 
@@ -129,12 +138,18 @@ function record(
   return {
     seqNum: writerSeqNum,
     timestampMs: writerSeqNum,
-    writerId: parseWriterId(new Uint8Array(16).fill(writer)),
+    writerId: writerId(writer),
     writerSeqNum,
     part,
     format: RecordFormat.Transcript,
     data: textEncoder.encode(data),
   };
+}
+
+function writerId(index: number): ReadRecord["writerId"] {
+  const bytes = new Uint8Array(16);
+  new DataView(bytes.buffer).setUint32(12, index);
+  return parseWriterId(bytes);
 }
 
 function text(record: ReturnType<LogicalTranscript["pushRecord"]>): string | undefined {

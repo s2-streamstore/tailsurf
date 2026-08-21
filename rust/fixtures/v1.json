@@ -1,9 +1,10 @@
 {
   "websocket_protocol": "tsf.v1",
-  "max_record_bytes": 524288,
-  "max_append_batch_records": 128,
-  "max_read_batch_records": 1000,
-  "max_batch_payload_bytes": 1048576,
+  "max_record_payload_bytes": 524288,
+  "max_append_frame_records": 128,
+  "max_read_frame_records": 1000,
+  "max_frame_payload_bytes": 1048576,
+  "max_encoded_frame_bytes": 1097577,
   "client_frames": [
     {
       "name": "open anonymous read",

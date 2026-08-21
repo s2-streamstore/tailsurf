@@ -27,6 +27,8 @@ function readLink(rawStreamId: string, linkSecret: string): URL {
 
 The package also exports its language-neutral fixtures at `@s2-dev/tailsurf-protocol/fixtures/v1.json` and `@s2-dev/tailsurf-protocol/fixtures/rest-v1.json`.
 
+`LogicalTranscript` uses one 16 MiB `maxReassemblyBytes` limit. It bounds bytes retained across unfinished split records and the size of one completed split-record assembly. Unsplit records borrow their input payload and do not consume this budget.
+
 ## Compatibility
 
 Protocol fixtures are shared with the Rust implementation in the `tailsurf` repository. CI rejects any byte-level drift between the two copies.

@@ -17,12 +17,17 @@ import {
 } from "./stream-url.js";
 
 export const TSF_WEBSOCKET_PROTOCOL = "tsf.v1";
-export const MAX_RECORD_BYTES = 512 * 1024;
-export const MAX_APPEND_BATCH_RECORDS = 128;
-export const MAX_READ_BATCH_RECORDS = 1_000;
-export const MAX_BATCH_PAYLOAD_BYTES = 1024 * 1024;
-export const MAX_BATCH_FRAME_BYTES =
-  1 + MAX_READ_BATCH_RECORDS * (4 + 45) + MAX_BATCH_PAYLOAD_BYTES;
+/** Maximum data payload in one physical record. */
+export const MAX_RECORD_PAYLOAD_BYTES = 512 * 1024;
+/** Maximum physical records in one append protocol frame. */
+export const MAX_APPEND_FRAME_RECORDS = 128;
+/** Maximum physical records in one read protocol frame. */
+export const MAX_READ_FRAME_RECORDS = 1_000;
+/** Maximum aggregate record payload in one append or read protocol frame. */
+export const MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024;
+/** Maximum encoded size of any TSF protocol frame. */
+export const MAX_ENCODED_FRAME_BYTES =
+  1 + MAX_READ_FRAME_RECORDS * (4 + 45) + MAX_FRAME_PAYLOAD_BYTES;
 export const PART_FINAL_BIT = 0x8000_0000;
 export const MAX_PART_INDEX = 0x7fff_ffff;
 
@@ -178,7 +183,7 @@ export function encodeClientFrame(frame: ClientFrame): Uint8Array {
     }
     case "appendBatch": {
       const output = new Uint8Array(
-        batchFrameLength(frame.records, 13, MAX_APPEND_BATCH_RECORDS),
+        batchFrameLength(frame.records, 13, MAX_APPEND_FRAME_RECORDS),
       );
       const view = new DataView(output.buffer);
       output[0] = ClientOp.AppendBatch;
@@ -239,7 +244,7 @@ export function decodeClientFrame(input: Uint8Array | ArrayBuffer): ClientFrame 
       const view = dataView(bytes);
       const records: AppendRecord[] = [];
       let payloadBytes = 0;
-      for (const body of recordBodies(bytes, view, MAX_APPEND_BATCH_RECORDS)) {
+      for (const body of recordBodies(bytes, view, MAX_APPEND_FRAME_RECORDS)) {
         requireLength(body, 13);
         const bodyView = dataView(body);
         const data = body.slice(13);
@@ -257,7 +262,7 @@ export function decodeClientFrame(input: Uint8Array | ArrayBuffer): ClientFrame 
       validateBatchBounds(
         records.length,
         payloadBytes,
-        MAX_APPEND_BATCH_RECORDS,
+        MAX_APPEND_FRAME_RECORDS,
       );
       return { type: "appendBatch", records };
     }
@@ -329,7 +334,7 @@ export function encodeServerFrame(frame: ServerFrame): Uint8Array {
     }
     case "readBatch": {
       const output = new Uint8Array(
-        batchFrameLength(frame.records, 45, MAX_READ_BATCH_RECORDS),
+        batchFrameLength(frame.records, 45, MAX_READ_FRAME_RECORDS),
       );
       validateReadBatchSequence(frame.records);
       const view = new DataView(output.buffer);
@@ -390,7 +395,7 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
     case ServerOp.ReadBatch: {
       const records: ReadRecord[] = [];
       let payloadBytes = 0;
-      for (const body of recordBodies(bytes, view, MAX_READ_BATCH_RECORDS)) {
+      for (const body of recordBodies(bytes, view, MAX_READ_FRAME_RECORDS)) {
         requireLength(body, 45);
         const bodyView = dataView(body);
         const data = body.slice(45);
@@ -406,7 +411,7 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
           data,
         });
       }
-      validateBatchBounds(records.length, payloadBytes, MAX_READ_BATCH_RECORDS);
+      validateBatchBounds(records.length, payloadBytes, MAX_READ_FRAME_RECORDS);
       validateReadBatchSequence(records);
       return { type: "readBatch", records };
     }
@@ -503,10 +508,10 @@ function validateBatchBounds(
       `batch must contain 1 to ${maximumRecords} records`,
     );
   }
-  if (payloadBytes > MAX_BATCH_PAYLOAD_BYTES) {
+  if (payloadBytes > MAX_FRAME_PAYLOAD_BYTES) {
     throw new ProtocolError(
       "batch_payload_too_large",
-      `batch payload exceeds ${MAX_BATCH_PAYLOAD_BYTES} bytes`,
+      `batch payload exceeds ${MAX_FRAME_PAYLOAD_BYTES} bytes`,
     );
   }
 }
@@ -567,10 +572,10 @@ function requireExactLength(bytes: Uint8Array, expected: number, op: number): vo
 }
 
 function validateRecordLength(length: number): void {
-  if (length > MAX_RECORD_BYTES) {
+  if (length > MAX_RECORD_PAYLOAD_BYTES) {
     throw new ProtocolError(
       "record_too_large",
-      `record is ${length} bytes; maximum is ${MAX_RECORD_BYTES}`,
+      `record is ${length} bytes; maximum is ${MAX_RECORD_PAYLOAD_BYTES}`,
     );
   }
 }

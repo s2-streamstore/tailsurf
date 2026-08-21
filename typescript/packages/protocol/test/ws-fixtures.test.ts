@@ -7,10 +7,11 @@ import {
   decodeServerFrame,
   encodeClientFrame,
   encodeServerFrame,
-  MAX_APPEND_BATCH_RECORDS,
-  MAX_BATCH_PAYLOAD_BYTES,
-  MAX_READ_BATCH_RECORDS,
-  MAX_RECORD_BYTES,
+  MAX_APPEND_FRAME_RECORDS,
+  MAX_ENCODED_FRAME_BYTES,
+  MAX_FRAME_PAYLOAD_BYTES,
+  MAX_READ_FRAME_RECORDS,
+  MAX_RECORD_PAYLOAD_BYTES,
   partHeaderFromRaw,
   parseClientWriterId,
   parseWriterId,
@@ -30,10 +31,11 @@ interface FrameFixture {
 
 interface Fixtures {
   readonly websocket_protocol: string;
-  readonly max_record_bytes: number;
-  readonly max_append_batch_records: number;
-  readonly max_read_batch_records: number;
-  readonly max_batch_payload_bytes: number;
+  readonly max_record_payload_bytes: number;
+  readonly max_append_frame_records: number;
+  readonly max_read_frame_records: number;
+  readonly max_frame_payload_bytes: number;
+  readonly max_encoded_frame_bytes: number;
   readonly client_frames: readonly FrameFixture[];
   readonly server_frames: readonly FrameFixture[];
 }
@@ -45,10 +47,11 @@ const fixtures = JSON.parse(
 describe("TSF v1 wire fixtures", () => {
   it("pins protocol constants", () => {
     expect(TSF_WEBSOCKET_PROTOCOL).toBe(fixtures.websocket_protocol);
-    expect(MAX_RECORD_BYTES).toBe(fixtures.max_record_bytes);
-    expect(MAX_APPEND_BATCH_RECORDS).toBe(fixtures.max_append_batch_records);
-    expect(MAX_READ_BATCH_RECORDS).toBe(fixtures.max_read_batch_records);
-    expect(MAX_BATCH_PAYLOAD_BYTES).toBe(fixtures.max_batch_payload_bytes);
+    expect(MAX_RECORD_PAYLOAD_BYTES).toBe(fixtures.max_record_payload_bytes);
+    expect(MAX_APPEND_FRAME_RECORDS).toBe(fixtures.max_append_frame_records);
+    expect(MAX_READ_FRAME_RECORDS).toBe(fixtures.max_read_frame_records);
+    expect(MAX_FRAME_PAYLOAD_BYTES).toBe(fixtures.max_frame_payload_bytes);
+    expect(MAX_ENCODED_FRAME_BYTES).toBe(fixtures.max_encoded_frame_bytes);
   });
 
   it.each(fixtures.client_frames)("encodes and decodes client $name", (fixture) => {
@@ -128,7 +131,7 @@ describe("TSF v1 wire fixtures", () => {
     const maximumRead: ServerFrame = {
       type: "readBatch",
       records: Array.from(
-        { length: MAX_READ_BATCH_RECORDS },
+        { length: MAX_READ_FRAME_RECORDS },
         (_, index) => ({ ...readRecord, seqNum: BigInt(index) }),
       ),
     };
@@ -140,7 +143,7 @@ describe("TSF v1 wire fixtures", () => {
       encodeClientFrame({
         type: "appendBatch",
         records: Array.from(
-          { length: MAX_APPEND_BATCH_RECORDS + 1 },
+          { length: MAX_APPEND_FRAME_RECORDS + 1 },
           () => appendRecord,
         ),
       })
@@ -149,7 +152,7 @@ describe("TSF v1 wire fixtures", () => {
       encodeServerFrame({
         type: "readBatch",
         records: Array.from(
-          { length: MAX_READ_BATCH_RECORDS + 1 },
+          { length: MAX_READ_FRAME_RECORDS + 1 },
           () => readRecord,
         ),
       })
@@ -182,7 +185,7 @@ describe("TSF v1 wire fixtures", () => {
           writerSeqNum: 0n,
           part: partHeaderFromRaw(0x8000_0000),
           format: 0,
-          data: new Uint8Array(MAX_RECORD_BYTES + 1),
+          data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES + 1),
         }],
       }),
     ).toThrow(ProtocolError);

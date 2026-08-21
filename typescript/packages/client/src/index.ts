@@ -44,23 +44,26 @@ export type {
 export { isRetryableSocketError } from "./socket.js";
 export type { WebSocketFactory, WebSocketLike } from "./socket.js";
 export {
-  MAX_PENDING_WRITER_PAYLOAD_BYTES,
-  MAX_PENDING_WRITER_RECORDS,
+  MAX_WRITER_IN_FLIGHT_BYTES,
+  MAX_WRITER_IN_FLIGHT_RECORDS,
 } from "./writer.js";
-export type { AppendInput, AppendReceipt, TsfWriter } from "./writer.js";
+export type {
+  AppendInput,
+  AppendReceipt,
+  LogicalAppendInput,
+  TsfWriter,
+} from "./writer.js";
 export {
-  DEFAULT_MAX_LOGICAL_RECORD_BYTES,
-  DEFAULT_MAX_TRANSCRIPT_PENDING_BYTES,
-  DEFAULT_MAX_TRANSCRIPT_PENDING_PARTS,
-  DEFAULT_MAX_TRANSCRIPT_WRITERS,
+  DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
   LINK_SECRET_BYTES,
   LINK_SECRET_ENCODED_LENGTH,
   LogicalTranscript,
-  MAX_APPEND_BATCH_RECORDS,
-  MAX_BATCH_PAYLOAD_BYTES,
+  MAX_APPEND_FRAME_RECORDS,
+  MAX_ENCODED_FRAME_BYTES,
+  MAX_FRAME_PAYLOAD_BYTES,
   MAX_PART_INDEX,
-  MAX_READ_BATCH_RECORDS,
-  MAX_RECORD_BYTES,
+  MAX_READ_FRAME_RECORDS,
+  MAX_RECORD_PAYLOAD_BYTES,
   MAX_STREAM_TITLE_CODE_POINTS,
   ProtocolError,
   RecordFormat,

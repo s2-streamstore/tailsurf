@@ -16,10 +16,10 @@ pub mod stream_url;
 pub mod transcript;
 
 pub use client::{
-    AppendAck, AppendReceipt, AppendTicket, IdempotencyKey, IntoRecordData, InvalidIdempotencyKey,
-    ListLinksOptions, MAX_WRITER_UNACKED_PAYLOAD_BYTES, MAX_WRITER_UNACKED_RECORDS, RetryPolicy,
-    TsfClient, TsfClientConfig, TsfClientError, TsfReadSession, TsfSseReadSession, TsfWriteSession,
-    TsfWriter, TsfWriterConfig, WritePermit, default_api_origin,
+    AppendAck, AppendReceipt, AppendTicket, DurableWriterOptions, IdempotencyKey,
+    InvalidIdempotencyKey, ListLinksOptions, MAX_WRITER_IN_FLIGHT_BYTES,
+    MAX_WRITER_IN_FLIGHT_RECORDS, RetryPolicy, TsfClient, TsfClientConfig, TsfClientError,
+    TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, default_api_origin,
 };
 pub use ids::{
     ClientWriterId, LinkId, LinkIdError, LinkSecret, LinkSecretError, MAX_LINK_ID_LEN, StreamId,
@@ -36,8 +36,8 @@ pub use protocol::{
     ws::{
         WriteStreamOptions,
         frame::{
-            AppendRecord, CaughtUpPosition, OwnedReadRecord, PartHeader, ReadBatch, ReadRecord,
-            RecordFormat,
+            AppendBatch, AppendRecord, CaughtUpPosition, IntoRecordData, OwnedReadRecord,
+            PartHeader, ReadBatch, ReadRecord, RecordFormat, RecordPayload,
         },
     },
 };

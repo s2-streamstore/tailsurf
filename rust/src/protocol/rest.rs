@@ -23,9 +23,9 @@ pub const MAX_REST_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 /// Maximum entries returned in one link inventory page.
 pub const MAX_LINK_PAGE_ITEMS: usize = 100;
 /// Maximum physical records in one SSE `read_batch` event.
-pub const MAX_SSE_READ_BATCH_RECORDS: usize = frame::MAX_READ_BATCH_RECORDS;
+pub const MAX_SSE_READ_BATCH_RECORDS: usize = frame::MAX_READ_FRAME_RECORDS;
 /// Maximum decoded record payload in one SSE `read_batch` event.
-pub const MAX_SSE_READ_BATCH_PAYLOAD_BYTES: usize = frame::MAX_BATCH_PAYLOAD_BYTES;
+pub const MAX_SSE_READ_BATCH_PAYLOAD_BYTES: usize = frame::MAX_FRAME_PAYLOAD_BYTES;
 /// Maximum encoded bytes in one completed SSE event, including its terminator.
 pub const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum encoded bytes retained for an SSE event whose terminator has not arrived.

@@ -70,7 +70,11 @@ Management methods require an owner link secret. `listLinks` returns one page. `
 
 ## Write
 
-`connectWriter` keeps one writer identity across reconnects. Concurrent append calls are coalesced into bounded batches. `close` rejects new appends and waits for accepted appends to settle.
+`connectWriter` creates a fresh writer identity and starts its sequence at zero. It keeps that identity and sequence progress across reconnects.
+
+Concurrent append calls receive contiguous sequence ranges in call order. The writer coalesces them into bounded protocol frames. It retains acknowledged progress and resends only the unacknowledged suffix after a reconnect.
+
+Retryable interruptions keep recovering until the records are acknowledged. This preserves the exact writer identity, sequence numbers, and payloads needed for logical deduplication. `close` waits through retryable outages. Call `abort` to stop recovery immediately.
 
 ```ts
 const writer = await client.connectWriter({
@@ -88,6 +92,24 @@ try {
 }
 ```
 
+`appendBatch` is one sequencing and Promise unit. It may span several protocol frames. It is not an atomic service append. A terminal failure can leave a durable prefix even when the Promise rejects.
+
+`writer_durability_unknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Submitting that record under a new writer identity may duplicate it.
+
+`appendLogical` splits data above the 512 KiB physical-record limit into contiguous parts.
+
+The writer queues submitted input and sends it through a fixed socket window of 128 records and 5 MiB. A submission may be larger than that window.
+
+```ts
+const writer = await client.connectWriter({
+  streamId: stream.streamId,
+  linkSecret: owner.secret,
+});
+
+await writer.appendLogical({ data: largeTranscriptRecord });
+await writer.close();
+```
+
 ## Retries and errors
 
 REST mutations use idempotency keys. Pass a caller-owned key as the second argument when a creation must survive page reloads.
@@ -96,7 +118,7 @@ REST mutations use idempotency keys. Pass a caller-owned key as the second argum
 await client.createStream(request, { idempotencyKey });
 ```
 
-Transient REST and connection failures use the configured bounded `retryPolicy`. A successful WebSocket handshake starts a fresh retry burst. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
+Transient REST failures, initial connections, and readers use the configured bounded `retryPolicy`. An established durable writer uses its backoff without an attempt limit. Client failures extend `TsfClientError`. HTTP failures are `TsfHttpError` and include the status, request ID, retry hint, and structured API code when the server provides them.
 
 ## Runtime configuration
 
