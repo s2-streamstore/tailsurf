@@ -73,18 +73,16 @@ describe("logical transcript", () => {
     );
   });
 
-  it("bounds writer cardinality without disturbing known writers", () => {
-    const transcript = new LogicalTranscript({ maxWriterStates: 2 });
+  it("bounds writer cardinality internally without disturbing known writers", () => {
+    const transcript = new LogicalTranscript();
 
-    expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "one", 1)))).toBe(
-      "one",
-    );
-    expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "two", 2)))).toBe(
-      "two",
-    );
-    expect(() => transcript.pushRecord(record(0n, UNSPLIT_PART, "three", 3)))
+    for (let writer = 0; writer < 4_096; writer += 1) {
+      expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "value", writer))))
+        .toBe("value");
+    }
+    expect(() => transcript.pushRecord(record(0n, UNSPLIT_PART, "overflow", 4_096)))
       .toThrowError(expect.objectContaining({ code: "transcript_writer_limit" }));
-    expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "next", 1)))).toBe(
+    expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "next", 0)))).toBe(
       "next",
     );
   });
@@ -109,18 +107,15 @@ describe("logical transcript", () => {
   });
 
   it("bounds total pending parts independently of payload bytes", () => {
-    const transcript = new LogicalTranscript({
-      maxTotalPendingParts: 2,
-    });
+    const transcript = new LogicalTranscript();
 
-    expect(
-      transcript.pushRecord(record(0n, partHeader(0, false), "", 1)),
-    ).toBeUndefined();
-    expect(
-      transcript.pushRecord(record(1n, partHeader(1, false), "", 1)),
-    ).toBeUndefined();
+    for (let index = 0; index < 16_384; index += 1) {
+      expect(
+        transcript.pushRecord(record(BigInt(index), partHeader(index, false), "", 1)),
+      ).toBeUndefined();
+    }
     expect(() =>
-      transcript.pushRecord(record(2n, partHeader(2, false), "", 1))
+      transcript.pushRecord(record(16_384n, partHeader(16_384, false), "", 1))
     ).toThrowError(
       expect.objectContaining({ code: "transcript_total_pending_parts_limit" }),
     );
@@ -143,12 +138,18 @@ function record(
   return {
     seqNum: writerSeqNum,
     timestampMs: writerSeqNum,
-    writerId: parseWriterId(new Uint8Array(16).fill(writer)),
+    writerId: writerId(writer),
     writerSeqNum,
     part,
     format: RecordFormat.Transcript,
     data: textEncoder.encode(data),
   };
+}
+
+function writerId(index: number): ReadRecord["writerId"] {
+  const bytes = new Uint8Array(16);
+  new DataView(bytes.buffer).setUint32(12, index);
+  return parseWriterId(bytes);
 }
 
 function text(record: ReturnType<LogicalTranscript["pushRecord"]>): string | undefined {

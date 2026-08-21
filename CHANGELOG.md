@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] keep transcript cardinality guards internal and expose only the reassembly-byte limit
+
 ## [0.11.0](https://github.com/s2-streamstore/tailsurf/compare/v0.10.0...v0.11.0) - 2026-08-17
 
 ### Added

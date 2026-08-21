@@ -9,18 +9,12 @@ import {
 
 /** Default maximum bytes used for split-record reassembly. */
 export const DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES = MAX_RECORD_PAYLOAD_BYTES * 32;
-/** Default maximum writer identities retained for deduplication and reassembly. */
-export const DEFAULT_MAX_TRANSCRIPT_WRITER_STATES = 4_096;
-/** Default maximum physical parts retained across all unfinished split records. */
-export const DEFAULT_MAX_TRANSCRIPT_TOTAL_PENDING_PARTS = 16_384;
+const MAX_TRANSCRIPT_WRITER_STATES = 4_096;
+const MAX_TRANSCRIPT_TOTAL_PENDING_PARTS = 16_384;
 
 export interface LogicalTranscriptOptions {
   /** Maximum bytes retained across unfinished split records or assembled for one completed split record. */
   readonly maxReassemblyBytes?: number;
-  /** Maximum writer identities retained for deduplication and reassembly. */
-  readonly maxWriterStates?: number;
-  /** Maximum physical parts retained across all unfinished split records. */
-  readonly maxTotalPendingParts?: number;
 }
 
 export interface TranscriptRecord {
@@ -47,21 +41,11 @@ export class LogicalTranscript {
   #totalPendingBytes = 0;
   #totalPendingParts = 0;
   public readonly maxReassemblyBytes: number;
-  public readonly maxWriterStates: number;
-  public readonly maxTotalPendingParts: number;
 
   public constructor(options: LogicalTranscriptOptions = {}) {
     this.maxReassemblyBytes = transcriptLimit(
       options.maxReassemblyBytes ?? DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
       "reassembly bytes",
-    );
-    this.maxWriterStates = transcriptLimit(
-      options.maxWriterStates ?? DEFAULT_MAX_TRANSCRIPT_WRITER_STATES,
-      "writer states",
-    );
-    this.maxTotalPendingParts = transcriptLimit(
-      options.maxTotalPendingParts ?? DEFAULT_MAX_TRANSCRIPT_TOTAL_PENDING_PARTS,
-      "total pending parts",
     );
   }
 
@@ -69,10 +53,10 @@ export class LogicalTranscript {
     const key = writerIdKey(record.writerId);
     let writer = this.#writers.get(key);
     if (writer === undefined) {
-      if (this.#writers.size >= this.maxWriterStates) {
+      if (this.#writers.size >= MAX_TRANSCRIPT_WRITER_STATES) {
         throw new ProtocolError(
           "transcript_writer_limit",
-          `transcript has reached its ${this.maxWriterStates} writer-state limit`,
+          `transcript has reached its ${MAX_TRANSCRIPT_WRITER_STATES} writer-state limit`,
         );
       }
       writer = {};
@@ -154,10 +138,10 @@ export class LogicalTranscript {
         `transcript reassembly would use ${reassemblyBytes} bytes; maximum is ${this.maxReassemblyBytes}`,
       );
     }
-    if (pending.partCount > this.maxTotalPendingParts - this.#totalPendingParts) {
+    if (pending.partCount > MAX_TRANSCRIPT_TOTAL_PENDING_PARTS - this.#totalPendingParts) {
       throw new ProtocolError(
         "transcript_total_pending_parts_limit",
-        `transcript has reached its ${this.maxTotalPendingParts} total pending-part limit`,
+        `transcript has reached its ${MAX_TRANSCRIPT_TOTAL_PENDING_PARTS} total pending-part limit`,
       );
     }
     writer.pending = pending;
