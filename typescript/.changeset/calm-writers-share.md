@@ -1,6 +1,6 @@
 ---
 "@tailsurf/protocol": minor
-"@tailsurf/client": patch
+"@tailsurf/client": minor
 ---
 
-Export the fixed durable-writer in-flight window from the protocol package and use it as the client implementation's single source of truth.
+Add reconnecting durable writers with a fixed sent-but-unacknowledged window and one transcript reassembly limit. Export the writer window from the protocol package and use it as the client implementation's single source of truth.
