@@ -61,7 +61,10 @@ try {
   assert.equal(clientManifest.private, undefined);
   assert.equal(protocolManifest.engines?.node, ">=22");
   assert.equal(clientManifest.engines?.node, ">=22");
-  assert.equal(clientManifest.dependencies?.["@tailsurf/protocol"], "^0.1.0");
+  assert.equal(
+    clientManifest.dependencies?.["@tailsurf/protocol"],
+    `^${protocolManifest.version}`,
+  );
   await Promise.all([
     access(join(installedProtocol, "LICENSE")),
     access(join(installedProtocol, "README.md")),

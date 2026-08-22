@@ -12,12 +12,15 @@ import {
   MAX_FRAME_PAYLOAD_BYTES,
   MAX_READ_FRAME_RECORDS,
   MAX_RECORD_PAYLOAD_BYTES,
+  MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES,
+  MAX_WRITER_IN_FLIGHT_RECORDS,
   partHeaderFromRaw,
   parseClientWriterId,
   parseWriterId,
   ProtocolError,
   streamMetadataSchema,
   TSF_WEBSOCKET_PROTOCOL,
+  WEBSOCKET_HEARTBEAT_INTERVAL_MS,
   type ClientFrame,
   type RecordFormat,
   type ServerFrame,
@@ -31,11 +34,14 @@ interface FrameFixture {
 
 interface Fixtures {
   readonly websocket_protocol: string;
+  readonly websocket_heartbeat_interval_ms: number;
   readonly max_record_payload_bytes: number;
   readonly max_append_frame_records: number;
   readonly max_read_frame_records: number;
   readonly max_frame_payload_bytes: number;
   readonly max_encoded_frame_bytes: number;
+  readonly max_writer_in_flight_records: number;
+  readonly max_writer_in_flight_payload_bytes: number;
   readonly client_frames: readonly FrameFixture[];
   readonly server_frames: readonly FrameFixture[];
 }
@@ -47,11 +53,20 @@ const fixtures = JSON.parse(
 describe("TSF v1 wire fixtures", () => {
   it("pins protocol constants", () => {
     expect(TSF_WEBSOCKET_PROTOCOL).toBe(fixtures.websocket_protocol);
+    expect(WEBSOCKET_HEARTBEAT_INTERVAL_MS).toBe(
+      fixtures.websocket_heartbeat_interval_ms,
+    );
     expect(MAX_RECORD_PAYLOAD_BYTES).toBe(fixtures.max_record_payload_bytes);
     expect(MAX_APPEND_FRAME_RECORDS).toBe(fixtures.max_append_frame_records);
     expect(MAX_READ_FRAME_RECORDS).toBe(fixtures.max_read_frame_records);
     expect(MAX_FRAME_PAYLOAD_BYTES).toBe(fixtures.max_frame_payload_bytes);
     expect(MAX_ENCODED_FRAME_BYTES).toBe(fixtures.max_encoded_frame_bytes);
+    expect(MAX_WRITER_IN_FLIGHT_RECORDS).toBe(
+      fixtures.max_writer_in_flight_records,
+    );
+    expect(MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES).toBe(
+      fixtures.max_writer_in_flight_payload_bytes,
+    );
   });
 
   it.each(fixtures.client_frames)("encodes and decodes client $name", (fixture) => {

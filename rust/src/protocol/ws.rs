@@ -3,11 +3,18 @@
 /// Binary TSF v1 frames and their codec.
 pub mod frame;
 
+/// Interval between WebSocket heartbeats while a reader is otherwise idle.
+pub const WEBSOCKET_HEARTBEAT_INTERVAL_MS: u64 = 20_000;
+/// Maximum payload bytes an SDK durable writer keeps sent but unacknowledged.
+pub const MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum physical records an SDK durable writer keeps sent but unacknowledged.
+pub const MAX_WRITER_IN_FLIGHT_RECORDS: usize = 1_024;
+
 use crate::{ClientWriterId, LinkSecret, StreamId};
 
 /// Stream, client writer identity, and credentials for one write WebSocket.
 #[derive(Clone, Debug)]
-pub struct WriteStreamOptions {
+pub struct WriteSessionOptions {
     /// Stream to append to.
     pub stream_id: StreamId,
     /// Stable client writer identity reused with sequence numbers across reconnects.
@@ -18,7 +25,7 @@ pub struct WriteStreamOptions {
     pub expected_next_seq_num: Option<u64>,
 }
 
-impl WriteStreamOptions {
+impl WriteSessionOptions {
     /// Creates write options from an owned stream link secret.
     pub fn new(
         stream_id: StreamId,

@@ -34,8 +34,10 @@ import {
   type SocketPolicy,
   u64,
   unexpectedFrame,
+  WEBSOCKET_READ_IDLE_TIMEOUT_MS,
   withTimeout,
 } from "./socket.js";
+import { INITIAL_RETRY_BACKOFF_MS } from "./retry.js";
 
 export interface ReadOptions {
   readonly streamId: StreamId;
@@ -255,7 +257,7 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
 
   protected async pump(): Promise<ReadRecord | undefined> {
     let reconnectAttempts = 0;
-    let reconnectDelay = this.policy.initialBackoffMs;
+    let reconnectDelay = INITIAL_RETRY_BACKOFF_MS;
     while (!this.finished && !readExhausted(this.options)) {
       const pending = this.nextPendingRecord();
       if (pending !== undefined) {
@@ -263,15 +265,12 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
       }
       let frame: ServerFrame;
       try {
-        const nextFrame = this.#socket.nextFrame();
-        frame = this.policy.webSocketReadIdleTimeoutMs === null
-          ? await nextFrame
-          : await withTimeout(
-            nextFrame,
-            this.policy.webSocketReadIdleTimeoutMs,
-            "read stream record",
-            this.controller.signal,
-          );
+        frame = await withTimeout(
+          this.#socket.nextFrame(),
+          WEBSOCKET_READ_IDLE_TIMEOUT_MS,
+          "read stream record",
+          this.controller.signal,
+        );
       } catch (error) {
         if (this.finished) {
           return undefined;
@@ -307,7 +306,7 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
         // A completed handshake starts a fresh retry burst. The retry budget bounds
         // consecutive connection failures, not established connections that later close.
         reconnectAttempts = 0;
-        reconnectDelay = this.policy.initialBackoffMs;
+        reconnectDelay = INITIAL_RETRY_BACKOFF_MS;
         continue;
       }
 

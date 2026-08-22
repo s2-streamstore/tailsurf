@@ -57,47 +57,31 @@ import {
 import { connectSseReader as openSseReader } from "./sse.js";
 import type { ReadOptions, TsfReadSession } from "./reader.js";
 import {
+  INITIAL_RETRY_BACKOFF_MS,
   integerOption,
   isRetryableHttpStatus,
   jitteredBackoffMs,
+  MAX_RETRY_BACKOFF_MS,
   MAX_TIMER_DELAY_MS,
 } from "./retry.js";
 import { sleep, withTimeout } from "./socket.js";
 
 export const DEFAULT_API_ORIGIN = "https://tail.surf";
 const API_PREFIX = "/api/v1";
-const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_HTTP_REQUEST_TIMEOUT_MS = 10_000;
 const textEncoder = new TextEncoder();
 
 interface Schema<T> {
   parse(input: unknown): T;
 }
 
-export interface RestClientOptions {
+export interface HttpClientOptions {
   readonly apiOrigin?: string | URL;
   readonly fetch?: typeof globalThis.fetch;
   /** Bounds REST requests and SSE opening handshakes. It does not time out an established SSE body. */
-  readonly restRequestTimeoutMs?: number;
-  /**
-   * Retry policy for bounded operations and reconnect delays.
-   * Established durable writers keep recovering until acknowledged or aborted.
-   */
-  readonly retryPolicy?: RetryPolicy;
-}
-
-export interface RetryPolicy {
+  readonly httpRequestTimeoutMs?: number;
   /** Total attempts for bounded operations, including the initial attempt. */
-  readonly maxAttempts?: number;
-  /** Base delay before the first retry. Client-controlled delays are jittered. */
-  readonly initialBackoffMs?: number;
-  /** Maximum base delay and server retry hint honored by the client. */
-  readonly maxBackoffMs?: number;
-}
-
-interface NormalizedRetryPolicy {
-  readonly maxAttempts: number;
-  readonly initialBackoffMs: number;
-  readonly maxBackoffMs: number;
+  readonly boundedOperationAttempts?: number;
 }
 
 export interface IdempotencyOptions {
@@ -178,11 +162,11 @@ export interface StatelessAppendRequest {
 
 export class BaseTsfClient {
   public readonly apiOrigin: string;
-  protected readonly retryPolicy: NormalizedRetryPolicy;
+  protected readonly boundedOperationAttempts: number;
   readonly #fetch: typeof globalThis.fetch;
-  readonly #restRequestTimeoutMs: number;
+  readonly #httpRequestTimeoutMs: number;
 
-  public constructor(options: RestClientOptions = {}) {
+  public constructor(options: HttpClientOptions = {}) {
     this.apiOrigin = parseApiOrigin(options.apiOrigin ?? DEFAULT_API_ORIGIN);
     const fetchImplementation = options.fetch ?? globalThis.fetch?.bind(globalThis);
     if (fetchImplementation === undefined) {
@@ -192,47 +176,25 @@ export class BaseTsfClient {
       );
     }
     this.#fetch = fetchImplementation;
-    this.#restRequestTimeoutMs = integerOption(
-      options.restRequestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      "restRequestTimeoutMs",
+    this.#httpRequestTimeoutMs = integerOption(
+      options.httpRequestTimeoutMs ?? DEFAULT_HTTP_REQUEST_TIMEOUT_MS,
+      "httpRequestTimeoutMs",
       1,
       MAX_TIMER_DELAY_MS,
     );
-    const initialBackoffMs = integerOption(
-      options.retryPolicy?.initialBackoffMs ?? 200,
-      "retryPolicy.initialBackoffMs",
-      0,
-      MAX_TIMER_DELAY_MS,
+    this.boundedOperationAttempts = integerOption(
+      options.boundedOperationAttempts ?? 3,
+      "boundedOperationAttempts",
+      1,
     );
-    const maxBackoffMs = integerOption(
-      options.retryPolicy?.maxBackoffMs ?? 2_000,
-      "retryPolicy.maxBackoffMs",
-      0,
-      MAX_TIMER_DELAY_MS,
-    );
-    if (initialBackoffMs > maxBackoffMs) {
-      throw new TsfClientError(
-        "invalid_client_option",
-        "retryPolicy.initialBackoffMs must not exceed retryPolicy.maxBackoffMs",
-      );
-    }
-    this.retryPolicy = {
-      maxAttempts: integerOption(
-        options.retryPolicy?.maxAttempts ?? 3,
-        "retryPolicy.maxAttempts",
-        1,
-      ),
-      initialBackoffMs,
-      maxBackoffMs,
-    };
   }
 
   public connectSseReader(options: ReadOptions): Promise<TsfReadSession> {
     return openSseReader(options, {
       fetch: this.#fetch,
       apiOrigin: this.apiOrigin,
-      restRequestTimeoutMs: this.#restRequestTimeoutMs,
-      retryPolicy: this.retryPolicy,
+      httpRequestTimeoutMs: this.#httpRequestTimeoutMs,
+      boundedOperationAttempts: this.boundedOperationAttempts,
     });
   }
 
@@ -596,7 +558,7 @@ export class BaseTsfClient {
   ): Promise<T> {
     return retryRest(
       () => this.#requestOnce(operation, path, consume, init, linkSecret),
-      this.retryPolicy,
+      this.boundedOperationAttempts,
     );
   }
 
@@ -617,7 +579,7 @@ export class BaseTsfClient {
     const controller = new AbortController();
     const timeoutError = new TsfClientError(
       "http_timeout",
-      `${operation} timed out after ${this.#restRequestTimeoutMs}ms`,
+      `${operation} timed out after ${this.#httpRequestTimeoutMs}ms`,
     );
     let timedOut = false;
     const request = (async () => {
@@ -647,7 +609,7 @@ export class BaseTsfClient {
         );
       }
     })();
-    return withTimeout(request, this.#restRequestTimeoutMs, operation, undefined, {
+    return withTimeout(request, this.#httpRequestTimeoutMs, operation, undefined, {
       error: timeoutError,
       onTimeout: () => {
         timedOut = true;
@@ -723,21 +685,28 @@ export function parseApiOrigin(input: string | URL): string {
 
 async function retryRest<T>(
   attempt: () => Promise<T>,
-  policy: NormalizedRetryPolicy,
+  boundedOperationAttempts: number,
 ): Promise<T> {
-  let retryDelayMs = policy.initialBackoffMs;
-  for (let attemptIndex = 0; attemptIndex < policy.maxAttempts; attemptIndex += 1) {
+  let retryDelayMs = INITIAL_RETRY_BACKOFF_MS;
+  for (
+    let attemptIndex = 0;
+    attemptIndex < boundedOperationAttempts;
+    attemptIndex += 1
+  ) {
     try {
       return await attempt();
     } catch (error) {
-      if (attemptIndex + 1 === policy.maxAttempts || !isRetryableRestError(error)) {
+      if (
+        attemptIndex + 1 === boundedOperationAttempts ||
+        !isRetryableRestError(error)
+      ) {
         throw error;
       }
       const delayMs = error instanceof TsfHttpError && error.retryAfterMs !== undefined
-        ? Math.min(error.retryAfterMs, policy.maxBackoffMs)
+        ? Math.min(error.retryAfterMs, MAX_RETRY_BACKOFF_MS)
         : jitteredBackoffMs(retryDelayMs);
       await sleep(delayMs);
-      retryDelayMs = Math.min(policy.maxBackoffMs, Math.max(1, retryDelayMs * 2));
+      retryDelayMs = Math.min(MAX_RETRY_BACKOFF_MS, retryDelayMs * 2);
     }
   }
   throw new Error("REST retry loop exhausted without returning");

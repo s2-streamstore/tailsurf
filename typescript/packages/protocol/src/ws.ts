@@ -17,6 +17,8 @@ import {
 } from "./stream-url.js";
 
 export const TSF_WEBSOCKET_PROTOCOL = "tsf.v1";
+/** Interval between WebSocket heartbeats while a reader is otherwise idle. */
+export const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 /** Maximum data payload in one physical record. */
 export const MAX_RECORD_PAYLOAD_BYTES = 512 * 1024;
 /** Maximum physical records in one append protocol frame. */
@@ -25,6 +27,10 @@ export const MAX_APPEND_FRAME_RECORDS = 128;
 export const MAX_READ_FRAME_RECORDS = 1_000;
 /** Maximum aggregate record payload in one append or read protocol frame. */
 export const MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024;
+/** Maximum payload bytes an SDK durable writer keeps sent but unacknowledged. */
+export const MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES = 5 * 1024 * 1024;
+/** Maximum physical records an SDK durable writer keeps sent but unacknowledged. */
+export const MAX_WRITER_IN_FLIGHT_RECORDS = 1_024;
 /** Maximum encoded size of any TSF protocol frame. */
 export const MAX_ENCODED_FRAME_BYTES =
   1 + MAX_READ_FRAME_RECORDS * (4 + 45) + MAX_FRAME_PAYLOAD_BYTES;

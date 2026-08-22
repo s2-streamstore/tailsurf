@@ -3,7 +3,7 @@
 This workspace contains the public TypeScript implementation of the TSF protocol.
 
 - `@tailsurf/client` is the supported high-level API for browsers and Node.js.
-- `@tailsurf/protocol` contains lower-level schemas, codecs, primitives, and compatibility fixtures.
+- `@tailsurf/protocol` contains lower-level schemas, codecs, primitives, and conformance fixtures.
 
 The packages use independent versions. A client release declares the protocol versions it supports.
 
