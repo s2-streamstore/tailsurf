@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.12.2](https://github.com/s2-streamstore/tailsurf/compare/v0.12.1...v0.12.2) - 2026-08-22
+
+### Fixed
+
+- *(cli)* allow forced interrupt during write shutdown ([#57](https://github.com/s2-streamstore/tailsurf/pull/57))
+- *(cli)* retry timed out update checks ([#55](https://github.com/s2-streamstore/tailsurf/pull/55))
+
+### Other
+
+- *(release)* release Rust SDK and CLI v0.12.1 ([#56](https://github.com/s2-streamstore/tailsurf/pull/56))
+
 ## [0.12.1](https://github.com/s2-streamstore/tailsurf/compare/v0.12.0...v0.12.1) - 2026-08-22
 
 ### Fixed
