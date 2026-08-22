@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.12.3](https://github.com/s2-streamstore/tailsurf/compare/v0.12.2...v0.12.3) - 2026-08-22
+
+### Other
+
+- *(release)* release Rust SDK and CLI v0.12.2 ([#58](https://github.com/s2-streamstore/tailsurf/pull/58))
+
 ## [0.12.2](https://github.com/s2-streamstore/tailsurf/compare/v0.12.1...v0.12.2) - 2026-08-22
 
 ### Fixed
