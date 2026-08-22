@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- *(cli)* allow a second interrupt to abort a stalled durable write shutdown
 - *(cli)* retry failed automatic update checks before the daily success interval
 
 ## [0.12.0](https://github.com/s2-streamstore/tailsurf/compare/v0.11.0...v0.12.0) - 2026-08-22

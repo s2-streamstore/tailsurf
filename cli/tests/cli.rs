@@ -65,6 +65,16 @@ fn canonical_test_link_secret() -> LinkSecret {
         .expect("canonical test link secret")
 }
 
+#[cfg(unix)]
+async fn interrupt_process(pid: u32) {
+    let signal = TokioCommand::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .await
+        .expect("send SIGINT");
+    assert!(signal.success());
+}
+
 #[test]
 fn update_refuses_an_unmanaged_executable() {
     let update = Command::new(env!("CARGO_BIN_EXE_tsf"))
@@ -784,12 +794,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
         "tsf exited while stdin remained open"
     );
     let pid = child.id().expect("tsf process ID");
-    let signal = TokioCommand::new("kill")
-        .args(["-INT", &pid.to_string()])
-        .status()
-        .await
-        .expect("send SIGINT");
-    assert!(signal.success());
+    interrupt_process(pid).await;
 
     stderr
         .read_to_string(&mut stderr_output)
@@ -805,6 +810,56 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
     let replay = run_tsf(&server, ["replay", read_link.as_str()], None).await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
     assert_eq!(replay.stdout, "complete line\npartial line");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn second_interrupt_aborts_a_stalled_stdin_write() {
+    let server = HoldingWriteServer::start(1).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
+    let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
+    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    command
+        .arg("--api-url")
+        .arg(server.api_url.as_str())
+        .args(["write", write_link.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("spawn tsf write");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+
+    stdin
+        .write_all(b"pending acknowledgement\n")
+        .await
+        .expect("write stdin");
+    server.wait_for_records(1).await;
+
+    let pid = child.id().expect("tsf process ID");
+    interrupt_process(pid).await;
+    let mut notice = String::new();
+    timeout(Duration::from_secs(5), stderr.read_line(&mut notice))
+        .await
+        .expect("timed out waiting for interrupt notice")
+        .expect("read interrupt notice");
+    assert!(
+        notice.contains("press Ctrl-C again to stop immediately"),
+        "stderr={notice}"
+    );
+    assert!(
+        child.try_wait().expect("check tsf process").is_none(),
+        "tsf exited before the second interrupt"
+    );
+
+    interrupt_process(pid).await;
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("timed out waiting for forced interrupt")
+        .expect("wait for tsf");
+    drop(stdin);
+    assert_eq!(status.code(), Some(130));
 }
 
 #[tokio::test]
