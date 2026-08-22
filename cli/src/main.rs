@@ -17,7 +17,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tailsurf::{
     AppendBatch, AppendTicket, DurableWriterOptions, LinkId, LinkPermissions, LinkSecret,
     ReadOptions, ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfReadSession,
@@ -52,8 +52,15 @@ const TRANSCRIPT_BATCH_QUEUE: usize = 8;
 /// Stdin read block size for line-framed and raw writes.
 const STDIN_READ_BYTES: usize = 16 * 1024;
 const UPDATE_HINT_CACHE_FILE: &str = ".tailsurf-cli-update-check";
-const UPDATE_HINT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const UPDATE_HINT_TIMEOUT: Duration = Duration::from_millis(500);
+const UPDATE_HINT_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const UPDATE_HINT_SUCCESS_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const UPDATE_HINT_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct UpdateHintCheckCache {
+    last_attempt_at: u64,
+    last_success_at: Option<u64>,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "tsf")]
@@ -701,30 +708,54 @@ async fn maybe_print_update_hint() {
         return;
     };
     let cache_path = install_root.join(UPDATE_HINT_CACHE_FILE);
-    if !claim_update_hint_check(cache_path.as_std_path(), now.as_secs()) {
+    let Some(mut cache) = claim_update_hint_check(cache_path.as_std_path(), now.as_secs()) else {
         return;
-    }
+    };
 
-    if matches!(
-        timeout(UPDATE_HINT_TIMEOUT, updater.is_update_needed()).await,
-        Ok(Ok(true))
-    ) {
+    let Ok(Ok(update_needed)) = timeout(UPDATE_HINT_TIMEOUT, updater.is_update_needed()).await
+    else {
+        return;
+    };
+    cache.last_success_at = Some(now.as_secs());
+    let _ = write_update_hint_check_cache(cache_path.as_std_path(), cache);
+
+    if update_needed {
         eprintln!("A tsf update is available. Run `tsf update` to install it.");
     }
 }
 
-fn claim_update_hint_check(cache_path: &Path, now: u64) -> bool {
-    let last_check = fs::read_to_string(cache_path)
+fn claim_update_hint_check(cache_path: &Path, now: u64) -> Option<UpdateHintCheckCache> {
+    let previous = fs::read(cache_path)
         .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    if !update_hint_check_is_due(last_check, now) {
-        return false;
+        .and_then(|value| serde_json::from_slice::<UpdateHintCheckCache>(&value).ok());
+    if !update_hint_check_is_due(previous.as_ref(), now) {
+        return None;
     }
-    fs::write(cache_path, format!("{now}\n")).is_ok()
+
+    let cache = UpdateHintCheckCache {
+        last_attempt_at: now,
+        last_success_at: previous.and_then(|cache| cache.last_success_at),
+    };
+    write_update_hint_check_cache(cache_path, cache).then_some(cache)
 }
 
-fn update_hint_check_is_due(last_check: Option<u64>, now: u64) -> bool {
-    last_check.is_none_or(|last_check| last_check.abs_diff(now) >= UPDATE_HINT_INTERVAL.as_secs())
+fn write_update_hint_check_cache(cache_path: &Path, cache: UpdateHintCheckCache) -> bool {
+    let Ok(mut value) = serde_json::to_vec(&cache) else {
+        return false;
+    };
+    value.push(b'\n');
+    fs::write(cache_path, value).is_ok()
+}
+
+fn update_hint_check_is_due(cache: Option<&UpdateHintCheckCache>, now: u64) -> bool {
+    let Some(cache) = cache else {
+        return true;
+    };
+    let success_is_current = cache.last_success_at.is_some_and(|last_success| {
+        last_success.abs_diff(now) < UPDATE_HINT_SUCCESS_INTERVAL.as_secs()
+    });
+    !success_is_current
+        && cache.last_attempt_at.abs_diff(now) >= UPDATE_HINT_RETRY_INTERVAL.as_secs()
 }
 
 fn is_broken_pipe(error: &eyre::Report) -> bool {
@@ -2106,17 +2137,42 @@ mod tests {
     }
 
     #[test]
-    fn update_hint_cache_has_a_bounded_daily_interval() {
+    fn update_hint_cache_retries_failures_before_successes() {
         const NOW: u64 = 2_000_000;
-        let interval = UPDATE_HINT_INTERVAL.as_secs();
+        let retry = UPDATE_HINT_RETRY_INTERVAL.as_secs();
+        let success = UPDATE_HINT_SUCCESS_INTERVAL.as_secs();
+        let cache = |last_attempt_at, last_success_at| UpdateHintCheckCache {
+            last_attempt_at,
+            last_success_at,
+        };
 
         assert!(update_hint_check_is_due(None, NOW));
-        assert!(!update_hint_check_is_due(Some(NOW), NOW));
-        assert!(!update_hint_check_is_due(Some(NOW - interval + 1), NOW));
-        assert!(update_hint_check_is_due(Some(NOW - interval), NOW));
-        assert!(!update_hint_check_is_due(Some(NOW + interval - 1), NOW));
-        assert!(update_hint_check_is_due(Some(NOW + interval), NOW));
-        assert!(!claim_update_hint_check(Path::new("."), NOW));
+        assert!(!update_hint_check_is_due(Some(&cache(NOW, None)), NOW));
+        assert!(!update_hint_check_is_due(
+            Some(&cache(NOW - retry + 1, None)),
+            NOW
+        ));
+        assert!(update_hint_check_is_due(
+            Some(&cache(NOW - retry, None)),
+            NOW
+        ));
+        assert!(!update_hint_check_is_due(
+            Some(&cache(NOW - success + 1, Some(NOW - success + 1))),
+            NOW
+        ));
+        assert!(update_hint_check_is_due(
+            Some(&cache(NOW - success, Some(NOW - success))),
+            NOW
+        ));
+        assert!(!update_hint_check_is_due(
+            Some(&cache(NOW + retry - 1, None)),
+            NOW
+        ));
+        assert!(update_hint_check_is_due(
+            Some(&cache(NOW + retry, None)),
+            NOW
+        ));
+        assert!(claim_update_hint_check(Path::new("."), NOW).is_none());
     }
 
     #[test]

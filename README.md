@@ -48,7 +48,7 @@ Check without installing:
 tsf update --check
 ```
 
-Installer-owned binaries may contact GitHub Releases and print an update hint after a successful interactive command against `https://tail.surf`. The check runs at most once per day, waits at most 500 milliseconds, and never installs an update. Set `TSF_NO_UPDATE_CHECK` or `DO_NOT_TRACK` to disable hints. CI and non-interactive commands do not check.
+Installer-owned binaries may contact GitHub Releases and print an update hint after a successful interactive command against `https://tail.surf`. Successful checks run at most once per day. Failed checks retry after one hour. Each request waits at most three seconds and never installs an update. Set `TSF_NO_UPDATE_CHECK` or `DO_NOT_TRACK` to disable hints. CI and non-interactive commands do not check.
 
 Installations owned by a package manager do not check or print the hint. Cargo users rerun `cargo install tailsurf-cli --locked`. cargo-binstall users rerun `cargo binstall tailsurf-cli`.
 
