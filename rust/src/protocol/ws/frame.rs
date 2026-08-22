@@ -282,6 +282,7 @@ impl ReadBatch {
     /// invariant.
     pub fn try_from_records(records: Vec<OwnedReadRecord>) -> Result<Self, FrameCodecError> {
         // Every bound precedes the copy, so a rejected batch never pays for it.
+        validate_batch_count(records.len(), MAX_READ_FRAME_RECORDS)?;
         let mut payload_bytes = 0_usize;
         for record in &records {
             validate_record_len(record.data.len())?;
@@ -317,6 +318,7 @@ impl ReadBatch {
         payload: Bytes,
         records: Vec<RecordMeta>,
     ) -> Result<Self, FrameCodecError> {
+        validate_batch_count(records.len(), MAX_READ_FRAME_RECORDS)?;
         let mut payload_bytes = 0_usize;
         for record in &records {
             let data_len = record.data_len as usize;
@@ -1826,6 +1828,17 @@ mod tests {
                 ..
             })
         ));
+        let mut over_count = (0..=MAX_READ_FRAME_RECORDS as u64)
+            .map(|seq_num| owned_read_record(seq_num, Bytes::new()))
+            .collect::<Vec<_>>();
+        over_count[0].data = Bytes::from(vec![0; MAX_RECORD_PAYLOAD_BYTES + 1]);
+        assert!(matches!(
+            ReadBatch::try_from_records(over_count),
+            Err(FrameCodecError::InvalidBatchRecordCount {
+                max: MAX_READ_FRAME_RECORDS,
+                ..
+            })
+        ));
         assert!(matches!(
             ReadBatch::try_from_records(vec![owned_read_record(
                 0,
@@ -1855,6 +1868,25 @@ mod tests {
             Err(FrameCodecError::NonContiguousReadBatch)
         ));
         assert!(ReadBatch::try_from_records(vec![owned_read_record(0, Bytes::new())]).is_ok());
+    }
+
+    #[test]
+    fn try_from_parts_rejects_an_out_of_range_payload_view() {
+        let record = RecordMeta {
+            seq_num: 0,
+            timestamp_ms: 0,
+            writer_id: WriterId::from_bytes([0; WriterId::BYTE_LEN]),
+            writer_seq_num: 0,
+            part: PartHeader::unsplit(),
+            format: RecordFormat::Bytes,
+            data_start: 1,
+            data_len: 1,
+        };
+
+        assert!(matches!(
+            ReadBatch::try_from_parts(Bytes::new(), vec![record]),
+            Err(FrameCodecError::InvalidRecordLength)
+        ));
     }
 
     #[test]

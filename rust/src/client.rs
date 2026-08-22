@@ -1520,7 +1520,7 @@ async fn run_writer(
             cmd = cmd_rx.recv(), if close_tx.is_none() => {
                 match cmd {
                     Some(command) => {
-                        if let Err(error) = admit_commands(
+                        if let Err(error) = drain_queued_commands(
                             &mut pending,
                             &mut close_tx,
                             &mut cursor,
@@ -1603,26 +1603,31 @@ async fn next_ack(
         })?
 }
 
-/// Admits one command plus whatever is already queued behind it, numbering each submitted batch
-/// from the actor's cursor.
+/// Moves one command plus queued commands into `pending`, numbering each submitted batch from the
+/// actor's cursor.
 ///
-/// Queued commands were submitted before this turn began, so coalescing them into one protocol
-/// frame adds no latency. Stopping at one socket window keeps a continuously filled channel from
-/// starving acknowledgements. Nothing awaits here, so a batch is retained for reconnect resend
-/// before any I/O can fail.
-fn admit_commands(
+/// This adds no deliberate batching delay. A drain stops after its submissions reach either
+/// dimension of the socket window, so a continuously filled channel cannot starve
+/// acknowledgements. A submission is never split at this boundary. The send path remains the sole
+/// owner of the actual in-flight limits and may encode the drained records in several frames.
+/// Nothing awaits here, so each batch is retained for reconnect resend before any I/O can fail.
+fn drain_queued_commands(
     pending: &mut VecDeque<PendingSubmission>,
     close_tx: &mut Option<oneshot::Sender<Result<(), TsfClientError>>>,
     cursor: &mut WriterCursor,
     cmd_rx: &mut mpsc::UnboundedReceiver<WriterCommand>,
     mut command: WriterCommand,
 ) -> Result<(), TsfClientError> {
-    let mut admitted = 0;
+    let mut drained_records = 0_usize;
+    let mut drained_payload_bytes = 0_usize;
     loop {
         match command {
             WriterCommand::Submit { batch, ack_tx } => {
                 let payloads = batch.into_payloads();
                 let record_count = payloads.len();
+                let payload_bytes = payloads.iter().fold(0_usize, |total, payload| {
+                    total.saturating_add(payload.data.len())
+                });
                 let start_seq_num = cursor.reserve(record_count)?;
                 pending.push_back(PendingSubmission {
                     receipts: Vec::with_capacity(record_count),
@@ -1632,14 +1637,17 @@ fn admit_commands(
                     sent: 0,
                     ack_tx,
                 });
-                admitted += record_count;
+                drained_records = drained_records.saturating_add(record_count);
+                drained_payload_bytes = drained_payload_bytes.saturating_add(payload_bytes);
             }
             WriterCommand::Close { done_tx } => {
                 *close_tx = Some(done_tx);
                 return Ok(());
             }
         }
-        if admitted >= MAX_WRITER_IN_FLIGHT_RECORDS {
+        if drained_records >= MAX_WRITER_IN_FLIGHT_RECORDS
+            || drained_payload_bytes >= MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES
+        {
             return Ok(());
         }
         let Ok(next) = cmd_rx.try_recv() else {
@@ -4010,6 +4018,25 @@ mod tests {
         }
     }
 
+    fn append_batch(record_count: usize, payload_bytes: usize) -> AppendBatch {
+        let data = Bytes::from(vec![0_u8; payload_bytes]);
+        AppendBatch::from_records(
+            (0..record_count)
+                .map(|_| {
+                    RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, data.clone())
+                })
+                .collect(),
+        )
+        .expect("append batch")
+    }
+
+    fn queue_writer_batch(cmd_tx: &mpsc::UnboundedSender<WriterCommand>, batch: AppendBatch) {
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        cmd_tx
+            .send(WriterCommand::Submit { batch, ack_tx })
+            .expect("queue submission");
+    }
+
     #[test]
     fn writer_cursor_rejects_sequence_exhaustion() {
         let mut cursor = WriterCursor {
@@ -4031,32 +4058,16 @@ mod tests {
     #[test]
     fn writer_commands_number_submissions_in_channel_order() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
-        let batch = |count: usize| {
-            AppendBatch::from_records(
-                (0..count)
-                    .map(|_| {
-                        RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new())
-                    })
-                    .collect(),
-            )
-            .expect("batch")
-        };
         for count in [2, 1] {
-            let (ack_tx, _ack_rx) = oneshot::channel();
-            cmd_tx
-                .send(WriterCommand::Submit {
-                    batch: batch(count),
-                    ack_tx,
-                })
-                .expect("submit command");
+            queue_writer_batch(&cmd_tx, append_batch(count, 0));
         }
 
         let mut pending = VecDeque::new();
         let mut close_tx = None;
         let mut cursor = WriterCursor::default();
         let first = cmd_rx.try_recv().expect("first command");
-        admit_commands(&mut pending, &mut close_tx, &mut cursor, &mut cmd_rx, first)
-            .expect("admit submissions");
+        drain_queued_commands(&mut pending, &mut close_tx, &mut cursor, &mut cmd_rx, first)
+            .expect("drain submissions");
 
         assert_eq!(
             pending
@@ -4066,6 +4077,92 @@ mod tests {
             [(0, 2), (2, 1)]
         );
         assert!(pending.iter().all(|submission| submission.sent == 0));
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn writer_command_drain_stops_at_the_record_window() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
+        for _ in 0..=MAX_WRITER_IN_FLIGHT_RECORDS {
+            queue_writer_batch(&cmd_tx, append_batch(1, 0));
+        }
+
+        let mut pending = VecDeque::new();
+        let mut close_tx = None;
+        let mut cursor = WriterCursor::default();
+        let first = cmd_rx.try_recv().expect("first command");
+        drain_queued_commands(&mut pending, &mut close_tx, &mut cursor, &mut cmd_rx, first)
+            .expect("drain one record window");
+
+        assert_eq!(pending.len(), MAX_WRITER_IN_FLIGHT_RECORDS);
+        assert_eq!(cursor.next_seq_num, MAX_WRITER_IN_FLIGHT_RECORDS as u64);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(WriterCommand::Submit { .. })
+        ));
+    }
+
+    #[test]
+    fn writer_command_drain_stops_at_the_payload_window() {
+        let records_per_window = MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES / MAX_RECORD_PAYLOAD_BYTES;
+        assert_eq!(
+            records_per_window * MAX_RECORD_PAYLOAD_BYTES,
+            MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES
+        );
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
+        for _ in 0..=records_per_window {
+            queue_writer_batch(&cmd_tx, append_batch(1, MAX_RECORD_PAYLOAD_BYTES));
+        }
+
+        let mut pending = VecDeque::new();
+        let mut close_tx = None;
+        let mut cursor = WriterCursor::default();
+        let first = cmd_rx.try_recv().expect("first command");
+        drain_queued_commands(&mut pending, &mut close_tx, &mut cursor, &mut cmd_rx, first)
+            .expect("drain one payload window");
+
+        assert_eq!(pending.len(), records_per_window);
+        assert_eq!(
+            pending
+                .iter()
+                .flat_map(|submission| &submission.payloads)
+                .map(|payload| payload.data.len())
+                .sum::<usize>(),
+            MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES
+        );
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(WriterCommand::Submit { .. })
+        ));
+    }
+
+    #[test]
+    fn writer_command_drain_stops_at_close() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WriterCommand>();
+        queue_writer_batch(&cmd_tx, append_batch(1, 0));
+        let (done_tx, _done_rx) = oneshot::channel();
+        cmd_tx
+            .send(WriterCommand::Close { done_tx })
+            .expect("queue close");
+        queue_writer_batch(&cmd_tx, append_batch(1, 0));
+
+        let mut pending = VecDeque::new();
+        let mut close_tx = None;
+        let mut cursor = WriterCursor::default();
+        let first = cmd_rx.try_recv().expect("first command");
+        drain_queued_commands(&mut pending, &mut close_tx, &mut cursor, &mut cmd_rx, first)
+            .expect("drain through close");
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(cursor.next_seq_num, 1);
+        assert!(close_tx.is_some());
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(WriterCommand::Submit { .. })
+        ));
     }
 
     #[test]
