@@ -20,8 +20,8 @@ use memchr::memchr;
 use serde::{Deserialize, Serialize};
 use tailsurf::{
     AppendBatch, AppendTicket, DurableWriterOptions, LinkId, LinkPermissions, LinkSecret,
-    ReadOptions, ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfReadSession,
-    TsfSseReadSession, TsfWriter, default_api_origin,
+    ReadOptions, ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfProducer,
+    TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
     protocol::{
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
@@ -923,6 +923,36 @@ fn print_write_summary(records: u64) {
     eprintln!("{records} {noun} durable");
 }
 
+async fn finish_and_close_writer(
+    session: WriterSession,
+    writer: TsfWriter,
+    interrupted: bool,
+) -> eyre::Result<u64> {
+    if interrupted {
+        eprintln!(
+            "Interrupted. Waiting for pending records to become durable; press Ctrl-C again to stop immediately."
+        );
+    }
+
+    let shutdown_interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown_interrupt);
+    let records = tokio::select! {
+        result = session.finish() => result?,
+        interrupt = &mut shutdown_interrupt => {
+            interrupt.context("failed to listen for interrupt signal")?;
+            exit_interrupted();
+        }
+    };
+    tokio::select! {
+        result = writer.close() => result.context("failed to close writer")?,
+        interrupt = &mut shutdown_interrupt => {
+            interrupt.context("failed to listen for interrupt signal")?;
+            exit_interrupted();
+        }
+    }
+    Ok(records)
+}
+
 async fn connect_session_writer(
     api_url: Url,
     stream_id: StreamId,
@@ -948,31 +978,27 @@ async fn stream_stdin_to_writer(
     let writer = connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
 
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<eyre::Result<Bytes>>(16);
-    // Ctrl-C drops the sender, so the consumer sees the channel close, flushes any
+    // The first Ctrl-C drops the sender, so the consumer sees the channel close, flushes any
     // pending data, and finishes the session cleanly before the interrupted exit.
     let stdin_task = tokio::spawn(async move {
         tokio::select! {
-            result = read_pipe_chunks(tokio::io::stdin(), chunk_tx, "failed to read stdin") => {
-                result.map(|()| false)
-            }
+            biased;
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt.context("failed to listen for interrupt signal")?;
                 Ok(true)
             }
-        }
-    });
-    let records = {
-        let mut session = WriterSession::new(&writer);
-        match buffering {
-            WriteBuffering::Raw => stream_raw_chunks_to_writer(&mut session, &mut chunk_rx).await?,
-            WriteBuffering::Lines => {
-                stream_line_chunks_to_writer(&mut session, &mut chunk_rx).await?
+            result = read_pipe_chunks(tokio::io::stdin(), chunk_tx, "failed to read stdin") => {
+                result.map(|()| false)
             }
         }
-        session.finish().await?
-    };
+    });
+    let mut session = WriterSession::new(&writer);
+    match buffering {
+        WriteBuffering::Raw => stream_raw_chunks_to_writer(&mut session, &mut chunk_rx).await?,
+        WriteBuffering::Lines => stream_line_chunks_to_writer(&mut session, &mut chunk_rx).await?,
+    }
     let interrupted = stdin_task.await.context("stdin reader task panicked")??;
-    writer.close().await.context("failed to close writer")?;
+    let records = finish_and_close_writer(session, writer, interrupted).await?;
     print_write_summary(records);
     if interrupted {
         exit_interrupted();
@@ -991,8 +1017,7 @@ async fn stream_command_to_writer(
     let writer = connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
     let mut session = WriterSession::new(&writer);
     let outcome = stream_child_command_output(&mut session, buffering, command).await?;
-    let records = session.finish().await?;
-    writer.close().await.context("failed to close writer")?;
+    let records = finish_and_close_writer(session, writer, outcome.interrupted).await?;
     print_write_summary(records);
     if outcome.interrupted {
         exit_interrupted();
@@ -1010,7 +1035,7 @@ struct ChildCommandOutcome {
 }
 
 async fn stream_child_command_output(
-    session: &mut WriterSession<'_>,
+    session: &mut WriterSession,
     buffering: WriteBuffering,
     command: Vec<String>,
 ) -> eyre::Result<ChildCommandOutcome> {
@@ -1130,7 +1155,7 @@ impl RawRecordAppender {
 
     async fn push_bytes(
         &mut self,
-        session: &mut WriterSession<'_>,
+        session: &mut WriterSession,
         mut bytes: &[u8],
     ) -> eyre::Result<()> {
         while !bytes.is_empty() {
@@ -1147,7 +1172,7 @@ impl RawRecordAppender {
         Ok(())
     }
 
-    async fn flush(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
+    async fn flush(&mut self, session: &mut WriterSession) -> eyre::Result<()> {
         if self.pending.is_empty() {
             self.deadline = None;
             return Ok(());
@@ -1161,7 +1186,7 @@ impl RawRecordAppender {
 }
 
 async fn stream_raw_chunks_to_writer(
-    session: &mut WriterSession<'_>,
+    session: &mut WriterSession,
     chunk_rx: &mut mpsc::Receiver<eyre::Result<Bytes>>,
 ) -> eyre::Result<()> {
     let mut appender = RawRecordAppender::new(RAW_LINGER);
@@ -1190,7 +1215,7 @@ async fn stream_raw_chunks_to_writer(
 }
 
 async fn stream_line_chunks_to_writer(
-    session: &mut WriterSession<'_>,
+    session: &mut WriterSession,
     chunk_rx: &mut mpsc::Receiver<eyre::Result<Bytes>>,
 ) -> eyre::Result<()> {
     let mut line_appender = LineRecordAppender::new();
@@ -1213,7 +1238,7 @@ impl LineRecordAppender {
 
     async fn push_bytes(
         &mut self,
-        session: &mut WriterSession<'_>,
+        session: &mut WriterSession,
         mut bytes: &[u8],
     ) -> eyre::Result<()> {
         while !bytes.is_empty() {
@@ -1228,37 +1253,35 @@ impl LineRecordAppender {
         Ok(())
     }
 
-    async fn finish(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
+    async fn finish(&mut self, session: &mut WriterSession) -> eyre::Result<()> {
         if !self.pending.is_empty() {
             self.send_line(session).await?;
         }
         Ok(())
     }
 
-    async fn send_line(&mut self, session: &mut WriterSession<'_>) -> eyre::Result<()> {
+    async fn send_line(&mut self, session: &mut WriterSession) -> eyre::Result<()> {
         session
             .append_logical_record(RecordFormat::Transcript, self.pending.split().freeze())
             .await
     }
 }
 
-struct WriterSession<'a> {
-    writer: &'a TsfWriter,
+struct WriterSession {
+    producer: TsfProducer,
     pending_tickets: VecDeque<AppendTicket>,
     records: u64,
 }
 
-impl<'a> WriterSession<'a> {
-    fn new(writer: &'a TsfWriter) -> Self {
+impl WriterSession {
+    fn new(writer: &TsfWriter) -> Self {
         Self {
-            writer,
+            producer: writer.producer(),
             pending_tickets: VecDeque::new(),
             records: 0,
         }
     }
-}
 
-impl WriterSession<'_> {
     async fn append_logical_record(
         &mut self,
         format: RecordFormat,
@@ -1282,7 +1305,7 @@ impl WriterSession<'_> {
     async fn submit_batch(&mut self, batch: AppendBatch) -> eyre::Result<()> {
         self.records += batch.record_count() as u64;
         let ticket = self
-            .writer
+            .producer
             .submit(batch)
             .context("failed to submit record")?;
         self.pending_tickets.push_back(ticket);

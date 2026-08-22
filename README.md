@@ -113,7 +113,7 @@ cat artifact.bin | tsf new --raw
 cat artifact.bin | tsf write '{write-link}' --raw
 ```
 
-On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the writer, and exits with status 130.
+On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the writer, and exits with status 130. Press Ctrl-C again to stop immediately without waiting for pending acknowledgements.
 
 Tail or replay a link or public stream URL:
 
