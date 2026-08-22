@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/s2-streamstore/tailsurf/compare/v0.11.0...v0.12.0) - 2026-08-22
+
+### Added
+
+- [**breaking**] batch durable writes with actor sequencing and frame pacing ([#46](https://github.com/s2-streamstore/tailsurf/pull/46))
+- publish TypeScript SDK packages ([#43](https://github.com/s2-streamstore/tailsurf/pull/43))
+
+### Other
+
+- coalesce writer submissions and decode SSE batches directly ([#52](https://github.com/s2-streamstore/tailsurf/pull/52))
+- [**breaking**] simplify client policy and writer limits ([#50](https://github.com/s2-streamstore/tailsurf/pull/50))
+- restore SDK and npm workflows ([#47](https://github.com/s2-streamstore/tailsurf/pull/47))
+- move npm packages to tailsurf scope ([#48](https://github.com/s2-streamstore/tailsurf/pull/48))
+- use s2-dev npm scope ([#45](https://github.com/s2-streamstore/tailsurf/pull/45))
+
 ### Added
 
 - add reconnecting Rust and TypeScript durable writers that preserve writer identity, sequence numbers, and unacknowledged payloads
