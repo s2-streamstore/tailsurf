@@ -97,5 +97,5 @@ The dry run requires `release` environment approval. It builds every platform an
 After a release, wait until `tailsurf-cli` is visible in the crates.io index. Then run the install smoke against the deployed service:
 
 ```sh
-TSF_API_URL=https://tail.surf TSF_WEB_URL=https://tail.surf python3 scripts/published-cli-smoke.py
+TSF_ORIGIN=https://tail.surf python3 scripts/published-cli-smoke.py
 ```

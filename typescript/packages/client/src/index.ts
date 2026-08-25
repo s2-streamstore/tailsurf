@@ -1,6 +1,7 @@
 export { TsfClientError, TsfHttpError, TsfWebSocketClosedError } from "./errors.js";
 export type { TsfHttpErrorDetails } from "./errors.js";
 export type {
+  CreateLinkResponse,
   CreateStreamResponse,
   ListLinksResponse,
   StreamMetadata,

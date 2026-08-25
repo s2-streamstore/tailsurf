@@ -26,6 +26,25 @@
     "expires_at": "2026-08-23T00:00:00Z",
     "future_field": true
   },
+  "create_response": {
+    "stream_id": "00000000000000000000000000000000",
+    "title": "Deploy log",
+    "visibility": "private",
+    "created_at": "2026-08-13T00:00:00Z",
+    "expires_at": "2026-08-23T00:00:00Z",
+    "web_origin": "https://tail.surf",
+    "links": [
+      { "link_id": "owner", "permissions": "o", "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "future_field": true }
+    ],
+    "future_field": true
+  },
+  "create_link_response": {
+    "web_origin": "https://tail.surf",
+    "link_id": "deploy-bot",
+    "permissions": "w",
+    "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "future_field": true
+  },
   "append_request": {
     "client_writer_id": "AAECAwQFBgcICQoLDA0ODw",
     "writer_start_seq_num": "41",

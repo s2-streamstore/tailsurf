@@ -1,4 +1,5 @@
 import type {
+  CreateLinkResponse as WireCreateLinkResponse,
   CreateStreamResponse as WireCreateStreamResponse,
   StreamLinkCredential as WireStreamLinkCredential,
   LinkId,
@@ -26,7 +27,12 @@ export interface StreamLinkCredential {
 }
 
 export interface CreateStreamResponse extends StreamMetadata {
+  readonly webOrigin: string;
   readonly links: readonly StreamLinkCredential[];
+}
+
+export interface CreateLinkResponse extends StreamLinkCredential {
+  readonly webOrigin: string;
 }
 
 export interface StreamLinkSummary {
@@ -71,7 +77,17 @@ export function createStreamResponseFromWire(
 ): CreateStreamResponse {
   return {
     ...streamMetadataFromWire(stream),
+    webOrigin: stream.web_origin,
     links: stream.links.map(streamLinkCredentialFromWire),
+  };
+}
+
+export function createLinkResponseFromWire(
+  link: WireCreateLinkResponse,
+): CreateLinkResponse {
+  return {
+    ...streamLinkCredentialFromWire(link),
+    webOrigin: link.web_origin,
   };
 }
 

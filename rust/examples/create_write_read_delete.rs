@@ -10,8 +10,8 @@ use url::Url;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = if let Ok(api_url) = env::var("TSF_API_URL") {
-        TsfClient::with_api_origin(Url::parse(&api_url)?)?
+    let client = if let Ok(origin) = env::var("TSF_ORIGIN") {
+        TsfClient::with_api_origin(Url::parse(&origin)?)?
     } else {
         TsfClient::new()
     };

@@ -71,7 +71,7 @@ Changing the fragment key does not change the secret's authority. The client may
 
 Browsers do not send URL fragments in HTTP requests. Clients extract the secret and send it in a bearer header or WebSocket opening frame.
 
-The API origin and web origin are configured independently. A stream link never selects the API backend.
+The API origin and web origin are configured independently on the server. Responses that mint link credentials carry the deployment's canonical `web_origin`, and clients present stream links against it. A stream link never selects the API backend.
 
 ## REST API
 
@@ -120,6 +120,8 @@ Link creation also requires an owner link secret. A supplied idempotency key is 
 The server rejects unknown request body fields. Official SDK decoders ignore unknown response fields. [openapi.yaml](openapi.yaml) defines the exact OpenAPI 3.1 schemas.
 
 Stream metadata includes `created_at` and `expires_at` as RFC 3339 timestamps.
+
+Stream creation and link creation responses include `web_origin`, the deployment's canonical origin for presenting the minted stream links.
 
 Sequence numbers, writer sequence numbers, and Unix epoch millisecond record timestamps in REST and SSE bodies are canonical decimal strings. Query parameters use their documented decimal forms.
 

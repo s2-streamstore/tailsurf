@@ -19,8 +19,8 @@ use eyre::{Context, ContextCompat, bail, eyre};
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
 use tailsurf::{
-    AppendBatch, AppendTicket, DurableWriterOptions, LinkId, LinkPermissions, LinkSecret,
-    ReadOptions, ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfProducer,
+    AppendBatch, AppendTicket, DEFAULT_API_ORIGIN, DurableWriterOptions, LinkId, LinkPermissions,
+    LinkSecret, ReadOptions, ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfProducer,
     TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
     protocol::{
         rest::{
@@ -30,7 +30,7 @@ use tailsurf::{
         },
         ws::frame::{MAX_RECORD_PAYLOAD_BYTES, PartHeader, RecordFormat},
     },
-    stream_url::{DEFAULT_WEB_BASE_URL, StreamLocator, public_stream_url, stream_link},
+    stream_url::{StreamLocator, public_stream_url, stream_link},
     transcript::{DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES, LogicalTranscript},
 };
 use tokio::{
@@ -69,24 +69,15 @@ struct UpdateHintCheckCache {
     after_help = "Create a stream from piped input:\n  anything | tsf\n  anything | tsf new\n\nCapture a program in a new stream:\n  tsf new -- program\n\nWrite to an existing stream:\n  anything | tsf write WRITE_LINK"
 )]
 struct Cli {
-    /// Tailsurf API origin.
+    /// Tailsurf service origin.
     #[arg(
-        long = "api-url",
-        env = "TSF_API_URL",
-        default_value = DEFAULT_WEB_BASE_URL,
+        long,
+        env = "TSF_ORIGIN",
+        default_value = DEFAULT_API_ORIGIN,
         global = true,
         help_heading = "Connection"
     )]
-    api_url: Url,
-    /// Origin used when printing stream links.
-    #[arg(
-        long = "web-url",
-        env = "TSF_WEB_URL",
-        default_value = DEFAULT_WEB_BASE_URL,
-        global = true,
-        help_heading = "Connection"
-    )]
-    web_url: Url,
+    origin: Url,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -592,11 +583,7 @@ enum WriteBuffering {
 // One socket, one stdin, one stdout: worker threads only add wakeup and handoff cost.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let Cli {
-        api_url,
-        web_url,
-        command,
-    } = Cli::parse();
+    let Cli { origin, command } = Cli::parse();
     let stdin_is_terminal = std::io::stdin().is_terminal();
     if command.is_none() && stdin_is_terminal {
         let help = <Cli as clap::CommandFactory>::command().render_help();
@@ -606,11 +593,11 @@ async fn main() -> ExitCode {
     let command = command.unwrap_or_else(|| Command::New(NewArgs::piped_defaults()));
     let check_for_update = should_check_for_update_hint(
         matches!(command, Command::Update(_)),
-        &api_url,
+        &origin,
         std::io::stderr().is_terminal(),
         automatic_update_checks_disabled(),
     );
-    let result = run(api_url, web_url, command).await;
+    let result = run(origin, command).await;
     match result {
         Ok(()) => {
             if check_for_update {
@@ -626,18 +613,18 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(api_url: Url, web_url: Url, command: Command) -> eyre::Result<()> {
+async fn run(origin: Url, command: Command) -> eyre::Result<()> {
     match command {
-        Command::New(args) => new_stream(api_url, web_url, args).await,
-        Command::Write(args) => write_stream(api_url, args).await,
-        Command::Tail(args) => tail_stream(api_url, args).await,
-        Command::Replay(args) => replay_stream(api_url, args).await,
-        Command::Info(args) => stream_metadata(api_url, args).await,
-        Command::Delete(args) => delete_stream(api_url, args).await,
-        Command::Visibility(args) => update_visibility(api_url, args).await,
-        Command::Title(args) => update_title(api_url, args).await,
-        Command::Renew(args) => renew_stream(api_url, args).await,
-        Command::Link(args) => link_command(api_url, web_url, args).await,
+        Command::New(args) => new_stream(origin, args).await,
+        Command::Write(args) => write_stream(origin, args).await,
+        Command::Tail(args) => tail_stream(origin, args).await,
+        Command::Replay(args) => replay_stream(origin, args).await,
+        Command::Info(args) => stream_metadata(origin, args).await,
+        Command::Delete(args) => delete_stream(origin, args).await,
+        Command::Visibility(args) => update_visibility(origin, args).await,
+        Command::Title(args) => update_title(origin, args).await,
+        Command::Renew(args) => renew_stream(origin, args).await,
+        Command::Link(args) => link_command(origin, args).await,
         Command::Update(args) => update_cli(args).await,
     }
 }
@@ -684,11 +671,11 @@ fn managed_updater() -> eyre::Result<AxoUpdater> {
 
 fn should_check_for_update_hint(
     is_update_command: bool,
-    api_url: &Url,
+    origin: &Url,
     stderr_is_terminal: bool,
     disabled: bool,
 ) -> bool {
-    stderr_is_terminal && !disabled && !is_update_command && *api_url == default_api_origin()
+    stderr_is_terminal && !disabled && !is_update_command && *origin == default_api_origin()
 }
 
 fn automatic_update_checks_disabled() -> bool {
@@ -776,7 +763,7 @@ fn print_error(error: &eyre::Report) {
     }
 }
 
-async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<()> {
+async fn new_stream(origin: Url, args: NewArgs) -> eyre::Result<()> {
     let visibility = if args.public {
         Visibility::Public
     } else {
@@ -784,7 +771,7 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
     };
     let links = new_stream_links(&args, visibility)?;
 
-    let created = TsfClient::with_api_origin(api_url.clone())?
+    let created = TsfClient::with_api_origin(origin.clone())?
         .create_stream(&CreateStreamRequest {
             title: args.title.clone(),
             visibility,
@@ -793,8 +780,8 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
         })
         .await
         .context("failed to create stream")?;
-    print_created_stream(&web_url, &created, args.json)?;
-    write_link_files(&web_url, &created, &args)?;
+    print_created_stream(&created, args.json)?;
+    write_link_files(&created, &args)?;
 
     if args.input.program.is_empty() && std::io::stdin().is_terminal() {
         return Ok(());
@@ -808,7 +795,7 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
         .secret
         .clone();
     write_input(
-        api_url,
+        origin,
         created.stream_id,
         owner_link_secret,
         None,
@@ -817,14 +804,14 @@ async fn new_stream(api_url: Url, web_url: Url, args: NewArgs) -> eyre::Result<(
     .await
 }
 
-async fn write_stream(api_url: Url, args: WriteArgs) -> eyre::Result<()> {
+async fn write_stream(origin: Url, args: WriteArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream link")?;
     let link = locator
         .link_declaring(LinkPermissions::allows_write)
         .context("link does not declare write permission")?
         .clone();
     write_input(
-        api_url,
+        origin,
         locator.stream_id,
         link,
         args.expected_next_seq_num,
@@ -892,7 +879,7 @@ fn new_stream_links(
 }
 
 async fn write_input(
-    api_url: Url,
+    origin: Url,
     stream_id: StreamId,
     link: LinkSecret,
     expected_next_seq_num: Option<u64>,
@@ -904,10 +891,10 @@ async fn write_input(
         WriteBuffering::Lines
     };
     if input.program.is_empty() {
-        stream_stdin_to_writer(api_url, stream_id, link, expected_next_seq_num, buffering).await
+        stream_stdin_to_writer(origin, stream_id, link, expected_next_seq_num, buffering).await
     } else {
         stream_command_to_writer(
-            api_url,
+            origin,
             stream_id,
             link,
             expected_next_seq_num,
@@ -954,12 +941,12 @@ async fn finish_and_close_writer(
 }
 
 async fn connect_session_writer(
-    api_url: Url,
+    origin: Url,
     stream_id: StreamId,
     link: LinkSecret,
     expected_next_seq_num: Option<u64>,
 ) -> eyre::Result<TsfWriter> {
-    let client = TsfClient::with_api_origin(api_url)?;
+    let client = TsfClient::with_api_origin(origin)?;
     let mut options = DurableWriterOptions::new(stream_id, link);
     options.expected_next_seq_num = expected_next_seq_num;
     client
@@ -969,13 +956,13 @@ async fn connect_session_writer(
 }
 
 async fn stream_stdin_to_writer(
-    api_url: Url,
+    origin: Url,
     stream_id: StreamId,
     link: LinkSecret,
     expected_next_seq_num: Option<u64>,
     buffering: WriteBuffering,
 ) -> eyre::Result<()> {
-    let writer = connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
+    let writer = connect_session_writer(origin, stream_id, link, expected_next_seq_num).await?;
 
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<eyre::Result<Bytes>>(16);
     // The first Ctrl-C drops the sender, so the consumer sees the channel close, flushes any
@@ -1007,14 +994,14 @@ async fn stream_stdin_to_writer(
 }
 
 async fn stream_command_to_writer(
-    api_url: Url,
+    origin: Url,
     stream_id: StreamId,
     link: LinkSecret,
     expected_next_seq_num: Option<u64>,
     buffering: WriteBuffering,
     command: Vec<String>,
 ) -> eyre::Result<()> {
-    let writer = connect_session_writer(api_url, stream_id, link, expected_next_seq_num).await?;
+    let writer = connect_session_writer(origin, stream_id, link, expected_next_seq_num).await?;
     let mut session = WriterSession::new(&writer);
     let outcome = stream_child_command_output(&mut session, buffering, command).await?;
     let records = finish_and_close_writer(session, writer, outcome.interrupted).await?;
@@ -1352,12 +1339,12 @@ fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadSta
     options
 }
 
-async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
+async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     let request = read_options(&locator, &args.read, ReadStart::TailOffset(0));
 
     read_transcript(
-        api_url,
+        origin,
         request,
         args.read.max_reassembly_bytes,
         args.read.sse,
@@ -1365,7 +1352,7 @@ async fn tail_stream(api_url: Url, args: TailArgs) -> eyre::Result<()> {
     .await
 }
 
-async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
+async fn replay_stream(origin: Url, args: ReplayArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
     request.stop.get_or_insert(ReadStop {
@@ -1374,7 +1361,7 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     });
 
     read_transcript(
-        api_url,
+        origin,
         request,
         args.read.max_reassembly_bytes,
         args.read.sse,
@@ -1382,9 +1369,9 @@ async fn replay_stream(api_url: Url, args: ReplayArgs) -> eyre::Result<()> {
     .await
 }
 
-async fn stream_metadata(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
+async fn stream_metadata(origin: Url, args: InfoArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
-    let client = TsfClient::with_api_origin(api_url)?;
+    let client = TsfClient::with_api_origin(origin)?;
     let stream = client
         .get_stream(
             &locator.stream_id,
@@ -1395,9 +1382,9 @@ async fn stream_metadata(api_url: Url, args: InfoArgs) -> eyre::Result<()> {
     print_stream_metadata(&stream, args.json)
 }
 
-async fn delete_stream(api_url: Url, args: DeleteArgs) -> eyre::Result<()> {
+async fn delete_stream(origin: Url, args: DeleteArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner_link.as_str())?;
     if !confirm_delete(&locator.stream_id, args.yes)? {
         eprintln!("Deletion cancelled.");
         return Ok(());
@@ -1418,14 +1405,13 @@ async fn delete_stream(api_url: Url, args: DeleteArgs) -> eyre::Result<()> {
 }
 
 async fn update_and_print(
-    api_url: Url,
+    origin: Url,
     owner_link: &LinkInput,
     request: &UpdateStreamRequest,
     json: bool,
     context: &'static str,
 ) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, owner_link.as_str())?;
+    let (client, locator, owner_link_secret) = owner_client_from_link(origin, owner_link.as_str())?;
     let stream = client
         .update_stream(&locator.stream_id, request, &owner_link_secret)
         .await
@@ -1433,9 +1419,9 @@ async fn update_and_print(
     print_stream_metadata(&stream, json)
 }
 
-async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<()> {
+async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()> {
     update_and_print(
-        api_url,
+        origin,
         &args.owner_link,
         &UpdateStreamRequest {
             title: StreamTitleUpdate::Unchanged,
@@ -1448,7 +1434,7 @@ async fn update_visibility(api_url: Url, args: VisibilityArgs) -> eyre::Result<(
     .await
 }
 
-async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
+async fn update_title(origin: Url, args: TitleArgs) -> eyre::Result<()> {
     let (owner_link, title, json) = match args.command {
         TitleCommand::Set(args) => (
             args.owner_link,
@@ -1458,7 +1444,7 @@ async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
         TitleCommand::Clear(args) => (args.owner_link, StreamTitleUpdate::Clear, args.json),
     };
     update_and_print(
-        api_url,
+        origin,
         &owner_link,
         &UpdateStreamRequest {
             title,
@@ -1471,9 +1457,9 @@ async fn update_title(api_url: Url, args: TitleArgs) -> eyre::Result<()> {
     .await
 }
 
-async fn renew_stream(api_url: Url, args: RenewArgs) -> eyre::Result<()> {
+async fn renew_stream(origin: Url, args: RenewArgs) -> eyre::Result<()> {
     update_and_print(
-        api_url,
+        origin,
         &args.owner_link,
         &UpdateStreamRequest {
             title: StreamTitleUpdate::Unchanged,
@@ -1486,17 +1472,17 @@ async fn renew_stream(api_url: Url, args: RenewArgs) -> eyre::Result<()> {
     .await
 }
 
-async fn link_command(api_url: Url, web_url: Url, args: LinkArgs) -> eyre::Result<()> {
+async fn link_command(origin: Url, args: LinkArgs) -> eyre::Result<()> {
     match args.command {
-        LinkCommand::List(args) => list_links(api_url, args).await,
-        LinkCommand::Create(args) => create_link(api_url, web_url, args).await,
-        LinkCommand::Revoke(args) => revoke_link(api_url, args).await,
+        LinkCommand::List(args) => list_links(origin, args).await,
+        LinkCommand::Create(args) => create_link(origin, args).await,
+        LinkCommand::Revoke(args) => revoke_link(origin, args).await,
     }
 }
 
-async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
+async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner_link.as_str())?;
     let inventory = client
         .list_all_links(&locator.stream_id, &owner_link_secret)
         .await
@@ -1522,15 +1508,15 @@ async fn list_links(api_url: Url, args: ListLinkArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::Result<()> {
+async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner_link.as_str())?;
     let InitialStreamLink {
         link_id,
         permissions,
     } = args.link.0;
     let expires_at = args.expires.rfc3339()?;
-    let credential = client
+    let created = client
         .create_link(
             &locator.stream_id,
             &CreateLinkInput {
@@ -1543,22 +1529,22 @@ async fn create_link(api_url: Url, web_url: Url, args: CreateLinkArgs) -> eyre::
         .await
         .context("failed to create link")?;
     let url = stream_link(
-        &web_url,
+        &created.web_origin,
         &locator.stream_id,
-        credential.permissions,
-        &credential.secret,
+        created.credential.permissions,
+        &created.credential.secret,
     )?;
     if let Some(path) = &args.link_file {
         write_private_file(path, url.as_str())
             .with_context(|| format!("failed to write link file {}", path.display()))?;
     }
-    print_created_link(&url, &credential, args.json)?;
+    print_created_link(&url, &created.credential, args.json)?;
     Ok(())
 }
 
-async fn revoke_link(api_url: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
+async fn revoke_link(origin: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(api_url, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner_link.as_str())?;
     client
         .revoke_link(&locator.stream_id, &args.link_id, &owner_link_secret)
         .await
@@ -1567,7 +1553,7 @@ async fn revoke_link(api_url: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
 }
 
 async fn read_transcript(
-    api_url: Url,
+    origin: Url,
     options: ReadOptions,
     max_reassembly_bytes: usize,
     sse: bool,
@@ -1576,7 +1562,7 @@ async fn read_transcript(
         return Ok(());
     }
 
-    let client = TsfClient::with_api_origin(api_url)?;
+    let client = TsfClient::with_api_origin(origin)?;
     let reader = if sse {
         TranscriptReader::Sse(Box::new(
             client
@@ -1701,7 +1687,7 @@ async fn write_transcript_data(
 }
 
 fn owner_client_from_link(
-    api_url: Url,
+    origin: Url,
     link: &str,
 ) -> eyre::Result<(TsfClient, StreamLocator, LinkSecret)> {
     let locator = StreamLocator::parse(link).context("invalid owner link")?;
@@ -1710,7 +1696,7 @@ fn owner_client_from_link(
         .context("link does not declare owner permission")?
         .clone();
     Ok((
-        TsfClient::with_api_origin(api_url)?,
+        TsfClient::with_api_origin(origin)?,
         locator,
         owner_link_secret,
     ))
@@ -1766,11 +1752,8 @@ fn write_json(writer: impl std::io::Write, value: &impl Serialize) -> eyre::Resu
     Ok(())
 }
 
-fn print_created_stream(
-    web_url: &Url,
-    created: &CreateStreamResponse,
-    json: bool,
-) -> eyre::Result<()> {
+fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Result<()> {
+    let web_origin = &created.web_origin;
     if !json {
         println!(
             "Created {} stream {}",
@@ -1792,7 +1775,7 @@ fn print_created_stream(
                     credential.link_id.as_str(),
                     credential.permissions,
                     stream_link(
-                        web_url,
+                        web_origin,
                         &created.stream_id,
                         credential.permissions,
                         &credential.secret,
@@ -1809,7 +1792,7 @@ fn print_created_stream(
             links.push((
                 "Public",
                 LinkPermissions::read(),
-                public_stream_url(web_url, &created.stream_id)?,
+                public_stream_url(web_origin, &created.stream_id)?,
                 "  (public)",
             ));
         }
@@ -1845,7 +1828,7 @@ fn print_created_stream(
                         link_id: credential.link_id.to_string(),
                         permissions: permission_label(credential.permissions),
                         url: stream_link(
-                            web_url,
+                            web_origin,
                             &created.stream_id,
                             credential.permissions,
                             &credential.secret,
@@ -1856,7 +1839,7 @@ fn print_created_stream(
                 .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?,
             public_url: match created.visibility {
                 Visibility::Public => {
-                    Some(public_stream_url(web_url, &created.stream_id)?.to_string())
+                    Some(public_stream_url(web_origin, &created.stream_id)?.to_string())
                 }
                 Visibility::Private => None,
             },
@@ -1910,28 +1893,21 @@ fn print_created_link(
     Ok(())
 }
 
-fn write_link_files(
-    web_url: &Url,
-    created: &CreateStreamResponse,
-    args: &NewArgs,
-) -> eyre::Result<()> {
+fn write_link_files(created: &CreateStreamResponse, args: &NewArgs) -> eyre::Result<()> {
     write_link_file(
         &args.owner_link_file,
-        web_url,
         created,
         LinkPermissions::owner(),
         "owner",
     )?;
     write_link_file(
         &args.read_link_file,
-        web_url,
         created,
         LinkPermissions::read(),
         "read",
     )?;
     write_link_file(
         &args.write_link_file,
-        web_url,
         created,
         LinkPermissions::write(),
         "write",
@@ -1941,7 +1917,6 @@ fn write_link_files(
 
 fn write_link_file(
     path: &Option<PathBuf>,
-    web_url: &Url,
     created: &CreateStreamResponse,
     permissions: LinkPermissions,
     kind: &str,
@@ -1954,7 +1929,12 @@ fn write_link_file(
         .iter()
         .find(|link| link.permissions == permissions)
         .with_context(|| format!("created stream did not include a {kind} link"))?;
-    let url = stream_link(web_url, &created.stream_id, link.permissions, &link.secret)?;
+    let url = stream_link(
+        &created.web_origin,
+        &created.stream_id,
+        link.permissions,
+        &link.secret,
+    )?;
     write_private_file(path, url.as_str())
         .with_context(|| format!("failed to write {kind} link file {}", path.display()))?;
     Ok(())
@@ -2149,8 +2129,8 @@ mod tests {
     fn update_hints_require_a_successful_interactive_production_command() {
         let production = Url::parse("https://tail.surf").expect("production URL");
         let non_production = Url::parse("https://api.example").expect("custom URL");
-        let check = |is_update, api_url, terminal, disabled| {
-            should_check_for_update_hint(is_update, api_url, terminal, disabled)
+        let check = |is_update, origin, terminal, disabled| {
+            should_check_for_update_hint(is_update, origin, terminal, disabled)
         };
         assert!(check(false, &production, true, false));
         assert!(!check(false, &production, false, false));

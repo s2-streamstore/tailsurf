@@ -4,9 +4,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   createStreamRequestSchema,
+  createStreamResponseSchema,
   decodeSseResumeCursor,
   encodeSseResumeCursor,
   createLinkRequestSchema,
+  createLinkResponseSchema,
   listLinksResponseSchema,
   streamTitleSchema,
   updateStreamRequestSchema,
@@ -74,6 +76,14 @@ describe("REST schemas", () => {
       .toHaveLength(2);
     expect(streamMetadataSchema.parse(fixtures.stream_resource)).not
       .toHaveProperty("future_field");
+    const createdStream = createStreamResponseSchema.parse(fixtures.create_response);
+    expect(createdStream.web_origin).toBe("https://tail.surf");
+    expect(createdStream.links).toHaveLength(1);
+    expect(createdStream).not.toHaveProperty("future_field");
+    const createdLink = createLinkResponseSchema.parse(fixtures.create_link_response);
+    expect(createdLink.web_origin).toBe("https://tail.surf");
+    expect(createdLink.link_id).toBe("deploy-bot");
+    expect(createdLink).not.toHaveProperty("future_field");
     expect(appendRecordsRequestSchema.parse(fixtures.append_request).records)
       .toHaveLength(2);
     expect(appendRangeSchema.parse(fixtures.append_response)).not
