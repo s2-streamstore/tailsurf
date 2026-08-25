@@ -179,6 +179,12 @@ Install the TypeScript client with `npm install @tailsurf/client`. Rust API docu
 
 See [Development](docs/development.md) for the workspace layout, local-service setup, checks, and diagnostics. Release maintainers should also read [Release operations](docs/release-operations.md).
 
+## Trust and support
+
+- [Trust](https://tail.surf/trust), [Privacy](https://tail.surf/privacy), and [Terms](https://tail.surf/terms) cover the hosted service.
+- Report vulnerabilities through [SECURITY.md](SECURITY.md).
+- [GitHub Issues](https://github.com/s2-streamstore/tailsurf/issues) is the public support path. Never post an owner, write, or private read link.
+
 ## License
 
 The SDKs and CLI are MIT licensed. See [LICENSE](LICENSE).
