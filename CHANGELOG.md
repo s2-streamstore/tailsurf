@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/s2-streamstore/tailsurf/compare/v0.12.2...v0.13.0) - 2026-08-25
+
+### Added
+
+- [**breaking**] one --origin flag; stream links use the server-supplied web origin ([#66](https://github.com/s2-streamstore/tailsurf/pull/66))
+- publish tailsurf as an alias for @tailsurf/client ([#67](https://github.com/s2-streamstore/tailsurf/pull/67))
+
+### Other
+
+- rustfmt rest_fixtures imports ([#69](https://github.com/s2-streamstore/tailsurf/pull/69))
+- add contributor guidance and repair release changelog plumbing ([#64](https://github.com/s2-streamstore/tailsurf/pull/64))
+- publish the TSF v1 protocol specification and OpenAPI contract ([#63](https://github.com/s2-streamstore/tailsurf/pull/63))
+- add security policy and hosted-service trust links ([#60](https://github.com/s2-streamstore/tailsurf/pull/60))
+
 ## [0.12.2](https://github.com/s2-streamstore/tailsurf/compare/v0.12.1...v0.12.2) - 2026-08-22
 
 This release contains no functional changes.
