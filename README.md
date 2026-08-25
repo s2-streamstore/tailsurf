@@ -175,6 +175,10 @@ The repository also contains public Rust and TypeScript SDKs.
 
 Install the TypeScript client with `npm install @tailsurf/client`. Rust API documentation is available on [docs.rs](https://docs.rs/tailsurf).
 
+## Protocol
+
+The [TSF v1 protocol](docs/protocol.md) defines the public REST, SSE, and WebSocket contract the SDKs and service implement. [openapi.yaml](docs/openapi.yaml) is the machine-readable REST and SSE contract.
+
 ## Development
 
 See [Development](docs/development.md) for the workspace layout, local-service setup, checks, and diagnostics. Release maintainers should also read [Release operations](docs/release-operations.md).

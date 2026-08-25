@@ -1,0 +1,435 @@
+openapi: 3.1.0
+info:
+  title: tail.surf REST API
+  version: v1
+  description: Public REST and Server-Sent Events contract. Request objects are strict. Response objects may gain fields.
+servers:
+  - url: https://tail.surf/api/v1
+paths:
+  /streams:
+    post:
+      operationId: createStream
+      summary: Create a stream
+      description: The server generates a random Stream ID. When Idempotency-Key is present, an exact key and request replay resolves that ID and returns the original stream and link credentials while the mapped stream remains active. Reusing the key with a different request returns 409. Treat the key and complete request as sensitive recovery material. When the header is absent, creation is one-shot. A retry creates another stream and cannot recover a lost response.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateStreamRequest' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateStreamResponse' }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /streams/{stream_id}:
+    parameters:
+      - $ref: '#/components/parameters/StreamId'
+    get:
+      operationId: getStream
+      summary: Get stream metadata
+      security: [{ linkBearer: [] }, {}]
+      responses:
+        '200':
+          description: Stream metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StreamMetadata' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: updateStream
+      summary: Update a stream
+      security: [{ linkBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                title: { oneOf: [{ $ref: '#/components/schemas/StreamTitle' }, { type: 'null' }] }
+                visibility: { enum: [private, public] }
+                expires_at: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Updated stream
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StreamMetadata' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteStream
+      summary: Delete a stream
+      security: [{ linkBearer: [] }]
+      responses:
+        '204': { description: Deletion request accepted or already complete }
+        default: { $ref: '#/components/responses/Error' }
+  /streams/{stream_id}/links:
+    parameters:
+      - $ref: '#/components/parameters/StreamId'
+    get:
+      operationId: listLinks
+      summary: List retained links
+      security: [{ linkBearer: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100 } }
+        - { name: cursor, in: query, schema: { type: string, minLength: 1 } }
+      responses:
+        '200':
+          description: Link page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorizing_link_id, links, next_cursor]
+                properties:
+                  authorizing_link_id: { $ref: '#/components/schemas/LinkId' }
+                  links: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/StreamLinkSummary' } }
+                  next_cursor: { oneOf: [{ type: string, minLength: 1 }, { type: 'null' }] }
+        default: { $ref: '#/components/responses/Error' }
+  /streams/{stream_id}/links/{link_id}:
+    parameters:
+      - $ref: '#/components/parameters/StreamId'
+      - { name: link_id, in: path, required: true, schema: { $ref: '#/components/schemas/LinkId' } }
+    put:
+      operationId: createLink
+      summary: Create a link
+      description: When Idempotency-Key is present, the same key, Link ID, and body return the same server-minted credential while the link row is retained. An exact replay does not reactivate an inactive retained link. After cleanup removes that row, the request is handled as a new link creation. Reusing a retained Link ID with different inputs returns 409. When the header is absent, creation is one-shot. A retry cannot recover a committed credential and may conflict with the existing Link ID.
+      security: [{ linkBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateLinkRequest' }
+      responses:
+        '200':
+          description: Created link or its identical existing representation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StreamLinkCredential' }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: revokeLink
+      summary: Revoke a link
+      security: [{ linkBearer: [] }]
+      responses:
+        '204': { description: Revoked or already revoked }
+        default: { $ref: '#/components/responses/Error' }
+  /streams/{stream_id}/records:
+    parameters:
+      - $ref: '#/components/parameters/StreamId'
+    post:
+      operationId: appendRecords
+      summary: Append one atomic durable batch
+      security: [{ linkBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppendRecordsRequest' }
+      responses:
+        '200':
+          description: Half-open durable sequence range
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppendRange' }
+        '412': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: readRecords
+      summary: Read resumable batched SSE
+      description: At most one start selector may be present. Omission means tail_offset 0. until is an exclusive timestamp. wait is an integer from 0 through 60. Omitted wait follows indefinitely unless count or until makes it default to zero. Playback requires count, until, or wait=0. The original query must remain valid when Last-Event-ID is present.
+      security: [{ linkBearer: [] }, {}]
+      parameters:
+        - { name: seq_num, in: query, schema: { $ref: '#/components/schemas/ReadSelectorValue' } }
+        - { name: timestamp, in: query, schema: { $ref: '#/components/schemas/ReadSelectorValue' } }
+        - { name: tail_offset, in: query, schema: { $ref: '#/components/schemas/ReadSelectorValue' } }
+        - { name: count, in: query, description: Maximum physical records delivered across resumptions., schema: { $ref: '#/components/schemas/DecimalU64' } }
+        - { name: until, in: query, description: Exclusive stop timestamp in Unix epoch milliseconds., schema: { $ref: '#/components/schemas/ReadSelectorValue' } }
+        - { name: rate, in: query, description: Playback speed multiplier., schema: { type: number, minimum: 0.1, maximum: 100 } }
+        - { name: wait, in: query, description: Seconds to wait at the tail before ending this connection., schema: { type: integer, minimum: 0, maximum: 60 } }
+        - name: Last-Event-ID
+          in: header
+          description: Versioned CSV resume cursor sent verbatim by EventSource. It overrides only the start position and preserves the consumed count. The original query is still validated.
+          schema: { $ref: '#/components/schemas/SseResumeCursor' }
+      responses:
+        '200':
+          description: stream_metadata is first. read_batch and caught_up carry advancing resume IDs. A count-zero stream_metadata carries a terminal resume ID. Comments are heartbeats.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: UTF-8 Server-Sent Events encoded according to the event variants below. Each completed event is at most 2 MiB including its terminator.
+              x-tsf-event-variants:
+                oneOf:
+                  - $ref: '#/components/schemas/SseStreamMetadataEvent'
+                  - $ref: '#/components/schemas/SseReadBatchEvent'
+                  - $ref: '#/components/schemas/SseCaughtUpEvent'
+                  - $ref: '#/components/schemas/SseHeartbeatComment'
+                  - $ref: '#/components/schemas/SseErrorEvent'
+        '204':
+          description: The resumed logical read is complete. Native EventSource stops reconnecting.
+        default: { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    linkBearer: { type: http, scheme: bearer, bearerFormat: canonical 32-character TSF link secret }
+  parameters:
+    StreamId: { name: stream_id, in: path, required: true, schema: { $ref: '#/components/schemas/StreamId' } }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Enables deterministic retry when supplied. Omission requests one-shot creation.
+      schema: { $ref: '#/components/schemas/IdempotencyKey' }
+  responses:
+    Error:
+      description: Stable API error
+      headers:
+        X-Request-ID:
+          description: Request identifier used for support and tracing.
+          schema: { type: string, minLength: 1 }
+        Retry-After:
+          description: Retry delay in whole seconds when the failure is temporary.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiErrorResponse' }
+  schemas:
+    ApiErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/ApiError' }
+    ApiError:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: { type: string, pattern: '^[a-z][a-z0-9_]*$' }
+        message: { type: string }
+        request_id: { type: string, minLength: 1 }
+        retry_after_ms: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        actual_next_seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
+    DecimalU64:
+      type: string
+      description: Canonical decimal unsigned 64-bit integer from 0 through 18446744073709551615.
+      pattern: '^(?![2-9][0-9]{19}$|19[0-9]{18}$|18[5-9][0-9]{17}$|184[5-9][0-9]{16}$|1844[7-9][0-9]{15}$|18446[8-9][0-9]{14}$|184467[5-9][0-9]{13}$|1844674[5-9][0-9]{12}$|18446744[1-9][0-9]{11}$|184467440[8-9][0-9]{10}$|1844674407[4-9][0-9]{9}$|18446744073[8-9][0-9]{8}$|184467440737[1-9][0-9]{7}$|18446744073709[6-9][0-9]{5}$|184467440737095[6-9][0-9]{4}$|1844674407370955[2-9][0-9]{3}$|18446744073709551[7-9][0-9]{2}$|184467440737095516[2-9][0-9]$|1844674407370955161[6-9]$)(?:0|[1-9][0-9]{0,19})$'
+    ReadSelectorValue: { type: integer, minimum: 0, maximum: 9007199254740991 }
+    DecimalSafeU64:
+      type: string
+      description: Canonical decimal integer from 0 through 9007199254740991.
+      pattern: '^(?:0|[1-9][0-9]{0,14}|[1-8][0-9]{15}|900[0-6][0-9]{12}|90070[0-9]{11}|90071[0-8][0-9]{10}|900719[0-8][0-9]{9}|9007199[0-1][0-9]{8}|90071992[0-4][0-9]{7}|900719925[0-3][0-9]{6}|9007199254[0-6][0-9]{5}|90071992547[0-3][0-9]{4}|9007199254740[0-8][0-9]{2}|90071992547409[0-8][0-9]|900719925474099[0-1])$'
+    SseResumeCursor:
+      type: string
+      description: v1,next sequence,consumed physical record count. Fields are canonical decimal u64 values. The next sequence is no greater than 9007199254740991. Consumed count cannot exceed next sequence.
+      pattern: '^v1,(?:0|[1-9][0-9]{0,19}),(?:0|[1-9][0-9]{0,19})$'
+      not:
+        pattern: '(?:^v1,|,)(?:[2-9][0-9]{19}|19[0-9]{18}|18[5-9][0-9]{17}|184[5-9][0-9]{16}|1844[7-9][0-9]{15}|18446[8-9][0-9]{14}|184467[5-9][0-9]{13}|1844674[5-9][0-9]{12}|18446744[1-9][0-9]{11}|184467440[8-9][0-9]{10}|1844674407[4-9][0-9]{9}|18446744073[8-9][0-9]{8}|184467440737[1-9][0-9]{7}|18446744073709[6-9][0-9]{5}|184467440737095[6-9][0-9]{4}|1844674407370955[2-9][0-9]{3}|18446744073709551[7-9][0-9]{2}|184467440737095516[2-9][0-9]|1844674407370955161[6-9])(?:,|$)'
+    LinkSecret:
+      type: string
+      description: Server-minted 24-byte credential encoded as canonical unpadded base64url.
+      pattern: '^[A-Za-z0-9_-]{32}$'
+    BytesBase64url:
+      type: string
+      description: Canonical unpadded base64url bytes.
+      pattern: '^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$'
+    IdempotencyKey:
+      type: string
+      description: Client-generated retry key for one logical creation operation.
+      pattern: '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+    StreamId: { type: string, pattern: '^[0-9a-hjkmnp-tv-z]{32}$' }
+    LinkId:
+      type: string
+      description: Client-chosen immutable name scoped to one stream.
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$'
+    ClientWriterId:
+      type: string
+      description: Client-chosen identity reused by one writer across reconnects.
+      pattern: '^[A-Za-z0-9_-]{21}[AQgw]$'
+    WriterId:
+      type: string
+      description: Server-derived writer identity attached to delivered records.
+      pattern: '^[A-Za-z0-9_-]{21}[AQgw]$'
+    StreamTitle:
+      type: string
+      minLength: 1
+      maxLength: 120
+      pattern: '^(?![ \u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF])(?!.*[ \u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF]$)(?!.*[\u0000-\u001F\u007F-\u009F\u2028\u2029])(?:[^\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$'
+      description: Human-facing Unicode title. Code-point length is at most 120. Leading or trailing whitespace, control characters, and line breaks are invalid.
+    StreamMetadata:
+      type: object
+      required: [stream_id, title, visibility, created_at, expires_at]
+      properties:
+        stream_id: { $ref: '#/components/schemas/StreamId' }
+        title: { oneOf: [{ $ref: '#/components/schemas/StreamTitle' }, { type: 'null' }] }
+        visibility: { enum: [private, public] }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+    InitialStreamLink:
+      type: object
+      additionalProperties: false
+      required: [link_id, permissions]
+      properties:
+        link_id: { $ref: '#/components/schemas/LinkId' }
+        permissions: { enum: [r, w, rw, o] }
+    CreateStreamRequest:
+      type: object
+      description: Links must contain a non-expiring owner. Link IDs must be unique within the request.
+      additionalProperties: false
+      required: [links]
+      properties:
+        title: { $ref: '#/components/schemas/StreamTitle' }
+        visibility: { enum: [private, public], default: private }
+        expires_in_seconds: { type: integer, minimum: 1, maximum: 864000 }
+        links: { type: array, minItems: 1, maxItems: 3, items: { $ref: '#/components/schemas/InitialStreamLink' } }
+    CreateStreamResponse:
+      description: Created stream metadata and server-minted initial link credentials.
+      allOf:
+        - $ref: '#/components/schemas/StreamMetadata'
+        - type: object
+          required: [links]
+          properties: { links: { type: array, minItems: 1, maxItems: 3, items: { $ref: '#/components/schemas/StreamLinkCredential' } } }
+    CreateLinkRequest:
+      type: object
+      additionalProperties: false
+      required: [permissions]
+      properties:
+        permissions: { enum: [r, w, rw, o] }
+        expires_at: { type: string, format: date-time }
+    StreamLinkCredential:
+      type: object
+      required: [link_id, secret, permissions]
+      properties:
+        link_id: { $ref: '#/components/schemas/LinkId' }
+        secret: { $ref: '#/components/schemas/LinkSecret' }
+        permissions: { enum: [r, w, rw, o] }
+    StreamLinkSummary:
+      type: object
+      required: [link_id, permissions, status, created_at, expires_at, revoked_at]
+      properties:
+        link_id: { $ref: '#/components/schemas/LinkId' }
+        permissions: { enum: [r, w, rw, o] }
+        status: { enum: [active, expired, revoked] }
+        created_at: { type: string, format: date-time }
+        expires_at: { oneOf: [{ type: string, format: date-time }, { type: 'null' }] }
+        revoked_at: { oneOf: [{ type: string, format: date-time }, { type: 'null' }] }
+    RecordPart:
+      type: object
+      additionalProperties: false
+      required: [index, is_final]
+      properties: { index: { type: integer, minimum: 0, maximum: 2147483647 }, is_final: { type: boolean } }
+    AppendRecord:
+      type: object
+      additionalProperties: false
+      required: [format, data]
+      properties:
+        part: { $ref: '#/components/schemas/RecordPart' }
+        format: { enum: [bytes, transcript] }
+        data:
+          description: Exact bytes. The Rust and TypeScript SDKs choose the smaller UTF-8 or base64url JSON representation.
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [encoding, value]
+              properties: { encoding: { const: utf8 }, value: { type: string } }
+            - type: object
+              additionalProperties: false
+              required: [encoding, value]
+              properties: { encoding: { const: base64url }, value: { $ref: '#/components/schemas/BytesBase64url' } }
+    AppendRecordsRequest:
+      type: object
+      description: Writer sequence numbers form a contiguous range starting at writer_start_seq_num and ending before 18446744073709551615. Each decoded record is at most 512 KiB. The aggregate decoded payload is at most 900 KiB. The encoded body is at most 1.3 MB. expected_next_seq_num requires the stream's next sequence number to equal the supplied value.
+      additionalProperties: false
+      required: [client_writer_id, writer_start_seq_num, records]
+      properties:
+        client_writer_id: { $ref: '#/components/schemas/ClientWriterId' }
+        writer_start_seq_num: { $ref: '#/components/schemas/DecimalU64' }
+        records: { type: array, minItems: 1, maxItems: 128, items: { $ref: '#/components/schemas/AppendRecord' } }
+        expected_next_seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
+    AppendRange:
+      type: object
+      description: Half-open durable sequence range. Its length equals the submitted record count.
+      required: [start_seq_num, end_seq_num]
+      properties:
+        start_seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
+        end_seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
+    CaughtUpPosition:
+      type: object
+      required: [next_seq_num, last_timestamp_ms]
+      properties:
+        next_seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
+        last_timestamp_ms: { $ref: '#/components/schemas/DecimalSafeU64' }
+    ReadRecord:
+      type: object
+      required: [seq_num, timestamp_ms, writer_id, writer_seq_num, part, format, data]
+      properties:
+        seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
+        timestamp_ms: { $ref: '#/components/schemas/DecimalSafeU64' }
+        writer_id: { $ref: '#/components/schemas/WriterId' }
+        writer_seq_num: { $ref: '#/components/schemas/DecimalU64' }
+        part: { $ref: '#/components/schemas/RecordPart' }
+        format: { enum: [bytes, transcript] }
+        data:
+          description: Exact bytes encoded using the smaller UTF-8 or base64url JSON representation when possible.
+          oneOf:
+            - type: object
+              required: [encoding, value]
+              properties: { encoding: { const: utf8 }, value: { type: string } }
+            - type: object
+              required: [encoding, value]
+              properties: { encoding: { const: base64url }, value: { $ref: '#/components/schemas/BytesBase64url' } }
+    SseStreamMetadataEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { const: stream_metadata }
+        id: { $ref: '#/components/schemas/SseResumeCursor' }
+        data: { $ref: '#/components/schemas/StreamMetadata' }
+    SseReadBatchEvent:
+      type: object
+      required: [event, id, data]
+      properties:
+        event: { const: read_batch }
+        id: { $ref: '#/components/schemas/SseResumeCursor' }
+        data:
+          type: object
+          description: Records use contiguous physical sequence numbers and remain within the requested limit and exclusive end.
+          required: [records]
+          properties:
+            records: { type: array, minItems: 1, maxItems: 1000, items: { $ref: '#/components/schemas/ReadRecord' } }
+    SseCaughtUpEvent:
+      type: object
+      required: [event, id, data]
+      properties:
+        event: { const: caught_up }
+        id: { $ref: '#/components/schemas/SseResumeCursor' }
+        data: { $ref: '#/components/schemas/CaughtUpPosition' }
+    SseHeartbeatComment:
+      type: object
+      required: [comment]
+      properties: { comment: { const: heartbeat } }
+    SseErrorEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { const: error }
+        data:
+          type: object
+          required: [error]
+          properties:
+            error:
+              type: object
+              required: [code, message]
+              properties: { code: { type: string }, message: { type: string } }
