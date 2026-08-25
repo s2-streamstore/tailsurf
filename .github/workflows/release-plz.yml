@@ -1,7 +1,7 @@
 name: Rust release PR
 
-# Rust SDK and CLI pushes update the release PR. Crate publishing is gated in
-# publish-crates.yml.
+# Rust SDK and CLI changes update the release PR. Release commits only run the
+# publishing workflow.
 on:
   push:
     branches: [main]
@@ -11,7 +11,9 @@ on:
 jobs:
   release-pr:
     name: Prepare Rust SDK and CLI release PR
-    if: github.repository == 's2-streamstore/tailsurf'
+    if: >-
+      github.repository == 's2-streamstore/tailsurf' &&
+      !startsWith(github.event.head_commit.message, 'chore(release): release Rust SDK and CLI')
     runs-on: ubuntu-latest
     permissions:
       contents: write
