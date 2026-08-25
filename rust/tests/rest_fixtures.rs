@@ -2,8 +2,9 @@
 
 use serde_json::Value;
 use tailsurf::protocol::rest::{
-    ApiErrorResponse, AppendRange, AppendRecordsRequest, CreateStreamRequest,
-    MAX_INITIAL_STREAM_LINKS, MAX_LINK_PAGE_ITEMS, MAX_REST_ERROR_RESPONSE_BYTES,
+    ApiErrorResponse, AppendRange, AppendRecordsRequest, CreateLinkResponse, CreateStreamRequest,
+    CreateStreamResponse, MAX_INITIAL_STREAM_LINKS, MAX_LINK_PAGE_ITEMS,
+    MAX_REST_ERROR_RESPONSE_BYTES,
     MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES, MAX_SSE_READ_BATCH_PAYLOAD_BYTES,
     MAX_SSE_READ_BATCH_RECORDS, MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_JSON_BYTES,
     MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, SseCaughtUpData,
@@ -62,6 +63,12 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     assert_eq!(create.links.len(), 2);
     let stream: StreamMetadata = fixture(&fixtures, "stream_resource");
     assert_eq!(stream.created_at, "2026-08-13T00:00:00Z");
+    let created: CreateStreamResponse = fixture(&fixtures, "create_response");
+    assert_eq!(created.web_origin.as_str(), "https://tail.surf/");
+    assert_eq!(created.links.len(), 1);
+    let created_link: CreateLinkResponse = fixture(&fixtures, "create_link_response");
+    assert_eq!(created_link.web_origin.as_str(), "https://tail.surf/");
+    assert_eq!(created_link.credential.link_id.as_str(), "deploy-bot");
     let append: AppendRecordsRequest = fixture(&fixtures, "append_request");
     assert_eq!(append.client_writer_id, "AAECAwQFBgcICQoLDA0ODw");
     assert_eq!(append.records.len(), 2);
