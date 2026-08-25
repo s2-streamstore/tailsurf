@@ -33,27 +33,24 @@ def main() -> int:
         return 0
 
     args = parse_args()
-    require(args.api_url, "TSF_API_URL or --api-url")
-    require(args.web_url, "TSF_WEB_URL or --web-url")
+    require(args.origin, "TSF_ORIGIN or --origin")
 
     with tempfile.TemporaryDirectory(prefix="tsf-published-cli-") as temp_dir:
         tsf_bin = install_published_cli(args.version, pathlib.Path(temp_dir))
         run_command([tsf_bin, "--help"], "tsf --help")
-        created = create_stream(tsf_bin, args.api_url, args.web_url)
+        created = create_stream(tsf_bin, args.origin)
         message = f"tailsurf published cli smoke {int(time.time())}\n".encode()
         try:
             run_tsf(
                 tsf_bin,
-                args.api_url,
-                args.web_url,
+                args.origin,
                 ["write", created.write_link],
                 "tsf write",
                 input_data=message,
             )
             replayed = run_tsf(
                 tsf_bin,
-                args.api_url,
-                args.web_url,
+                args.origin,
                 ["replay", created.read_link],
                 "tsf replay",
             )
@@ -62,8 +59,7 @@ def main() -> int:
         except Exception:
             run_tsf(
                 tsf_bin,
-                args.api_url,
-                args.web_url,
+                args.origin,
                 ["delete", created.owner_link, "--yes"],
                 "tsf delete cleanup",
                 expect_success=False,
@@ -71,8 +67,7 @@ def main() -> int:
             raise
         run_tsf(
             tsf_bin,
-            args.api_url,
-            args.web_url,
+            args.origin,
             ["delete", created.owner_link, "--yes"],
             "tsf delete",
         )
@@ -85,8 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Install tailsurf-cli from crates.io and run new/write/replay/delete against a Tailsurf API."
     )
-    parser.add_argument("--api-url", default=os.environ.get("TSF_API_URL"))
-    parser.add_argument("--web-url", default=os.environ.get("TSF_WEB_URL"))
+    parser.add_argument("--origin", default=os.environ.get("TSF_ORIGIN"))
     parser.add_argument("--version", default=os.environ.get("TSF_CLI_VERSION") or workspace_version())
     return parser.parse_args()
 
@@ -117,11 +111,10 @@ def install_published_cli(version: str, temp_dir: pathlib.Path) -> str:
     return str(tsf_bin)
 
 
-def create_stream(tsf_bin: str, api_url: str, web_url: str) -> CreatedStream:
+def create_stream(tsf_bin: str, origin: str) -> CreatedStream:
     result = run_tsf(
         tsf_bin,
-        api_url,
-        web_url,
+        origin,
         [
             "new",
             "--json",
@@ -139,8 +132,7 @@ def create_stream(tsf_bin: str, api_url: str, web_url: str) -> CreatedStream:
 
 def run_tsf(
     tsf_bin: str,
-    api_url: str,
-    web_url: str,
+    origin: str,
     args: list[str],
     label: str,
     *,
@@ -148,7 +140,7 @@ def run_tsf(
     expect_success: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
     return run_command(
-        [tsf_bin, "--api-url", api_url, "--web-url", web_url, *args],
+        [tsf_bin, "--origin", origin, *args],
         label,
         input_data=input_data,
         expect_success=expect_success,

@@ -79,6 +79,7 @@ describe("TsfClient REST API", () => {
     } as const;
     const idempotencyKey = generateIdempotencyKey();
     const request = vi.fn<typeof fetch>(async () => Response.json({
+      web_origin: "https://tail.surf",
       link_id: link.linkId,
       permissions: link.permissions,
       secret: LINK_SECRET,
@@ -107,6 +108,7 @@ describe("TsfClient REST API", () => {
 
   it("generates an idempotency key for link creation", async () => {
     const request = vi.fn<typeof fetch>(async () => Response.json({
+      web_origin: "https://tail.surf",
       link_id: "deploy-bot",
       permissions: "w",
       secret: LINK_SECRET,
@@ -800,6 +802,7 @@ function createResponse(
     visibility,
     created_at: "2026-08-11T00:00:00Z",
     expires_at: "2026-08-21T00:00:00Z",
+    web_origin: "https://tail.surf",
     links: [],
   });
 }

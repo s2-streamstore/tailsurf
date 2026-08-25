@@ -4,8 +4,6 @@ use url::{Url, form_urlencoded};
 
 use crate::{LinkPermissions, LinkSecret, StreamId, protocol::MAX_SAFE_INTEGER_U64};
 
-/// Default origin for Tailsurf stream links.
-pub const DEFAULT_WEB_BASE_URL: &str = "https://tail.surf";
 /// Encoded length of a 24-byte stream link credential.
 pub const LINK_SECRET_ENCODED_LENGTH: usize = LinkSecret::ENCODED_LEN;
 /// Declared permission and secret value decoded from a stream link fragment.
@@ -103,11 +101,6 @@ pub fn public_stream_url(base_url: &Url, stream_id: &StreamId) -> Result<Url, St
     url.set_fragment(None);
 
     Ok(url)
-}
-
-/// Returns the default Tailsurf web origin.
-pub fn default_web_base_url() -> Url {
-    Url::parse(DEFAULT_WEB_BASE_URL).expect("default tsf web base URL is valid")
 }
 
 fn parse_stream_id(url: &Url) -> Result<StreamId, StreamLinkError> {

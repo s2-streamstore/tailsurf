@@ -69,7 +69,7 @@ Changing the fragment key does not change authority. The client may use the decl
 
 The backend must never receive URL fragments. Clients copy the secret into a bearer header or WebSocket opening frame.
 
-The API origin and web origin are configured independently. A stream link never selects the API backend.
+The API origin and web origin are configured independently on the server. Responses that mint link credentials carry the deployment's canonical `web_origin`, and clients present stream links against it. A stream link never selects the API backend.
 
 ## REST API
 
@@ -120,6 +120,8 @@ The browser stores one pending normalized request, API origin, and creation key 
 Request bodies reject unknown fields. Response decoders ignore unknown fields. The OpenAPI 3.1 contract is in `docs/openapi.yaml`.
 
 Stream metadata includes `created_at` and `expires_at` as RFC 3339 timestamps.
+
+Stream creation and link creation responses include `web_origin`, the deployment's canonical origin for presenting the minted stream links.
 
 Sequence zero is the absolute start of every non-empty stream. The browser uses `created_at` as the timeline start and the last record timestamp as the timeline end. It reads the exact left edge from sequence zero. Other scrub positions use timestamps.
 

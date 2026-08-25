@@ -33,9 +33,9 @@ use tailsurf::{
     protocol::{
         read::{ReadOptions, ReadStart, ReadStop},
         rest::{
-            CreateLinkInput, CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
-            StreamLinkCredential, StreamLinkStatus, StreamLinkSummary, StreamMetadata,
-            StreamTitleUpdate, UpdateStreamRequest, Visibility,
+            CreateLinkInput, CreateLinkResponse, CreateStreamRequest, CreateStreamResponse,
+            ListLinksResponse, StreamLinkCredential, StreamLinkStatus, StreamLinkSummary,
+            StreamMetadata, StreamTitleUpdate, UpdateStreamRequest, Visibility,
         },
         ws::frame::{
             CaughtUpPosition, ClientFrame, MAX_FRAME_PAYLOAD_BYTES, MAX_RECORD_PAYLOAD_BYTES,
@@ -268,7 +268,7 @@ async fn create_stream_recovers_a_committed_truncated_response() {
         .expose_secret()
         .to_owned();
 
-    let created = TsfClient::with_api_origin(server.api_url.clone())
+    let created = TsfClient::with_api_origin(server.origin.clone())
         .expect("valid API origin")
         .create_stream_with_idempotency_key(&request, &key)
         .await
@@ -292,7 +292,7 @@ async fn create_stream_recovers_a_committed_truncated_response() {
 #[tokio::test]
 async fn create_link_recovers_a_committed_truncated_response() {
     let server = TestServer::start().await;
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let created = client
         .create_stream(&CreateStreamRequest::default())
         .await
@@ -309,10 +309,11 @@ async fn create_link_recovers_a_committed_truncated_response() {
         .await
         .expect("recover committed link creation");
 
-    assert_eq!(link.link_id, link_id);
-    assert_eq!(link.permissions, LinkPermissions::read());
+    assert_eq!(link.web_origin, test_web_origin());
+    assert_eq!(link.credential.link_id, link_id);
+    assert_eq!(link.credential.permissions, LinkPermissions::read());
     assert_eq!(
-        link.secret.expose_secret(),
+        link.credential.secret.expose_secret(),
         test_minted_link_secret(&link_id).expose_secret()
     );
     let observed_keys = server.link_create_idempotency_keys();
@@ -322,7 +323,7 @@ async fn create_link_recovers_a_committed_truncated_response() {
 #[tokio::test]
 async fn create_stream_is_always_anonymous() {
     let server = TestServer::start().await;
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
 
     client
         .create_stream(&CreateStreamRequest::default())
@@ -577,7 +578,7 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
     request.stop = Some(ReadStop {
@@ -656,7 +657,7 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
     request.stop = Some(ReadStop {
@@ -727,7 +728,7 @@ async fn write_raw_flushes_on_linger() {
     let read_link = locator
         .link_declaring(LinkPermissions::allows_read)
         .expect("read link");
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(locator.stream_id).with_link_secret(read_link.clone());
     request.start = Some(ReadStart::SeqNum(0));
     request.stop = Some(ReadStop {
@@ -759,10 +760,8 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
     let server = TestServer::start().await;
     let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
     command
-        .arg("--api-url")
-        .arg(server.api_url.to_string())
-        .arg("--web-url")
-        .arg("http://localhost:3000")
+        .arg("--origin")
+        .arg(server.origin.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -820,8 +819,8 @@ async fn second_interrupt_aborts_a_stalled_stdin_write() {
     let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
     let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
     command
-        .arg("--api-url")
-        .arg(server.api_url.as_str())
+        .arg("--origin")
+        .arg(server.origin.as_str())
         .args(["write", write_link.as_str()])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -870,8 +869,8 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
         .expect("stream id");
     let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
 
-    let output = run_tsf_with_api_url(
-        server.api_url.clone(),
+    let output = run_tsf_with_origin(
+        server.origin.clone(),
         [
             "write",
             write_link.as_str(),
@@ -906,7 +905,7 @@ async fn durable_writer_recovery_outlives_the_bounded_operation_retry_count() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.bounded_operation_attempts = 1;
     let writer = TsfClient::with_config(config)
         .expect("valid client config")
@@ -944,7 +943,7 @@ async fn durable_writer_recovery_outlives_the_bounded_operation_retry_count() {
 #[tokio::test]
 async fn writer_preserves_its_terminal_failure_for_later_submissions() {
     let server = FakeWriteServer::start_terminal().await;
-    let writer = connect_default_writer(&server.api_url).await;
+    let writer = connect_default_writer(&server.origin).await;
     let first = writer
         .submit(test_write_batch(Bytes::from_static(b"first")))
         .expect("submit first record");
@@ -972,7 +971,7 @@ async fn writer_queues_submissions_beyond_the_in_flight_window() {
 
 async fn assert_writer_window(capacity: usize, payload: Bytes) {
     let server = HoldingWriteServer::start(capacity).await;
-    let writer = connect_default_writer(&server.api_url).await;
+    let writer = connect_default_writer(&server.origin).await;
     let mut tickets = Vec::new();
     for _ in 0..capacity {
         tickets.push(
@@ -997,7 +996,7 @@ async fn assert_writer_window(capacity: usize, payload: Bytes) {
 #[tokio::test]
 async fn writer_reconnect_resends_every_unacknowledged_record_in_order() {
     let server = HoldingWriteServer::start_reconnecting(3).await;
-    let writer = connect_default_writer(&server.api_url).await;
+    let writer = connect_default_writer(&server.origin).await;
     let mut tickets = Vec::new();
     for record in 0..3 {
         tickets.push(
@@ -1037,7 +1036,7 @@ async fn writer_reconnect_resends_only_the_unacknowledged_tail() {
     // socket. The reconnect must resend only the unacknowledged tail, and the ticket must
     // retain the receipt earned on the first connection.
     let server = HoldingWriteServer::start_partially_acknowledging(3).await;
-    let writer = connect_default_writer(&server.api_url).await;
+    let writer = connect_default_writer(&server.origin).await;
     let batch = AppendBatch::from_records(
         (0..3)
             .map(|index| {
@@ -1093,7 +1092,7 @@ async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let writer = TsfClient::with_api_origin(server.api_url.clone())
+    let writer = TsfClient::with_api_origin(server.origin.clone())
         .expect("valid API origin")
         .connect_writer(tailsurf::DurableWriterOptions::new(
             stream_id,
@@ -1148,7 +1147,7 @@ async fn cloned_producers_share_one_contiguous_writer_sequence() {
     // writer sequence range, and the ranges across producers must tile 0..total without gaps
     // or overlaps regardless of submission order.
     let server = TestServer::start().await;
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let created = client
         .create_stream(&CreateStreamRequest::default())
         .await
@@ -1227,7 +1226,7 @@ async fn cloned_producers_share_one_contiguous_writer_sequence() {
 #[tokio::test]
 async fn separate_durable_writers_use_fresh_writer_ids() {
     let server = TestServer::start().await;
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let created = client
         .create_stream(&CreateStreamRequest::default())
         .await
@@ -1267,7 +1266,7 @@ async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.websocket_progress_timeout = Duration::from_millis(100);
     let writer = TsfClient::with_config(config)
         .expect("valid client config")
@@ -1315,7 +1314,7 @@ async fn writer_reconnect_arms_a_fresh_acknowledgement_deadline() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.websocket_progress_timeout = Duration::from_millis(200);
     let writer = TsfClient::with_config(config)
         .expect("valid client config")
@@ -1352,7 +1351,7 @@ async fn tail_reconnect_resumes_after_last_sequence() {
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
     let output = run_tsf_until_stdout_contains(
-        server.api_url.clone(),
+        server.origin.clone(),
         ["tail", read_link.as_str()],
         b"first\nsecond\n",
         Duration::from_secs(5),
@@ -1378,7 +1377,7 @@ async fn tail_reconnect_after_multi_record_batch_advances_start_and_count() {
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
     let output = run_tsf_until_stdout_contains(
-        server.api_url.clone(),
+        server.origin.clone(),
         ["tail", "--seq", "0", "--count", "10", read_link.as_str()],
         b"four\n",
         Duration::from_secs(5),
@@ -1403,8 +1402,8 @@ async fn bounded_sse_tail_finishes_at_clean_eof() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
-    let output = run_tsf_with_api_url(
-        server.api_url.clone(),
+    let output = run_tsf_with_origin(
+        server.origin.clone(),
         ["tail", "--sse", "--count", "1", read_link.as_str()],
         None,
     )
@@ -1435,8 +1434,8 @@ async fn bounded_sse_tail_finishes_after_a_multi_record_batch() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
-    let output = run_tsf_with_api_url(
-        server.api_url.clone(),
+    let output = run_tsf_with_origin(
+        server.origin.clone(),
         ["tail", "--sse", "--count", "10", read_link.as_str()],
         None,
     )
@@ -1472,7 +1471,7 @@ async fn sse_wait_zero_finishes_at_the_current_tail() {
     });
     options.link_secret = Some(canonical_test_link_secret());
 
-    let mut session = TsfClient::with_api_origin(server.api_url.clone())
+    let mut session = TsfClient::with_api_origin(server.origin.clone())
         .expect("valid API origin")
         .connect_sse_reader(options)
         .await
@@ -1504,7 +1503,7 @@ async fn tail_since_is_sent_as_a_timestamp_selector() {
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
     let output = run_tsf_until_stdout_contains(
-        server.api_url.clone(),
+        server.origin.clone(),
         [
             "tail",
             "--since",
@@ -1532,7 +1531,7 @@ async fn empty_caught_up_establishes_the_reconnect_position() {
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
     let output = run_tsf_until_stdout_contains(
-        server.api_url.clone(),
+        server.origin.clone(),
         ["tail", "-n", "2", read_link.as_str()],
         b"stable\n",
         Duration::from_secs(5),
@@ -1553,7 +1552,7 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     let mut reader = client.connect_reader(request).await.expect("reader");
 
@@ -1578,7 +1577,7 @@ async fn reader_restarts_retries_after_established_idle_connections() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.bounded_operation_attempts = 2;
     let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
@@ -1603,7 +1602,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let mut config = TsfClientConfig::new(server.api_url.clone()).expect("valid API origin");
+    let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.bounded_operation_attempts = 100;
     let client = TsfClient::with_config(config).expect("valid client config");
     let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
@@ -1633,7 +1632,7 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    let client = TsfClient::with_api_origin(server.api_url.clone()).expect("valid API origin");
+    let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::TailOffset(2));
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -1668,8 +1667,8 @@ async fn count_zero_reads_complete_without_opening_a_socket() {
         .expect("stream id");
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
-    let replay = run_tsf_with_api_url(
-        server.api_url.clone(),
+    let replay = run_tsf_with_origin(
+        server.origin.clone(),
         ["replay", "--count", "0", read_link.as_str()],
         None,
     )
@@ -1687,8 +1686,8 @@ async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
         .expect("stream id");
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
-    let output = run_tsf_with_api_url(
-        server.api_url.clone(),
+    let output = run_tsf_with_origin(
+        server.origin.clone(),
         ["tail", "--last", "10", "--seq", "5", read_link.as_str()],
         None,
     )
@@ -1742,8 +1741,8 @@ async fn replay_rejects_split_records_above_the_reassembly_limit() {
         .expect("stream id");
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
-    let output = run_tsf_with_api_url(
-        server.api_url.clone(),
+    let output = run_tsf_with_origin(
+        server.origin.clone(),
         ["replay", "--max-reassembly-bytes", "4", read_link.as_str()],
         None,
     )
@@ -1775,7 +1774,7 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
 
     let output =
-        run_tsf_bytes_with_api_url(server.api_url.clone(), ["replay", read_link.as_str()]).await;
+        run_tsf_bytes_with_origin(server.origin.clone(), ["replay", read_link.as_str()]).await;
 
     assert!(output.status.success(), "stderr={:?}", output.stderr);
     assert_eq!(
@@ -1941,7 +1940,7 @@ async fn start_server(router: Router) -> (Url, AbortOnDrop) {
 }
 
 struct TestServer {
-    api_url: Url,
+    origin: Url,
     state: Arc<TestApiState>,
     _task: AbortOnDrop,
 }
@@ -1972,9 +1971,9 @@ impl TestServer {
             .route("/api/v1/streams/{stream_id}/write", get(test_write_socket))
             .route("/api/v1/streams/{stream_id}/read", get(test_read_socket))
             .with_state(state.clone());
-        let (api_url, task) = start_server(router).await;
+        let (origin, task) = start_server(router).await;
         Self {
-            api_url,
+            origin,
             state,
             _task: task,
         }
@@ -2256,6 +2255,7 @@ async fn test_create_stream(
         visibility: request.visibility,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
         expires_at,
+        web_origin: test_web_origin(),
         links: response_links,
     };
     if let Some(key) = idempotency_key {
@@ -2380,7 +2380,7 @@ async fn test_create_link(
     if !test_authorized(stream, &headers, LinkPermissions::allows_owner) {
         return test_error(StatusCode::FORBIDDEN, "forbidden", "owner link required");
     }
-    let response = if let Some(link) = stream.links.iter().find(|link| link.link_id == link_id) {
+    let credential = if let Some(link) = stream.links.iter().find(|link| link.link_id == link_id) {
         if link.permissions != request.permissions {
             return test_error(
                 StatusCode::CONFLICT,
@@ -2399,13 +2399,13 @@ async fn test_create_link(
             test_minted_link_secret(&link_id),
             request.permissions,
         );
-        let response = StreamLinkCredential {
+        let credential = StreamLinkCredential {
             link_id: link.link_id.clone(),
             permissions: link.permissions,
             secret: link.secret.clone(),
         };
         stream.links.push(link);
-        response
+        credential
     };
     drop(streams);
     let mut invalid_json = state
@@ -2416,7 +2416,11 @@ async fn test_create_link(
         *invalid_json -= 1;
         return (StatusCode::OK, [("content-type", "application/json")], "{").into_response();
     }
-    Json(response).into_response()
+    Json(CreateLinkResponse {
+        web_origin: test_web_origin(),
+        credential,
+    })
+    .into_response()
 }
 
 async fn test_list_links(
@@ -2739,6 +2743,10 @@ fn test_store_stream_link(
     }
 }
 
+fn test_web_origin() -> Url {
+    Url::parse("http://localhost:3000").expect("test web origin")
+}
+
 fn test_minted_link_secret(link_id: &LinkId) -> LinkSecret {
     let mut hasher = DefaultHasher::new();
     link_id.hash(&mut hasher);
@@ -2840,16 +2848,16 @@ async fn run_tsf<const N: usize>(
     args: [&str; N],
     stdin: Option<&str>,
 ) -> CommandOutput {
-    run_tsf_with_api_url(server.api_url.clone(), args, stdin).await
+    run_tsf_with_origin(server.origin.clone(), args, stdin).await
 }
 
-async fn run_tsf_with_api_url<const N: usize>(
-    api_url: Url,
+async fn run_tsf_with_origin<const N: usize>(
+    origin: Url,
     args: [&str; N],
     stdin: Option<&str>,
 ) -> CommandOutput {
     let args = args.map(str::to_owned).to_vec();
-    let output = run_tsf_bytes(api_url, args, stdin.map(|value| value.as_bytes().to_vec())).await;
+    let output = run_tsf_bytes(origin, args, stdin.map(|value| value.as_bytes().to_vec())).await;
     CommandOutput {
         status: output.status,
         stdout: String::from_utf8(output.stdout).expect("stdout utf8"),
@@ -2863,25 +2871,23 @@ struct CommandOutputBytes {
     stderr: Vec<u8>,
 }
 
-async fn run_tsf_bytes_with_api_url<const N: usize>(
-    api_url: Url,
+async fn run_tsf_bytes_with_origin<const N: usize>(
+    origin: Url,
     args: [&str; N],
 ) -> CommandOutputBytes {
     let args = args.map(str::to_owned).to_vec();
-    run_tsf_bytes(api_url, args, None).await
+    run_tsf_bytes(origin, args, None).await
 }
 
 async fn run_tsf_bytes(
-    api_url: Url,
+    origin: Url,
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
 ) -> CommandOutputBytes {
     let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
     command
-        .arg("--api-url")
-        .arg(api_url.to_string())
-        .arg("--web-url")
-        .arg("http://localhost:3000")
+        .arg("--origin")
+        .arg(origin.to_string())
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2911,17 +2917,15 @@ async fn run_tsf_bytes(
 }
 
 async fn run_tsf_until_stdout_contains<const N: usize>(
-    api_url: Url,
+    origin: Url,
     args: [&str; N],
     needle: &[u8],
     wait_for: Duration,
 ) -> CommandOutput {
     let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
     command
-        .arg("--api-url")
-        .arg(api_url.to_string())
-        .arg("--web-url")
-        .arg("http://localhost:3000")
+        .arg("--origin")
+        .arg(origin.to_string())
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3055,6 +3059,10 @@ fn assert_created_links_parse(output: &str, expected_links: &[(&str, &str)]) {
             .lines()
             .find_map(|line| extract_link_line(line, label))
             .expect("permission URL line");
+        assert!(
+            url.starts_with("http://localhost:3000/s/"),
+            "URL must use the server-supplied web origin: {url}"
+        );
         let locator = StreamLocator::parse(url).expect("stream URL parses");
         assert_eq!(locator.stream_id.to_string(), stream_id);
         let permissions = permission
@@ -3069,11 +3077,11 @@ fn assert_created_links_parse(output: &str, expected_links: &[(&str, &str)]) {
     }
 }
 
-async fn connect_default_writer(api_url: &Url) -> tailsurf::TsfWriter {
+async fn connect_default_writer(origin: &Url) -> tailsurf::TsfWriter {
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
         .parse::<StreamId>()
         .expect("stream id");
-    TsfClient::with_api_origin(api_url.clone())
+    TsfClient::with_api_origin(origin.clone())
         .expect("valid API origin")
         .connect_writer(tailsurf::DurableWriterOptions::new(
             stream_id,
@@ -3128,7 +3136,7 @@ struct HoldingWriteAttempt {
 }
 
 struct HoldingWriteServer {
-    api_url: Url,
+    origin: Url,
     state: Arc<HoldingWriteState>,
     _task: AbortOnDrop,
 }
@@ -3162,9 +3170,9 @@ impl HoldingWriteServer {
                 get(holding_write_socket),
             )
             .with_state(state.clone());
-        let (api_url, task) = start_server(router).await;
+        let (origin, task) = start_server(router).await;
         Self {
-            api_url,
+            origin,
             state,
             _task: task,
         }
@@ -3366,7 +3374,7 @@ struct StallingWriteState {
 }
 
 struct StallingWriteServer {
-    api_url: Url,
+    origin: Url,
     state: Arc<StallingWriteState>,
     _task: AbortOnDrop,
 }
@@ -3384,9 +3392,9 @@ impl StallingWriteServer {
                 get(stalling_write_socket),
             )
             .with_state(state.clone());
-        let (api_url, task) = start_server(router).await;
+        let (origin, task) = start_server(router).await;
         Self {
-            api_url,
+            origin,
             state,
             _task: task,
         }
@@ -3465,7 +3473,7 @@ struct FakeWriteState {
 }
 
 struct FakeWriteServer {
-    api_url: Url,
+    origin: Url,
     state: Arc<FakeWriteState>,
     _task: AbortOnDrop,
 }
@@ -3492,9 +3500,9 @@ impl FakeWriteServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/write", get(fake_write_socket))
             .with_state(state.clone());
-        let (api_url, task) = start_server(router).await;
+        let (origin, task) = start_server(router).await;
         Self {
-            api_url,
+            origin,
             state,
             _task: task,
         }
@@ -3615,7 +3623,7 @@ struct FakeSseState {
 }
 
 struct FakeSseServer {
-    api_url: Url,
+    origin: Url,
     state: Arc<FakeSseState>,
     _task: AbortOnDrop,
 }
@@ -3633,9 +3641,9 @@ impl FakeSseServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/records", get(fake_sse_read))
             .with_state(state.clone());
-        let (api_url, task) = start_server(router).await;
+        let (origin, task) = start_server(router).await;
         Self {
-            api_url,
+            origin,
             state,
             _task: task,
         }
@@ -3756,7 +3764,7 @@ enum FakeReadMode {
 }
 
 struct FakeReadServer {
-    api_url: Url,
+    origin: Url,
     state: Arc<FakeReadState>,
     _task: AbortOnDrop,
 }
@@ -3770,9 +3778,9 @@ impl FakeReadServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/read", get(fake_read_socket))
             .with_state(state.clone());
-        let (api_url, task) = start_server(router).await;
+        let (origin, task) = start_server(router).await;
         Self {
-            api_url,
+            origin,
             state,
             _task: task,
         }

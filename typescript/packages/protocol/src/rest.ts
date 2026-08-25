@@ -143,8 +143,15 @@ export const streamMetadataSchema = z.object({
   expires_at: streamTimestampSchema,
 });
 
+export const webOriginSchema = z.url();
+
 export const createStreamResponseSchema = z.extend(streamMetadataSchema, {
+  web_origin: webOriginSchema,
   links: z.array(streamLinkCredentialSchema),
+});
+
+export const createLinkResponseSchema = z.extend(streamLinkCredentialSchema, {
+  web_origin: webOriginSchema,
 });
 
 export const createLinkRequestSchema = z.strictObject({
@@ -265,6 +272,7 @@ export type InitialStreamLink = z.infer<typeof initialStreamLinkSchema>;
 export type CreateStreamRequest = z.infer<typeof createStreamRequestSchema>;
 export type StreamLinkCredential = z.infer<typeof streamLinkCredentialSchema>;
 export type CreateStreamResponse = z.infer<typeof createStreamResponseSchema>;
+export type CreateLinkResponse = z.infer<typeof createLinkResponseSchema>;
 export type CreateLinkRequestInput = z.input<typeof createLinkRequestSchema>;
 export type CreateLinkRequest = z.infer<typeof createLinkRequestSchema>;
 export type StreamLinkSummary = z.infer<typeof streamLinkSummarySchema>;

@@ -28,7 +28,7 @@ thiserror = "2.0.20"
 tokio = "1.53.1"
 tokio-tungstenite = "0.30.0"
 ubid = { version = "0.1.5", features = ["serde"] }
-url = "2.5.8"
+url = { version = "2.5.8", features = ["serde"] }
 
 [workspace.lints.rust]
 missing_docs = "deny"

@@ -2,7 +2,7 @@ import {
   createStreamRequestSchema,
   createStreamResponseSchema,
   createLinkRequestSchema,
-  streamLinkCredentialSchema,
+  createLinkResponseSchema,
   listLinksResponseSchema,
   parseStreamId,
   parseLinkId,
@@ -46,11 +46,11 @@ import {
 } from "./errors.js";
 import {
   createStreamResponseFromWire,
-  streamLinkCredentialFromWire,
+  createLinkResponseFromWire,
   listLinksResponseFromWire,
   streamMetadataFromWire,
   type CreateStreamResponse,
-  type StreamLinkCredential,
+  type CreateLinkResponse,
   type ListLinksResponse,
   type StreamMetadata,
 } from "./models.js";
@@ -276,7 +276,7 @@ export class BaseTsfClient {
     streamId: StreamId,
     request: CreateLinkInput,
     options: CreateLinkOptions,
-  ): Promise<StreamLinkCredential> {
+  ): Promise<CreateLinkResponse> {
     const linkId = parseLinkId(request.linkId);
     const idempotencyKey = parseIdempotencyKey(
       options.idempotencyKey ?? generateIdempotencyKey(),
@@ -288,14 +288,14 @@ export class BaseTsfClient {
     return this.#json(
       "create link",
       `/streams/${parseStreamId(streamId)}/links/${linkId}`,
-      streamLinkCredentialSchema,
+      createLinkResponseSchema,
       {
         method: "PUT",
         headers: { "idempotency-key": idempotencyKey },
         body: JSON.stringify(createLinkRequestSchema.parse(createRequest)),
       },
       requiredLinkSecret(options, "create link", "owner"),
-    ).then(streamLinkCredentialFromWire);
+    ).then(createLinkResponseFromWire);
   }
 
   public listLinks(

@@ -18,14 +18,15 @@ cargo install --path cli
 
 ## Local service
 
-Point the clients at a local API and web application:
+Point the CLI at a local service:
 
 ```sh
-export TSF_API_URL=http://127.0.0.1:8787
-export TSF_WEB_URL=http://localhost:3000
+export TSF_ORIGIN=http://127.0.0.1:8787
 ```
 
-`TSF_API_URL` is the API origin. The SDK appends the versioned `/api/v1` namespace.
+`--origin` (env `TSF_ORIGIN`) is the service origin. It defaults to `https://tail.surf`. The SDK appends the versioned `/api/v1` namespace.
+
+Stream links use the `web_origin` the service returns when it mints credentials. The server configures it with `TSF_WEB_ORIGIN`, so a split local web and API deployment prints correct links without extra CLI configuration.
 
 ## Checks
 

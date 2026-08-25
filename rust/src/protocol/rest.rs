@@ -1,6 +1,7 @@
 //! JSON models for the REST v1 management and HTTP data planes.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use url::Url;
 
 use crate::{
     LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
@@ -140,8 +141,20 @@ pub struct CreateStreamResponse {
     /// Absolute RFC 3339 stream expiration timestamp.
     #[serde(deserialize_with = "deserialize_rfc3339_string")]
     pub expires_at: String,
+    /// Canonical web origin for presenting this deployment's stream links.
+    pub web_origin: Url,
     /// Initial link credentials.
     pub links: Vec<StreamLinkCredential>,
+}
+
+/// A created link credential and the web origin for presenting it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateLinkResponse {
+    /// Canonical web origin for presenting this deployment's stream links.
+    pub web_origin: Url,
+    /// The created link credential.
+    #[serde(flatten)]
+    pub credential: StreamLinkCredential,
 }
 
 /// Options for creating a stream link.
@@ -775,14 +788,24 @@ mod tests {
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z",
+            "web_origin": "https://tail.surf",
             "links": []
         });
-        assert!(
-            serde_json::from_value::<CreateStreamResponse>(created)
-                .expect("deserialize absent created stream title")
-                .title
-                .is_none()
-        );
+        let created = serde_json::from_value::<CreateStreamResponse>(created)
+            .expect("deserialize absent created stream title");
+        assert!(created.title.is_none());
+        assert_eq!(created.web_origin.as_str(), "https://tail.surf/");
+
+        let created_link = json!({
+            "web_origin": "http://localhost:3000",
+            "link_id": "reader",
+            "permissions": "r",
+            "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        });
+        let created_link = serde_json::from_value::<CreateLinkResponse>(created_link)
+            .expect("deserialize created link");
+        assert_eq!(created_link.web_origin.as_str(), "http://localhost:3000/");
+        assert_eq!(created_link.credential.link_id.as_str(), "reader");
 
         let invalid_time = json!({
             "stream_id": "00000000000000000000000000000000",

@@ -116,7 +116,7 @@ paths:
           description: Created link or its identical existing representation
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/StreamLinkCredential' }
+              schema: { $ref: '#/components/schemas/CreateLinkResponse' }
         '409': { $ref: '#/components/responses/Error' }
         default: { $ref: '#/components/responses/Error' }
     delete:
@@ -294,13 +294,19 @@ components:
         visibility: { enum: [private, public], default: private }
         expires_in_seconds: { type: integer, minimum: 1, maximum: 864000 }
         links: { type: array, minItems: 1, maxItems: 3, items: { $ref: '#/components/schemas/InitialStreamLink' } }
+    WebOrigin:
+      type: string
+      format: uri
+      description: Canonical web origin for presenting this deployment's stream links.
     CreateStreamResponse:
-      description: Created stream metadata and server-minted initial link credentials.
+      description: Created stream metadata, the web origin for its links, and server-minted initial link credentials.
       allOf:
         - $ref: '#/components/schemas/StreamMetadata'
         - type: object
-          required: [links]
-          properties: { links: { type: array, minItems: 1, maxItems: 3, items: { $ref: '#/components/schemas/StreamLinkCredential' } } }
+          required: [web_origin, links]
+          properties:
+            web_origin: { $ref: '#/components/schemas/WebOrigin' }
+            links: { type: array, minItems: 1, maxItems: 3, items: { $ref: '#/components/schemas/StreamLinkCredential' } }
     CreateLinkRequest:
       type: object
       additionalProperties: false
@@ -315,6 +321,14 @@ components:
         link_id: { $ref: '#/components/schemas/LinkId' }
         secret: { $ref: '#/components/schemas/LinkSecret' }
         permissions: { enum: [r, w, rw, o] }
+    CreateLinkResponse:
+      description: Created link credential and the web origin for presenting it.
+      allOf:
+        - $ref: '#/components/schemas/StreamLinkCredential'
+        - type: object
+          required: [web_origin]
+          properties:
+            web_origin: { $ref: '#/components/schemas/WebOrigin' }
     StreamLinkSummary:
       type: object
       required: [link_id, permissions, status, created_at, expires_at, revoked_at]

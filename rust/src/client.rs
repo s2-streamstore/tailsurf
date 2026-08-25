@@ -50,12 +50,12 @@ use crate::{
         },
         rest::{
             ApiError, ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest,
-            CreateLinkInput, CreateStreamRequest, CreateStreamResponse, ListLinksResponse,
-            MAX_LINK_PAGE_ITEMS, MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES,
-            MAX_SSE_EVENT_BYTES, MAX_SSE_UNTERMINATED_EVENT_BYTES,
+            CreateLinkInput, CreateLinkResponse, CreateStreamRequest, CreateStreamResponse,
+            ListLinksResponse, MAX_LINK_PAGE_ITEMS, MAX_REST_ERROR_RESPONSE_BYTES,
+            MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES, MAX_SSE_UNTERMINATED_EVENT_BYTES,
             MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, RecordData,
-            RestRecordPart, SseCaughtUpData, SseReadBatchData, StreamLinkCredential,
-            StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
+            RestRecordPart, SseCaughtUpData, SseReadBatchData, StreamMetadata, UpdateStreamRequest,
+            parse_canonical_decimal_u64,
         },
         ws::{
             MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
@@ -297,7 +297,7 @@ impl TsfClient {
         stream_id: &StreamId,
         request: &CreateLinkInput,
         owner_link_secret: &LinkSecret,
-    ) -> Result<StreamLinkCredential, TsfClientError> {
+    ) -> Result<CreateLinkResponse, TsfClientError> {
         let idempotency_key = IdempotencyKey::new_random();
         self.create_link_with_idempotency_key(
             stream_id,
@@ -315,7 +315,7 @@ impl TsfClient {
         request: &CreateLinkInput,
         idempotency_key: &IdempotencyKey,
         owner_link_secret: &LinkSecret,
-    ) -> Result<StreamLinkCredential, TsfClientError> {
+    ) -> Result<CreateLinkResponse, TsfClientError> {
         self.retry_when(
             || {
                 self.send_json_with_bearer(
@@ -891,9 +891,12 @@ impl Default for TsfClient {
     }
 }
 
-/// Returns the default `https://tail.surf` API origin.
+/// Default Tailsurf service origin.
+pub const DEFAULT_API_ORIGIN: &str = "https://tail.surf";
+
+/// Returns the default [`DEFAULT_API_ORIGIN`] API origin.
 pub fn default_api_origin() -> Url {
-    Url::parse("https://tail.surf").expect("default tsf API base URL is valid")
+    Url::parse(DEFAULT_API_ORIGIN).expect("default tsf API base URL is valid")
 }
 
 /// Sensitive recovery key for one logical creation request.

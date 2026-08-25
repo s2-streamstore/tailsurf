@@ -16,9 +16,10 @@ pub mod stream_url;
 pub mod transcript;
 
 pub use client::{
-    AppendAck, AppendReceipt, AppendTicket, DurableWriterOptions, IdempotencyKey,
-    InvalidIdempotencyKey, ListLinksOptions, TsfClient, TsfClientConfig, TsfClientError,
-    TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter, default_api_origin,
+    AppendAck, AppendReceipt, AppendTicket, DEFAULT_API_ORIGIN, DurableWriterOptions,
+    IdempotencyKey, InvalidIdempotencyKey, ListLinksOptions, TsfClient, TsfClientConfig,
+    TsfClientError, TsfProducer, TsfReadSession, TsfSseReadSession, TsfWriteSession, TsfWriter,
+    default_api_origin,
 };
 pub use ids::{
     ClientWriterId, LinkId, LinkIdError, LinkSecret, LinkSecretError, MAX_LINK_ID_LEN, StreamId,
@@ -28,9 +29,9 @@ pub use permissions::{LinkPermissions, PermissionsError};
 pub use protocol::{
     read::{ReadOptions, ReadStart, ReadStop},
     rest::{
-        AppendRange, CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
-        ListLinksResponse, MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamLinkSummary,
-        StreamMetadata, UpdateStreamRequest, Visibility,
+        AppendRange, CreateLinkInput, CreateLinkResponse, CreateStreamRequest,
+        CreateStreamResponse, InitialStreamLink, ListLinksResponse, MAX_INITIAL_STREAM_LINKS,
+        StreamLinkCredential, StreamLinkSummary, StreamMetadata, UpdateStreamRequest, Visibility,
     },
     ws::{
         MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteSessionOptions,
