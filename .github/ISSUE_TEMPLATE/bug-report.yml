@@ -1,0 +1,33 @@
+name: Bug report
+description: Something is broken in the CLI, an SDK, or the hosted service.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never include owner, write, or private read links, link secrets, idempotency keys, or private stream content. Redact stream IDs unless the stream is public and sharing it is intentional.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: component
+    attributes:
+      label: Component and version
+      description: For example `tsf 0.12.2`, `tailsurf 0.12.2`, `@tailsurf/client 0.2.0`, or the tail.surf web app.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Commands or code that reproduce the problem, with secrets redacted.
+      render: sh
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and architecture, such as `macOS arm64` or `Ubuntu 24.04 x86_64`.

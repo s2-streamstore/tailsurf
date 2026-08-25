@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/s2-streamstore/tailsurf/security/policy
+    about: Vulnerabilities go to security@s2.dev, never to public Issues.
+  - name: Hosted service trust, privacy, and terms
+    url: https://tail.surf/trust
+    about: Operator, access model, retention, and contact information for tail.surf.
