@@ -1,0 +1,18 @@
+name: Feature request
+description: Propose an improvement to the CLI, an SDK, the protocol, or the hosted service.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change? Note any alternatives you considered.
+    validations:
+      required: true
