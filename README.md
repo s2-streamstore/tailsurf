@@ -173,7 +173,7 @@ The repository also contains public Rust and TypeScript SDKs.
 - [`rust`](rust/README.md) is the `tailsurf` Rust SDK crate.
 - [`typescript`](typescript/README.md) contains `@tailsurf/client` and the lower-level `@tailsurf/protocol` package.
 
-Install the TypeScript client with `npm install @tailsurf/client`. Rust API documentation is available on [docs.rs](https://docs.rs/tailsurf).
+Install the TypeScript client with `npm install @tailsurf/client`. The unscoped `tailsurf` npm package is an alias for it. Rust API documentation is available on [docs.rs](https://docs.rs/tailsurf).
 
 ## Protocol
 

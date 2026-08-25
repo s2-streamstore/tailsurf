@@ -26,6 +26,7 @@ try {
   await Promise.all([mkdir(tarballs), mkdir(consumer)]);
   const protocolTarball = await pack("protocol");
   const clientTarball = await pack("client");
+  const aliasTarball = await pack("tailsurf");
 
   await writeFile(
     join(consumer, "package.json"),
@@ -39,6 +40,7 @@ try {
     "@types/node@22",
     protocolTarball,
     clientTarball,
+    aliasTarball,
   ], consumer);
 
   const installedProtocol = join(
@@ -53,17 +55,25 @@ try {
     "@tailsurf",
     "client",
   );
-  const [protocolManifest, clientManifest] = await Promise.all([
+  const installedAlias = join(consumer, "node_modules", "tailsurf");
+  const [protocolManifest, clientManifest, aliasManifest] = await Promise.all([
     readManifest(installedProtocol),
     readManifest(installedClient),
+    readManifest(installedAlias),
   ]);
   assert.equal(protocolManifest.private, undefined);
   assert.equal(clientManifest.private, undefined);
+  assert.equal(aliasManifest.private, undefined);
   assert.equal(protocolManifest.engines?.node, ">=22");
   assert.equal(clientManifest.engines?.node, ">=22");
+  assert.equal(aliasManifest.engines?.node, ">=22");
   assert.equal(
     clientManifest.dependencies?.["@tailsurf/protocol"],
     `^${protocolManifest.version}`,
+  );
+  assert.equal(
+    aliasManifest.dependencies?.["@tailsurf/client"],
+    `^${clientManifest.version}`,
   );
   await Promise.all([
     access(join(installedProtocol, "LICENSE")),
@@ -71,9 +81,12 @@ try {
     access(join(installedProtocol, "fixtures", "v1.json")),
     access(join(installedClient, "LICENSE")),
     access(join(installedClient, "README.md")),
+    access(join(installedAlias, "LICENSE")),
+    access(join(installedAlias, "README.md")),
   ]);
   await assert.rejects(access(join(installedProtocol, "src")));
   await assert.rejects(access(join(installedClient, "src")));
+  await assert.rejects(access(join(installedAlias, "src")));
   await assert.rejects(access(join(installedProtocol, "dist", ".tsbuildinfo")));
   await assert.rejects(access(join(installedProtocol, "dist", "link-label.js")));
   await assert.rejects(access(join(installedClient, "dist", ".tsbuildinfo")));
@@ -89,11 +102,13 @@ try {
   await writeFile(join(consumer, "node-smoke.mjs"), `
 import assert from "node:assert/strict";
 import { TsfClient, parseStreamId } from "@tailsurf/client";
+import { TsfClient as AliasTsfClient } from "tailsurf";
 
 const id = parseStreamId("0123456789abcdefghjkmnpqrstvwxyz");
 const client = new TsfClient({ apiOrigin: "https://tail.surf" });
 assert.equal(id, "0123456789abcdefghjkmnpqrstvwxyz");
 assert.equal(client.apiOrigin, "https://tail.surf");
+assert.equal(AliasTsfClient, TsfClient);
 `);
   await run(process.execPath, ["node-smoke.mjs"], consumer);
 
