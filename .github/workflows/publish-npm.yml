@@ -112,5 +112,7 @@ jobs:
         with:
           cwd: typescript
           script: pnpm release:publish
-          create-github-releases: true
+          # A GitHub release here would take the repository "Latest" slot from the
+          # cargo-dist v* releases that back releases/latest installer downloads.
+          create-github-releases: false
           push-git-tags: true

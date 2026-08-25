@@ -19,7 +19,7 @@ Changesets updates a dependent package when its `workspace:` range must change. 
 
 `publish-npm.yml` collects pending changesets into a pull request named `chore: release TypeScript SDK packages`. The pull request updates package versions and changelogs.
 
-Merging the release pull request tests both packages and publishes every new version in dependency order. The workflow creates a package tag and GitHub release for each published version.
+Merging the release pull request tests the packages and publishes every new version in dependency order. The workflow pushes a package tag for each published version. It does not create GitHub releases, which are reserved for the Rust `v*` releases that back `releases/latest` installer downloads. npm package history lives in the registry and each package changelog.
 
 ## Trust and recovery
 
