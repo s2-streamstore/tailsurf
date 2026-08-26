@@ -364,9 +364,12 @@ components:
               properties: { encoding: { const: base64url }, value: { $ref: '#/components/schemas/BytesBase64url' } }
     AppendRecordsRequest:
       type: object
-      description: Writer sequence numbers form a contiguous range starting at writer_start_seq_num and ending before 18446744073709551615. Each decoded record is at most 512 KiB. The aggregate decoded payload is at most 900 KiB. The encoded body is at most 1.3 MB. expected_next_seq_num requires the stream's next sequence number to equal the supplied value.
+      description: Writer sequence numbers form a contiguous range starting at writer_start_seq_num and ending before 18446744073709551615. Omitting the writer identity requests a one-shot append; the server mints a random writer, and a retry may append a duplicate. client_writer_id and writer_start_seq_num must be supplied together. Each decoded record is at most 512 KiB. The aggregate decoded payload is at most 900 KiB. The encoded body is at most 1.3 MB. expected_next_seq_num requires the stream's next sequence number to equal the supplied value.
       additionalProperties: false
-      required: [client_writer_id, writer_start_seq_num, records]
+      required: [records]
+      dependentRequired:
+        client_writer_id: [writer_start_seq_num]
+        writer_start_seq_num: [client_writer_id]
       properties:
         client_writer_id: { $ref: '#/components/schemas/ClientWriterId' }
         writer_start_seq_num: { $ref: '#/components/schemas/DecimalU64' }

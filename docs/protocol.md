@@ -153,7 +153,9 @@ Title visibility follows stream metadata visibility. A public stream title is pu
 
 ## HTTP data plane
 
-`POST /streams/{stream_id}/records` appends one atomic batch. The body carries a stable `client_writer_id`, `writer_start_seq_num`, one to 128 records, and an optional `expected_next_seq_num`. The client writer ID is 16 bytes encoded as exactly 22 canonical unpadded base64url characters. The precondition compares the stream's next sequence number.
+`POST /streams/{stream_id}/records` appends one atomic batch. The body carries one to 128 records, an optional writer identity, and an optional `expected_next_seq_num`. The writer identity is a stable `client_writer_id` with a `writer_start_seq_num`; the two are supplied together or not at all. The client writer ID is 16 bytes encoded as exactly 22 canonical unpadded base64url characters. The precondition compares the stream's next sequence number.
+
+Omitting the writer identity requests a one-shot append. The server mints a random writer for the batch. A retry of a one-shot append may create a duplicate, the same way one-shot creation retries do.
 
 Each record contains an optional part header, a presentation format, and byte-preserving data encoded as UTF-8 or base64url. An omitted part header means final part zero, which is an unsplit record. The Rust and TypeScript SDKs use whichever JSON representation is smaller.
 
