@@ -157,7 +157,7 @@ Title visibility follows stream metadata visibility. A public stream title is pu
 
 Omitting the writer identity requests a one-shot append. The server mints a random writer for the batch. A retry of a one-shot append may create a duplicate, the same way one-shot creation retries do.
 
-Each record contains an optional part header, a presentation format, and byte-preserving data encoded as UTF-8 or base64url. An omitted part header means final part zero, which is an unsplit record. The Rust and TypeScript SDKs use whichever JSON representation is smaller.
+Each record contains an optional part header, a presentation format, and byte-preserving data encoded as UTF-8 or base64url. The format defaults to `transcript` and the data encoding defaults to `utf8`, so the minimal record is `{"data":{"value":"..."}}`. An omitted part header means final part zero, which is an unsplit record. The Rust and TypeScript SDKs state format and encoding explicitly and use whichever JSON representation is smaller.
 
 Each decoded record is at most 512 KiB. The decoded batch payload is at most 900 KiB. The encoded body is at most 1,300,000 bytes. The writer sequence range must end before `u64::MAX`.
 
