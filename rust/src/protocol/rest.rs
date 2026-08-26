@@ -268,36 +268,46 @@ pub struct RestRecordPart {
     pub is_final: bool,
 }
 
-/// JSON encoding for exact record bytes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "encoding", content = "value", rename_all = "lowercase")]
-pub enum RecordData {
-    /// UTF-8 text encoded directly in JSON.
-    Utf8(String),
-    /// Canonical unpadded base64url bytes.
-    Base64url(String),
-}
-
 /// One record in a stateless atomic append.
+///
+/// The payload key is the JSON representation: `text` carries UTF-8
+/// directly and `bytes` carries canonical unpadded base64url. Exactly one
+/// is present. The key implies the presentation format; an explicit
+/// `format` covers the cross cases.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppendJsonRecord {
     /// Split-part metadata, or an implicit unsplit record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<RestRecordPart>,
-    /// Presentation hint for the payload.
-    pub format: RecordFormat,
-    /// Exact record bytes and their JSON encoding.
-    pub data: RecordData,
+    /// Presentation hint when it differs from the payload key's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<RecordFormat>,
+    /// UTF-8 payload text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Canonical unpadded base64url payload bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<String>,
+}
+
+/// Writer identity for a stateless append: the id and the writer-local
+/// sequence assigned to the first record travel together or not at all.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppendWriter {
+    /// Canonical client writer ID.
+    pub id: String,
+    /// Writer-local sequence assigned to the first record.
+    #[serde(with = "decimal_u64")]
+    pub seq_num: u64,
 }
 
 /// Stateless durable append request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppendRecordsRequest {
-    /// Canonical client writer ID.
-    pub client_writer_id: String,
-    /// Writer-local sequence assigned to the first record.
-    #[serde(with = "decimal_u64")]
-    pub writer_start_seq_num: u64,
+    /// Optional writer identity. An omitted writer requests a one-shot
+    /// append with a server-minted random writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<AppendWriter>,
     /// Atomic record batch.
     pub records: Vec<AppendJsonRecord>,
     /// Optional expected stream next sequence.
@@ -441,7 +451,21 @@ mod optional_safe_decimal_u64 {
     }
 }
 
+/// Writer identity carried by one read record.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct SseReadWriter {
+    /// Server-derived writer identity.
+    pub id: String,
+    /// Writer-local sequence number.
+    #[serde(with = "decimal_u64")]
+    pub seq_num: u64,
+}
+
 /// One record in a batched SSE `read_batch` event.
+///
+/// Exactly one of `text` or `bytes` carries the payload. An omitted
+/// `part` is an unsplit record. An omitted `format` follows the payload
+/// key: `text` is a transcript record and `bytes` is a byte record.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct SseReadRecord {
     /// Absolute physical sequence number.
@@ -450,17 +474,31 @@ pub struct SseReadRecord {
     /// Record timestamp in Unix milliseconds.
     #[serde(with = "decimal_u64")]
     pub timestamp_ms: u64,
-    /// Server-derived writer identity.
-    pub writer_id: String,
-    /// Writer-local sequence number.
-    #[serde(with = "decimal_u64")]
-    pub writer_seq_num: u64,
-    /// Split-part metadata.
-    pub part: RestRecordPart,
-    /// Presentation hint for the payload.
-    pub format: RecordFormat,
-    /// Exact record bytes and their JSON encoding.
-    pub data: RecordData,
+    /// Writer identity for logical deduplication.
+    pub writer: SseReadWriter,
+    /// Split-part metadata, or an implicit unsplit record.
+    #[serde(default)]
+    pub part: Option<RestRecordPart>,
+    /// Presentation hint when it differs from the payload key's default.
+    #[serde(default)]
+    pub format: Option<RecordFormat>,
+    /// UTF-8 payload text.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Canonical unpadded base64url payload bytes.
+    #[serde(default)]
+    pub bytes: Option<String>,
+}
+
+impl SseReadRecord {
+    /// The presentation format: explicit, else implied by the payload key.
+    pub fn resolved_format(&self) -> RecordFormat {
+        self.format.unwrap_or(if self.text.is_some() {
+            RecordFormat::Transcript
+        } else {
+            RecordFormat::Bytes
+        })
+    }
 }
 
 /// Payload of a batched SSE `read_batch` event.

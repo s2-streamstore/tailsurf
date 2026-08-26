@@ -11,7 +11,7 @@ import {
   updateStreamRequestSchema,
   appendRecordsRequestSchema,
   appendRangeSchema,
-  compactRecordData,
+  compactRecordPayload,
   encodeBase64url,
   isCanonicalIdempotencyKey,
   IDEMPOTENCY_KEY_BYTES,
@@ -427,11 +427,12 @@ export class BaseTsfClient {
         : record.data;
       validateStatelessRecordBytes(bytes.byteLength);
       payloadBytes += bytes.byteLength;
+      // The SDK states the format even when the payload key implies it.
       return {
         format: record.format === RecordFormat.Transcript
           ? "transcript" as const
           : "bytes" as const,
-        data: compactRecordData(bytes),
+        ...compactRecordPayload(bytes),
         ...(part === undefined
           ? {}
           : { part: { index: part.index, is_final: part.isFinal } }),
@@ -461,10 +462,10 @@ export class BaseTsfClient {
       );
     }
     const body = appendRecordsRequestSchema.parse({
-      client_writer_id: encodeBase64url(
-        parseClientWriterId(request.clientWriterId),
-      ),
-      writer_start_seq_num: request.writerStartSeqNum.toString(),
+      writer: {
+        id: encodeBase64url(parseClientWriterId(request.clientWriterId)),
+        seq_num: request.writerStartSeqNum.toString(),
+      },
       records,
       ...(request.expectedNextSeqNum === undefined
         ? {}

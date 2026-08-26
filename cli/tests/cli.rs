@@ -3686,7 +3686,7 @@ async fn fake_sse_read(
     let cursor = "v1,0,0";
     let record = |seq_num: u64, value: &str| {
         format!(
-            "{{\"seq_num\":\"{seq_num}\",\"timestamp_ms\":\"1781717406000\",\"writer_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"writer_seq_num\":\"{seq_num}\",\"part\":{{\"index\":0,\"is_final\":true}},\"format\":\"transcript\",\"data\":{{\"encoding\":\"utf8\",\"value\":\"{value}\"}}}}"
+            "{{\"seq_num\":\"{seq_num}\",\"timestamp_ms\":\"1781717406000\",\"writer\":{{\"id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"seq_num\":\"{seq_num}\"}},\"text\":\"{value}\"}}"
         )
     };
     let events = match state.mode {

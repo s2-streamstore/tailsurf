@@ -16,7 +16,9 @@ import {
   appendRecordsRequestSchema,
   appendRangeSchema,
   apiErrorResponseSchema,
-  compactRecordData,
+  compactRecordPayload,
+  recordPayloadBytes,
+  resolvedRecordFormat,
   sseReadBatchDataSchema,
   sseCaughtUpDataSchema,
   MAX_SSE_EVENT_BYTES,
@@ -54,7 +56,7 @@ describe("REST schemas", () => {
     });
   });
 
-  it("chooses the smaller exact JSON record representation", () => {
+  it("chooses the smaller exact JSON payload key", () => {
     const encoder = new TextEncoder();
     const inputs = [
       "plain deployment output\n",
@@ -62,13 +64,24 @@ describe("REST schemas", () => {
       "\u0000\u0001\b\f\n\r\t",
       "κόσμε 😀 \u2028 \u2029",
     ];
-    expect(inputs.map((value) => compactRecordData(encoder.encode(value))))
+    expect(inputs.map((value) => compactRecordPayload(encoder.encode(value))))
       .toEqual([
-        { encoding: "utf8", value: inputs[0] },
-        { encoding: "utf8", value: inputs[1] },
-        { encoding: "base64url", value: "AAEIDAoNCQ" },
-        { encoding: "utf8", value: inputs[3] },
+        { text: inputs[0] },
+        { text: inputs[1] },
+        { bytes: "AAEIDAoNCQ" },
+        { text: inputs[3] },
       ]);
+    for (const value of inputs) {
+      expect(recordPayloadBytes(compactRecordPayload(encoder.encode(value))))
+        .toEqual(encoder.encode(value));
+    }
+  });
+
+  it("implies the format from the payload key", () => {
+    expect(resolvedRecordFormat({ text: "hello\n" })).toBe("transcript");
+    expect(resolvedRecordFormat({ bytes: "AP8" } as never)).toBe("bytes");
+    expect(resolvedRecordFormat({ format: "transcript", bytes: "AP8" } as never))
+      .toBe("transcript");
   });
 
   it("decodes shared additive response fixtures", () => {
@@ -84,8 +97,23 @@ describe("REST schemas", () => {
     expect(createdLink.web_origin).toBe("https://tail.surf");
     expect(createdLink.link_id).toBe("deploy-bot");
     expect(createdLink).not.toHaveProperty("future_field");
-    expect(appendRecordsRequestSchema.parse(fixtures.append_request).records)
-      .toHaveLength(2);
+    const append = appendRecordsRequestSchema.parse(fixtures.append_request);
+    expect(append.records).toHaveLength(2);
+    expect(append.writer).toEqual({
+      id: "AAECAwQFBgcICQoLDA0ODw",
+      seq_num: "41",
+    });
+    expect(appendRecordsRequestSchema.parse({
+      records: [{ text: "one-shot\n" }],
+    }).writer).toBeUndefined();
+    expect(() =>
+      appendRecordsRequestSchema.parse({
+        records: [{ text: "both", bytes: "AP8" }],
+      })
+    ).toThrow();
+    expect(() =>
+      appendRecordsRequestSchema.parse({ records: [{ format: "bytes" }] })
+    ).toThrow();
     expect(appendRangeSchema.parse(fixtures.append_response)).not
       .toHaveProperty("future_field");
     expect(apiErrorResponseSchema.parse(fixtures.error_response)).toEqual({
@@ -96,7 +124,11 @@ describe("REST schemas", () => {
         actual_next_seq_num: "9",
       },
     });
-    expect(sseReadBatchDataSchema.parse(fixtures.sse_read_batch).records).toHaveLength(1);
+    const batch = sseReadBatchDataSchema.parse(fixtures.sse_read_batch);
+    expect(batch.records).toHaveLength(2);
+    expect(batch.records[0]?.part).toBeUndefined();
+    expect(resolvedRecordFormat(batch.records[0]!)).toBe("transcript");
+    expect(resolvedRecordFormat(batch.records[1]!)).toBe("bytes");
     expect(sseCaughtUpDataSchema.parse(fixtures.sse_caught_up).next_seq_num).toBe("8");
     expect(decodeSseResumeCursor(String(fixtures.sse_resume_cursor))).toEqual({
       nextSeqNum: 2n,

@@ -153,11 +153,11 @@ Title visibility follows stream metadata visibility. A public stream title is pu
 
 ## HTTP data plane
 
-`POST /streams/{stream_id}/records` appends one atomic batch. The body carries one to 128 records, an optional writer identity, and an optional `expected_next_seq_num`. The writer identity is a stable `client_writer_id` with a `writer_start_seq_num`; the two are supplied together or not at all. The client writer ID is 16 bytes encoded as exactly 22 canonical unpadded base64url characters. The precondition compares the stream's next sequence number.
+`POST /streams/{stream_id}/records` appends one atomic batch. The body carries one to 128 records, an optional `writer` identity, and an optional `expected_next_seq_num`. The writer identity is one object: a stable `id` with the `seq_num` assigned to the first record. The id is 16 bytes encoded as exactly 22 canonical unpadded base64url characters. The precondition compares the stream's next sequence number.
 
-Omitting the writer identity requests a one-shot append. The server mints a random writer for the batch. A retry of a one-shot append may create a duplicate, the same way one-shot creation retries do.
+Omitting the writer requests a one-shot append. The server mints a random writer for the batch. A retry of a one-shot append may create a duplicate, the same way one-shot creation retries do.
 
-Each record contains an optional part header, a presentation format, and byte-preserving data encoded as UTF-8 or base64url. The format defaults to `transcript` and the data encoding defaults to `utf8`, so the minimal record is `{"data":{"value":"..."}}`. An omitted part header means final part zero, which is an unsplit record. The Rust and TypeScript SDKs state format and encoding explicitly and use whichever JSON representation is smaller.
+A record carries its payload under exactly one key: `text` holds UTF-8 directly and `bytes` holds canonical unpadded base64url. The minimal record is `{"text":"..."}`. The payload key implies the presentation format, `text` as `transcript` and `bytes` as `bytes`; an explicit `format` field covers the cross cases, such as a non-UTF-8 transcript record sent under `bytes`. An omitted part header means final part zero, which is an unsplit record. The Rust and TypeScript SDKs state the format and use whichever payload key is smaller.
 
 Each decoded record is at most 512 KiB. The decoded batch payload is at most 900 KiB. The encoded body is at most 1,300,000 bytes. The writer sequence range must end before `u64::MAX`.
 
@@ -172,6 +172,8 @@ An ambiguous append response does not imply physical exactly-once delivery. A re
 An SSE response sends `stream_metadata` first. Its data is the same stream metadata object returned by REST.
 
 `read_batch` events contain up to 1,000 records and 1 MiB of decoded record data. Completed events are at most 2 MiB including their terminator. Clients separately cap an unterminated event at 2 MiB so acceptance does not depend on transport chunking.
+
+Each read record carries `seq_num`, `timestamp_ms`, and a `writer` object with the server-derived `id` and the writer-local `seq_num`. The payload sits under exactly one key, `text` or `bytes`, chosen as the smaller JSON representation. An omitted `part` is an unsplit record. An omitted `format` follows the payload key.
 
 The Rust and TypeScript SDKs validate decoded record and batch limits, contiguous sequences, requested stop conditions, and event cursor progression. `caught_up` establishes a safe reconnect position. SSE comments are heartbeats.
 
@@ -193,11 +195,11 @@ The SDK HTTP request timeout bounds each opening handshake through `stream_metad
 
 The tail.surf web app reads from sequence zero with `wait=0` and writes `application/x-ndjson`. It finishes when the read catches up.
 
-The first line has `type` set to `tailsurf_export`, `version` set to `1`, and the `stream_id`.
+The first line has `type` set to `tailsurf_export`, `version` set to `2`, and the `stream_id`.
 
-Each later line has `type` set to `record`. It preserves `seq_num`, `timestamp_ms`, `writer_id`, `writer_seq_num`, `part`, `format`, `encoding`, and `data`. Sequence values are decimal strings. The writer ID is 32 lowercase hexadecimal characters. `part` contains `index` and `is_final`. `format` is `bytes` or `transcript`.
+Each later line has `type` set to `record` and uses the read-record shape: `seq_num`, `timestamp_ms`, a `writer` object with `id` and `seq_num`, an optional `part`, an optional `format`, and the payload under `text` or `bytes`. Sequence values are decimal strings.
 
-A valid UTF-8 transcript record uses `encoding: "utf8"` and its text as `data`. Opaque bytes and invalid UTF-8 transcript records use `encoding: "base64"` and standard padded base64 data.
+A valid UTF-8 transcript record exports under `text`. Opaque bytes and invalid UTF-8 transcript records export under `bytes` as canonical unpadded base64url.
 
 A reconnect resumes at the next sequence number and can observe a newer tail. Records appended during an interrupted export can therefore be included. Stream expiry or owner deletion can terminate an export.
 

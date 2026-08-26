@@ -5,6 +5,7 @@ import { parseLinkId, parseStreamId } from "./ids.js";
 import { parseLinkPermissions } from "./permissions.js";
 import {
   canonicalBase64url,
+  decodeBase64url,
   encodeBase64url,
   MAX_SAFE_INTEGER_U64,
   MAX_U64,
@@ -16,8 +17,8 @@ import { parseStreamTitle } from "./stream-title.js";
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const WRITER_ID_BASE64URL_PATTERN = /^[A-Za-z0-9_-]{22}$/;
-const BASE64URL_RECORD_DATA_JSON_OVERHEAD =
-  '{"encoding":"base64url","value":""}'.length;
+const TEXT_PAYLOAD_JSON_OVERHEAD = '"text":""'.length;
+const BYTES_PAYLOAD_JSON_OVERHEAD = '"bytes":""'.length;
 
 export const MAX_STATELESS_APPEND_RECORDS = 128;
 export const MAX_STATELESS_APPEND_PAYLOAD_BYTES = 900 * 1024;
@@ -76,7 +77,7 @@ export const clientWriterIdBase64urlSchema = z.string().check(
   z.regex(WRITER_ID_BASE64URL_PATTERN),
   z.refine(
     (value) => canonicalBase64url(value, 16),
-    "client_writer_id must be 16 bytes encoded as unpadded base64url",
+    "writer id must be 16 bytes encoded as unpadded base64url",
   ),
 );
 export const writerIdBase64urlSchema = z.string().check(
@@ -194,30 +195,29 @@ const ssePartSchema = z.object({
   is_final: z.boolean(),
 });
 
-export const utf8RecordDataSchema = z.strictObject({
-  encoding: z.literal("utf8"),
-  value: z.string(),
-});
-
-export const base64urlRecordDataSchema = z.strictObject({
-  encoding: z.literal("base64url"),
-  value: bytesBase64urlSchema,
-});
-
-export const recordDataSchema = z.discriminatedUnion("encoding", [
-  utf8RecordDataSchema,
-  base64urlRecordDataSchema,
-]);
-
+// A record's payload key is its JSON representation: `text` carries UTF-8
+// directly, `bytes` carries canonical base64url. The key also implies the
+// presentation format (text -> transcript, bytes -> bytes); an explicit
+// `format` field covers the rare cross case.
 export const appendJsonRecordSchema = z.strictObject({
   part: z.optional(appendPartSchema),
-  format: z.enum(["bytes", "transcript"]),
-  data: recordDataSchema,
+  format: z.optional(z.enum(["bytes", "transcript"])),
+  text: z.optional(z.string()),
+  bytes: z.optional(bytesBase64urlSchema),
+}).check(z.refine(
+  (record) => (record.text === undefined) !== (record.bytes === undefined),
+  "a record carries exactly one of text or bytes",
+));
+
+// Writer identity is one optional value: an id and the writer-local
+// sequence assigned to the first record travel together or not at all.
+export const appendWriterSchema = z.strictObject({
+  id: clientWriterIdBase64urlSchema,
+  seq_num: decimalU64Schema,
 });
 
 export const appendRecordsRequestSchema = z.strictObject({
-  client_writer_id: clientWriterIdBase64urlSchema,
-  writer_start_seq_num: decimalU64Schema,
+  writer: z.optional(appendWriterSchema),
   records: z.array(appendJsonRecordSchema).check(
     z.minLength(1),
     z.maxLength(MAX_STATELESS_APPEND_RECORDS),
@@ -245,15 +245,18 @@ export const apiErrorResponseSchema = z.object({
 export const sseReadRecordSchema = z.object({
   seq_num: decimalU64Schema,
   timestamp_ms: decimalU64Schema,
-  writer_id: writerIdBase64urlSchema,
-  writer_seq_num: decimalU64Schema,
-  part: ssePartSchema,
-  format: z.enum(["bytes", "transcript"]),
-  data: z.discriminatedUnion("encoding", [
-    z.object({ encoding: z.literal("utf8"), value: z.string() }),
-    z.object({ encoding: z.literal("base64url"), value: bytesBase64urlSchema }),
-  ]),
-});
+  writer: z.object({
+    id: writerIdBase64urlSchema,
+    seq_num: decimalU64Schema,
+  }),
+  part: z.optional(ssePartSchema),
+  format: z.optional(z.enum(["bytes", "transcript"])),
+  text: z.optional(z.string()),
+  bytes: z.optional(bytesBase64urlSchema),
+}).check(z.refine(
+  (record) => (record.text === undefined) !== (record.bytes === undefined),
+  "a record carries exactly one of text or bytes",
+));
 
 export const sseReadBatchDataSchema = z.object({
   records: z.array(sseReadRecordSchema).check(
@@ -279,7 +282,9 @@ export type StreamLinkSummary = z.infer<typeof streamLinkSummarySchema>;
 export type ListLinksResponse = z.infer<typeof listLinksResponseSchema>;
 export type StreamMetadata = z.infer<typeof streamMetadataSchema>;
 export type UpdateStreamRequest = z.infer<typeof updateStreamRequestSchema>;
-export type RecordData = z.infer<typeof recordDataSchema>;
+export type RecordPayload =
+  | { readonly text: string; readonly bytes?: undefined }
+  | { readonly bytes: string; readonly text?: undefined };
 export type AppendRange = z.infer<typeof appendRangeSchema>;
 export type ApiError = z.infer<typeof apiErrorSchema>;
 export type SseReadRecord = z.infer<typeof sseReadRecordSchema>;
@@ -287,22 +292,39 @@ export type SseReadRecord = z.infer<typeof sseReadRecordSchema>;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const utf8Encoder = new TextEncoder();
 
-/** Chooses the smaller JSON representation while preserving the exact record bytes. */
-export function compactRecordData(bytes: Uint8Array): RecordData {
-  let utf8: RecordData;
+/** Chooses the smaller JSON payload key while preserving the exact record bytes. */
+export function compactRecordPayload(bytes: Uint8Array): RecordPayload {
+  let text: string;
   try {
-    utf8 = {
-      encoding: "utf8",
-      value: utf8Decoder.decode(bytes),
-    };
+    text = utf8Decoder.decode(bytes);
   } catch {
-    return base64urlRecordData(bytes);
+    return { bytes: encodeBase64url(bytes) };
   }
-  const base64urlByteLength = BASE64URL_RECORD_DATA_JSON_OVERHEAD +
+  const textByteLength = TEXT_PAYLOAD_JSON_OVERHEAD +
+    jsonByteLength(text) - '""'.length;
+  const bytesByteLength = BYTES_PAYLOAD_JSON_OVERHEAD +
     Math.ceil(bytes.byteLength * 4 / 3);
-  return jsonByteLength(utf8) <= base64urlByteLength
-    ? utf8
-    : base64urlRecordData(bytes);
+  return textByteLength <= bytesByteLength
+    ? { text }
+    : { bytes: encodeBase64url(bytes) };
+}
+
+/** The presentation format a payload key implies when `format` is absent. */
+export function resolvedRecordFormat(record: {
+  readonly format?: "bytes" | "transcript" | undefined;
+  readonly text?: string | undefined;
+}): "bytes" | "transcript" {
+  return record.format ?? (record.text === undefined ? "bytes" : "transcript");
+}
+
+/** The exact payload bytes named by a record's `text` or `bytes` key. */
+export function recordPayloadBytes(record: {
+  readonly text?: string | undefined;
+  readonly bytes?: string | undefined;
+}): Uint8Array {
+  return record.text === undefined
+    ? decodeBase64url(record.bytes ?? "")
+    : utf8Encoder.encode(record.text);
 }
 
 function jsonByteLength(value: unknown): number {
@@ -314,6 +336,3 @@ export function isCanonicalIdempotencyKey(value: string): boolean {
     canonicalBase64url(value, IDEMPOTENCY_KEY_BYTES);
 }
 
-function base64urlRecordData(bytes: Uint8Array): RecordData {
-  return { encoding: "base64url", value: encodeBase64url(bytes) };
-}
