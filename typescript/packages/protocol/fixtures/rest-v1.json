@@ -46,11 +46,10 @@
     "future_field": true
   },
   "append_request": {
-    "client_writer_id": "AAECAwQFBgcICQoLDA0ODw",
-    "writer_start_seq_num": "41",
+    "writer": { "id": "AAECAwQFBgcICQoLDA0ODw", "seq_num": "41" },
     "records": [
-      { "part": { "index": 0, "is_final": true }, "format": "transcript", "data": { "encoding": "utf8", "value": "hello\n" } },
-      { "format": "bytes", "data": { "encoding": "base64url", "value": "AP8" } }
+      { "part": { "index": 0, "is_final": true }, "text": "hello\n" },
+      { "format": "bytes", "bytes": "AP8" }
     ],
     "expected_next_seq_num": "7"
   },
@@ -70,11 +69,18 @@
       {
         "seq_num": "7",
         "timestamp_ms": "1786579200000",
-        "writer_id": "AAECAwQFBgcICQoLDA0ODw",
-        "writer_seq_num": "41",
+        "writer": { "id": "AAECAwQFBgcICQoLDA0ODw", "seq_num": "41", "future_field": true },
+        "text": "hello\n",
+        "future_field": true
+      },
+      {
+        "seq_num": "8",
+        "timestamp_ms": "1786579200001",
+        "writer": { "id": "AAECAwQFBgcICQoLDA0ODw", "seq_num": "42", "future_field": true },
         "part": { "index": 0, "is_final": true, "future_field": true },
-        "format": "transcript",
-        "data": { "encoding": "utf8", "value": "hello\n", "future_field": true }
+        "format": "bytes",
+        "bytes": "AP8",
+        "future_field": true
       }
     ],
     "future_field": true

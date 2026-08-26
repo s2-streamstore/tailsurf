@@ -10,6 +10,8 @@ import {
   RecordFormat,
   decodeBase64url,
   parseWriterId,
+  recordPayloadBytes,
+  resolvedRecordFormat,
   decodeSseResumeCursor,
   type CaughtUpPosition,
   type ReadRecord,
@@ -42,7 +44,6 @@ const API_PREFIX = "/api/v1";
 const CARRIAGE_RETURN = 0x0d;
 const LINE_FEED = 0x0a;
 const MAX_RETAINED_SSE_BUFFER_BYTES = 64 * 1024;
-const textEncoder = new TextEncoder();
 interface SseConnectOptions {
   readonly fetch: typeof globalThis.fetch;
   readonly apiOrigin: string;
@@ -714,20 +715,20 @@ function invalidResumeEventId(event: string): TsfClientError {
 }
 
 function readRecord(record: ReturnType<typeof sseReadBatchDataSchema.parse>["records"][number]): ReadRecord {
-  const bytes = record.data.encoding === "utf8"
-    ? textEncoder.encode(record.data.value)
-    : decodeBase64url(record.data.value);
-  const format = record.format === "transcript"
+  const format = resolvedRecordFormat(record) === "transcript"
     ? RecordFormat.Transcript
     : RecordFormat.Bytes;
   return {
     seqNum: BigInt(record.seq_num),
     timestampMs: BigInt(record.timestamp_ms),
-    writerId: parseWriterId(decodeBase64url(record.writer_id)),
-    writerSeqNum: BigInt(record.writer_seq_num),
-    part: { index: record.part.index, isFinal: record.part.is_final },
+    writerId: parseWriterId(decodeBase64url(record.writer.id)),
+    writerSeqNum: BigInt(record.writer.seq_num),
+    // An omitted part header is an unsplit record.
+    part: record.part === undefined
+      ? { index: 0, isFinal: true }
+      : { index: record.part.index, isFinal: record.part.is_final },
     format,
-    data: bytes,
+    data: recordPayloadBytes(record),
   };
 }
 

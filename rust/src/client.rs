@@ -50,12 +50,12 @@ use crate::{
         },
         rest::{
             ApiError, ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest,
-            CreateLinkInput, CreateLinkResponse, CreateStreamRequest, CreateStreamResponse,
-            ListLinksResponse, MAX_LINK_PAGE_ITEMS, MAX_REST_ERROR_RESPONSE_BYTES,
-            MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES, MAX_SSE_UNTERMINATED_EVENT_BYTES,
-            MAX_STATELESS_APPEND_PAYLOAD_BYTES, MAX_STATELESS_APPEND_RECORDS, RecordData,
-            RestRecordPart, SseCaughtUpData, SseReadBatchData, StreamMetadata, UpdateStreamRequest,
-            parse_canonical_decimal_u64,
+            AppendWriter, CreateLinkInput, CreateLinkResponse, CreateStreamRequest,
+            CreateStreamResponse, ListLinksResponse, MAX_LINK_PAGE_ITEMS,
+            MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
+            MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
+            MAX_STATELESS_APPEND_RECORDS, RestRecordPart, SseCaughtUpData, SseReadBatchData,
+            StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
         },
         ws::{
             MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
@@ -509,10 +509,12 @@ impl TsfClient {
                     "writer sequence numbers must be contiguous",
                 ));
             }
-            let data = compact_record_data(&record.data);
+            let (text, bytes) = compact_record_payload(&record.data);
+            // The SDK states the format even when the payload key implies it.
             json_records.push(AppendJsonRecord {
-                data,
-                format: record.format,
+                text,
+                bytes,
+                format: Some(record.format),
                 part: Some(RestRecordPart {
                     index: record.part.index(),
                     is_final: record.part.is_final(),
@@ -525,8 +527,10 @@ impl TsfClient {
             ));
         }
         let request = AppendRecordsRequest {
-            client_writer_id: URL_SAFE_NO_PAD.encode(client_writer_id.as_bytes()),
-            writer_start_seq_num,
+            writer: Some(AppendWriter {
+                id: URL_SAFE_NO_PAD.encode(client_writer_id.as_bytes()),
+                seq_num: writer_start_seq_num,
+            }),
             records: json_records,
             expected_next_seq_num,
         };
@@ -2582,20 +2586,20 @@ const JSON_ESCAPED_LEN: [u8; 256] = {
     table
 };
 
-fn compact_record_data(bytes: &[u8]) -> RecordData {
+/// Chooses the smaller JSON payload key while preserving the exact record bytes.
+fn compact_record_payload(bytes: &[u8]) -> (Option<String>, Option<String>) {
     let Ok(text) = std::str::from_utf8(bytes) else {
-        return RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes));
+        return (None, Some(URL_SAFE_NO_PAD.encode(bytes)));
     };
     let escaped_len = bytes.iter().fold(0usize, |total, byte| {
         total + JSON_ESCAPED_LEN[*byte as usize] as usize
     });
-    let utf8_len = br#"{"encoding":"utf8","value":""}"#.len() + escaped_len;
-    let base64url_len =
-        br#"{"encoding":"base64url","value":""}"#.len() + bytes.len().saturating_mul(4).div_ceil(3);
-    if utf8_len <= base64url_len {
-        RecordData::Utf8(text.to_owned())
+    let text_len = br#""text":""#.len() + escaped_len;
+    let bytes_len = br#""bytes":""#.len() + bytes.len().saturating_mul(4).div_ceil(3);
+    if text_len <= bytes_len {
+        (Some(text.to_owned()), None)
     } else {
-        RecordData::Base64url(URL_SAFE_NO_PAD.encode(bytes))
+        (None, Some(URL_SAFE_NO_PAD.encode(bytes)))
     }
 }
 
@@ -2606,9 +2610,10 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
     let capacity: usize = batch
         .records
         .iter()
-        .map(|record| match &record.data {
-            RecordData::Utf8(value) => value.len(),
-            RecordData::Base64url(value) => base64::decoded_len_estimate(value.len()),
+        .map(|record| match (&record.text, &record.bytes) {
+            (Some(text), _) => text.len(),
+            (None, Some(bytes)) => base64::decoded_len_estimate(bytes.len()),
+            (None, None) => 0,
         })
         .sum();
     let mut payload = Vec::with_capacity(capacity);
@@ -2616,26 +2621,37 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
     for record in batch.records {
         let mut writer = [0u8; WriterId::BYTE_LEN];
         let decoded_len = URL_SAFE_NO_PAD
-            .decode_slice(record.writer_id, &mut writer)
-            .map_err(|_| TsfClientError::InvalidSse("invalid writer_id"))?;
+            .decode_slice(&record.writer.id, &mut writer)
+            .map_err(|_| TsfClientError::InvalidSse("invalid writer id"))?;
         if decoded_len != WriterId::BYTE_LEN {
-            return Err(TsfClientError::InvalidSse("invalid writer_id length"));
+            return Err(TsfClientError::InvalidSse("invalid writer id length"));
         }
+        let format = record.resolved_format();
         let data_start = payload.len();
-        match record.data {
-            RecordData::Utf8(value) => payload.extend_from_slice(value.as_bytes()),
-            RecordData::Base64url(value) => URL_SAFE_NO_PAD
-                .decode_vec(&value, &mut payload)
+        match (record.text, record.bytes) {
+            (Some(text), None) => payload.extend_from_slice(text.as_bytes()),
+            (None, Some(bytes)) => URL_SAFE_NO_PAD
+                .decode_vec(&bytes, &mut payload)
                 .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?,
+            _ => {
+                return Err(TsfClientError::InvalidSse(
+                    "a record carries exactly one of text or bytes",
+                ));
+            }
         }
-        // The SSE event bound caps the buffer well inside u32, so these narrows cannot truncate.
+        // An omitted part header is an unsplit record. The SSE event bound
+        // caps the buffer well inside u32, so these narrows cannot truncate.
+        let part = record.part.map_or_else(
+            || Ok(PartHeader::unsplit()),
+            |part| PartHeader::new(part.index, part.is_final),
+        )?;
         records.push(RecordMeta {
             seq_num: record.seq_num,
             timestamp_ms: record.timestamp_ms,
             writer_id: WriterId::from_bytes(writer),
-            writer_seq_num: record.writer_seq_num,
-            part: PartHeader::new(record.part.index, record.part.is_final)?,
-            format: record.format,
+            writer_seq_num: record.writer.seq_num,
+            part,
+            format,
             data_start: data_start as u32,
             data_len: (payload.len() - data_start) as u32,
         });
@@ -3326,7 +3342,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         read::ReadStop,
-        rest::SseReadRecord,
+        rest::{SseReadRecord, SseReadWriter},
         ws::frame::{MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, RecordFormat},
     };
 
@@ -4563,7 +4579,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_record_data_choice_matches_serialized_lengths() {
+    fn compact_record_payload_choice_matches_serialized_lengths() {
         let cases: Vec<Vec<u8>> = vec![
             b"plain text".to_vec(),
             "unicode 😀 text".as_bytes().to_vec(),
@@ -4574,24 +4590,20 @@ mod tests {
             vec![0xff; 32],
         ];
         for bytes in cases {
-            let chosen = compact_record_data(&bytes);
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                let utf8_len = serde_json::to_vec(&RecordData::Utf8(text.to_owned()))
-                    .expect("measure utf8")
-                    .len();
-                let base64url_len = br#"{"encoding":"base64url","value":""}"#.len()
-                    + bytes.len().saturating_mul(4).div_ceil(3);
-                assert_eq!(
-                    matches!(chosen, RecordData::Utf8(_)),
-                    utf8_len <= base64url_len,
-                    "bytes={bytes:?}"
-                );
+            let (text, encoded) = compact_record_payload(&bytes);
+            if let Ok(value) = std::str::from_utf8(&bytes) {
+                let text_len = br#""text":""#.len()
+                    + serde_json::to_vec(value).expect("measure text").len()
+                    - 2;
+                let bytes_len = br#""bytes":""#.len() + bytes.len().saturating_mul(4).div_ceil(3);
+                assert_eq!(text.is_some(), text_len <= bytes_len, "bytes={bytes:?}");
             } else {
-                assert!(matches!(chosen, RecordData::Base64url(_)));
+                assert!(text.is_none());
             }
-            let round_tripped = match &chosen {
-                RecordData::Utf8(value) => value.as_bytes().to_vec(),
-                RecordData::Base64url(value) => URL_SAFE_NO_PAD.decode(value).expect("decode"),
+            let round_tripped = match (&text, &encoded) {
+                (Some(value), None) => value.as_bytes().to_vec(),
+                (None, Some(value)) => URL_SAFE_NO_PAD.decode(value).expect("decode"),
+                _ => unreachable!("exactly one payload key"),
             };
             assert_eq!(round_tripped, bytes);
         }
@@ -4643,25 +4655,25 @@ mod tests {
         let mut wire_record = SseReadRecord {
             seq_num: 0,
             timestamp_ms: 0,
-            writer_id: URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN - 1]),
-            writer_seq_num: 0,
-            part: RestRecordPart {
-                index: 0,
-                is_final: true,
+            writer: SseReadWriter {
+                id: URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN - 1]),
+                seq_num: 0,
             },
-            format: RecordFormat::Bytes,
-            data: RecordData::Utf8(String::new()),
+            part: None,
+            format: Some(RecordFormat::Bytes),
+            text: Some(String::new()),
+            bytes: None,
         };
         assert!(matches!(
             sse_read_batch(SseReadBatchData {
                 records: vec![wire_record.clone()],
             }),
-            Err(TsfClientError::InvalidSse("invalid writer_id length"))
+            Err(TsfClientError::InvalidSse("invalid writer id length"))
         ));
 
-        wire_record.writer_id = URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]);
-        wire_record.data =
-            RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES + 1]));
+        wire_record.writer.id = URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]);
+        wire_record.text = None;
+        wire_record.bytes = Some(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES + 1]));
         assert!(
             sse_read_batch(SseReadBatchData {
                 records: vec![wire_record],
@@ -4729,14 +4741,14 @@ mod tests {
         SseReadRecord {
             seq_num,
             timestamp_ms: seq_num,
-            writer_id: URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]),
-            writer_seq_num: seq_num,
-            part: RestRecordPart {
-                index: 0,
-                is_final: true,
+            writer: SseReadWriter {
+                id: URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]),
+                seq_num,
             },
-            format: RecordFormat::Bytes,
-            data: RecordData::Base64url(URL_SAFE_NO_PAD.encode(vec![0_u8; payload_bytes])),
+            part: None,
+            format: None,
+            text: None,
+            bytes: Some(URL_SAFE_NO_PAD.encode(vec![0_u8; payload_bytes])),
         }
     }
 
@@ -4745,26 +4757,29 @@ mod tests {
         let text = SseReadRecord {
             seq_num: 3,
             timestamp_ms: 300,
-            writer_id: URL_SAFE_NO_PAD.encode([7_u8; WriterId::BYTE_LEN]),
-            writer_seq_num: 30,
-            part: RestRecordPart {
-                index: 0,
-                is_final: true,
+            writer: SseReadWriter {
+                id: URL_SAFE_NO_PAD.encode([7_u8; WriterId::BYTE_LEN]),
+                seq_num: 30,
             },
-            format: RecordFormat::Transcript,
-            data: RecordData::Utf8("héllo".to_owned()),
+            part: None,
+            format: None,
+            text: Some("héllo".to_owned()),
+            bytes: None,
         };
         let binary = SseReadRecord {
             seq_num: 4,
             timestamp_ms: 301,
-            writer_id: URL_SAFE_NO_PAD.encode([8_u8; WriterId::BYTE_LEN]),
-            writer_seq_num: 40,
-            part: RestRecordPart {
+            writer: SseReadWriter {
+                id: URL_SAFE_NO_PAD.encode([8_u8; WriterId::BYTE_LEN]),
+                seq_num: 40,
+            },
+            part: Some(RestRecordPart {
                 index: 0,
                 is_final: true,
-            },
-            format: RecordFormat::Bytes,
-            data: RecordData::Base64url(URL_SAFE_NO_PAD.encode([0_u8, 159, 146, 150])),
+            }),
+            format: None,
+            text: None,
+            bytes: Some(URL_SAFE_NO_PAD.encode([0_u8, 159, 146, 150])),
         };
         let batch = sse_read_batch(SseReadBatchData {
             records: vec![text, binary],
@@ -4792,15 +4807,18 @@ mod tests {
     #[test]
     fn stateless_append_compacts_an_escape_heavy_maximum_record() {
         let data = vec![0_u8; MAX_RECORD_PAYLOAD_BYTES];
-        let encoded = compact_record_data(&data);
-        assert!(matches!(encoded, RecordData::Base64url(_)));
+        let (text, bytes) = compact_record_payload(&data);
+        assert!(text.is_none());
         let request = AppendRecordsRequest {
-            client_writer_id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
-            writer_start_seq_num: 0,
+            writer: Some(AppendWriter {
+                id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
+                seq_num: 0,
+            }),
             records: vec![AppendJsonRecord {
                 part: None,
-                format: RecordFormat::Transcript,
-                data: encoded,
+                format: Some(RecordFormat::Transcript),
+                text,
+                bytes,
             }],
             expected_next_seq_num: None,
         };

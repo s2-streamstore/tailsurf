@@ -197,8 +197,8 @@ describe("TsfClient REST API", () => {
     const encoded = new TextEncoder().encode(body as string);
     expect(encoded.byteLength).toBeLessThanOrEqual(MAX_STATELESS_APPEND_JSON_BYTES);
     const parsed = appendRecordsRequestSchema.parse(JSON.parse(body as string));
-    expect(parsed.records[0]!.data.encoding).toBe("base64url");
-    expect(Buffer.from(parsed.records[0]!.data.value, "base64url")).toHaveLength(
+    expect(parsed.records[0]!.text).toBeUndefined();
+    expect(Buffer.from(parsed.records[0]!.bytes!, "base64url")).toHaveLength(
       MAX_RECORD_PAYLOAD_BYTES,
     );
   });

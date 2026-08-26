@@ -346,33 +346,34 @@ components:
       properties: { index: { type: integer, minimum: 0, maximum: 2147483647 }, is_final: { type: boolean } }
     AppendRecord:
       type: object
+      description: Exactly one of text or bytes carries the payload. The payload key implies the format when it is absent, text as transcript and bytes as bytes; an explicit format covers the cross cases. The SDKs state the format and choose the smaller payload key.
       additionalProperties: false
-      required: [data]
+      minProperties: 1
       properties:
         part: { $ref: '#/components/schemas/RecordPart' }
-        format: { enum: [bytes, transcript], default: transcript }
-        data:
-          description: Exact bytes. The encoding defaults to utf8. The Rust and TypeScript SDKs state the encoding and choose the smaller UTF-8 or base64url JSON representation.
-          oneOf:
-            - type: object
-              additionalProperties: false
-              required: [value]
-              properties: { encoding: { const: utf8, default: utf8 }, value: { type: string } }
-            - type: object
-              additionalProperties: false
-              required: [encoding, value]
-              properties: { encoding: { const: base64url }, value: { $ref: '#/components/schemas/BytesBase64url' } }
+        format: { enum: [bytes, transcript] }
+        text: { type: string }
+        bytes: { $ref: '#/components/schemas/BytesBase64url' }
+      oneOf:
+        - required: [text]
+          not: { required: [bytes] }
+        - required: [bytes]
+          not: { required: [text] }
+    AppendWriter:
+      type: object
+      description: Writer identity for logical deduplication. The id and the writer-local sequence assigned to the first record travel together.
+      additionalProperties: false
+      required: [id, seq_num]
+      properties:
+        id: { $ref: '#/components/schemas/ClientWriterId' }
+        seq_num: { $ref: '#/components/schemas/DecimalU64' }
     AppendRecordsRequest:
       type: object
-      description: Writer sequence numbers form a contiguous range starting at writer_start_seq_num and ending before 18446744073709551615. Omitting the writer identity requests a one-shot append; the server mints a random writer, and a retry may append a duplicate. client_writer_id and writer_start_seq_num must be supplied together. Each decoded record is at most 512 KiB. The aggregate decoded payload is at most 900 KiB. The encoded body is at most 1.3 MB. expected_next_seq_num requires the stream's next sequence number to equal the supplied value.
+      description: Writer sequence numbers form a contiguous range starting at writer.seq_num and ending before 18446744073709551615. Omitting the writer requests a one-shot append; the server mints a random writer, and a retry may append a duplicate. Each decoded record is at most 512 KiB. The aggregate decoded payload is at most 900 KiB. The encoded body is at most 1.3 MB. expected_next_seq_num requires the stream's next sequence number to equal the supplied value.
       additionalProperties: false
       required: [records]
-      dependentRequired:
-        client_writer_id: [writer_start_seq_num]
-        writer_start_seq_num: [client_writer_id]
       properties:
-        client_writer_id: { $ref: '#/components/schemas/ClientWriterId' }
-        writer_start_seq_num: { $ref: '#/components/schemas/DecimalU64' }
+        writer: { $ref: '#/components/schemas/AppendWriter' }
         records: { type: array, minItems: 1, maxItems: 128, items: { $ref: '#/components/schemas/AppendRecord' } }
         expected_next_seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
     AppendRange:
@@ -390,23 +391,26 @@ components:
         last_timestamp_ms: { $ref: '#/components/schemas/DecimalSafeU64' }
     ReadRecord:
       type: object
-      required: [seq_num, timestamp_ms, writer_id, writer_seq_num, part, format, data]
+      description: Exactly one of text or bytes carries the payload, chosen as the smaller JSON representation. An omitted part is an unsplit record. An omitted format follows the payload key, text as transcript and bytes as bytes.
+      required: [seq_num, timestamp_ms, writer]
       properties:
         seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
         timestamp_ms: { $ref: '#/components/schemas/DecimalSafeU64' }
-        writer_id: { $ref: '#/components/schemas/WriterId' }
-        writer_seq_num: { $ref: '#/components/schemas/DecimalU64' }
+        writer:
+          type: object
+          required: [id, seq_num]
+          properties:
+            id: { $ref: '#/components/schemas/WriterId' }
+            seq_num: { $ref: '#/components/schemas/DecimalU64' }
         part: { $ref: '#/components/schemas/RecordPart' }
         format: { enum: [bytes, transcript] }
-        data:
-          description: Exact bytes encoded using the smaller UTF-8 or base64url JSON representation when possible.
-          oneOf:
-            - type: object
-              required: [encoding, value]
-              properties: { encoding: { const: utf8 }, value: { type: string } }
-            - type: object
-              required: [encoding, value]
-              properties: { encoding: { const: base64url }, value: { $ref: '#/components/schemas/BytesBase64url' } }
+        text: { type: string }
+        bytes: { $ref: '#/components/schemas/BytesBase64url' }
+      oneOf:
+        - required: [text]
+          not: { required: [bytes] }
+        - required: [bytes]
+          not: { required: [text] }
     SseStreamMetadataEvent:
       type: object
       required: [event, data]

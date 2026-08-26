@@ -33,8 +33,7 @@ describe("SSE reader resume", () => {
     const streamId = generateStreamId();
     const encoded = new TextEncoder().encode(
       sseResponseText(streamId, readBatchEvent("v1,1,1", {
-        encoding: "utf8",
-        value: "split 😀 payload",
+        text: "split 😀 payload",
       })),
     );
     const body = new ReadableStream<Uint8Array>({
@@ -110,7 +109,7 @@ describe("SSE reader resume", () => {
     const streamId = generateStreamId();
     const count = 1_000;
     const records = Array.from({ length: count }, (_unused, seqNum) =>
-      readRecordWire(seqNum, { encoding: "utf8", value: `${seqNum}\n` })
+      readRecordWire(seqNum, { text: `${seqNum}\n` })
     );
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
       sseResponse(
@@ -135,10 +134,7 @@ describe("SSE reader resume", () => {
     const streamId = generateStreamId();
     const value = Buffer.alloc(MAX_RECORD_PAYLOAD_BYTES).toString("base64url");
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, readBatchEvent("v1,1,1", {
-        encoding: "base64url",
-        value,
-      })),
+      sseResponse(streamId, readBatchEvent("v1,1,1", { bytes: value })),
     );
     const session = await new TsfClient({ fetch }).connectSseReader({
       streamId,
@@ -155,8 +151,7 @@ describe("SSE reader resume", () => {
       name: "an oversized decoded record",
       count: undefined,
       event: () => readBatchEvent("v1,1,1", {
-        encoding: "base64url",
-        value: Buffer.alloc(MAX_RECORD_PAYLOAD_BYTES + 1).toString("base64url"),
+        bytes: Buffer.alloc(MAX_RECORD_PAYLOAD_BYTES + 1).toString("base64url"),
       }),
     },
     {
@@ -164,8 +159,7 @@ describe("SSE reader resume", () => {
       count: undefined,
       event: () => readBatchRecordsEvent("v1,3,3", [0, 1, 2].map((seqNum) =>
         readRecordWire(seqNum, {
-          encoding: "base64url",
-          value: Buffer.alloc(400 * 1024).toString("base64url"),
+          bytes: Buffer.alloc(400 * 1024).toString("base64url"),
         })
       )),
     },
@@ -178,8 +172,8 @@ describe("SSE reader resume", () => {
       name: "more records than the remaining count",
       count: 1n,
       event: () => readBatchRecordsEvent("v1,2,2", [
-        readRecordWire(0, { encoding: "utf8", value: "zero" }),
-        readRecordWire(1, { encoding: "utf8", value: "one" }),
+        readRecordWire(0, { text: "zero" }),
+        readRecordWire(1, { text: "one" }),
       ]),
     },
   ])("rejects read_batch with $name", async ({ event, count }) => {
@@ -636,17 +630,16 @@ function interruptedSseResponseAfter(streamId: string, events: string): Response
 
 function recordsEvent(id: string | undefined, seqNum: number): string {
   return readBatchEvent(id, {
-    encoding: "utf8",
-    value: `record ${seqNum.toString()}\n`,
+    text: `record ${seqNum.toString()}\n`,
   }, seqNum);
 }
 
 function readBatchEvent(
   id: string | undefined,
-  data: { readonly encoding: "utf8" | "base64url"; readonly value: string },
+  payload: { readonly text: string } | { readonly bytes: string },
   seqNum = 0,
 ): string {
-  return readBatchRecordsEvent(id, [readRecordWire(seqNum, data)]);
+  return readBatchRecordsEvent(id, [readRecordWire(seqNum, payload)]);
 }
 
 function readBatchRecordsEvent(
@@ -660,15 +653,13 @@ function readBatchRecordsEvent(
 
 function readRecordWire(
   seqNum: number,
-  data: { readonly encoding: "utf8" | "base64url"; readonly value: string },
+  payload: { readonly text: string } | { readonly bytes: string },
 ) {
   return {
     seq_num: seqNum.toString(),
     timestamp_ms: (1_786_579_200_000 + seqNum).toString(),
-    writer_id: "AAAAAAAAAAAAAAAAAAAAAA",
-    writer_seq_num: seqNum.toString(),
-    part: { index: 0, is_final: true },
+    writer: { id: "AAAAAAAAAAAAAAAAAAAAAA", seq_num: seqNum.toString() },
     format: "transcript",
-    data,
+    ...payload,
   } as const;
 }
