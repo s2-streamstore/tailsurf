@@ -104,6 +104,8 @@ make test | tsf
 make test | tsf write '{write-link}'
 ```
 
+The delimiting newline is not stored; records hold line content only, and newlines inside a record written by other clients are preserved. On read, `tsf` appends one newline after each transcript record.
+
 The writer splits a logical line into physical records and paces them through its fixed in-flight window. `tail` and `replay` retain a 16 MiB reassembly safety bound by default. Raise `--max-reassembly-bytes` when reading larger logical records.
 
 Use `--bytes` when you want to send stdin as byte records instead of line-framed transcript records. Byte records flush at the physical record size limit, after a short linger, and at EOF:

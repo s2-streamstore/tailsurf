@@ -1212,6 +1212,8 @@ async fn stream_line_chunks_to_writer(
     line_appender.finish(session).await
 }
 
+/// Splits input into transcript records on `\n`. The delimiter is consumed, not stored;
+/// every other byte, including `\r`, is record content.
 struct LineRecordAppender {
     pending: BytesMut,
 }
@@ -1229,12 +1231,16 @@ impl LineRecordAppender {
         mut bytes: &[u8],
     ) -> eyre::Result<()> {
         while !bytes.is_empty() {
-            let newline = memchr(b'\n', bytes);
-            let take = newline.map_or(bytes.len(), |index| index + 1);
-            self.pending.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-            if newline.is_some() {
-                self.send_line(session).await?;
+            match memchr(b'\n', bytes) {
+                Some(index) => {
+                    self.pending.extend_from_slice(&bytes[..index]);
+                    bytes = &bytes[index + 1..];
+                    self.send_line(session).await?;
+                }
+                None => {
+                    self.pending.extend_from_slice(bytes);
+                    break;
+                }
             }
         }
         Ok(())
@@ -1620,7 +1626,15 @@ async fn write_transcript_batches(
             else {
                 continue;
             };
+            let format = record.format;
             write_transcript_data(stdout, record.data).await?;
+            // Transcript records carry no delimiter; the terminator is presentation framing.
+            if format == RecordFormat::Transcript {
+                stdout
+                    .write_all(b"\n")
+                    .await
+                    .context("failed to write stdout")?;
+            }
         }
         // Batching must never hold output back, so flush as soon as nothing is already decoded.
         if batch_rx.is_empty() {

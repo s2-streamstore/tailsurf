@@ -312,7 +312,9 @@ The format byte is a presentation hint. It does not transform bytes.
 - `0x00` means opaque bytes.
 - `0x01` means transcript text.
 
-Transcript readers preserve payload bytes. They do not add separators or remove newlines.
+Record data carries no delimiter. A writer that delimits input on newlines consumes the delimiter instead of storing it. Newlines inside record data, including a trailing newline, are content.
+
+Transcript readers preserve payload bytes. They do not add separators or remove newlines. Line-oriented presentation appends one newline after each transcript record, without inspecting content.
 
 The part header uses bit 31 as the final bit. Bits 0 through 30 contain the part index.
 
