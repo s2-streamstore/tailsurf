@@ -42,14 +42,14 @@ use tokio::{
 use url::Url;
 
 const INTERRUPT_EXIT_CODE: i32 = 130;
-const RAW_LINGER: Duration = Duration::from_millis(10);
+const BYTE_RECORD_LINGER: Duration = Duration::from_millis(10);
 /// Stdout batching window for `tail` and `replay`.
 const TRANSCRIPT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
 /// Read batches held while stdout drains. Each frame carries at most MAX_READ_FRAME_RECORDS
 /// records and about 1 MiB of payload backing, so the queue bounds in-flight output to roughly
 /// 8 MiB plus the batch being printed and transcript split-part pending state.
 const TRANSCRIPT_BATCH_QUEUE: usize = 8;
-/// Stdin read block size for line-framed and raw writes.
+/// Stdin read block size for line-framed and byte-record writes.
 const STDIN_READ_BYTES: usize = 16 * 1024;
 const UPDATE_HINT_CACHE_FILE: &str = ".tailsurf-cli-update-check";
 const UPDATE_HINT_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -164,7 +164,7 @@ struct WriteArgs {
 struct InputArgs {
     /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
     #[arg(long)]
-    raw: bool,
+    bytes: bool,
     /// Program to run. Its stdout and stderr are written to the stream.
     #[arg(last = true, value_name = "PROGRAM")]
     program: Vec<String>,
@@ -173,7 +173,7 @@ struct InputArgs {
 impl InputArgs {
     fn piped_defaults() -> Self {
         Self {
-            raw: false,
+            bytes: false,
             program: Vec::new(),
         }
     }
@@ -576,7 +576,7 @@ impl FromStr for ExpiresArg {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteBuffering {
-    Raw,
+    Bytes,
     Lines,
 }
 
@@ -885,8 +885,8 @@ async fn write_input(
     expected_next_seq_num: Option<u64>,
     input: InputArgs,
 ) -> eyre::Result<()> {
-    let buffering = if input.raw {
-        WriteBuffering::Raw
+    let buffering = if input.bytes {
+        WriteBuffering::Bytes
     } else {
         WriteBuffering::Lines
     };
@@ -981,7 +981,7 @@ async fn stream_stdin_to_writer(
     });
     let mut session = WriterSession::new(&writer);
     match buffering {
-        WriteBuffering::Raw => stream_raw_chunks_to_writer(&mut session, &mut chunk_rx).await?,
+        WriteBuffering::Bytes => stream_byte_chunks_to_writer(&mut session, &mut chunk_rx).await?,
         WriteBuffering::Lines => stream_line_chunks_to_writer(&mut session, &mut chunk_rx).await?,
     }
     let interrupted = stdin_task.await.context("stdin reader task panicked")??;
@@ -1058,7 +1058,7 @@ async fn stream_child_command_output(
 
     let stream_output = async {
         match buffering {
-            WriteBuffering::Raw => stream_raw_chunks_to_writer(session, &mut chunk_rx).await?,
+            WriteBuffering::Bytes => stream_byte_chunks_to_writer(session, &mut chunk_rx).await?,
             WriteBuffering::Lines => stream_line_chunks_to_writer(session, &mut chunk_rx).await?,
         }
         eyre::Result::<()>::Ok(())
@@ -1121,13 +1121,13 @@ where
     }
 }
 
-struct RawRecordAppender {
+struct ByteRecordAppender {
     pending: BytesMut,
     deadline: Option<Instant>,
     linger: Duration,
 }
 
-impl RawRecordAppender {
+impl ByteRecordAppender {
     fn new(linger: Duration) -> Self {
         Self {
             pending: BytesMut::with_capacity(MAX_RECORD_PAYLOAD_BYTES),
@@ -1172,11 +1172,11 @@ impl RawRecordAppender {
     }
 }
 
-async fn stream_raw_chunks_to_writer(
+async fn stream_byte_chunks_to_writer(
     session: &mut WriterSession,
     chunk_rx: &mut mpsc::Receiver<eyre::Result<Bytes>>,
 ) -> eyre::Result<()> {
-    let mut appender = RawRecordAppender::new(RAW_LINGER);
+    let mut appender = ByteRecordAppender::new(BYTE_RECORD_LINGER);
     loop {
         if let Some(deadline) = appender.deadline() {
             tokio::select! {
@@ -2086,7 +2086,7 @@ mod tests {
             read_link_file: None,
             write_link_file: None,
             input: InputArgs {
-                raw: false,
+                bytes: false,
                 program: Vec::new(),
             },
         };

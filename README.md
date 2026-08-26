@@ -106,11 +106,11 @@ make test | tsf write '{write-link}'
 
 The writer splits a logical line into physical records and paces them through its fixed in-flight window. `tail` and `replay` retain a 16 MiB reassembly safety bound by default. Raise `--max-reassembly-bytes` when reading larger logical records.
 
-Use raw mode when you want to send stdin as byte records instead of line-framed transcript records. Raw mode flushes at the physical record size limit, after a short linger, and at EOF:
+Use `--bytes` when you want to send stdin as byte records instead of line-framed transcript records. Byte records flush at the physical record size limit, after a short linger, and at EOF:
 
 ```sh
-cat artifact.bin | tsf new --raw
-cat artifact.bin | tsf write '{write-link}' --raw
+cat artifact.bin | tsf new --bytes
+cat artifact.bin | tsf write '{write-link}' --bytes
 ```
 
 On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the writer, and exits with status 130. Press Ctrl-C again to stop immediately without waiting for pending acknowledgements.
