@@ -642,11 +642,11 @@ async fn write_line_above_the_default_reader_limit_round_trips_when_the_reader_r
 }
 
 #[tokio::test]
-async fn write_raw_preserves_large_input_across_flush_boundaries() {
+async fn write_bytes_preserves_large_input_across_flush_boundaries() {
     let server = TestServer::start().await;
     let input = "x".repeat(MAX_RECORD_PAYLOAD_BYTES + 10);
 
-    let output = run_tsf(&server, ["new", "--raw"], Some(input.as_str())).await;
+    let output = run_tsf(&server, ["new", "--bytes"], Some(input.as_str())).await;
     assert!(output.status.success(), "stderr={}", output.stderr);
     let read_link = output
         .stdout
@@ -702,14 +702,14 @@ async fn write_raw_preserves_large_input_across_flush_boundaries() {
 }
 
 #[tokio::test]
-async fn write_raw_flushes_on_linger() {
+async fn write_bytes_flushes_on_linger() {
     let server = TestServer::start().await;
 
     let output = run_tsf(
         &server,
         [
             "new",
-            "--raw",
+            "--bytes",
             "--",
             "sh",
             "-c",
