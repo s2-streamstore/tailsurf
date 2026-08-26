@@ -27,7 +27,7 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "process", "rt", "signal", "sync"] }
-tailsurf = { version = "0.13.0", path = "../rust" }
+tailsurf = { version = "0.14.0", path = "../rust" }
 url.workspace = true
 
 [dev-dependencies]

@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/s2-streamstore/tailsurf/compare/v0.13.0...v0.14.0) - 2026-08-26
+
+### Added
+
+- [**breaking**] flatten record JSON and group writer identity ([#77](https://github.com/s2-streamstore/tailsurf/pull/77))
+- *(cli)* [**breaking**] records carry no newline delimiter ([#79](https://github.com/s2-streamstore/tailsurf/pull/79))
+
+### Other
+
+- rename --raw to --bytes ([#72](https://github.com/s2-streamstore/tailsurf/pull/72))
+
 ## [0.13.0](https://github.com/s2-streamstore/tailsurf/compare/v0.12.2...v0.13.0) - 2026-08-25
 
 ### Added
