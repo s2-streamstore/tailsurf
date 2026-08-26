@@ -533,6 +533,27 @@ async fn capture_then_replay_round_trips_piped_input() {
 }
 
 #[tokio::test]
+async fn blank_lines_round_trip_as_empty_records() {
+    let server = TestServer::start().await;
+    let output = run_tsf(&server, [], Some("\na\n\nb\n")).await;
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    assert!(
+        output.stderr.contains("4 records durable"),
+        "stderr={}",
+        output.stderr
+    );
+    let read_link = output
+        .stdout
+        .lines()
+        .find_map(|line| extract_link_line(line, "reader"))
+        .expect("read link");
+
+    let replay = run_tsf(&server, ["replay", read_link], None).await;
+    assert!(replay.status.success(), "stderr={}", replay.stderr);
+    assert_eq!(replay.stdout, "\na\n\nb\n");
+}
+
+#[tokio::test]
 async fn capture_command_streams_output_and_propagates_exit_status() {
     let server = TestServer::start().await;
     let output = run_tsf(
