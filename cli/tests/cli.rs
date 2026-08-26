@@ -533,6 +533,27 @@ async fn capture_then_replay_round_trips_piped_input() {
 }
 
 #[tokio::test]
+async fn blank_lines_round_trip_as_empty_records() {
+    let server = TestServer::start().await;
+    let output = run_tsf(&server, [], Some("\na\n\nb\n")).await;
+    assert!(output.status.success(), "stderr={}", output.stderr);
+    assert!(
+        output.stderr.contains("4 records durable"),
+        "stderr={}",
+        output.stderr
+    );
+    let read_link = output
+        .stdout
+        .lines()
+        .find_map(|line| extract_link_line(line, "reader"))
+        .expect("read link");
+
+    let replay = run_tsf(&server, ["replay", read_link], None).await;
+    assert!(replay.status.success(), "stderr={}", replay.stderr);
+    assert_eq!(replay.stdout, "\na\n\nb\n");
+}
+
+#[tokio::test]
 async fn capture_command_streams_output_and_propagates_exit_status() {
     let server = TestServer::start().await;
     let output = run_tsf(
@@ -602,12 +623,12 @@ async fn write_defaults_to_lines_and_splits_large_records() {
     assert_eq!(records[1].writer_seq_num, 1);
     assert_eq!(records[1].part, PartHeader::new(1, true).expect("part"));
     assert_eq!(records[1].format, RecordFormat::Transcript);
-    assert_eq!(records[1].data.len(), 11);
-    assert_eq!(records[1].data.last(), Some(&b'\n'));
+    assert_eq!(records[1].data.len(), 10);
+    assert_eq!(records[1].data.last(), Some(&b'x'));
     assert_eq!(records[2].writer_seq_num, 2);
     assert_eq!(records[2].part, PartHeader::unsplit());
     assert_eq!(records[2].format, RecordFormat::Transcript);
-    assert_eq!(records[2].data.as_ref(), b"tail\n");
+    assert_eq!(records[2].data.as_ref(), b"tail");
 }
 
 #[tokio::test]
@@ -615,7 +636,7 @@ async fn write_line_above_the_default_reader_limit_round_trips_when_the_reader_r
     let server = TestServer::start().await;
     let configured_limit = DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES + 1;
     let configured_limit_arg = configured_limit.to_string();
-    let mut input = "x".repeat(configured_limit - 1);
+    let mut input = "x".repeat(configured_limit);
     input.push('\n');
 
     let output = run_tsf(&server, ["new"], Some(input.as_str())).await;
@@ -808,7 +829,7 @@ async fn interrupted_stdin_write_flushes_before_exiting_130() {
 
     let replay = run_tsf(&server, ["replay", read_link.as_str()], None).await;
     assert!(replay.status.success(), "stderr={}", replay.stderr);
-    assert_eq!(replay.stdout, "complete line\npartial line");
+    assert_eq!(replay.stdout, "complete line\npartial line\n");
 }
 
 #[cfg(unix)]
@@ -891,8 +912,8 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
     assert_eq!(attempts[1].expected_next_seq_num, None);
     assert_eq!(attempts[0].writer_seq_num, 0);
     assert_eq!(attempts[1].writer_seq_num, 0);
-    assert_eq!(attempts[0].data.as_ref(), b"retry me\n");
-    assert_eq!(attempts[1].data.as_ref(), b"retry me\n");
+    assert_eq!(attempts[0].data.as_ref(), b"retry me");
+    assert_eq!(attempts[1].data.as_ref(), b"retry me");
     assert_eq!(attempts[0].part, PartHeader::unsplit());
     assert_eq!(attempts[1].part, PartHeader::unsplit());
     assert_eq!(attempts[0].format, RecordFormat::Transcript);
@@ -1564,7 +1585,7 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
     let record = batch.first();
 
     assert_eq!(record.seq_num, 20);
-    assert_eq!(record.data, b"default\n");
+    assert_eq!(record.data, b"default");
     let attempts = server.read_attempts();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].start, ReadStart::TailOffset(0));
@@ -1592,7 +1613,7 @@ async fn reader_restarts_retries_after_established_idle_connections() {
     let record = batch.first();
 
     assert_eq!(record.seq_num, 0);
-    assert_eq!(record.data, b"recovered\n");
+    assert_eq!(record.data, b"recovered");
     assert_eq!(server.read_attempts().len(), 3);
 }
 
@@ -1655,7 +1676,7 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
         .expect("batch");
     let record = batch.first();
     assert_eq!(record.seq_num, 5);
-    assert_eq!(record.data, b"stable\n");
+    assert_eq!(record.data, b"stable");
     assert_eq!(server.read_attempts().len(), 2);
 }
 
@@ -3697,9 +3718,9 @@ async fn fake_sse_read(
         // client must reconnect with this cursor.
         FakeSseMode::BatchThenClose => format!(
             "id: v1,3,3\nevent: read_batch\ndata: {{\"records\":[{},{},{}]}}\n\n",
-            record(0, "one\\n"),
-            record(1, "two\\n"),
-            record(2, "three\\n"),
+            record(0, "one"),
+            record(1, "two"),
+            record(2, "three"),
         ),
     };
     let body = format!(
@@ -3863,10 +3884,10 @@ async fn fake_read_flow(
                 ReadStart::TimestampMs(_) | ReadStart::TailOffset(_) => 0,
             };
             if attempt_count == 1 {
-                send_read_record(&mut socket, first_seq_num, 0, b"first\n").await;
+                send_read_record(&mut socket, first_seq_num, 0, b"first").await;
                 close_retryable_read(&mut socket).await;
             } else {
-                send_read_record(&mut socket, first_seq_num, 1, b"second\n").await;
+                send_read_record(&mut socket, first_seq_num, 1, b"second").await;
             }
         }
         FakeReadMode::ReconnectAfterBatch => {
@@ -3878,9 +3899,9 @@ async fn fake_read_flow(
                     ServerFrame::ReadBatch(
                         ReadBatch::try_from_records(
                             [
-                                (0, 0, b"one\n".as_slice()),
-                                (1, 1, b"two\n".as_slice()),
-                                (2, 2, b"three\n".as_slice()),
+                                (0, 0, b"one".as_slice()),
+                                (1, 1, b"two".as_slice()),
+                                (2, 2, b"three".as_slice()),
                             ]
                             .into_iter()
                             .map(|(seq_num, writer_seq_num, data)| OwnedReadRecord {
@@ -3901,7 +3922,7 @@ async fn fake_read_flow(
                 .expect("send batch");
                 close_retryable_read(&mut socket).await;
             } else {
-                send_read_record(&mut socket, 3, 3, b"four\n").await;
+                send_read_record(&mut socket, 3, 3, b"four").await;
             }
         }
         FakeReadMode::ReconnectAfterEmptyCaughtUp => {
@@ -3917,21 +3938,21 @@ async fn fake_read_flow(
                 .expect("send empty caught up");
                 close_retryable_read(&mut socket).await;
             } else {
-                send_read_record(&mut socket, 5, 0, b"stable\n").await;
+                send_read_record(&mut socket, 5, 0, b"stable").await;
             }
         }
         FakeReadMode::ReconnectBeforeFirstDefault => {
             if attempt_count == 1 {
                 close_retryable_read(&mut socket).await;
             } else {
-                send_read_record(&mut socket, 20, 0, b"default\n").await;
+                send_read_record(&mut socket, 20, 0, b"default").await;
             }
         }
         FakeReadMode::ReconnectTwiceThenRecord => {
             if attempt_count < 3 {
                 close_retryable_read(&mut socket).await;
             } else {
-                send_read_record(&mut socket, 0, 0, b"recovered\n").await;
+                send_read_record(&mut socket, 0, 0, b"recovered").await;
             }
         }
         FakeReadMode::SlowReconnectForever => {
