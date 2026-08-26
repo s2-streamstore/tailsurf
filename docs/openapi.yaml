@@ -347,17 +347,17 @@ components:
     AppendRecord:
       type: object
       additionalProperties: false
-      required: [format, data]
+      required: [data]
       properties:
         part: { $ref: '#/components/schemas/RecordPart' }
-        format: { enum: [bytes, transcript] }
+        format: { enum: [bytes, transcript], default: transcript }
         data:
-          description: Exact bytes. The Rust and TypeScript SDKs choose the smaller UTF-8 or base64url JSON representation.
+          description: Exact bytes. The encoding defaults to utf8. The Rust and TypeScript SDKs state the encoding and choose the smaller UTF-8 or base64url JSON representation.
           oneOf:
             - type: object
               additionalProperties: false
-              required: [encoding, value]
-              properties: { encoding: { const: utf8 }, value: { type: string } }
+              required: [value]
+              properties: { encoding: { const: utf8, default: utf8 }, value: { type: string } }
             - type: object
               additionalProperties: false
               required: [encoding, value]
