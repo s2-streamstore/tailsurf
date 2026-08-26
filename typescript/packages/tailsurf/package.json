@@ -1,6 +1,6 @@
 {
   "name": "tailsurf",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Alias for @tailsurf/client, the TypeScript client for tail.surf",
   "type": "module",
   "sideEffects": false,
