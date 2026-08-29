@@ -106,7 +106,7 @@ make test | tsf write '{write-link}'
 
 The delimiting newline is not stored; reads append one newline after each transcript record.
 
-The writer splits a logical line into physical records and paces them through its fixed in-flight window. `tail` and `replay` retain a 16 MiB reassembly safety bound by default. Raise `--max-reassembly-bytes` when reading larger logical records.
+The writer splits a logical line into physical records and applies backpressure at its fixed in-flight window. A single larger logical line remains contiguous. `tail` and `replay` retain a 16 MiB reassembly safety bound by default. Raise `--max-reassembly-bytes` when reading larger logical records.
 
 Use `--bytes` when you want to send stdin as byte records instead of line-framed transcript records. Byte records flush at the physical record size limit, after a short linger, and at EOF:
 
@@ -115,7 +115,7 @@ cat artifact.bin | tsf new --bytes
 cat artifact.bin | tsf write '{write-link}' --bytes
 ```
 
-On Ctrl-C, `tsf` stops input, flushes accepted bytes, waits for durability acknowledgements, closes the writer, and exits with status 130. Press Ctrl-C again to stop immediately without waiting for pending acknowledgements.
+On Ctrl-C, `tsf` stops input, flushes the current input chunk, waits for durability acknowledgements, closes the writer, and exits with status 130. Press Ctrl-C again to stop immediately without waiting for pending acknowledgements.
 
 Tail or replay a link or public stream URL:
 
