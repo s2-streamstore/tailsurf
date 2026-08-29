@@ -9,6 +9,10 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitCode, ExitStatus, Stdio},
     str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,8 +24,9 @@ use memchr::memchr;
 use serde::{Deserialize, Serialize};
 use tailsurf::{
     AppendBatch, AppendTicket, DEFAULT_API_ORIGIN, DurableWriterOptions, LinkId, LinkPermissions,
-    LinkSecret, ReadOptions, ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfProducer,
-    TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
+    LinkSecret, MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, ReadOptions,
+    ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfProducer, TsfReadSession,
+    TsfSseReadSession, TsfWriter, default_api_origin,
     protocol::{
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
@@ -36,7 +41,7 @@ use tailsurf::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     process::Command as TokioCommand,
-    sync::mpsc,
+    sync::{Notify, mpsc},
     time::{Duration, Instant, sleep_until, timeout},
 };
 use url::Url;
@@ -917,7 +922,7 @@ async fn finish_and_close_writer(
 ) -> eyre::Result<u64> {
     if interrupted {
         eprintln!(
-            "Interrupted. Waiting for pending records to become durable; press Ctrl-C again to stop immediately."
+            "Interrupted. Input stopped. Waiting for accepted records to become durable; press Ctrl-C again to stop immediately."
         );
     }
 
@@ -963,15 +968,18 @@ async fn stream_stdin_to_writer(
     buffering: WriteBuffering,
 ) -> eyre::Result<()> {
     let writer = connect_session_writer(origin, stream_id, link, expected_next_seq_num).await?;
+    let interrupt = Arc::new(WriteInterrupt::default());
 
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<eyre::Result<Bytes>>(16);
-    // The first Ctrl-C drops the sender, so the consumer sees the channel close, flushes any
-    // pending data, and finishes the session cleanly before the interrupted exit.
+    // The first Ctrl-C stops the consumer before its next chunk and drops the sender. The
+    // consumer flushes its current chunk and finishes the session before the interrupted exit.
+    let stdin_interrupt = Arc::clone(&interrupt);
     let stdin_task = tokio::spawn(async move {
         tokio::select! {
             biased;
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt.context("failed to listen for interrupt signal")?;
+                stdin_interrupt.trigger();
                 Ok(true)
             }
             result = read_pipe_chunks(tokio::io::stdin(), chunk_tx, "failed to read stdin") => {
@@ -979,7 +987,7 @@ async fn stream_stdin_to_writer(
             }
         }
     });
-    let mut session = WriterSession::new(&writer);
+    let mut session = WriterSession::new(&writer, interrupt);
     match buffering {
         WriteBuffering::Bytes => stream_byte_chunks_to_writer(&mut session, &mut chunk_rx).await?,
         WriteBuffering::Lines => stream_line_chunks_to_writer(&mut session, &mut chunk_rx).await?,
@@ -1002,8 +1010,9 @@ async fn stream_command_to_writer(
     command: Vec<String>,
 ) -> eyre::Result<()> {
     let writer = connect_session_writer(origin, stream_id, link, expected_next_seq_num).await?;
-    let mut session = WriterSession::new(&writer);
-    let outcome = stream_child_command_output(&mut session, buffering, command).await?;
+    let interrupt = Arc::new(WriteInterrupt::default());
+    let mut session = WriterSession::new(&writer, Arc::clone(&interrupt));
+    let outcome = stream_child_command_output(&mut session, interrupt, buffering, command).await?;
     let records = finish_and_close_writer(session, writer, outcome.interrupted).await?;
     print_write_summary(records);
     if outcome.interrupted {
@@ -1023,6 +1032,7 @@ struct ChildCommandOutcome {
 
 async fn stream_child_command_output(
     session: &mut WriterSession,
+    write_interrupt: Arc<WriteInterrupt>,
     buffering: WriteBuffering,
     command: Vec<String>,
 ) -> eyre::Result<ChildCommandOutcome> {
@@ -1069,6 +1079,7 @@ async fn stream_child_command_output(
         result = &mut stream_output => (result, false),
         interrupt = tokio::signal::ctrl_c() => {
             interrupt.context("failed to listen for interrupt signal")?;
+            write_interrupt.trigger();
             let _ = child.kill().await;
             (stream_output.await, true)
         }
@@ -1181,6 +1192,7 @@ async fn stream_byte_chunks_to_writer(
         if let Some(deadline) = appender.deadline() {
             tokio::select! {
                 biased;
+                _ = session.interrupted() => break,
                 chunk = chunk_rx.recv() => {
                     let Some(chunk) = chunk else {
                         break;
@@ -1192,7 +1204,12 @@ async fn stream_byte_chunks_to_writer(
                 }
             }
         } else {
-            let Some(chunk) = chunk_rx.recv().await else {
+            let chunk = tokio::select! {
+                biased;
+                _ = session.interrupted() => break,
+                chunk = chunk_rx.recv() => chunk,
+            };
+            let Some(chunk) = chunk else {
                 break;
             };
             appender.push_bytes(session, &chunk?).await?;
@@ -1206,7 +1223,15 @@ async fn stream_line_chunks_to_writer(
     chunk_rx: &mut mpsc::Receiver<eyre::Result<Bytes>>,
 ) -> eyre::Result<()> {
     let mut line_appender = LineRecordAppender::new();
-    while let Some(chunk) = chunk_rx.recv().await {
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = session.interrupted() => break,
+            chunk = chunk_rx.recv() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         line_appender.push_bytes(session, &chunk?).await?;
     }
     line_appender.finish(session).await
@@ -1260,19 +1285,64 @@ impl LineRecordAppender {
     }
 }
 
+#[derive(Default)]
+struct WriteInterrupt {
+    triggered: AtomicBool,
+    notify: Notify,
+}
+
+impl WriteInterrupt {
+    fn trigger(&self) {
+        self.triggered.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_triggered(&self) -> bool {
+        self.triggered.load(Ordering::Acquire)
+    }
+
+    async fn triggered(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_triggered() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct PendingAppend {
+    ticket: AppendTicket,
+    record_count: usize,
+    payload_bytes: usize,
+}
+
 struct WriterSession {
     producer: TsfProducer,
-    pending_tickets: VecDeque<AppendTicket>,
+    interrupt: Arc<WriteInterrupt>,
+    pending: VecDeque<PendingAppend>,
+    pending_records: usize,
+    pending_payload_bytes: usize,
     records: u64,
 }
 
 impl WriterSession {
-    fn new(writer: &TsfWriter) -> Self {
+    fn new(writer: &TsfWriter, interrupt: Arc<WriteInterrupt>) -> Self {
         Self {
             producer: writer.producer(),
-            pending_tickets: VecDeque::new(),
+            interrupt,
+            pending: VecDeque::new(),
+            pending_records: 0,
+            pending_payload_bytes: 0,
             records: 0,
         }
+    }
+
+    async fn interrupted(&self) {
+        self.interrupt.triggered().await;
     }
 
     async fn append_logical_record(
@@ -1280,9 +1350,10 @@ impl WriterSession {
         format: RecordFormat,
         data: Bytes,
     ) -> eyre::Result<()> {
+        let payload_bytes = data.len();
         let batch =
             AppendBatch::split_logical(format, data).context("failed to split logical record")?;
-        self.submit_batch(batch).await
+        self.submit_batch(batch, payload_bytes).await
     }
 
     async fn append_physical_record(
@@ -1291,39 +1362,88 @@ impl WriterSession {
         format: RecordFormat,
         data: Bytes,
     ) -> eyre::Result<()> {
+        let payload_bytes = data.len();
         let batch = AppendBatch::single(part, format, data).context("failed to build record")?;
-        self.submit_batch(batch).await
+        self.submit_batch(batch, payload_bytes).await
     }
 
-    async fn submit_batch(&mut self, batch: AppendBatch) -> eyre::Result<()> {
-        self.records += batch.record_count() as u64;
+    async fn submit_batch(&mut self, batch: AppendBatch, payload_bytes: usize) -> eyre::Result<()> {
+        let record_count = batch.record_count();
+        self.wait_for_capacity(record_count, payload_bytes).await?;
         let ticket = self
             .producer
             .submit(batch)
             .context("failed to submit record")?;
-        self.pending_tickets.push_back(ticket);
+        self.records += record_count as u64;
+        self.pending_records += record_count;
+        self.pending_payload_bytes += payload_bytes;
+        self.pending.push_back(PendingAppend {
+            ticket,
+            record_count,
+            payload_bytes,
+        });
         self.drain_ready_tickets()
     }
 
     async fn finish(mut self) -> eyre::Result<u64> {
-        while let Some(ticket) = self.pending_tickets.pop_front() {
-            ticket.await.context("failed to append record")?;
+        while !self.pending.is_empty() {
+            self.wait_for_oldest().await?;
         }
         Ok(self.records)
+    }
+
+    async fn wait_for_capacity(
+        &mut self,
+        record_count: usize,
+        payload_bytes: usize,
+    ) -> eyre::Result<()> {
+        // Keep ordinary accepted input within one socket window. An empty queue admits one
+        // larger logical record intact. An interrupt admits the rest of the current input chunk;
+        // the input loops stop before receiving another chunk.
+        self.drain_ready_tickets()?;
+        while !self.pending.is_empty()
+            && !self.interrupt.is_triggered()
+            && (self.pending_records.saturating_add(record_count) > MAX_WRITER_IN_FLIGHT_RECORDS
+                || self.pending_payload_bytes.saturating_add(payload_bytes)
+                    > MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES)
+        {
+            let interrupt = Arc::clone(&self.interrupt);
+            tokio::select! {
+                biased;
+                _ = interrupt.triggered() => return Ok(()),
+                result = self.wait_for_oldest() => result?,
+            }
+        }
+        Ok(())
+    }
+
+    async fn wait_for_oldest(&mut self) -> eyre::Result<()> {
+        let pending = self.pending.front_mut().expect("pending append");
+        (&mut pending.ticket)
+            .await
+            .context("failed to append record")?;
+        self.remove_oldest();
+        Ok(())
     }
 
     fn drain_ready_tickets(&mut self) -> eyre::Result<()> {
         loop {
             let Some(result) = self
-                .pending_tickets
+                .pending
                 .front_mut()
-                .and_then(AppendTicket::try_recv)
+                .and_then(|pending| pending.ticket.try_recv())
             else {
                 return Ok(());
             };
             result.context("failed to append record")?;
-            self.pending_tickets.pop_front();
+            self.remove_oldest();
         }
+    }
+
+    fn remove_oldest(&mut self) {
+        let pending = self.pending.pop_front().expect("pending append");
+        self.pending_records -= pending.record_count;
+        self.pending_payload_bytes -= pending.payload_bytes;
     }
 }
 

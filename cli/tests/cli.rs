@@ -882,6 +882,58 @@ async fn second_interrupt_aborts_a_stalled_stdin_write() {
     assert_eq!(status.code(), Some(130));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn first_interrupt_does_not_drain_an_unbounded_input_backlog() {
+    let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
+    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
+    let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
+    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    command
+        .arg("--origin")
+        .arg(server.origin.as_str())
+        .args(["write", write_link.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("spawn tsf write");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+
+    let input_records = MAX_WRITER_IN_FLIGHT_RECORDS * 10;
+    let input = "123456789012345\n".repeat(input_records);
+    timeout(Duration::from_secs(5), stdin.write_all(input.as_bytes()))
+        .await
+        .expect("timed out filling stdin")
+        .expect("write stdin");
+    server.wait_for_records(MAX_WRITER_IN_FLIGHT_RECORDS).await;
+
+    let pid = child.id().expect("tsf process ID");
+    interrupt_process(pid).await;
+    let mut notice = String::new();
+    timeout(Duration::from_secs(5), stderr.read_line(&mut notice))
+        .await
+        .expect("timed out waiting for interrupt notice")
+        .expect("read interrupt notice");
+    assert!(notice.contains("Input stopped"), "stderr={notice}");
+
+    server.release_acknowledgements();
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("timed out waiting for interrupted tsf")
+        .expect("wait for tsf");
+    drop(stdin);
+    assert_eq!(status.code(), Some(130));
+
+    let written_records = server.attempts().len();
+    assert!(
+        written_records <= MAX_WRITER_IN_FLIGHT_RECORDS * 2,
+        "interrupt drained {written_records} records"
+    );
+    assert!(written_records < input_records);
+}
+
 #[tokio::test]
 async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret() {
     let server = FakeWriteServer::start().await;
