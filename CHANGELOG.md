@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/s2-streamstore/tailsurf/compare/v0.14.0...v0.14.1) - 2026-08-29
+
+### Fixed
+
+- *(cli)* bound backlog drained after interrupt ([#81](https://github.com/s2-streamstore/tailsurf/pull/81))
+
 ## [0.14.0](https://github.com/s2-streamstore/tailsurf/compare/v0.13.0...v0.14.0) - 2026-08-26
 
 ### Added
