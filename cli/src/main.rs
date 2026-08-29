@@ -1066,22 +1066,28 @@ async fn stream_child_command_output(
         "failed to read command output",
     ));
 
-    let stream_output = async {
-        match buffering {
-            WriteBuffering::Bytes => stream_byte_chunks_to_writer(session, &mut chunk_rx).await?,
-            WriteBuffering::Lines => stream_line_chunks_to_writer(session, &mut chunk_rx).await?,
-        }
-        eyre::Result::<()>::Ok(())
-    };
-    tokio::pin!(stream_output);
+    let (stream_result, interrupted) = {
+        let stream_output = async {
+            match buffering {
+                WriteBuffering::Bytes => {
+                    stream_byte_chunks_to_writer(session, &mut chunk_rx).await?
+                }
+                WriteBuffering::Lines => {
+                    stream_line_chunks_to_writer(session, &mut chunk_rx).await?
+                }
+            }
+            eyre::Result::<()>::Ok(())
+        };
+        tokio::pin!(stream_output);
 
-    let (stream_result, interrupted) = tokio::select! {
-        result = &mut stream_output => (result, false),
-        interrupt = tokio::signal::ctrl_c() => {
-            interrupt.context("failed to listen for interrupt signal")?;
-            write_interrupt.trigger();
-            let _ = child.kill().await;
-            (stream_output.await, true)
+        tokio::select! {
+            result = &mut stream_output => (result, false),
+            interrupt = tokio::signal::ctrl_c() => {
+                interrupt.context("failed to listen for interrupt signal")?;
+                write_interrupt.trigger();
+                let _ = child.kill().await;
+                (stream_output.await, true)
+            }
         }
     };
 
@@ -1094,6 +1100,9 @@ async fn stream_child_command_output(
         return Err(error);
     }
 
+    if interrupted {
+        chunk_rx.close();
+    }
     stdout_task.await.context("stdout reader task panicked")??;
     stderr_task.await.context("stderr reader task panicked")??;
     let status = child.wait().await.context("failed to wait for command")?;
