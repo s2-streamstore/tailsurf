@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     future::pending,
     io::{Read as _, Write as _},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 use clap::Args;
@@ -119,7 +119,14 @@ type PtyOutput = std::io::Result<Vec<u8>>;
 #[derive(Default)]
 struct PtyOutputHandoffState {
     closing: bool,
+    resizing: bool,
     sending: bool,
+}
+
+#[derive(Default)]
+struct PtyOutputHandoff {
+    state: Mutex<PtyOutputHandoffState>,
+    changed: Condvar,
 }
 
 struct PtyWrite {
@@ -515,7 +522,7 @@ async fn host(
     let (output_tx, mut output_rx) = mpsc::channel::<PtyOutput>(PTY_OUTPUT_QUEUE);
     // The cutoff handshake recovers the one chunk that may already be blocked in
     // `blocking_send` when the receiver closes.
-    let output_handoff_state = Arc::new(Mutex::new(PtyOutputHandoffState::default()));
+    let output_handoff_state = Arc::new(PtyOutputHandoff::default());
     let thread_handoff_state = Arc::clone(&output_handoff_state);
     let (output_close_tx, mut output_close_rx) = oneshot::channel();
     // A descendant may retain the slave after the direct child exits. A native thread can be
@@ -585,7 +592,11 @@ async fn host(
             }
             resize = pty_resize_rx.recv(), if exit_status.is_none() && pending_output.is_empty() => {
                 let resize = resize.context("terminal input forwarder stopped")?;
-                output_open = queue_available_pty_output(&mut output_rx, &mut pending_output)?;
+                output_open = pause_and_queue_pty_output(
+                    &mut output_rx,
+                    &output_handoff_state,
+                    &mut pending_output,
+                ).await?;
                 let result = master
                     .resize(PtySize {
                         rows: resize.rows,
@@ -600,6 +611,7 @@ async fn host(
                         rows: resize.rows,
                     });
                 }
+                resume_pty_output(&output_handoff_state);
                 let _ = resize.applied.send(result);
             }
             result = input_task.handle(), if exit_status.is_none() => {
@@ -714,13 +726,34 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     }
 }
 
-fn queue_available_pty_output(
+async fn pause_and_queue_pty_output(
     output: &mut mpsc::Receiver<PtyOutput>,
+    handoff: &Arc<PtyOutputHandoff>,
     pending: &mut VecDeque<OwnedTerminalOutput>,
 ) -> eyre::Result<bool> {
-    // The channel can hold this many chunks plus one blocked native-thread send. Bound the drain
-    // so a continuously writing PTY cannot monopolize the async runtime during a resize.
-    for _ in 0..=PTY_OUTPUT_QUEUE {
+    {
+        let mut state = handoff
+            .state
+            .lock()
+            .expect("PTY output handoff lock poisoned");
+        state.resizing = true;
+    }
+    loop {
+        let sending = handoff
+            .state
+            .lock()
+            .expect("PTY output handoff lock poisoned")
+            .sending;
+        if !sending {
+            break;
+        }
+        match output.recv().await {
+            Some(Ok(data)) => pending.push_back(OwnedTerminalOutput::Data(data)),
+            Some(Err(error)) => return Err(error).context("failed to read PTY output"),
+            None => return Ok(false),
+        }
+    }
+    loop {
         match output.try_recv() {
             Ok(Ok(data)) => pending.push_back(OwnedTerminalOutput::Data(data)),
             Ok(Err(error)) => return Err(error).context("failed to read PTY output"),
@@ -728,25 +761,44 @@ fn queue_available_pty_output(
             Err(mpsc::error::TryRecvError::Disconnected) => return Ok(false),
         }
     }
-    Ok(true)
+}
+
+fn resume_pty_output(handoff: &Arc<PtyOutputHandoff>) {
+    let mut state = handoff
+        .state
+        .lock()
+        .expect("PTY output handoff lock poisoned");
+    state.resizing = false;
+    handoff.changed.notify_all();
 }
 
 fn send_pty_output(
     output: PtyOutput,
     sender: &mpsc::Sender<PtyOutput>,
-    state: &Arc<Mutex<PtyOutputHandoffState>>,
+    handoff: &Arc<PtyOutputHandoff>,
     close_ack: &mut Option<oneshot::Sender<Option<PtyOutput>>>,
 ) -> bool {
-    {
-        let mut state = state.lock().expect("PTY output handoff lock poisoned");
-        if state.closing {
-            return false;
-        }
-        state.sending = true;
+    let mut state = handoff
+        .state
+        .lock()
+        .expect("PTY output handoff lock poisoned");
+    while state.resizing && !state.closing {
+        state = handoff
+            .changed
+            .wait(state)
+            .expect("PTY output handoff lock poisoned");
     }
+    if state.closing {
+        return false;
+    }
+    state.sending = true;
+    drop(state);
 
     let result = sender.blocking_send(output);
-    let mut state = state.lock().expect("PTY output handoff lock poisoned");
+    let mut state = handoff
+        .state
+        .lock()
+        .expect("PTY output handoff lock poisoned");
     state.sending = false;
     if state.closing {
         let unsent = result.err().map(|error| error.0);
@@ -761,13 +813,18 @@ fn send_pty_output(
 
 async fn close_and_queue_pty_output(
     output: &mut mpsc::Receiver<PtyOutput>,
-    state: &Arc<Mutex<PtyOutputHandoffState>>,
+    handoff: &Arc<PtyOutputHandoff>,
     close_ack: &mut oneshot::Receiver<Option<PtyOutput>>,
     pending: &mut VecDeque<OwnedTerminalOutput>,
 ) -> eyre::Result<()> {
     let wait_for_in_flight = {
-        let mut state = state.lock().expect("PTY output handoff lock poisoned");
+        let mut state = handoff
+            .state
+            .lock()
+            .expect("PTY output handoff lock poisoned");
         state.closing = true;
+        state.resizing = false;
+        handoff.changed.notify_all();
         state.sending
     };
     output.close();
@@ -810,17 +867,110 @@ mod tests {
             .send(Ok(vec![2]))
             .await
             .expect("second PTY chunk should enqueue");
+        let handoff = Arc::new(PtyOutputHandoff::default());
         let mut pending = VecDeque::new();
 
         assert!(
-            queue_available_pty_output(&mut receiver, &mut pending)
+            pause_and_queue_pty_output(&mut receiver, &handoff, &mut pending)
+                .await
                 .expect("queued PTY output should be valid")
         );
         pending.push_back(OwnedTerminalOutput::Resize {
             columns: 120,
             rows: 40,
         });
+        resume_pty_output(&handoff);
 
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == vec![1]
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == vec![2]
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Resize {
+                columns: 120,
+                rows: 40,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pauses_new_pty_output_until_after_a_resize() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(vec![1]))
+            .await
+            .expect("first PTY chunk should enqueue");
+        let handoff = Arc::new(PtyOutputHandoff::default());
+        let blocked_handoff = Arc::clone(&handoff);
+        let blocked_sender = sender.clone();
+        let (close_tx, _close_rx) = oneshot::channel();
+        let blocked_send = std::thread::spawn(move || {
+            let mut close_tx = Some(close_tx);
+            send_pty_output(
+                Ok(vec![2]),
+                &blocked_sender,
+                &blocked_handoff,
+                &mut close_tx,
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handoff
+                .state
+                .lock()
+                .expect("PTY output handoff lock should not be poisoned")
+                .sending
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("PTY output send should block on the full queue");
+
+        let mut pending = VecDeque::new();
+        assert!(
+            pause_and_queue_pty_output(&mut receiver, &handoff, &mut pending)
+                .await
+                .expect("PTY output should pause")
+        );
+        assert!(blocked_send.join().expect("blocked send should finish"));
+        pending.push_back(OwnedTerminalOutput::Resize {
+            columns: 120,
+            rows: 40,
+        });
+
+        let paused_handoff = Arc::clone(&handoff);
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (close_tx, _close_rx) = oneshot::channel();
+        let paused_send = std::thread::spawn(move || {
+            let mut close_tx = Some(close_tx);
+            attempted_tx
+                .send(())
+                .expect("send attempt should be observed");
+            send_pty_output(Ok(vec![3]), &sender, &paused_handoff, &mut close_tx)
+        });
+        attempted_rx
+            .recv()
+            .expect("paused output thread should start sending");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        resume_pty_output(&handoff);
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("resumed output should enqueue")
+                .expect("resumed output should be valid"),
+            vec![3],
+        );
+        assert!(paused_send.join().expect("paused send should finish"));
         assert!(matches!(
             pending.pop_front(),
             Some(OwnedTerminalOutput::Data(data)) if data == vec![1]
@@ -849,7 +999,7 @@ mod tests {
             .send(Ok(vec![2]))
             .await
             .expect("second PTY chunk should enqueue");
-        let state = Arc::new(Mutex::new(PtyOutputHandoffState::default()));
+        let state = Arc::new(PtyOutputHandoff::default());
         let thread_state = Arc::clone(&state);
         let (close_tx, mut close_rx) = oneshot::channel();
         let blocked_send = std::thread::spawn(move || {
@@ -858,6 +1008,7 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !state
+                .state
                 .lock()
                 .expect("PTY output handoff lock should not be poisoned")
                 .sending
@@ -892,7 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn closing_output_does_not_wait_without_an_in_flight_send() {
         let (_sender, mut receiver) = mpsc::channel(1);
-        let state = Arc::new(Mutex::new(PtyOutputHandoffState::default()));
+        let state = Arc::new(PtyOutputHandoff::default());
         let (_close_tx, mut close_rx) = oneshot::channel();
         let mut pending = VecDeque::new();
 

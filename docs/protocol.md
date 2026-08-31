@@ -277,6 +277,8 @@ Only an owner can read the input log or write the output log. Terminal routes re
 
 Terminal events use unsplit byte records. Every payload begins with a version byte and a type byte. The version is `0x01`.
 
+Terminal consumers suppress physical retries by writer identity and writer sequence number. This preserves one logical input or output event when an acknowledgement is lost.
+
 Input event types are:
 
 | Type | Name | Body |
