@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    future::pending,
     io::{Read as _, Write as _},
 };
 
@@ -17,7 +18,7 @@ use tailsurf::{
 };
 use tokio::{
     sync::{mpsc, oneshot},
-    time::Duration,
+    time::{Duration, Instant, sleep_until},
 };
 use url::Url;
 
@@ -29,6 +30,8 @@ use super::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_INPUT_WRITERS: usize = 4_096;
 const MAX_PENDING_OUTPUT_RECORDS: usize = 32;
+const PTY_EXIT_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+const PTY_EXIT_DRAIN_MAX_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_OUTPUT_QUEUE: usize = 16;
 
 #[derive(Debug, Args)]
@@ -282,7 +285,9 @@ async fn host(
     });
 
     let (output_tx, mut output_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>(PTY_OUTPUT_QUEUE);
-    let output_task = tokio::task::spawn_blocking(move || {
+    // A descendant may retain the slave after the direct child exits. A native thread can be
+    // detached after the bounded drain without delaying Tokio runtime shutdown.
+    let output_thread = std::thread::spawn(move || {
         let mut buffer = vec![0_u8; STDIN_READ_BYTES];
         loop {
             match pty_reader.read(&mut buffer) {
@@ -307,6 +312,8 @@ async fn host(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat.tick().await;
     let mut output_open = true;
+    let mut output_drain_deadline = None;
+    let mut output_drain_max_deadline = None;
     let mut exit_status = None;
     let mut interrupted = false;
     let mut input_writer_positions = HashMap::<WriterId, u64>::new();
@@ -359,7 +366,15 @@ async fn host(
             }
             chunk = output_rx.recv(), if output_open => {
                 match chunk {
-                    Some(Ok(data)) => output.publish(TerminalOutputEvent::Data(&data)).await?,
+                    Some(Ok(data)) => {
+                        output.publish(TerminalOutputEvent::Data(&data)).await?;
+                        if let Some(max_deadline) = output_drain_max_deadline {
+                            output_drain_deadline = Some(std::cmp::min(
+                                Instant::now() + PTY_EXIT_DRAIN_IDLE_TIMEOUT,
+                                max_deadline,
+                            ));
+                        }
+                    }
                     Some(Err(error)) => return Err(error).context("failed to read PTY output"),
                     None => output_open = false,
                 }
@@ -370,6 +385,12 @@ async fn host(
                     .context("failed to wait for terminal command")?;
                 exit_status = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
                 child_guard.disarm();
+                let now = Instant::now();
+                output_drain_deadline = Some(now + PTY_EXIT_DRAIN_IDLE_TIMEOUT);
+                output_drain_max_deadline = Some(now + PTY_EXIT_DRAIN_MAX_TIMEOUT);
+            }
+            _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() => {
+                output_open = false;
             }
             _ = heartbeat.tick(), if exit_status.is_none() => {
                 output.publish(TerminalOutputEvent::Heartbeat).await?;
@@ -388,6 +409,7 @@ async fn host(
     }
 
     let status = exit_status.context("terminal command ended without an exit status")?;
+    drop(output_rx);
     output
         .publish(TerminalOutputEvent::Exited {
             status: if interrupted {
@@ -400,7 +422,11 @@ async fn host(
     output.close().await?;
     drop(pty_input_tx);
     input_task.await.context("PTY input task panicked")??;
-    output_task.await.context("PTY output task panicked")?;
+    if output_thread.is_finished() {
+        output_thread
+            .join()
+            .map_err(|_| eyre!("PTY output thread panicked"))?;
+    }
 
     if interrupted {
         exit_interrupted();
@@ -409,5 +435,12 @@ async fn host(
         Ok(())
     } else {
         std::process::exit(status);
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => pending().await,
     }
 }
