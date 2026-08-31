@@ -7,5 +7,6 @@ export * from "./rest.js";
 export * from "./sse-resume-cursor.js";
 export * from "./stream-title.js";
 export * from "./stream-url.js";
+export * from "./terminal.js";
 export * from "./transcript.js";
 export * from "./ws.js";

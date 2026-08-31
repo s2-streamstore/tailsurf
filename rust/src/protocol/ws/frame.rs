@@ -1466,7 +1466,7 @@ mod tests {
     #[test]
     fn stream_metadata_ignores_unknown_json_fields() {
         let mut encoded = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-        encoded.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z","future_field":{"enabled":true}}"#);
+        encoded.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","kind":"records","title":null,"visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z","future_field":{"enabled":true}}"#);
 
         assert_eq!(
             ServerFrame::decode(&encoded).expect("decode stream metadata"),
@@ -1474,6 +1474,7 @@ mod tests {
                 stream_id: "00000000000000000000000000000000"
                     .parse()
                     .expect("stream ID"),
+                kind: crate::protocol::rest::StreamKind::Records,
                 title: None,
                 visibility: Visibility::Private,
                 created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -1485,7 +1486,7 @@ mod tests {
     #[test]
     fn stream_metadata_tolerates_absent_title_and_requires_valid_timestamps() {
         let mut missing_title = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-        missing_title.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#);
+        missing_title.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","kind":"records","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#);
         assert!(matches!(
             ServerFrame::decode(&missing_title),
             Ok(ServerFrame::StreamMetadata(StreamMetadata {
@@ -1495,7 +1496,7 @@ mod tests {
         ));
 
         let mut invalid_time = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-        invalid_time.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","title":null,"visibility":"private","created_at":"not-a-time","expires_at":"2026-08-23T00:00:00Z"}"#);
+        invalid_time.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","kind":"records","title":null,"visibility":"private","created_at":"not-a-time","expires_at":"2026-08-23T00:00:00Z"}"#);
         assert!(matches!(
             ServerFrame::decode(&invalid_time),
             Err(FrameCodecError::InvalidStreamMetadata(_))

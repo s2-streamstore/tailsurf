@@ -298,7 +298,13 @@ export function unexpectedFrame(frame: ServerFrame): TsfClientError {
 export function dataPlaneUrl(
   apiOrigin: string,
   streamId: StreamId,
-  operation: "read" | "write",
+  operation:
+    | "read"
+    | "write"
+    | "terminal/input/read"
+    | "terminal/input/write"
+    | "terminal/output/read"
+    | "terminal/output/write",
 ): string {
   const url = new URL(
     `/api/v1/streams/${streamId}/${operation}`,

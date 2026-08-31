@@ -110,6 +110,16 @@ await writer.appendLogical({ data: largeTranscriptRecord });
 await writer.close();
 ```
 
+## Terminal sessions
+
+Create a terminal resource with `kind: "terminal"`.
+
+Terminal sessions have separate input and output logs. Controllers use `connectTerminalInputWriter`. Observers use `connectTerminalOutputReader`. A host with an owner link uses `connectTerminalInputReader` and `connectTerminalOutputWriter`.
+
+`buildTerminalLink` and `buildPublicTerminalUrl` build the canonical `/t/{streamId}` browser URLs.
+
+`encodeTerminalInputEvent`, `decodeTerminalInputEvent`, `encodeTerminalOutputEvent`, and `decodeTerminalOutputEvent` implement the versioned terminal event payloads. Events remain ordinary unsplit byte records, so terminal clients retain the normal durability and reconnect behavior.
+
 ## Retries and errors
 
 REST mutations use idempotency keys. Pass a caller-owned key as the second argument when a creation must survive page reloads.

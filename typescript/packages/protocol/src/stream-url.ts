@@ -4,6 +4,7 @@ import type { LinkPermissions } from "./permissions.js";
 import { parseLinkPermissions } from "./permissions.js";
 import { ProtocolError } from "./errors.js";
 import { canonicalBase64url, MAX_SAFE_INTEGER_U64, U64_PATTERN } from "./primitives.js";
+import type { StreamKind } from "./rest.js";
 
 export const LINK_SECRET_BYTES = 24;
 export const LINK_SECRET_ENCODED_LENGTH = Math.ceil(
@@ -23,6 +24,7 @@ export interface StreamAnchor {
 
 export interface StreamLocator {
   readonly streamId: StreamId;
+  readonly kind: StreamKind;
   readonly link?: StreamLinkParam;
   readonly anchor?: StreamAnchor;
 }
@@ -47,18 +49,20 @@ export function parseStreamUrl(input: string): StreamLocator {
     );
   }
 
-  const path = /^\/s\/([^/]+)$/.exec(url.pathname);
-  const rawStreamId = path?.[1];
-  if (rawStreamId === undefined) {
+  const path = /^\/([st])\/([^/]+)$/.exec(url.pathname);
+  const prefix = path?.[1];
+  const rawStreamId = path?.[2];
+  if (prefix === undefined || rawStreamId === undefined) {
     throw new ProtocolError(
       "invalid_stream_path",
-      "stream URL path must be /s/{stream_id}",
+      "stream URL path must be /s/{stream_id} or /t/{stream_id}",
     );
   }
 
   const streamId = parseStreamId(rawStreamId);
+  const kind: StreamKind = prefix === "t" ? "terminal" : "records";
   if (fragmentIndex === -1) {
-    return { streamId };
+    return { streamId, kind };
   }
   const fragment = url.hash.slice(1);
   const parameters = Array.from(new URLSearchParams(fragment));
@@ -95,8 +99,15 @@ export function parseStreamUrl(input: string): StreamLocator {
       secret: parseLinkSecret(value),
     };
   }
+  if (kind === "terminal" && anchor !== undefined) {
+    throw new ProtocolError(
+      "terminal_anchor_not_allowed",
+      "terminal URLs do not accept record anchors",
+    );
+  }
   return {
     streamId,
+    kind,
     ...(link === undefined ? {} : { link }),
     ...(anchor === undefined ? {} : { anchor }),
   };
@@ -126,12 +137,42 @@ export function buildStreamLink(
   secret: string,
   anchor?: StreamAnchor,
 ): URL {
-  const url = new URL(baseUrl);
-  requireWebUrl(url);
-  url.username = "";
-  url.password = "";
-  url.pathname = `/s/${parseStreamId(streamId)}`;
-  url.search = "";
+  return buildLink(baseUrl, "s", streamId, permissions, secret, anchor);
+}
+
+export function buildTerminalLink(
+  baseUrl: string | URL,
+  streamId: StreamId,
+  permissions: LinkPermissions,
+  secret: string,
+): URL {
+  return buildLink(baseUrl, "t", streamId, permissions, secret);
+}
+
+export function buildPublicTerminalUrl(
+  baseUrl: string | URL,
+  streamId: StreamId,
+): URL {
+  const url = normalizedStreamUrl(baseUrl, "t", streamId);
+  url.hash = "";
+  return url;
+}
+
+function buildLink(
+  baseUrl: string | URL,
+  prefix: "s" | "t",
+  streamId: StreamId,
+  permissions: LinkPermissions,
+  secret: string,
+  anchor?: StreamAnchor,
+): URL {
+  const url = normalizedStreamUrl(baseUrl, prefix, streamId);
+  if (prefix === "t" && anchor !== undefined) {
+    throw new ProtocolError(
+      "terminal_anchor_not_allowed",
+      "terminal URLs do not accept record anchors",
+    );
+  }
   const fragment = new URLSearchParams([
     [parseLinkPermissions(permissions), parseLinkSecret(secret)],
   ]);
@@ -139,6 +180,21 @@ export function buildStreamLink(
     fragment.set("at", parseStreamAnchor(anchor.seqNum.toString()).seqNum.toString());
   }
   url.hash = fragment.toString();
+  return url;
+}
+
+function normalizedStreamUrl(
+  baseUrl: string | URL,
+  prefix: "s" | "t",
+  streamId: StreamId,
+): URL {
+  const url = new URL(baseUrl);
+  requireWebUrl(url);
+  url.username = "";
+  url.password = "";
+  url.pathname = `/${prefix}/${parseStreamId(streamId)}`;
+  url.search = "";
+  url.hash = "";
   return url;
 }
 

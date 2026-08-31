@@ -6,7 +6,11 @@ This document defines the public TSF v1 wire contract across REST, Server-Sent E
 
 ## Stream model
 
-A stream is an append-only sequence of physical records. Its complete history remains readable until the stream expires or an owner deletes it.
+A stream has an immutable kind. A `records` stream is one append-only sequence of physical records. A `terminal` stream is a terminal session with independent input and output record sequences.
+
+The default kind is `records`.
+
+A stream's complete retained history remains readable until the stream expires or an owner deletes it.
 
 The service assigns each physical record a zero-based `seq_num` in append order. Sequence numbers are contiguous. The stream's `next_seq_num` is the sequence number that the next appended record will receive.
 
@@ -45,6 +49,8 @@ Private reads require read permission. Public reads require no link. All writes 
 
 A stream page uses `/s/{stream_id}`.
 
+A terminal page uses `/t/{stream_id}`. The distinct path selects terminal mode without a control-plane request.
+
 A link secret is carried in one URL fragment parameter:
 
 ```txt
@@ -68,6 +74,12 @@ Browser stream URLs do not accept query parameters. API read controls such as `s
 Changing the fragment key does not change the secret's authority. The server rejects any operation that the secret does not authorize.
 
 Browsers do not send URL fragments in HTTP requests. Clients extract the secret and send it in a bearer header or WebSocket opening frame.
+
+Terminal links use the same fragment format:
+
+```txt
+https://tail.surf/t/{stream_id}#rw={secret}
+```
 
 The API origin and web origin are independent deployment settings. Responses that mint credentials include the canonical `web_origin` used to present stream links. A stream link never selects the API backend.
 
@@ -95,9 +107,9 @@ Stream creation does not use a link secret and may be disabled by deployment pol
 
 ### Creation retries
 
-Stream and link creation accept an optional `Idempotency-Key`. A key is 32 random bytes encoded as exactly 43 unpadded base64url characters. One logical creation uses the same key, method, path, and body for every retry.
+Record stream and link creation accept an optional `Idempotency-Key`. Terminal stream creation requires it because the operation provisions metadata and two physical streams. A key is 32 random bytes encoded as exactly 43 unpadded base64url characters. One logical creation uses the same key, method, path, and body for every retry.
 
-Omitting the header requests one-shot creation. Retrying stream creation can create another stream. Retrying link creation cannot recover a committed credential and may conflict with the existing Link ID.
+Omitting the header requests one-shot record stream or link creation. Retrying record stream creation can create another stream. Retrying link creation cannot recover a committed credential and may conflict with the existing Link ID.
 
 An exact stream-creation replay returns the same Stream ID and initial credentials while the stream remains active. Reusing the key with a different request returns `409 conflict`.
 
@@ -115,7 +127,7 @@ An exact link-creation replay returns the same credential while the link row is 
 
 The server rejects unknown request fields. Clients ignore unknown response fields. [openapi.yaml](openapi.yaml) defines the exact OpenAPI 3.1 schemas.
 
-Stream metadata includes `created_at` and `expires_at` as RFC 3339 timestamps. Responses that create a stream or link also include `web_origin`.
+Stream metadata includes `kind`, `created_at`, and `expires_at`. The timestamps use RFC 3339. Responses that create a stream or link also include `web_origin`.
 
 Link creation uses `PUT /streams/{stream_id}/links/{link_id}`. The body carries `permissions` and an optional RFC 3339 `expires_at`.
 
@@ -123,7 +135,7 @@ A request that would mint a different credential or change the attributes of a r
 
 The Link ID is immutable. It identifies the link in owner interfaces, management paths, authorization state, rate limits, and derived writer identity.
 
-Stream creation defaults to private visibility and expiry 10 days after creation. A request creates one to three initial, non-expiring links. Each link has a unique `link_id` and permissions. At least one must be an owner.
+Stream creation defaults to the `records` kind, private visibility, and expiry 10 days after creation. A request creates one to three initial, non-expiring links. Each link has a unique `link_id` and permissions. At least one must be an owner.
 
 Stream creation accepts an optional `title`. Creation and metadata responses always contain `title`, using `null` for an untitled stream.
 
@@ -239,6 +251,48 @@ A zero-count read carries its terminal cursor on `stream_metadata`. A resume aft
 A retryable interruption aborts the response. A client resumes with the unchanged URL and the latest event ID.
 
 A non-retryable failure after the response opens sends a terminal `error` event and ends the response. Its data is `{ "error": { "code": "...", "message": "..." } }`. It has no resume ID.
+
+## Terminal sessions
+
+A terminal stream has independent `input` and `output` logs. Each log follows the ordinary record ordering, durability, retry, and read semantics.
+
+Terminal data uses WebSocket routes.
+
+```txt
+/api/v1/streams/{stream_id}/terminal/input/read
+/api/v1/streams/{stream_id}/terminal/input/write
+/api/v1/streams/{stream_id}/terminal/output/read
+/api/v1/streams/{stream_id}/terminal/output/write
+```
+
+Read permission authorizes output reads. Write permission authorizes input writes. Owner permission authorizes every terminal route. Public visibility authorizes output reads without a link.
+
+Only an owner can read the input log or write the output log. Generic record data-plane routes reject terminal streams. Terminal routes reject `records` streams.
+
+Terminal events use unsplit byte records. Every payload begins with a version byte and a type byte. The version is `0x01`.
+
+Input event types are:
+
+| Type | Name | Body |
+| --- | --- | --- |
+| `0x01` | `data` | PTY input bytes |
+| `0x02` | `resize` | Columns and rows as big-endian `uint16` values |
+
+Output event types are:
+
+| Type | Name | Body |
+| --- | --- | --- |
+| `0x01` | `data` | PTY output bytes |
+| `0x02` | `resize` | Accepted columns and rows as big-endian `uint16` values |
+| `0x03` | `started` | Initial columns and rows as big-endian `uint16` values |
+| `0x04` | `exited` | Signed exit status as a big-endian `int32` value |
+| `0x05` | `heartbeat` | Empty |
+
+Resize dimensions are non-zero. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors.
+
+The host writes one `started` event before other output. It writes data, resize, and heartbeat events while the child runs. A clean exit ends with one `exited` event. The browser rejects an event before `started` or a second `started`, and stops reading at `exited`.
+
+The `tsf terminal` host claims sequence zero before starting its PTY. This prevents a second CLI host from attaching to the same output log. It applies a requested resize before publishing the output resize event.
 
 ## History export
 

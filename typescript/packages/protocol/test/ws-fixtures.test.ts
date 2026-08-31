@@ -346,6 +346,7 @@ function serverFrame(frame: FrameFixture["frame"]): ServerFrame {
         type: "streamMetadata",
         stream: streamMetadataSchema.parse({
           stream_id: requiredString(frame, "stream_id"),
+          kind: requiredString(frame, "kind"),
           title: requiredString(frame, "title"),
           visibility: requiredString(frame, "visibility"),
           created_at: requiredString(frame, "created_at"),

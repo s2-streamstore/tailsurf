@@ -95,6 +95,18 @@ async fn write_stream(
 
 The [complete example](https://github.com/s2-streamstore/tailsurf/blob/main/rust/examples/create_write_read_delete.rs) creates, writes, reads, and deletes a stream.
 
+## Terminal sessions
+
+Create a terminal resource with `StreamKind::Terminal`.
+
+Terminal sessions have separate input and output logs. Controllers use `connect_terminal_input_writer`. Observers use `connect_terminal_output_reader`.
+
+A host with an owner link uses `connect_terminal_input_reader` and `connect_terminal_output_writer`.
+
+`terminal_link` and `public_terminal_url` build the canonical `/t/{stream_id}` browser URLs.
+
+`encode_terminal_input`, `decode_terminal_input`, `encode_terminal_output`, and `decode_terminal_output` implement the versioned terminal event payloads. Events remain ordinary unsplit byte records, so terminal clients retain the normal durability and reconnect behavior.
+
 ## Manage
 
 Management methods require an owner link secret. `list_links` returns one page. `list_all_links` follows pagination and validates the complete inventory.

@@ -242,6 +242,7 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             expires_at,
         } => ServerFrame::StreamMetadata(StreamMetadata {
             stream_id: stream_id.parse().expect("fixture stream ID"),
+            kind: tailsurf::StreamKind::Records,
             title: title.map(|title| title.parse().expect("fixture stream title")),
             visibility,
             created_at,

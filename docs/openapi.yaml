@@ -10,7 +10,7 @@ paths:
     post:
       operationId: createStream
       summary: Create a stream
-      description: The server generates a random Stream ID. When Idempotency-Key is present, an exact key and request replay resolves that ID and returns the original stream and link credentials while the mapped stream remains active. Reusing the key with a different request returns 409. Treat the key and complete request as sensitive recovery material. When the header is absent, creation is one-shot. A retry creates another stream and cannot recover a lost response.
+      description: The server generates a random Stream ID. Terminal creation requires Idempotency-Key. When the header is present, an exact key and request replay resolves that ID and returns the original stream and link credentials while the mapped stream remains active. Reusing the key with a different request returns 409. Treat the key and complete request as sensitive recovery material. Record stream creation without the header is one-shot. A retry creates another stream and cannot recover a lost response.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -270,9 +270,10 @@ components:
       description: Human-facing Unicode title. Code-point length is at most 120. Leading or trailing whitespace, control characters, and line breaks are invalid.
     StreamMetadata:
       type: object
-      required: [stream_id, title, visibility, created_at, expires_at]
+      required: [stream_id, kind, title, visibility, created_at, expires_at]
       properties:
         stream_id: { $ref: '#/components/schemas/StreamId' }
+        kind: { enum: [records, terminal] }
         title: { oneOf: [{ $ref: '#/components/schemas/StreamTitle' }, { type: 'null' }] }
         visibility: { enum: [private, public] }
         created_at: { type: string, format: date-time }
@@ -290,6 +291,7 @@ components:
       additionalProperties: false
       required: [links]
       properties:
+        kind: { enum: [records, terminal], default: records }
         title: { $ref: '#/components/schemas/StreamTitle' }
         visibility: { enum: [private, public], default: private }
         expires_in_seconds: { type: integer, minimum: 1, maximum: 864000 }

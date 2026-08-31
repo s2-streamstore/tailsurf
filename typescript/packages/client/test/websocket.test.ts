@@ -121,6 +121,43 @@ describe("TsfClient configuration", () => {
       webSocketConnectTimeoutMs: 2_147_483_648,
     })).toThrow(expect.objectContaining({ code: "invalid_client_option" }));
   });
+
+  it("routes terminal readers and writers to separate channels", async () => {
+    const streamId = generateStreamId();
+    const urls: string[] = [];
+    const client = new TsfClient({
+      apiOrigin: "http://localhost:8787",
+      webSocketFactory: (url) => {
+        urls.push(url);
+        return new ScriptedWebSocket(
+          new URL(url).pathname.endsWith("/read")
+            ? [{ type: "ready" }, streamMetadataFrame(streamId)]
+            : [{ type: "ready" }],
+          1000,
+        );
+      },
+    });
+    const options = {
+      streamId,
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+
+    const outputReader = await client.connectTerminalOutputReader(options);
+    outputReader.close();
+    const inputReader = await client.connectTerminalInputReader(options);
+    inputReader.close();
+    const inputWriter = await client.connectTerminalInputWriter(options);
+    await inputWriter.close();
+    const outputWriter = await client.connectTerminalOutputWriter(options);
+    await outputWriter.close();
+
+    expect(urls.map((url) => new URL(url).pathname)).toEqual([
+      `/api/v1/streams/${streamId}/terminal/output/read`,
+      `/api/v1/streams/${streamId}/terminal/input/read`,
+      `/api/v1/streams/${streamId}/terminal/input/write`,
+      `/api/v1/streams/${streamId}/terminal/output/write`,
+    ]);
+  });
 });
 
 describe("TsfReadSession", () => {
@@ -1717,6 +1754,7 @@ function streamMetadataFrame(
     type: "streamMetadata",
     stream: {
       stream_id: streamId,
+      kind: "records",
       title: null,
       visibility: "public",
       created_at: "2026-08-13T00:00:00Z",

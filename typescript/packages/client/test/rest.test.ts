@@ -217,6 +217,7 @@ describe("TsfClient REST API", () => {
     expect(input).toBe("http://localhost:8787/api/v1/streams");
     expect(init?.method).toBe("POST");
     const createBody = jsonRequestBody(init?.body);
+    expect(createBody.kind).toBe("records");
     expect(createBody.visibility).toBe("private");
     expect(createBody.links).toHaveLength(1);
     expect(createBody.links[0]).toMatchObject({
@@ -798,6 +799,7 @@ function createResponse(
 ): Response {
   return Response.json({
     stream_id: streamId,
+    kind: "records",
     title: null,
     visibility,
     created_at: "2026-08-11T00:00:00Z",

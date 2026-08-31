@@ -596,6 +596,7 @@ function sseResponseText(
 ): string {
   return `${options.streamMetadataCursor === undefined ? "" : `id: ${options.streamMetadataCursor}\n`}event: stream_metadata\ndata: ${JSON.stringify({
       stream_id: streamId,
+      kind: "records",
       title: null,
       visibility: "public",
       created_at: "2026-08-13T00:00:00Z",
@@ -614,6 +615,7 @@ function interruptedSseResponseAfter(streamId: string, events: string): Response
       controller.enqueue(encoder.encode(
         `event: stream_metadata\ndata: ${JSON.stringify({
           stream_id: streamId,
+          kind: "records",
           title: null,
           visibility: "public",
           created_at: "2026-08-13T00:00:00Z",

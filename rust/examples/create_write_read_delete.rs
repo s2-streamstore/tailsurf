@@ -18,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let created = client
         .create_stream(&CreateStreamRequest {
+            kind: tailsurf::StreamKind::Records,
             title: Some("SDK lifecycle".parse()?),
             visibility: Visibility::Private,
             expires_in_seconds: None,

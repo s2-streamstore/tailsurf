@@ -56,6 +56,7 @@ export const linkIdSchema = transformedString(parseLinkId);
 export const streamTitleSchema = transformedString(parseStreamTitle);
 export const linkPermissionsSchema = transformedString(parseLinkPermissions);
 export const visibilitySchema = z.enum(["private", "public"]);
+export const streamKindSchema = z.enum(["records", "terminal"]);
 export const jsonU64Schema = z.number().check(
   z.int(),
   z.nonnegative(),
@@ -101,6 +102,7 @@ export const initialStreamLinkSchema = z.strictObject({
 });
 
 export const createStreamRequestSchema = z.strictObject({
+  kind: z._default(streamKindSchema, "records"),
   title: z.optional(streamTitleSchema),
   visibility: z._default(visibilitySchema, "private"),
   expires_in_seconds: z.optional(z.number().check(
@@ -138,6 +140,7 @@ export const streamLinkCredentialSchema = z.object({
 
 export const streamMetadataSchema = z.object({
   stream_id: streamIdSchema,
+  kind: streamKindSchema,
   title: z.nullable(streamTitleSchema),
   visibility: visibilitySchema,
   created_at: streamTimestampSchema,
@@ -271,6 +274,7 @@ export const sseCaughtUpDataSchema = z.object({
 });
 
 export type Visibility = z.infer<typeof visibilitySchema>;
+export type StreamKind = z.infer<typeof streamKindSchema>;
 export type InitialStreamLink = z.infer<typeof initialStreamLinkSchema>;
 export type CreateStreamRequest = z.infer<typeof createStreamRequestSchema>;
 export type StreamLinkCredential = z.infer<typeof streamLinkCredentialSchema>;
@@ -335,4 +339,3 @@ export function isCanonicalIdempotencyKey(value: string): boolean {
   return IDEMPOTENCY_KEY_PATTERN.test(value) &&
     canonicalBase64url(value, IDEMPOTENCY_KEY_BYTES);
 }
-

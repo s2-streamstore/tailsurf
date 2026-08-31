@@ -78,6 +78,27 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const WEBSOCKET_READ_IDLE_TIMEOUT: Duration =
     Duration::from_millis(WEBSOCKET_HEARTBEAT_INTERVAL_MS * 3);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DataPlaneRoute {
+    Records,
+    TerminalInput,
+    TerminalOutput,
+}
+
+impl DataPlaneRoute {
+    fn path(self, stream_id: &StreamId, operation: &str) -> String {
+        match self {
+            Self::Records => format!("/streams/{stream_id}/{operation}"),
+            Self::TerminalInput => {
+                format!("/streams/{stream_id}/terminal/input/{operation}")
+            }
+            Self::TerminalOutput => {
+                format!("/streams/{stream_id}/terminal/output/{operation}")
+            }
+        }
+    }
+}
+
 /// Timeouts, retry behavior, and API origin for [`TsfClient`].
 ///
 /// Configured durations cannot exceed 2,147,483,647 milliseconds. Required timeouts must be
@@ -556,15 +577,47 @@ impl TsfClient {
         &self,
         options: DurableWriterOptions,
     ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_route(options, DataPlaneRoute::Records)
+            .await
+    }
+
+    /// Connects a controller writer to a terminal session's input channel.
+    pub async fn connect_terminal_input_writer(
+        &self,
+        options: DurableWriterOptions,
+    ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_route(options, DataPlaneRoute::TerminalInput)
+            .await
+    }
+
+    /// Connects the terminal host writer to the output channel. The link must be an owner.
+    pub async fn connect_terminal_output_writer(
+        &self,
+        options: DurableWriterOptions,
+    ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_route(options, DataPlaneRoute::TerminalOutput)
+            .await
+    }
+
+    async fn connect_writer_route(
+        &self,
+        options: DurableWriterOptions,
+        route: DataPlaneRoute,
+    ) -> Result<TsfWriter, TsfClientError> {
         let mut session_options = WriteSessionOptions::new(
             options.stream_id,
             ClientWriterId::new_random(),
             options.link_secret,
         );
         session_options.expected_next_seq_num = options.expected_next_seq_num;
-        let session = self.open_write_session(&session_options).await?;
+        let session = self.open_write_session(&session_options, route).await?;
         session_options.expected_next_seq_num = None;
-        Ok(TsfWriter::new(self.clone(), session_options, session))
+        Ok(TsfWriter::new(
+            self.clone(),
+            session_options,
+            route,
+            session,
+        ))
     }
 
     /// Connects a low-level write session that sends records and receives ack ranges directly.
@@ -574,22 +627,25 @@ impl TsfClient {
         &self,
         options: WriteSessionOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        self.open_write_session(&options).await
+        self.open_write_session(&options, DataPlaneRoute::Records)
+            .await
     }
 
     async fn open_write_session(
         &self,
         options: &WriteSessionOptions,
+        route: DataPlaneRoute,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        self.retry_transient(|| self.connect_write_session_once(options))
+        self.retry_transient(|| self.connect_write_session_once(options, route))
             .await
     }
 
     async fn connect_write_session_once(
         &self,
         options: &WriteSessionOptions,
+        route: DataPlaneRoute,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        let url = self.websocket_url(format_args!("/streams/{}/write", options.stream_id))?;
+        let url = self.websocket_url(route.path(&options.stream_id, "write"))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let progress_timeout = self.config.websocket_progress_timeout;
         let opening_frame = ClientFrame::OpenWrite {
@@ -614,13 +670,41 @@ impl TsfClient {
         &self,
         options: ReadOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
+        self.connect_reader_route(options, DataPlaneRoute::Records)
+            .await
+    }
+
+    /// Connects an observer reader to a terminal session's output channel.
+    pub async fn connect_terminal_output_reader(
+        &self,
+        options: ReadOptions,
+    ) -> Result<TsfReadSession, TsfClientError> {
+        self.connect_reader_route(options, DataPlaneRoute::TerminalOutput)
+            .await
+    }
+
+    /// Connects the terminal host to its input channel. The link must be an owner.
+    pub async fn connect_terminal_input_reader(
+        &self,
+        options: ReadOptions,
+    ) -> Result<TsfReadSession, TsfClientError> {
+        self.connect_reader_route(options, DataPlaneRoute::TerminalInput)
+            .await
+    }
+
+    async fn connect_reader_route(
+        &self,
+        options: ReadOptions,
+        route: DataPlaneRoute,
+    ) -> Result<TsfReadSession, TsfClientError> {
         let ConnectedReadSocket {
             socket,
             stream_metadata,
-        } = self.connect_read_socket(&options).await?;
+        } = self.connect_read_socket(&options, route).await?;
         Ok(TsfReadSession::new(
             self.clone(),
             options,
+            route,
             socket,
             stream_metadata,
         ))
@@ -739,13 +823,14 @@ impl TsfClient {
     async fn connect_read_socket(
         &self,
         options: &ReadOptions,
+        route: DataPlaneRoute,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
         validate_read_options(options)?;
         let opening_frame = ClientFrame::OpenRead {
             link_secret: options.link_secret.clone(),
         }
         .encode()?;
-        let mut url = self.websocket_url(format_args!("/streams/{}/read", options.stream_id))?;
+        let mut url = self.websocket_url(route.path(&options.stream_id, "read"))?;
         append_read_query(&mut url, options);
         let connect_timeout = self.config.websocket_connect_timeout;
         let progress_timeout = self.config.websocket_progress_timeout;
@@ -1184,7 +1269,12 @@ impl fmt::Debug for TsfWriter {
 }
 
 impl TsfWriter {
-    fn new(client: TsfClient, options: WriteSessionOptions, session: TsfWriteSession) -> Self {
+    fn new(
+        client: TsfClient,
+        options: WriteSessionOptions,
+        route: DataPlaneRoute,
+        session: TsfWriteSession,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(WriterShared {
             terminal_error: Arc::new(OnceLock::new()),
@@ -1194,6 +1284,7 @@ impl TsfWriter {
         let task = tokio::spawn(run_writer(
             client,
             options,
+            route,
             session,
             cmd_rx,
             Arc::clone(&shared),
@@ -1479,11 +1570,17 @@ impl WriterCursor {
 async fn run_writer(
     client: TsfClient,
     options: WriteSessionOptions,
+    route: DataPlaneRoute,
     mut session: TsfWriteSession,
     mut cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
     shared: Arc<WriterShared>,
 ) {
     let _shutdown_guard = ShutdownGuard(Arc::clone(&shared));
+    let connection = WriterReconnectContext {
+        client: &client,
+        options: &options,
+        route,
+    };
     let mut pending: VecDeque<PendingSubmission> = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
     let mut reconnect_attempts = 0;
@@ -1498,8 +1595,7 @@ async fn run_writer(
         {
             match recover_pending_appends(
                 &mut session,
-                &client,
-                &options,
+                &connection,
                 &mut pending,
                 &mut in_flight,
                 &mut reconnect_attempts,
@@ -1575,8 +1671,7 @@ async fn run_writer(
                 if let Some(error) = recover_from
                     && let Err(error) = recover_pending_appends(
                         &mut session,
-                        &client,
-                        &options,
+                        &connection,
                         &mut pending,
                         &mut in_flight,
                         &mut reconnect_attempts,
@@ -1724,6 +1819,12 @@ async fn send_pending(
     .await
 }
 
+struct WriterReconnectContext<'a> {
+    client: &'a TsfClient,
+    options: &'a WriteSessionOptions,
+    route: DataPlaneRoute,
+}
+
 /// Reconnects the write session and marks every unacknowledged record for paced resend.
 ///
 /// The fresh socket carries no in-flight records, so the whole in-flight window is replaced —
@@ -1733,8 +1834,7 @@ async fn send_pending(
 /// exact writer identity, sequence ranges, and payloads.
 async fn recover_pending_appends(
     session: &mut TsfWriteSession,
-    client: &TsfClient,
-    options: &WriteSessionOptions,
+    connection: &WriterReconnectContext<'_>,
     pending: &mut VecDeque<PendingSubmission>,
     in_flight: &mut InFlightWindow,
     reconnect_attempts: &mut usize,
@@ -1748,7 +1848,11 @@ async fn recover_pending_appends(
         let delay = reconnect_delay(*reconnect_attempts);
         sleep(delay).await;
         *reconnect_attempts = (*reconnect_attempts).saturating_add(1);
-        match client.connect_write_session_once(options).await {
+        match connection
+            .client
+            .connect_write_session_once(connection.options, connection.route)
+            .await
+        {
             Ok(connected) => {
                 *session = connected;
                 for submission in pending.iter_mut() {
@@ -2022,6 +2126,7 @@ impl TsfSseReadSession {
 pub struct TsfReadSession {
     client: TsfClient,
     options: ReadOptions,
+    route: DataPlaneRoute,
     socket: ReadSocket,
     stream_metadata: StreamMetadata,
     finished: bool,
@@ -2034,12 +2139,14 @@ impl TsfReadSession {
     fn new(
         client: TsfClient,
         options: ReadOptions,
+        route: DataPlaneRoute,
         socket: ReadSocket,
         stream_metadata: StreamMetadata,
     ) -> Self {
         Self {
             client,
             options,
+            route,
             socket,
             stream_metadata,
             finished: false,
@@ -2115,7 +2222,10 @@ impl TsfReadSession {
         let ConnectedReadSocket {
             socket,
             stream_metadata,
-        } = self.client.connect_read_socket(&self.options).await?;
+        } = self
+            .client
+            .connect_read_socket(&self.options, self.route)
+            .await?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
         self.no_progress_reconnects = 0;
@@ -3347,6 +3457,22 @@ mod tests {
     };
 
     #[test]
+    fn terminal_data_plane_routes_are_distinct() {
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+
+        assert_eq!(
+            DataPlaneRoute::TerminalInput.path(&stream_id, "read"),
+            "/streams/00000000000000000000000000000000/terminal/input/read"
+        );
+        assert_eq!(
+            DataPlaneRoute::TerminalOutput.path(&stream_id, "write"),
+            "/streams/00000000000000000000000000000000/terminal/output/write"
+        );
+    }
+
+    #[test]
     fn parses_structured_http_error_details() {
         let body = r#"{"error":{"code":"sequence_mismatch","message":"position changed","request_id":"request-42","retry_after_ms":125,"actual_next_seq_num":"42","future_field":true}}"#;
         let parsed: ApiErrorResponse = serde_json::from_str(body).expect("structured API error");
@@ -3527,6 +3653,7 @@ mod tests {
             stream_id: "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
+            kind: crate::protocol::rest::StreamKind::Records,
             title: None,
             visibility: crate::protocol::rest::Visibility::Private,
             created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -4501,7 +4628,7 @@ mod tests {
                 let _ = stream.read(&mut request).await;
                 let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
                     event: stream_metadata\n\
-                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
+                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"kind\":\"records\",\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
                 let _ = stream.write_all(response.as_bytes()).await;
             }
         });

@@ -35,6 +35,7 @@ import {
   type LinkId,
   type LinkPermissions,
   type Visibility,
+  type StreamKind,
 } from "@tailsurf/protocol";
 
 import {
@@ -95,6 +96,7 @@ export interface InitialStreamLinkOptions {
 }
 
 export interface CreateStreamInput {
+  readonly kind?: StreamKind;
   readonly title?: string;
   readonly visibility?: Visibility;
   readonly expiresInSeconds?: number;
@@ -102,6 +104,7 @@ export interface CreateStreamInput {
 }
 
 export interface PreparedCreateStreamRequest {
+  readonly kind: StreamKind;
   readonly title?: string;
   readonly visibility: Visibility;
   readonly expiresInSeconds?: number;
@@ -738,6 +741,7 @@ export function prepareCreateStreamRequest(
     ? requestedLinks
     : [{ linkId: parseLinkId("owner"), permissions: "o" as const }, ...requestedLinks];
   return parsePreparedCreateStreamRequest({
+    kind: request.kind ?? "records",
     ...(request.title === undefined ? {} : { title: request.title }),
     visibility: request.visibility ?? "private",
     ...(request.expiresInSeconds === undefined
@@ -757,6 +761,7 @@ export function parsePreparedCreateStreamRequest(
     );
   }
   const wire = createStreamRequestSchema.parse({
+    ...(input.kind === undefined ? {} : { kind: input.kind }),
     ...(input.title === undefined ? {} : { title: input.title }),
     ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
     ...(input.expiresInSeconds === undefined
@@ -776,6 +781,7 @@ export function parsePreparedCreateStreamRequest(
     }),
   });
   return {
+    kind: wire.kind,
     ...(wire.title === undefined ? {} : { title: wire.title }),
     visibility: wire.visibility,
     ...(wire.expires_in_seconds === undefined
@@ -792,6 +798,7 @@ function createStreamRequestToWire(
   request: PreparedCreateStreamRequest,
 ): WireCreateStreamRequest {
   return {
+    kind: request.kind,
     ...(request.title === undefined
       ? {}
       : { title: parseStreamTitle(request.title) }),

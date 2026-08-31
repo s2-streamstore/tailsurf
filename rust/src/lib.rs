@@ -31,7 +31,12 @@ pub use protocol::{
     rest::{
         AppendRange, CreateLinkInput, CreateLinkResponse, CreateStreamRequest,
         CreateStreamResponse, InitialStreamLink, ListLinksResponse, MAX_INITIAL_STREAM_LINKS,
-        StreamLinkCredential, StreamLinkSummary, StreamMetadata, UpdateStreamRequest, Visibility,
+        StreamKind, StreamLinkCredential, StreamLinkSummary, StreamMetadata, UpdateStreamRequest,
+        Visibility,
+    },
+    terminal::{
+        TerminalInputEvent, TerminalOutputEvent, TerminalProtocolError, decode_terminal_input,
+        decode_terminal_output, encode_terminal_input, encode_terminal_output,
     },
     ws::{
         MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteSessionOptions,

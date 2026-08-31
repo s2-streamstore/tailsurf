@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tailsurf::{
     AppendBatch, AppendTicket, DEFAULT_API_ORIGIN, DurableWriterOptions, LinkId, LinkPermissions,
     LinkSecret, MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, ReadOptions,
-    ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfProducer, TsfReadSession,
+    ReadStart, ReadStop, StreamId, StreamKind, StreamTitle, TsfClient, TsfProducer, TsfReadSession,
     TsfSseReadSession, TsfWriter, default_api_origin,
     protocol::{
         rest::{
@@ -35,7 +35,9 @@ use tailsurf::{
         },
         ws::frame::{MAX_RECORD_PAYLOAD_BYTES, PartHeader, RecordFormat},
     },
-    stream_url::{StreamLocator, public_stream_url, stream_link},
+    stream_url::{
+        StreamLocator, public_stream_url, public_terminal_url, stream_link, terminal_link,
+    },
     transcript::{DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES, LogicalTranscript},
 };
 use tokio::{
@@ -61,6 +63,10 @@ const UPDATE_HINT_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_HINT_SUCCESS_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_HINT_TIMEOUT: Duration = Duration::from_secs(3);
 
+mod terminal;
+
+use terminal::TerminalArgs;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct UpdateHintCheckCache {
     last_attempt_at: u64,
@@ -71,7 +77,7 @@ struct UpdateHintCheckCache {
 #[command(name = "tsf")]
 #[command(version, about = "Create, write, and read tail.surf streams")]
 #[command(
-    after_help = "Create a stream from piped input:\n  anything | tsf\n  anything | tsf new\n\nCapture a program in a new stream:\n  tsf new -- program\n\nWrite to an existing stream:\n  anything | tsf write WRITE_LINK"
+    after_help = "Create a stream from piped input:\n  anything | tsf\n  anything | tsf new\n\nCapture a program in a new stream:\n  tsf new -- program\n\nHost a multiplayer web terminal:\n  tsf terminal\n  tsf terminal -- htop\n\nWrite to an existing stream:\n  anything | tsf write WRITE_LINK"
 )]
 struct Cli {
     /// Tailsurf service origin.
@@ -91,6 +97,8 @@ struct Cli {
 enum Command {
     /// Create a stream and print its links.
     New(NewArgs),
+    /// Host a command in a multiplayer web terminal.
+    Terminal(TerminalArgs),
     /// Write piped input or a program's output to an existing stream.
     Write(WriteArgs),
     /// Follow a stream, optionally starting from existing records.
@@ -621,6 +629,7 @@ async fn main() -> ExitCode {
 async fn run(origin: Url, command: Command) -> eyre::Result<()> {
     match command {
         Command::New(args) => new_stream(origin, args).await,
+        Command::Terminal(args) => terminal::run(origin, args).await,
         Command::Write(args) => write_stream(origin, args).await,
         Command::Tail(args) => tail_stream(origin, args).await,
         Command::Replay(args) => replay_stream(origin, args).await,
@@ -778,6 +787,7 @@ async fn new_stream(origin: Url, args: NewArgs) -> eyre::Result<()> {
 
     let created = TsfClient::with_api_origin(origin.clone())?
         .create_stream(&CreateStreamRequest {
+            kind: tailsurf::StreamKind::Records,
             title: args.title.clone(),
             visibility,
             expires_in_seconds: args.expires.map(StreamExpiryArg::seconds),
@@ -811,6 +821,7 @@ async fn new_stream(origin: Url, args: NewArgs) -> eyre::Result<()> {
 
 async fn write_stream(origin: Url, args: WriteArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream link")?;
+    require_record_stream(&locator, "write")?;
     let link = locator
         .link_declaring(LinkPermissions::allows_write)
         .context("link does not declare write permission")?
@@ -1476,6 +1487,7 @@ fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadSta
 
 async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
+    require_record_stream(&locator, "tail")?;
     let request = read_options(&locator, &args.read, ReadStart::TailOffset(0));
 
     read_transcript(
@@ -1489,6 +1501,7 @@ async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
 
 async fn replay_stream(origin: Url, args: ReplayArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
+    require_record_stream(&locator, "replay")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
     request.stop.get_or_insert(ReadStop {
         wait_seconds: Some(0),
@@ -1663,9 +1676,10 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
         )
         .await
         .context("failed to create link")?;
-    let url = stream_link(
+    let url = resource_link(
         &created.web_origin,
         &locator.stream_id,
+        locator.kind,
         created.credential.permissions,
         &created.credential.secret,
     )?;
@@ -1845,6 +1859,13 @@ fn owner_client_from_link(
     ))
 }
 
+fn require_record_stream(locator: &StreamLocator, command: &str) -> eyre::Result<()> {
+    if locator.kind == StreamKind::Terminal {
+        bail!("`tsf {command}` accepts record stream links, not terminal links");
+    }
+    Ok(())
+}
+
 fn confirm_delete(stream_id: &StreamId, yes: bool) -> eyre::Result<bool> {
     if yes {
         return Ok(true);
@@ -1895,11 +1916,39 @@ fn write_json(writer: impl std::io::Write, value: &impl Serialize) -> eyre::Resu
     Ok(())
 }
 
+fn resource_link(
+    web_origin: &Url,
+    stream_id: &StreamId,
+    kind: StreamKind,
+    permissions: LinkPermissions,
+    secret: &LinkSecret,
+) -> Result<Url, tailsurf::stream_url::StreamLinkError> {
+    match kind {
+        StreamKind::Records => stream_link(web_origin, stream_id, permissions, secret),
+        StreamKind::Terminal => terminal_link(web_origin, stream_id, permissions, secret),
+    }
+}
+
+fn public_resource_url(
+    web_origin: &Url,
+    stream_id: &StreamId,
+    kind: StreamKind,
+) -> Result<Url, tailsurf::stream_url::StreamLinkError> {
+    match kind {
+        StreamKind::Records => public_stream_url(web_origin, stream_id),
+        StreamKind::Terminal => public_terminal_url(web_origin, stream_id),
+    }
+}
+
 fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Result<()> {
     let web_origin = &created.web_origin;
     if !json {
+        let resource = match created.kind {
+            StreamKind::Records => "stream",
+            StreamKind::Terminal => "terminal",
+        };
         println!(
-            "Created {} stream {}",
+            "Created {} {resource} {}",
             created.visibility, created.stream_id
         );
         println!(
@@ -1907,7 +1956,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
             created
                 .title
                 .as_ref()
-                .map_or("Untitled stream", StreamTitle::as_str)
+                .map_or_else(|| format!("Untitled {resource}"), |title| title.to_string())
         );
         println!("Expires: {}", created.expires_at);
         let mut links = created
@@ -1917,9 +1966,10 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
                 Ok((
                     credential.link_id.as_str(),
                     credential.permissions,
-                    stream_link(
+                    resource_link(
                         web_origin,
                         &created.stream_id,
+                        created.kind,
                         credential.permissions,
                         &credential.secret,
                     )?,
@@ -1935,7 +1985,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
             links.push((
                 "Public",
                 LinkPermissions::read(),
-                public_stream_url(web_origin, &created.stream_id)?,
+                public_resource_url(web_origin, &created.stream_id, created.kind)?,
                 "  (public)",
             ));
         }
@@ -1957,6 +2007,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
     } else {
         let output = CreatedStreamOutput {
             stream_id: created.stream_id.to_string(),
+            kind: created.kind.as_str(),
             title: created
                 .title
                 .as_ref()
@@ -1970,9 +2021,10 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
                     Ok(CreatedLinkOutput {
                         link_id: credential.link_id.to_string(),
                         permissions: permission_label(credential.permissions),
-                        url: stream_link(
+                        url: resource_link(
                             web_origin,
                             &created.stream_id,
+                            created.kind,
                             credential.permissions,
                             &credential.secret,
                         )?
@@ -1981,9 +2033,9 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
                 })
                 .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?,
             public_url: match created.visibility {
-                Visibility::Public => {
-                    Some(public_stream_url(web_origin, &created.stream_id)?.to_string())
-                }
+                Visibility::Public => Some(
+                    public_resource_url(web_origin, &created.stream_id, created.kind)?.to_string(),
+                ),
                 Visibility::Private => None,
             },
         };
@@ -1995,6 +2047,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
 fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()> {
     if !json {
         println!("Stream {}", stream.stream_id);
+        println!("Kind: {}", stream.kind);
         println!(
             "Title: {}",
             stream
@@ -2072,9 +2125,10 @@ fn write_link_file(
         .iter()
         .find(|link| link.permissions == permissions)
         .with_context(|| format!("created stream did not include a {kind} link"))?;
-    let url = stream_link(
+    let url = resource_link(
         &created.web_origin,
         &created.stream_id,
+        created.kind,
         link.permissions,
         &link.secret,
     )?;
@@ -2164,6 +2218,7 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
 #[derive(Serialize)]
 struct CreatedStreamOutput {
     stream_id: String,
+    kind: &'static str,
     title: Option<String>,
     visibility: &'static str,
     expires_at: String,
@@ -2194,6 +2249,33 @@ struct LinkMutationOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_commands_reject_terminal_links() {
+        let stream_id: StreamId = "00000000000000000000000000000000"
+            .parse()
+            .expect("valid stream ID");
+        let terminal = StreamLocator {
+            stream_id,
+            kind: StreamKind::Terminal,
+            link: None,
+            anchor: None,
+        };
+        let records = StreamLocator {
+            stream_id,
+            kind: StreamKind::Records,
+            link: None,
+            anchor: None,
+        };
+
+        assert_eq!(
+            require_record_stream(&terminal, "tail")
+                .expect_err("terminal link must be rejected")
+                .to_string(),
+            "`tsf tail` accepts record stream links, not terminal links",
+        );
+        require_record_stream(&records, "tail").expect("record link must be accepted");
+    }
 
     #[test]
     fn initial_links_accept_semantic_ids_and_short_permissions() {

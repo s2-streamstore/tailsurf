@@ -11,6 +11,7 @@
   "max_sse_event_bytes": 2097152,
   "max_sse_unterminated_event_bytes": 2097152,
   "create_request": {
+    "kind": "records",
     "title": "Deploy log",
     "visibility": "private",
     "links": [
@@ -20,6 +21,7 @@
   },
   "stream_resource": {
     "stream_id": "00000000000000000000000000000000",
+    "kind": "records",
     "title": "Deploy log",
     "visibility": "private",
     "created_at": "2026-08-13T00:00:00Z",
@@ -28,6 +30,7 @@
   },
   "create_response": {
     "stream_id": "00000000000000000000000000000000",
+    "kind": "records",
     "title": "Deploy log",
     "visibility": "private",
     "created_at": "2026-08-13T00:00:00Z",

@@ -34,6 +34,33 @@ pub const MAX_SSE_UNTERMINATED_EVENT_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum links accepted atomically with stream creation.
 pub const MAX_INITIAL_STREAM_LINKS: usize = 3;
 
+/// Immutable stream resource kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamKind {
+    /// One ordinary append-only record log.
+    #[default]
+    Records,
+    /// A terminal session with independent input and output logs.
+    Terminal,
+}
+
+impl StreamKind {
+    /// Returns the canonical lowercase wire form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Records => "records",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Whether a stream requires read authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +91,9 @@ impl std::fmt::Display for Visibility {
 /// Options for creating a stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
+    /// Immutable resource kind. Defaults to an ordinary record stream.
+    #[serde(default)]
+    pub kind: StreamKind,
     /// Optional human-facing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<StreamTitle>,
@@ -81,6 +111,7 @@ pub struct CreateStreamRequest {
 impl Default for CreateStreamRequest {
     fn default() -> Self {
         Self {
+            kind: StreamKind::Records,
             title: None,
             visibility: Visibility::Private,
             expires_in_seconds: None,
@@ -131,6 +162,8 @@ pub struct StreamLinkCredential {
 pub struct CreateStreamResponse {
     /// Stable stream identifier.
     pub stream_id: StreamId,
+    /// Immutable resource kind.
+    pub kind: StreamKind,
     /// Human-facing title when one has been set.
     pub title: Option<StreamTitle>,
     /// Initial visibility.
@@ -247,6 +280,8 @@ pub struct ListLinksResponse {
 pub struct StreamMetadata {
     /// Stable stream identifier.
     pub stream_id: StreamId,
+    /// Immutable resource kind.
+    pub kind: StreamKind,
     /// Human-facing title when one has been set.
     pub title: Option<StreamTitle>,
     /// Current visibility.
@@ -810,6 +845,7 @@ mod tests {
     fn response_models_tolerate_absent_titles_and_validate_rfc3339_timestamps() {
         let stream = json!({
             "stream_id": "00000000000000000000000000000000",
+            "kind": "records",
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z"
@@ -823,6 +859,7 @@ mod tests {
 
         let created = json!({
             "stream_id": "00000000000000000000000000000000",
+            "kind": "records",
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z",
@@ -847,6 +884,7 @@ mod tests {
 
         let invalid_time = json!({
             "stream_id": "00000000000000000000000000000000",
+            "kind": "records",
             "title": null,
             "visibility": "private",
             "created_at": "2026-02-30T00:00:00Z",
@@ -863,6 +901,7 @@ mod tests {
         ] {
             let signed_time = json!({
                 "stream_id": "00000000000000000000000000000000",
+                "kind": "records",
                 "title": null,
                 "visibility": "private",
                 "created_at": signed,

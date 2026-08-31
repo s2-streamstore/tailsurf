@@ -28,8 +28,8 @@ use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
     AppendBatch, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret,
-    MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, StreamId, StreamTitle, TsfClient, TsfClientConfig,
-    TsfClientError, WriterId,
+    MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, StreamId, StreamKind, StreamTitle, TsfClient,
+    TsfClientConfig, TsfClientError, WriterId,
     protocol::{
         read::{ReadOptions, ReadStart, ReadStop},
         rest::{
@@ -2230,6 +2230,7 @@ struct TestApiState {
 
 struct TestStream {
     stream_id: StreamId,
+    kind: StreamKind,
     title: Option<StreamTitle>,
     visibility: Visibility,
     expires_at: String,
@@ -2351,6 +2352,7 @@ async fn test_create_stream(
         stream_id.to_string(),
         TestStream {
             stream_id,
+            kind: request.kind,
             title: request.title.clone(),
             visibility: request.visibility,
             expires_at: expires_at.clone(),
@@ -2362,6 +2364,7 @@ async fn test_create_stream(
 
     let response = CreateStreamResponse {
         stream_id,
+        kind: request.kind,
         title: request.title,
         visibility: request.visibility,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -2870,6 +2873,7 @@ fn test_minted_link_secret(link_id: &LinkId) -> LinkSecret {
 fn test_get_stream_response(stream: &TestStream) -> StreamMetadata {
     StreamMetadata {
         stream_id: stream.stream_id,
+        kind: stream.kind,
         title: stream.title.clone(),
         visibility: stream.visibility,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -2880,6 +2884,7 @@ fn test_get_stream_response(stream: &TestStream) -> StreamMetadata {
 fn test_read_stream_metadata(stream: &TestStream) -> StreamMetadata {
     StreamMetadata {
         stream_id: stream.stream_id,
+        kind: stream.kind,
         title: stream.title.clone(),
         visibility: stream.visibility,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -3814,7 +3819,7 @@ async fn fake_sse_read(
         ),
     };
     let body = format!(
-        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{events}"
+        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"kind\":\"records\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{events}"
     );
     (
         StatusCode::OK,
@@ -3909,6 +3914,7 @@ impl FakeReadServer {
 fn fake_stream_metadata(stream_id: &str) -> StreamMetadata {
     StreamMetadata {
         stream_id: stream_id.parse().expect("fake stream ID"),
+        kind: StreamKind::Records,
         title: None,
         visibility: Visibility::Private,
         created_at: "2026-08-13T00:00:00Z".to_owned(),

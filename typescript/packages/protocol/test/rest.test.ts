@@ -176,6 +176,7 @@ describe("REST schemas", () => {
         ],
       }),
     ).toEqual({
+      kind: "records",
       title: "Deploy log",
       visibility: "private",
       links: [
@@ -244,6 +245,7 @@ describe("REST schemas", () => {
   it("keeps management stream metadata lean and forward-compatible", () => {
     const stream = {
       stream_id: "0123456789abcdefghjkmnpqrstvwxyz",
+      kind: "records" as const,
       title: null,
       visibility: "private",
       created_at: "2026-08-13T00:00:00Z",
