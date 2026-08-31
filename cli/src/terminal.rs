@@ -108,13 +108,15 @@ pub(super) async fn run(origin: Url, args: TerminalArgs) -> eyre::Result<()> {
     .await
 }
 
-enum PtyInput {
-    Data(Vec<u8>),
-    Resize {
-        columns: u16,
-        rows: u16,
-        applied: oneshot::Sender<Result<(), String>>,
-    },
+struct PtyResize {
+    columns: u16,
+    rows: u16,
+    applied: oneshot::Sender<Result<(), String>>,
+}
+
+struct PtyWrite {
+    data: Vec<u8>,
+    applied: oneshot::Sender<Result<(), String>>,
 }
 
 enum OwnedTerminalOutput {
@@ -279,8 +281,8 @@ async fn run_output_publisher(
 
 async fn forward_terminal_input(
     mut input_reader: tailsurf::TsfReadSession,
-    pty_input: mpsc::Sender<PtyInput>,
-    applied_resizes: mpsc::Sender<(u16, u16)>,
+    pty_input: mpsc::Sender<PtyWrite>,
+    pty_resizes: mpsc::Sender<PtyResize>,
 ) -> eyre::Result<()> {
     let mut writer_positions = HashMap::<WriterId, u64>::new();
     loop {
@@ -308,16 +310,11 @@ async fn forward_terminal_input(
                 bail!("terminal input must use unsplit byte records");
             }
             match decode_terminal_input(record.data).context("invalid terminal input event")? {
-                TerminalInputEvent::Data(data) => pty_input
-                    .send(PtyInput::Data(data.to_vec()))
-                    .await
-                    .map_err(|_| eyre!("PTY input worker stopped"))?,
-                TerminalInputEvent::Resize { columns, rows } => {
+                TerminalInputEvent::Data(data) => {
                     let (applied, confirmation) = oneshot::channel();
                     pty_input
-                        .send(PtyInput::Resize {
-                            columns,
-                            rows,
+                        .send(PtyWrite {
+                            data: data.to_vec(),
                             applied,
                         })
                         .await
@@ -325,11 +322,22 @@ async fn forward_terminal_input(
                     confirmation
                         .await
                         .map_err(|_| eyre!("PTY input worker stopped"))?
-                        .map_err(|error| eyre!("failed to resize PTY: {error}"))?;
-                    applied_resizes
-                        .send((columns, rows))
+                        .map_err(|error| eyre!("failed to write PTY input: {error}"))?;
+                }
+                TerminalInputEvent::Resize { columns, rows } => {
+                    let (applied, confirmation) = oneshot::channel();
+                    pty_resizes
+                        .send(PtyResize {
+                            columns,
+                            rows,
+                            applied,
+                        })
                         .await
                         .map_err(|_| eyre!("terminal host stopped"))?;
+                    confirmation
+                        .await
+                        .map_err(|_| eyre!("terminal host stopped"))?
+                        .map_err(|error| eyre!("failed to resize PTY: {error}"))?;
                 }
             }
         }
@@ -456,32 +464,25 @@ async fn host(
 
     // A stalled PTY write must not block the async runtime. The native thread may be detached on
     // shutdown, while the bounded channel prevents unbounded input retention.
-    let (pty_input_tx, mut pty_input_rx) = mpsc::channel::<PtyInput>(PTY_INPUT_QUEUE);
+    let (pty_input_tx, mut pty_input_rx) = mpsc::channel::<PtyWrite>(PTY_INPUT_QUEUE);
     let (input_worker_done_tx, mut input_worker_done_rx) = oneshot::channel();
     let input_thread = std::thread::spawn(move || {
         let result = (|| -> eyre::Result<()> {
-            while let Some(event) = pty_input_rx.blocking_recv() {
-                match event {
-                    PtyInput::Data(data) => {
-                        pty_writer
-                            .write_all(&data)
-                            .context("failed to write terminal input to PTY")?;
-                        pty_writer.flush().context("failed to flush PTY input")?;
+            while let Some(write) = pty_input_rx.blocking_recv() {
+                let result = (|| -> eyre::Result<()> {
+                    pty_writer
+                        .write_all(&write.data)
+                        .context("failed to write terminal input to PTY")?;
+                    pty_writer.flush().context("failed to flush PTY input")
+                })();
+                match result {
+                    Ok(()) => {
+                        let _ = write.applied.send(Ok(()));
                     }
-                    PtyInput::Resize {
-                        columns,
-                        rows,
-                        applied,
-                    } => {
-                        let result = master
-                            .resize(PtySize {
-                                rows,
-                                cols: columns,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            })
-                            .map_err(|error| format!("{error:#}"));
-                        let _ = applied.send(result);
+                    Err(error) => {
+                        let error = format!("{error:#}");
+                        let _ = write.applied.send(Err(error.clone()));
+                        bail!(error);
                     }
                 }
             }
@@ -489,11 +490,11 @@ async fn host(
         })();
         let _ = input_worker_done_tx.send(result);
     });
-    let (applied_resize_tx, mut applied_resize_rx) = mpsc::channel(PTY_INPUT_QUEUE);
+    let (pty_resize_tx, mut pty_resize_rx) = mpsc::channel(PTY_INPUT_QUEUE);
     let mut input_task = AbortOnDropTask::new(tokio::spawn(forward_terminal_input(
         input_reader,
         pty_input_tx,
-        applied_resize_tx,
+        pty_resize_tx,
     )));
 
     let (output_tx, mut output_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>(PTY_OUTPUT_QUEUE);
@@ -528,21 +529,21 @@ async fn host(
     let mut output_drain_max_deadline = None;
     let mut exit_status = None;
     let mut interrupted = false;
-    let mut pending_output = None;
+    let mut pending_output = VecDeque::new();
 
     while exit_status.is_none() || output_open {
         tokio::select! {
-            permit = output_command_tx.reserve(), if pending_output.is_some() => {
+            permit = output_command_tx.reserve(), if !pending_output.is_empty() => {
                 let permit = permit.map_err(|_| eyre!("terminal output publisher stopped"))?;
                 permit.send(OutputCommand {
-                    event: pending_output.take().expect("pending output"),
+                    event: pending_output.pop_front().expect("pending output"),
                     durable: None,
                 });
             }
-            chunk = output_rx.recv(), if output_open && pending_output.is_none() => {
+            chunk = output_rx.recv(), if output_open && pending_output.is_empty() => {
                 match chunk {
                     Some(Ok(data)) => {
-                        pending_output = Some(OwnedTerminalOutput::Data(data));
+                        pending_output.push_back(OwnedTerminalOutput::Data(data));
                         if let Some(max_deadline) = output_drain_max_deadline {
                             output_drain_deadline = Some(std::cmp::min(
                                 Instant::now() + PTY_EXIT_DRAIN_IDLE_TIMEOUT,
@@ -554,9 +555,24 @@ async fn host(
                     None => output_open = false,
                 }
             }
-            resize = applied_resize_rx.recv(), if exit_status.is_none() && pending_output.is_none() => {
-                let (columns, rows) = resize.context("PTY input worker stopped")?;
-                pending_output = Some(OwnedTerminalOutput::Resize { columns, rows });
+            resize = pty_resize_rx.recv(), if exit_status.is_none() && pending_output.is_empty() => {
+                let resize = resize.context("terminal input forwarder stopped")?;
+                output_open = queue_available_pty_output(&mut output_rx, &mut pending_output)?;
+                let result = master
+                    .resize(PtySize {
+                        rows: resize.rows,
+                        cols: resize.columns,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                if result.is_ok() {
+                    pending_output.push_back(OwnedTerminalOutput::Resize {
+                        columns: resize.columns,
+                        rows: resize.rows,
+                    });
+                }
+                let _ = resize.applied.send(result);
             }
             result = input_task.handle(), if exit_status.is_none() => {
                 result.context("terminal input forwarder panicked")??;
@@ -581,11 +597,14 @@ async fn host(
                 output_drain_deadline = Some(now + PTY_EXIT_DRAIN_IDLE_TIMEOUT);
                 output_drain_max_deadline = Some(now + PTY_EXIT_DRAIN_MAX_TIMEOUT);
             }
-            _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() => {
+            _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() && pty_output_is_idle(&pending_output, &output_rx) => {
                 output_open = false;
             }
-            _ = heartbeat.tick(), if exit_status.is_none() && pending_output.is_none() => {
-                pending_output = Some(OwnedTerminalOutput::Heartbeat);
+            _ = wait_for_deadline(output_drain_max_deadline), if output_open && exit_status.is_some() => {
+                output_open = false;
+            }
+            _ = heartbeat.tick(), if exit_status.is_none() && pending_output.is_empty() => {
+                pending_output.push_back(OwnedTerminalOutput::Heartbeat);
             }
             interrupt = tokio::signal::ctrl_c(), if exit_status.is_none() => {
                 interrupt.context("failed to listen for interrupt signal")?;
@@ -600,8 +619,9 @@ async fn host(
     }
 
     let status = exit_status.context("terminal command ended without an exit status")?;
+    drop(master);
     drop(output_rx);
-    if let Some(event) = pending_output.take() {
+    while let Some(event) = pending_output.pop_front() {
         enqueue_final_output(&output_command_tx, &mut output_task, event).await?;
     }
     enqueue_final_output(
@@ -651,5 +671,94 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => sleep_until(deadline).await,
         None => pending().await,
+    }
+}
+
+fn queue_available_pty_output(
+    output: &mut mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    pending: &mut VecDeque<OwnedTerminalOutput>,
+) -> eyre::Result<bool> {
+    // The channel can hold this many chunks plus one blocked native-thread send. Bound the drain
+    // so a continuously writing PTY cannot monopolize the async runtime during a resize.
+    for _ in 0..=PTY_OUTPUT_QUEUE {
+        match output.try_recv() {
+            Ok(Ok(data)) => pending.push_back(OwnedTerminalOutput::Data(data)),
+            Ok(Err(error)) => return Err(error).context("failed to read PTY output"),
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(true),
+            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn pty_output_is_idle(
+    pending: &VecDeque<OwnedTerminalOutput>,
+    output: &mpsc::Receiver<std::io::Result<Vec<u8>>>,
+) -> bool {
+    pending.is_empty() && output.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queues_buffered_pty_bytes_before_a_resize() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        sender
+            .send(Ok(vec![1]))
+            .await
+            .expect("first PTY chunk should enqueue");
+        sender
+            .send(Ok(vec![2]))
+            .await
+            .expect("second PTY chunk should enqueue");
+        let mut pending = VecDeque::new();
+
+        assert!(
+            queue_available_pty_output(&mut receiver, &mut pending)
+                .expect("queued PTY output should be valid")
+        );
+        pending.push_back(OwnedTerminalOutput::Resize {
+            columns: 120,
+            rows: 40,
+        });
+
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == vec![1]
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == vec![2]
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Resize {
+                columns: 120,
+                rows: 40,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_pty_bytes_are_not_idle() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut pending = VecDeque::new();
+
+        sender
+            .send(Ok(vec![1]))
+            .await
+            .expect("PTY chunk should enqueue");
+        assert!(!pty_output_is_idle(&pending, &receiver));
+        receiver
+            .recv()
+            .await
+            .expect("PTY channel should remain open")
+            .expect("PTY chunk should be valid");
+        assert!(pty_output_is_idle(&pending, &receiver));
+
+        pending.push_back(OwnedTerminalOutput::Heartbeat);
+        assert!(!pty_output_is_idle(&pending, &receiver));
     }
 }
