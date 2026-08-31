@@ -10,6 +10,10 @@ A stream has an immutable kind. A `records` stream is one append-only sequence o
 
 The default kind is `records`.
 
+Clients omit `kind` when creating a record stream. They send `kind: terminal` when creating a terminal session.
+
+Servers include `kind` in stream metadata and creation responses. Clients treat a missing response field as `records` for compatibility with record-only servers.
+
 A stream's complete retained history remains readable until the stream expires or an owner deletes it.
 
 The service assigns each physical record a zero-based `seq_num` in append order. Sequence numbers are contiguous. The stream's `next_seq_num` is the sequence number that the next appended record will receive.

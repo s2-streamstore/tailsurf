@@ -217,7 +217,7 @@ describe("TsfClient REST API", () => {
     expect(input).toBe("http://localhost:8787/api/v1/streams");
     expect(init?.method).toBe("POST");
     const createBody = jsonRequestBody(init?.body);
-    expect(createBody.kind).toBe("records");
+    expect(createBody).not.toHaveProperty("kind");
     expect(createBody.visibility).toBe("private");
     expect(createBody.links).toHaveLength(1);
     expect(createBody.links[0]).toMatchObject({
@@ -257,9 +257,24 @@ describe("TsfClient REST API", () => {
       idempotencyKey,
     );
     const createBody = jsonRequestBody(init?.body);
+    expect(createBody).not.toHaveProperty("kind");
     expect(createBody.title).toBe("Deploy log");
     expect(createBody.visibility).toBe("public");
     expect(createBody.links).toHaveLength(1);
+  });
+
+  it("creates record streams against a legacy server", async () => {
+    const streamId = generateStreamId();
+    const request = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(jsonRequestBody(init?.body)).not.toHaveProperty("kind");
+      return createResponse(streamId, "private", undefined);
+    });
+    const client = new TsfClient({ fetch: request });
+
+    await expect(client.createStream()).resolves.toMatchObject({
+      streamId,
+      kind: "records",
+    });
   });
 
   it.each([
@@ -796,10 +811,11 @@ function linkSummary(linkId: string) {
 function createResponse(
   streamId: string,
   visibility: "private" | "public" = "private",
+  kind: "records" | "terminal" | undefined = "records",
 ): Response {
   return Response.json({
     stream_id: streamId,
-    kind: "records",
+    ...(kind === undefined ? {} : { kind }),
     title: null,
     visibility,
     created_at: "2026-08-11T00:00:00Z",

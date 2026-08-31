@@ -176,7 +176,6 @@ describe("REST schemas", () => {
         ],
       }),
     ).toEqual({
-      kind: "records",
       title: "Deploy log",
       visibility: "private",
       links: [
@@ -254,6 +253,8 @@ describe("REST schemas", () => {
     expect(streamMetadataSchema.parse(stream)).toEqual(stream);
     expect(streamMetadataSchema.parse({ ...stream, future_field: true }))
       .toEqual(stream);
+    const { kind: _kind, ...legacyStream } = stream;
+    expect(streamMetadataSchema.parse(legacyStream)).toEqual(stream);
     expect(() => updateStreamRequestSchema.parse({})).toThrow();
   });
 });

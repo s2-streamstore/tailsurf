@@ -102,7 +102,7 @@ export const initialStreamLinkSchema = z.strictObject({
 });
 
 export const createStreamRequestSchema = z.strictObject({
-  kind: z._default(streamKindSchema, "records"),
+  kind: z.optional(streamKindSchema),
   title: z.optional(streamTitleSchema),
   visibility: z._default(visibilitySchema, "private"),
   expires_in_seconds: z.optional(z.number().check(
@@ -140,7 +140,7 @@ export const streamLinkCredentialSchema = z.object({
 
 export const streamMetadataSchema = z.object({
   stream_id: streamIdSchema,
-  kind: streamKindSchema,
+  kind: z._default(streamKindSchema, "records"),
   title: z.nullable(streamTitleSchema),
   visibility: visibilitySchema,
   created_at: streamTimestampSchema,

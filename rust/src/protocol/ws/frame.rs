@@ -1486,10 +1486,11 @@ mod tests {
     #[test]
     fn stream_metadata_tolerates_absent_title_and_requires_valid_timestamps() {
         let mut missing_title = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-        missing_title.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","kind":"records","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#);
+        missing_title.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#);
         assert!(matches!(
             ServerFrame::decode(&missing_title),
             Ok(ServerFrame::StreamMetadata(StreamMetadata {
+                kind: crate::protocol::rest::StreamKind::Records,
                 title: None,
                 ..
             }))

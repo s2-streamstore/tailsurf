@@ -53,6 +53,10 @@ impl StreamKind {
             Self::Terminal => "terminal",
         }
     }
+
+    const fn is_records(&self) -> bool {
+        matches!(self, Self::Records)
+    }
 }
 
 impl std::fmt::Display for StreamKind {
@@ -92,7 +96,7 @@ impl std::fmt::Display for Visibility {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
     /// Immutable resource kind. Defaults to an ordinary record stream.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "StreamKind::is_records")]
     pub kind: StreamKind,
     /// Optional human-facing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +167,7 @@ pub struct CreateStreamResponse {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Immutable resource kind.
+    #[serde(default)]
     pub kind: StreamKind,
     /// Human-facing title when one has been set.
     pub title: Option<StreamTitle>,
@@ -281,6 +286,7 @@ pub struct StreamMetadata {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Immutable resource kind.
+    #[serde(default)]
     pub kind: StreamKind,
     /// Human-facing title when one has been set.
     pub title: Option<StreamTitle>,
@@ -769,6 +775,7 @@ mod tests {
         let value = serde_json::to_value(request).expect("serialize create request");
 
         assert_eq!(value["visibility"], "private");
+        assert!(value.get("kind").is_none());
         assert_eq!(value["links"][0]["link_id"], "owner");
         assert_eq!(value["links"][0]["permissions"], "o");
         assert!(value["links"][0].get("secret").is_none());
@@ -845,21 +852,17 @@ mod tests {
     fn response_models_tolerate_absent_titles_and_validate_rfc3339_timestamps() {
         let stream = json!({
             "stream_id": "00000000000000000000000000000000",
-            "kind": "records",
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z"
         });
-        assert_eq!(
-            serde_json::from_value::<StreamMetadata>(stream)
-                .expect("deserialize absent stream title")
-                .title,
-            None
-        );
+        let stream = serde_json::from_value::<StreamMetadata>(stream)
+            .expect("deserialize legacy stream metadata");
+        assert_eq!(stream.kind, StreamKind::Records);
+        assert_eq!(stream.title, None);
 
         let created = json!({
             "stream_id": "00000000000000000000000000000000",
-            "kind": "records",
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z",
@@ -867,7 +870,8 @@ mod tests {
             "links": []
         });
         let created = serde_json::from_value::<CreateStreamResponse>(created)
-            .expect("deserialize absent created stream title");
+            .expect("deserialize legacy create response");
+        assert_eq!(created.kind, StreamKind::Records);
         assert!(created.title.is_none());
         assert_eq!(created.web_origin.as_str(), "https://tail.surf/");
 

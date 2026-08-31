@@ -11,7 +11,6 @@
   "max_sse_event_bytes": 2097152,
   "max_sse_unterminated_event_bytes": 2097152,
   "create_request": {
-    "kind": "records",
     "title": "Deploy log",
     "visibility": "private",
     "links": [

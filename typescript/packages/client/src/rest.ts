@@ -781,7 +781,7 @@ export function parsePreparedCreateStreamRequest(
     }),
   });
   return {
-    kind: wire.kind,
+    kind: wire.kind ?? "records",
     ...(wire.title === undefined ? {} : { title: wire.title }),
     visibility: wire.visibility,
     ...(wire.expires_in_seconds === undefined
@@ -798,7 +798,7 @@ function createStreamRequestToWire(
   request: PreparedCreateStreamRequest,
 ): WireCreateStreamRequest {
   return {
-    kind: request.kind,
+    ...(request.kind === "terminal" ? { kind: request.kind } : {}),
     ...(request.title === undefined
       ? {}
       : { title: parseStreamTitle(request.title) }),
