@@ -231,7 +231,47 @@ pub enum TerminalProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
+
     use super::*;
+
+    #[derive(Deserialize)]
+    struct TestVector {
+        name: String,
+        bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn matches_shared_test_vectors() {
+        let vectors: Vec<TestVector> =
+            serde_json::from_str(include_str!("../../testdata/terminal-events.json"))
+                .expect("terminal event vectors");
+        for vector in vectors {
+            let encoded = match vector.name.as_str() {
+                "input-data" => encode_terminal_input(TerminalInputEvent::Data(&[0, 1, 255])),
+                "input-resize" => encode_terminal_input(TerminalInputEvent::Resize {
+                    columns: 132,
+                    rows: 43,
+                }),
+                "output-data" => encode_terminal_output(TerminalOutputEvent::Data(&[27, 91, 109])),
+                "output-resize" => encode_terminal_output(TerminalOutputEvent::Resize {
+                    columns: 80,
+                    rows: 24,
+                }),
+                "output-started" => encode_terminal_output(TerminalOutputEvent::Started {
+                    columns: 120,
+                    rows: 40,
+                }),
+                "output-exited" => {
+                    encode_terminal_output(TerminalOutputEvent::Exited { status: -1 })
+                }
+                "output-heartbeat" => encode_terminal_output(TerminalOutputEvent::Heartbeat),
+                name => panic!("unknown terminal test vector {name}"),
+            }
+            .expect("encode terminal event");
+            assert_eq!(encoded, vector.bytes, "{}", vector.name);
+        }
+    }
 
     #[test]
     fn round_trips_input_events() {

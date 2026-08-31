@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -9,6 +11,17 @@ import {
 } from "../src/index.js";
 
 describe("terminal event protocol", () => {
+  it("matches the shared Rust and TypeScript vectors", () => {
+    const vectors = JSON.parse(readFileSync(
+      new URL("../../../../rust/testdata/terminal-events.json", import.meta.url),
+      "utf8",
+    )) as readonly { readonly name: string; readonly bytes: readonly number[] }[];
+    for (const vector of vectors) {
+      const encoded = encodeVector(vector.name);
+      expect(Array.from(encoded), vector.name).toEqual(vector.bytes);
+    }
+  });
+
   it("round trips input events", () => {
     expect(decodeTerminalInputEvent(encodeTerminalInputEvent({
       type: "data",
@@ -49,3 +62,30 @@ describe("terminal event protocol", () => {
     })).toThrow(/columns/);
   });
 });
+
+function encodeVector(name: string): Uint8Array {
+  switch (name) {
+    case "input-data":
+      return encodeTerminalInputEvent({
+        type: "data",
+        data: Uint8Array.of(0, 1, 255),
+      });
+    case "input-resize":
+      return encodeTerminalInputEvent({ type: "resize", columns: 132, rows: 43 });
+    case "output-data":
+      return encodeTerminalOutputEvent({
+        type: "data",
+        data: Uint8Array.of(27, 91, 109),
+      });
+    case "output-resize":
+      return encodeTerminalOutputEvent({ type: "resize", columns: 80, rows: 24 });
+    case "output-started":
+      return encodeTerminalOutputEvent({ type: "started", columns: 120, rows: 40 });
+    case "output-exited":
+      return encodeTerminalOutputEvent({ type: "exited", status: -1 });
+    case "output-heartbeat":
+      return encodeTerminalOutputEvent({ type: "heartbeat" });
+    default:
+      throw new Error(`unknown terminal test vector ${name}`);
+  }
+}
