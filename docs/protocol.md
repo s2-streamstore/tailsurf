@@ -296,9 +296,9 @@ Output event types are:
 
 Terminal dimensions are between 1 and 1,000 columns, between 1 and 500 rows, and at most 131,072 cells. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors. Servers validate the record envelope and direction-specific event before append.
 
-The host writes one `started` event before other output. It writes data, resize, and heartbeat events while the child runs. A clean exit ends with one `exited` event. The browser rejects an event before `started` or a second `started`, and stops reading at `exited`.
+The host writes one `started` event before other output. It writes data, resize, and heartbeat events while the child runs. A clean exit ends with one `exited` event. Full-history browser reconstruction rejects an event before `started` or a second `started`. Bounded live-tail recovery may join after `started`. Both stop reading at `exited`.
 
-The `tsf terminal` host claims sequence zero before starting its PTY. This prevents a second CLI host from attaching to the same output log. It applies a requested resize before publishing the output resize event.
+The `started` event is the host's first output append and requires sequence zero. The host stops its child if that precondition fails. This prevents multiple hosts from publishing to the same output log. The host applies a requested resize before publishing the output resize event.
 
 ## History export
 

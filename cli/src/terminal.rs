@@ -344,11 +344,18 @@ async fn forward_terminal_input(
 }
 
 async fn stop_child(child_guard: &mut ChildGuard) -> eyre::Result<()> {
-    if let Some(mut child_killer) = child_guard.take() {
-        tokio::task::spawn_blocking(move || child_killer.kill())
-            .await
-            .context("terminal kill task panicked")?
-            .context("failed to stop terminal command")?;
+    let Some(mut child_killer) = child_guard.take() else {
+        return Ok(());
+    };
+    let (child_killer, result) = tokio::task::spawn_blocking(move || {
+        let result = child_killer.kill();
+        (child_killer, result)
+    })
+    .await
+    .context("terminal kill task panicked")?;
+    if let Err(error) = result {
+        child_guard.killer = Some(child_killer);
+        return Err(error).context("failed to stop terminal command");
     }
     Ok(())
 }
@@ -597,9 +604,11 @@ async fn host(
                 output_drain_max_deadline = Some(now + PTY_EXIT_DRAIN_MAX_TIMEOUT);
             }
             _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() && pty_output_is_idle(&pending_output, &output_rx) => {
+                close_and_queue_pty_output(&mut output_rx, &mut pending_output).await?;
                 output_open = false;
             }
             _ = wait_for_deadline(output_drain_max_deadline), if output_open && exit_status.is_some() => {
+                close_and_queue_pty_output(&mut output_rx, &mut pending_output).await?;
                 output_open = false;
             }
             _ = heartbeat.tick(), if exit_status.is_none() && pending_output.is_empty() => {
@@ -690,6 +699,19 @@ fn queue_available_pty_output(
     Ok(true)
 }
 
+async fn close_and_queue_pty_output(
+    output: &mut mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    pending: &mut VecDeque<OwnedTerminalOutput>,
+) -> eyre::Result<()> {
+    output.close();
+    while let Some(result) = output.recv().await {
+        pending.push_back(OwnedTerminalOutput::Data(
+            result.context("failed to read PTY output")?,
+        ));
+    }
+    Ok(())
+}
+
 fn pty_output_is_idle(
     pending: &VecDeque<OwnedTerminalOutput>,
     output: &mpsc::Receiver<std::io::Result<Vec<u8>>>,
@@ -738,6 +760,41 @@ mod tests {
                 rows: 40,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn queues_all_accepted_pty_bytes_when_closing_output() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        sender
+            .send(Ok(vec![1]))
+            .await
+            .expect("first PTY chunk should enqueue");
+        sender
+            .send(Ok(vec![2]))
+            .await
+            .expect("second PTY chunk should enqueue");
+        let blocked_send = tokio::spawn(async move { sender.send(Ok(vec![3])).await });
+
+        let mut pending = VecDeque::new();
+        close_and_queue_pty_output(&mut receiver, &mut pending)
+            .await
+            .expect("accepted PTY output should drain");
+
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == [1]
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == [2]
+        ));
+        assert!(pending.is_empty());
+        assert!(
+            blocked_send
+                .await
+                .expect("send task should finish")
+                .is_err()
+        );
     }
 
     #[tokio::test]
