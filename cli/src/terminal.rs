@@ -20,7 +20,7 @@ use tailsurf::{
 };
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{Duration, Instant, sleep_until},
+    time::{Duration, Instant, sleep_until, timeout},
 };
 use url::Url;
 
@@ -34,6 +34,7 @@ const MAX_INPUT_WRITERS: usize = 4_096;
 const MAX_PENDING_OUTPUT_RECORDS: usize = 32;
 const PTY_EXIT_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 const PTY_EXIT_DRAIN_MAX_TIMEOUT: Duration = Duration::from_secs(2);
+const PTY_OUTPUT_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
 const PTY_INPUT_QUEUE: usize = 16;
 const PTY_OUTPUT_QUEUE: usize = 16;
 
@@ -520,8 +521,8 @@ async fn host(
     )));
 
     let (output_tx, mut output_rx) = mpsc::channel::<PtyOutput>(PTY_OUTPUT_QUEUE);
-    // The cutoff handshake recovers the one chunk that may already be blocked in
-    // `blocking_send` when the receiver closes.
+    // The cutoff handshake recovers the one chunk that may already be between `read` and the
+    // output channel when the receiver closes.
     let output_handoff_state = Arc::new(PtyOutputHandoff::default());
     let thread_handoff_state = Arc::clone(&output_handoff_state);
     let (output_close_tx, mut output_close_rx) = oneshot::channel();
@@ -789,6 +790,10 @@ fn send_pty_output(
             .expect("PTY output handoff lock poisoned");
     }
     if state.closing {
+        drop(state);
+        if let Some(close_ack) = close_ack.take() {
+            let _ = close_ack.send(Some(output));
+        }
         return false;
     }
     state.sending = true;
@@ -833,14 +838,24 @@ async fn close_and_queue_pty_output(
             result.context("failed to read PTY output")?,
         ));
     }
-    if wait_for_in_flight
-        && let Some(result) = close_ack
+    if wait_for_in_flight {
+        if let Some(result) = close_ack
             .await
             .context("PTY output thread stopped during shutdown")?
+        {
+            pending.push_back(OwnedTerminalOutput::Data(
+                result.context("failed to read PTY output")?,
+            ));
+        }
+    // The reader can be between a completed read and the handoff lock. Give it a bounded window
+    // to transfer that chunk without waiting indefinitely for another read.
+    } else if let Ok(Ok(Some(result))) = timeout(PTY_OUTPUT_HANDOFF_TIMEOUT, &mut *close_ack).await
     {
         pending.push_back(OwnedTerminalOutput::Data(
             result.context("failed to read PTY output")?,
         ));
+    } else {
+        close_ack.close();
     }
     Ok(())
 }
@@ -1041,7 +1056,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_output_does_not_wait_without_an_in_flight_send() {
+    async fn queues_pre_send_pty_bytes_when_closing_output() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let handoff = Arc::new(PtyOutputHandoff::default());
+        handoff
+            .state
+            .lock()
+            .expect("PTY output handoff lock should not be poisoned")
+            .closing = true;
+        let (close_tx, close_rx) = oneshot::channel();
+        let mut close_tx = Some(close_tx);
+
+        assert!(!send_pty_output(
+            Ok(vec![1]),
+            &sender,
+            &handoff,
+            &mut close_tx,
+        ));
+        assert!(matches!(
+            close_rx.await.expect("pre-send output should be handed off"),
+            Some(Ok(data)) if data == vec![1]
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_output_bounds_a_stalled_read_handoff() {
         let (_sender, mut receiver) = mpsc::channel(1);
         let state = Arc::new(PtyOutputHandoff::default());
         let (_close_tx, mut close_rx) = oneshot::channel();
