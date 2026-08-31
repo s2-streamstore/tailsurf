@@ -293,12 +293,12 @@ Output event types are:
 | `0x01` | `data` | PTY output bytes |
 | `0x02` | `resize` | Accepted columns and rows as big-endian `uint16` values |
 | `0x03` | `started` | Initial columns and rows as big-endian `uint16` values |
-| `0x04` | `exited` | Signed exit status as a big-endian `int32` value |
+| `0x04` | `exited` | Signed exit status as a big-endian `int32`, then `output_truncated` as `0x00` or `0x01` |
 | `0x05` | `heartbeat` | Empty |
 
 Terminal dimensions are between 1 and 1,000 columns, between 1 and 500 rows, and at most 131,072 cells. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors. Servers validate the record envelope and direction-specific event before append.
 
-The host writes one `started` event before other output. It writes data, resize, and heartbeat events while the child runs. A clean exit ends with one `exited` event. Full-history browser reconstruction rejects an event before `started` or a second `started`. Bounded live-tail recovery may join after `started`. Both stop reading at `exited`.
+The host writes one `started` event before other output. It writes data, resize, and heartbeat events while the child runs. A session ends with one `exited` event. `output_truncated` is true when the direct child exits but another process keeps the PTY open past the bounded drain. Full-history browser reconstruction rejects an event before `started` or a second `started`. Bounded live-tail recovery may join after `started`. Both stop reading at `exited`.
 
 The `started` event is the host's first output append and requires sequence zero. The host stops its child if that precondition fails. This prevents multiple hosts from publishing to the same output log. The host applies a requested resize before publishing the output resize event.
 

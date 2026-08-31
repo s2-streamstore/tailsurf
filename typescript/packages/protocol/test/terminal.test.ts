@@ -42,7 +42,8 @@ describe("terminal event protocol", () => {
       { type: "data", data: Uint8Array.of(27, 91, 109) },
       { type: "resize", columns: 80, rows: 24 },
       { type: "started", columns: 120, rows: 40 },
-      { type: "exited", status: -1 },
+      { type: "exited", status: -1, outputTruncated: false },
+      { type: "exited", status: 0, outputTruncated: true },
       { type: "heartbeat" },
     ] as const;
     for (const event of events) {
@@ -58,6 +59,9 @@ describe("terminal event protocol", () => {
     );
     expect(() => decodeTerminalInputEvent(Uint8Array.of(1, 2, 0, 80, 0)))
       .toThrow(/expected 6/);
+    expect(() => decodeTerminalOutputEvent(
+      Uint8Array.of(1, 4, 0, 0, 0, 0, 2),
+    )).toThrow(/invalid terminal exited flags/);
     expect(() => encodeTerminalInputEvent({
       type: "resize",
       columns: 0,
@@ -95,7 +99,17 @@ function encodeVector(name: string): Uint8Array {
     case "output-started":
       return encodeTerminalOutputEvent({ type: "started", columns: 120, rows: 40 });
     case "output-exited":
-      return encodeTerminalOutputEvent({ type: "exited", status: -1 });
+      return encodeTerminalOutputEvent({
+        type: "exited",
+        status: -1,
+        outputTruncated: false,
+      });
+    case "output-exited-truncated":
+      return encodeTerminalOutputEvent({
+        type: "exited",
+        status: 0,
+        outputTruncated: true,
+      });
     case "output-heartbeat":
       return encodeTerminalOutputEvent({ type: "heartbeat" });
     default:

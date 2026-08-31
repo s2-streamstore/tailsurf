@@ -6,7 +6,8 @@ export const MAX_TERMINAL_ROWS = 500;
 export const MAX_TERMINAL_CELLS = 131_072;
 
 const HEADER_BYTES = 2;
-const FIXED_EVENT_BYTES = HEADER_BYTES + 4;
+const SIZE_EVENT_BYTES = HEADER_BYTES + 4;
+const EXITED_EVENT_BYTES = HEADER_BYTES + 5;
 
 const DATA = 0x01;
 const RESIZE = 0x02;
@@ -22,7 +23,11 @@ export type TerminalOutputEvent =
   | { readonly type: "data"; readonly data: Uint8Array }
   | { readonly type: "resize"; readonly columns: number; readonly rows: number }
   | { readonly type: "started"; readonly columns: number; readonly rows: number }
-  | { readonly type: "exited"; readonly status: number }
+  | {
+    readonly type: "exited";
+    readonly status: number;
+    readonly outputTruncated: boolean;
+  }
   | { readonly type: "heartbeat" };
 
 export function encodeTerminalInputEvent(event: TerminalInputEvent): Uint8Array {
@@ -56,8 +61,9 @@ export function encodeTerminalOutputEvent(event: TerminalOutputEvent): Uint8Arra
       return encodeSize(STARTED, event.columns, event.rows);
     case "exited": {
       requireInt32(event.status, "terminal exit status");
-      const payload = eventHeader(EXITED, FIXED_EVENT_BYTES);
+      const payload = eventHeader(EXITED, EXITED_EVENT_BYTES);
       new DataView(payload.buffer).setInt32(HEADER_BYTES, event.status);
+      payload[HEADER_BYTES + 4] = event.outputTruncated ? 1 : 0;
       return payload;
     }
     case "heartbeat":
@@ -75,7 +81,13 @@ export function decodeTerminalOutputEvent(payload: Uint8Array): TerminalOutputEv
     case STARTED:
       return { type: "started", ...decodeSize(payload, "started") };
     case EXITED:
-      requireLength(payload, FIXED_EVENT_BYTES, "exited");
+      requireLength(payload, EXITED_EVENT_BYTES, "exited");
+      if (payload[HEADER_BYTES + 4]! > 1) {
+        throw new ProtocolError(
+          "invalid_terminal_exit_flags",
+          `invalid terminal exited flags 0x${hex(payload[HEADER_BYTES + 4])}`,
+        );
+      }
       return {
         type: "exited",
         status: new DataView(
@@ -83,6 +95,7 @@ export function decodeTerminalOutputEvent(payload: Uint8Array): TerminalOutputEv
           payload.byteOffset,
           payload.byteLength,
         ).getInt32(HEADER_BYTES),
+        outputTruncated: payload[HEADER_BYTES + 4] === 1,
       };
     case HEARTBEAT:
       requireLength(payload, HEADER_BYTES, "heartbeat");
@@ -104,7 +117,7 @@ function encodeSize(
   rows: number,
 ): Uint8Array {
   validateTerminalSize(columns, rows);
-  const payload = eventHeader(type, FIXED_EVENT_BYTES);
+  const payload = eventHeader(type, SIZE_EVENT_BYTES);
   const view = new DataView(payload.buffer);
   view.setUint16(HEADER_BYTES, columns);
   view.setUint16(HEADER_BYTES + 2, rows);
@@ -115,7 +128,7 @@ function decodeSize(
   payload: Uint8Array,
   name: string,
 ): { readonly columns: number; readonly rows: number } {
-  requireLength(payload, FIXED_EVENT_BYTES, name);
+  requireLength(payload, SIZE_EVENT_BYTES, name);
   const view = new DataView(
     payload.buffer,
     payload.byteOffset,

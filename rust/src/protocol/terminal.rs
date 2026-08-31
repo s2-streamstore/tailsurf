@@ -12,7 +12,8 @@ pub const MAX_TERMINAL_ROWS: u16 = 500;
 pub const MAX_TERMINAL_CELLS: u32 = 131_072;
 
 const HEADER_LEN: usize = 2;
-const FIXED_EVENT_LEN: usize = HEADER_LEN + 4;
+const SIZE_EVENT_LEN: usize = HEADER_LEN + 4;
+const EXITED_EVENT_LEN: usize = HEADER_LEN + 5;
 const DATA: u8 = 0x01;
 const RESIZE: u8 = 0x02;
 const STARTED: u8 = 0x03;
@@ -56,6 +57,8 @@ pub enum TerminalOutputEvent<'a> {
     Exited {
         /// Signed process status selected by the host.
         status: i32,
+        /// Whether the host stopped draining output before the PTY reached EOF.
+        output_truncated: bool,
     },
     /// The PTY host is still connected.
     Heartbeat,
@@ -96,9 +99,13 @@ pub fn encode_terminal_output(
         TerminalOutputEvent::Data(data) => Ok(encode_data(DATA, data)),
         TerminalOutputEvent::Resize { columns, rows } => encode_size(RESIZE, columns, rows),
         TerminalOutputEvent::Started { columns, rows } => encode_size(STARTED, columns, rows),
-        TerminalOutputEvent::Exited { status } => {
-            let mut payload = event_header(EXITED, FIXED_EVENT_LEN);
-            payload[HEADER_LEN..].copy_from_slice(&status.to_be_bytes());
+        TerminalOutputEvent::Exited {
+            status,
+            output_truncated,
+        } => {
+            let mut payload = event_header(EXITED, EXITED_EVENT_LEN);
+            payload[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&status.to_be_bytes());
+            payload[HEADER_LEN + 4] = u8::from(output_truncated);
             Ok(payload)
         }
         TerminalOutputEvent::Heartbeat => Ok(event_header(HEARTBEAT, HEADER_LEN)),
@@ -120,14 +127,22 @@ pub fn decode_terminal_output(
             Ok(TerminalOutputEvent::Started { columns, rows })
         }
         EXITED => {
-            require_length(payload, FIXED_EVENT_LEN, "exited")?;
+            require_length(payload, EXITED_EVENT_LEN, "exited")?;
             let status = i32::from_be_bytes([
                 payload[HEADER_LEN],
                 payload[HEADER_LEN + 1],
                 payload[HEADER_LEN + 2],
                 payload[HEADER_LEN + 3],
             ]);
-            Ok(TerminalOutputEvent::Exited { status })
+            let output_truncated = match payload[HEADER_LEN + 4] {
+                0 => false,
+                1 => true,
+                value => return Err(TerminalProtocolError::InvalidExitFlags(value)),
+            };
+            Ok(TerminalOutputEvent::Exited {
+                status,
+                output_truncated,
+            })
         }
         HEARTBEAT => {
             require_length(payload, HEADER_LEN, "heartbeat")?;
@@ -148,14 +163,14 @@ fn encode_data(event_type: u8, data: &[u8]) -> Vec<u8> {
 
 fn encode_size(event_type: u8, columns: u16, rows: u16) -> Result<Vec<u8>, TerminalProtocolError> {
     validate_terminal_size(columns, rows)?;
-    let mut payload = event_header(event_type, FIXED_EVENT_LEN);
+    let mut payload = event_header(event_type, SIZE_EVENT_LEN);
     payload[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&columns.to_be_bytes());
     payload[HEADER_LEN + 2..].copy_from_slice(&rows.to_be_bytes());
     Ok(payload)
 }
 
 fn decode_size(payload: &[u8], name: &'static str) -> Result<(u16, u16), TerminalProtocolError> {
-    require_length(payload, FIXED_EVENT_LEN, name)?;
+    require_length(payload, SIZE_EVENT_LEN, name)?;
     let columns = u16::from_be_bytes([payload[HEADER_LEN], payload[HEADER_LEN + 1]]);
     let rows = u16::from_be_bytes([payload[HEADER_LEN + 2], payload[HEADER_LEN + 3]]);
     validate_terminal_size(columns, rows)?;
@@ -243,6 +258,9 @@ pub enum TerminalProtocolError {
         /// Required encoded length.
         expected: usize,
     },
+    /// An exited event uses unsupported flag bits.
+    #[error("invalid terminal exited flags 0x{0:02x}")]
+    InvalidExitFlags(u8),
     /// A terminal dimension is outside its supported range.
     #[error("terminal {name} must be between 1 and {maximum}")]
     InvalidDimension {
@@ -292,9 +310,14 @@ mod tests {
                     columns: 120,
                     rows: 40,
                 }),
-                "output-exited" => {
-                    encode_terminal_output(TerminalOutputEvent::Exited { status: -1 })
-                }
+                "output-exited" => encode_terminal_output(TerminalOutputEvent::Exited {
+                    status: -1,
+                    output_truncated: false,
+                }),
+                "output-exited-truncated" => encode_terminal_output(TerminalOutputEvent::Exited {
+                    status: 0,
+                    output_truncated: true,
+                }),
                 "output-heartbeat" => encode_terminal_output(TerminalOutputEvent::Heartbeat),
                 name => panic!("unknown terminal test vector {name}"),
             }
@@ -329,7 +352,14 @@ mod tests {
                 columns: 120,
                 rows: 40,
             },
-            TerminalOutputEvent::Exited { status: -1 },
+            TerminalOutputEvent::Exited {
+                status: -1,
+                output_truncated: false,
+            },
+            TerminalOutputEvent::Exited {
+                status: 0,
+                output_truncated: true,
+            },
             TerminalOutputEvent::Heartbeat,
         ] {
             let encoded = encode_terminal_output(event).expect("encode output event");
@@ -351,6 +381,10 @@ mod tests {
             decode_terminal_input(&[TERMINAL_EVENT_VERSION, RESIZE, 0, 80, 0]),
             Err(TerminalProtocolError::InvalidLength { .. })
         ));
+        assert_eq!(
+            decode_terminal_output(&[TERMINAL_EVENT_VERSION, EXITED, 0, 0, 0, 0, 2]),
+            Err(TerminalProtocolError::InvalidExitFlags(2))
+        );
         assert_eq!(
             encode_terminal_input(TerminalInputEvent::Resize {
                 columns: 0,
