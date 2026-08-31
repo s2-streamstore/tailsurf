@@ -260,6 +260,8 @@ A non-retryable failure after the response opens sends a terminal `error` event 
 
 A terminal stream has independent `input` and `output` logs. Each log follows the ordinary record ordering, durability, retry, and read semantics.
 
+The generic read route selects terminal output. The generic write route selects terminal input. Explicit routes select either log for hosts and specialized clients.
+
 Terminal data uses WebSocket routes.
 
 ```txt
@@ -271,7 +273,7 @@ Terminal data uses WebSocket routes.
 
 Read permission authorizes output reads. Write permission authorizes input writes. Owner permission authorizes every terminal route. Public visibility authorizes output reads without a link.
 
-Only an owner can read the input log or write the output log. Generic record data-plane routes reject terminal streams. Terminal routes reject `records` streams.
+Only an owner can read the input log or write the output log. Terminal routes reject `records` streams.
 
 Terminal events use unsplit byte records. Every payload begins with a version byte and a type byte. The version is `0x01`.
 
