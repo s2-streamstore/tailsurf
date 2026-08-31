@@ -15,6 +15,7 @@ use tailsurf::{
         rest::{CreateStreamRequest, Visibility},
         ws::frame::{PartHeader, RecordFormat},
     },
+    validate_terminal_size,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -61,9 +62,7 @@ pub(super) struct TerminalArgs {
 }
 
 pub(super) async fn run(origin: Url, args: TerminalArgs) -> eyre::Result<()> {
-    if args.columns == 0 || args.rows == 0 {
-        bail!("terminal columns and rows must be positive");
-    }
+    validate_terminal_size(args.columns, args.rows).context("invalid initial terminal size")?;
     let visibility = if args.public {
         Visibility::Public
     } else {

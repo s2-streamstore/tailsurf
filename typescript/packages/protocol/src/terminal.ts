@@ -1,7 +1,9 @@
 import { ProtocolError } from "./errors.js";
 
 export const TERMINAL_EVENT_VERSION = 0x01;
-export const MAX_TERMINAL_DIMENSION = 0xffff;
+export const MAX_TERMINAL_COLUMNS = 1_000;
+export const MAX_TERMINAL_ROWS = 500;
+export const MAX_TERMINAL_CELLS = 131_072;
 
 const HEADER_BYTES = 2;
 const FIXED_EVENT_BYTES = HEADER_BYTES + 4;
@@ -101,8 +103,7 @@ function encodeSize(
   columns: number,
   rows: number,
 ): Uint8Array {
-  requireDimension(columns, "terminal columns");
-  requireDimension(rows, "terminal rows");
+  validateTerminalSize(columns, rows);
   const payload = eventHeader(type, FIXED_EVENT_BYTES);
   const view = new DataView(payload.buffer);
   view.setUint16(HEADER_BYTES, columns);
@@ -122,8 +123,7 @@ function decodeSize(
   );
   const columns = view.getUint16(HEADER_BYTES);
   const rows = view.getUint16(HEADER_BYTES + 2);
-  requireDimension(columns, "terminal columns");
-  requireDimension(rows, "terminal rows");
+  validateTerminalSize(columns, rows);
   return { columns, rows };
 }
 
@@ -160,11 +160,22 @@ function requireLength(payload: Uint8Array, expected: number, name: string): voi
   }
 }
 
-function requireDimension(value: number, name: string): void {
-  if (!Number.isInteger(value) || value < 1 || value > MAX_TERMINAL_DIMENSION) {
+export function validateTerminalSize(columns: number, rows: number): void {
+  requireDimension(columns, "terminal columns", MAX_TERMINAL_COLUMNS);
+  requireDimension(rows, "terminal rows", MAX_TERMINAL_ROWS);
+  if (columns * rows > MAX_TERMINAL_CELLS) {
     throw new ProtocolError(
       "invalid_terminal_dimension",
-      `${name} must be an integer between 1 and ${MAX_TERMINAL_DIMENSION}`,
+      `terminal viewport must not exceed ${MAX_TERMINAL_CELLS} cells`,
+    );
+  }
+}
+
+function requireDimension(value: number, name: string, maximum: number): void {
+  if (!Number.isInteger(value) || value < 1 || value > maximum) {
+    throw new ProtocolError(
+      "invalid_terminal_dimension",
+      `${name} must be an integer between 1 and ${maximum}`,
     );
   }
 }

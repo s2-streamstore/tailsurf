@@ -4,6 +4,12 @@ use thiserror::Error;
 
 /// Current terminal event payload version.
 pub const TERMINAL_EVENT_VERSION: u8 = 0x01;
+/// Largest supported terminal width.
+pub const MAX_TERMINAL_COLUMNS: u16 = 1_000;
+/// Largest supported terminal height.
+pub const MAX_TERMINAL_ROWS: u16 = 500;
+/// Largest supported terminal viewport area.
+pub const MAX_TERMINAL_CELLS: u32 = 131_072;
 
 const HEADER_LEN: usize = 2;
 const FIXED_EVENT_LEN: usize = HEADER_LEN + 4;
@@ -141,8 +147,7 @@ fn encode_data(event_type: u8, data: &[u8]) -> Vec<u8> {
 }
 
 fn encode_size(event_type: u8, columns: u16, rows: u16) -> Result<Vec<u8>, TerminalProtocolError> {
-    require_dimension(columns, "columns")?;
-    require_dimension(rows, "rows")?;
+    validate_terminal_size(columns, rows)?;
     let mut payload = event_header(event_type, FIXED_EVENT_LEN);
     payload[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&columns.to_be_bytes());
     payload[HEADER_LEN + 2..].copy_from_slice(&rows.to_be_bytes());
@@ -153,8 +158,7 @@ fn decode_size(payload: &[u8], name: &'static str) -> Result<(u16, u16), Termina
     require_length(payload, FIXED_EVENT_LEN, name)?;
     let columns = u16::from_be_bytes([payload[HEADER_LEN], payload[HEADER_LEN + 1]]);
     let rows = u16::from_be_bytes([payload[HEADER_LEN + 2], payload[HEADER_LEN + 3]]);
-    require_dimension(columns, "columns")?;
-    require_dimension(rows, "rows")?;
+    validate_terminal_size(columns, rows)?;
     Ok((columns, rows))
 }
 
@@ -190,9 +194,24 @@ fn require_length(
     Ok(())
 }
 
-fn require_dimension(value: u16, name: &'static str) -> Result<(), TerminalProtocolError> {
-    if value == 0 {
-        return Err(TerminalProtocolError::InvalidDimension(name));
+/// Validates terminal dimensions accepted by every TSF implementation.
+pub fn validate_terminal_size(columns: u16, rows: u16) -> Result<(), TerminalProtocolError> {
+    if columns == 0 || columns > MAX_TERMINAL_COLUMNS {
+        return Err(TerminalProtocolError::InvalidDimension {
+            name: "columns",
+            maximum: MAX_TERMINAL_COLUMNS,
+        });
+    }
+    if rows == 0 || rows > MAX_TERMINAL_ROWS {
+        return Err(TerminalProtocolError::InvalidDimension {
+            name: "rows",
+            maximum: MAX_TERMINAL_ROWS,
+        });
+    }
+    if u32::from(columns) * u32::from(rows) > MAX_TERMINAL_CELLS {
+        return Err(TerminalProtocolError::TooManyCells {
+            maximum: MAX_TERMINAL_CELLS,
+        });
     }
     Ok(())
 }
@@ -224,9 +243,20 @@ pub enum TerminalProtocolError {
         /// Required encoded length.
         expected: usize,
     },
-    /// A terminal dimension is zero.
-    #[error("terminal {0} must be non-zero")]
-    InvalidDimension(&'static str),
+    /// A terminal dimension is outside its supported range.
+    #[error("terminal {name} must be between 1 and {maximum}")]
+    InvalidDimension {
+        /// Dimension name.
+        name: &'static str,
+        /// Inclusive maximum.
+        maximum: u16,
+    },
+    /// A terminal viewport has too many cells.
+    #[error("terminal viewport must not exceed {maximum} cells")]
+    TooManyCells {
+        /// Inclusive maximum.
+        maximum: u32,
+    },
 }
 
 #[cfg(test)]
@@ -326,7 +356,19 @@ mod tests {
                 columns: 0,
                 rows: 24
             }),
-            Err(TerminalProtocolError::InvalidDimension("columns"))
+            Err(TerminalProtocolError::InvalidDimension {
+                name: "columns",
+                maximum: MAX_TERMINAL_COLUMNS,
+            })
+        );
+        assert_eq!(
+            encode_terminal_output(TerminalOutputEvent::Started {
+                columns: MAX_TERMINAL_COLUMNS,
+                rows: MAX_TERMINAL_ROWS,
+            }),
+            Err(TerminalProtocolError::TooManyCells {
+                maximum: MAX_TERMINAL_CELLS,
+            })
         );
     }
 }

@@ -53,7 +53,7 @@ Private reads require read permission. Public reads require no link. All writes 
 
 A stream page uses `/s/{stream_id}`.
 
-A terminal page uses `/t/{stream_id}`. The distinct path selects terminal mode without a control-plane request.
+A terminal page uses `/t/{stream_id}`. The distinct path names the terminal workspace. Read-capable browser workspaces verify it against the immutable stream kind.
 
 A link secret is carried in one URL fragment parameter:
 
@@ -262,7 +262,7 @@ A terminal stream has independent `input` and `output` logs. Each log follows th
 
 The generic read route selects terminal output. The generic write route selects terminal input. Explicit routes select either log for hosts and specialized clients.
 
-Terminal data uses WebSocket routes.
+The explicit terminal routes are WebSocket-only. Generic HTTP append and SSE read routes select terminal input and output using the same defaults as generic WebSocket routes.
 
 ```txt
 /api/v1/streams/{stream_id}/terminal/input/read
@@ -294,7 +294,7 @@ Output event types are:
 | `0x04` | `exited` | Signed exit status as a big-endian `int32` value |
 | `0x05` | `heartbeat` | Empty |
 
-Resize dimensions are non-zero. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors.
+Terminal dimensions are between 1 and 1,000 columns, between 1 and 500 rows, and at most 131,072 cells. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors. Servers validate the record envelope and direction-specific event before append.
 
 The host writes one `started` event before other output. It writes data, resize, and heartbeat events while the child runs. A clean exit ends with one `exited` event. The browser rejects an event before `started` or a second `started`, and stops reading at `exited`.
 

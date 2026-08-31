@@ -7,6 +7,9 @@ import {
   decodeTerminalOutputEvent,
   encodeTerminalInputEvent,
   encodeTerminalOutputEvent,
+  MAX_TERMINAL_CELLS,
+  MAX_TERMINAL_COLUMNS,
+  MAX_TERMINAL_ROWS,
   ProtocolError,
 } from "../src/index.js";
 
@@ -60,6 +63,16 @@ describe("terminal event protocol", () => {
       columns: 0,
       rows: 24,
     })).toThrow(/columns/);
+    expect(() => encodeTerminalInputEvent({
+      type: "resize",
+      columns: MAX_TERMINAL_COLUMNS + 1,
+      rows: 24,
+    })).toThrow(/columns/);
+    expect(() => encodeTerminalOutputEvent({
+      type: "started",
+      columns: MAX_TERMINAL_COLUMNS,
+      rows: MAX_TERMINAL_ROWS,
+    })).toThrow(new RegExp(`${MAX_TERMINAL_CELLS} cells`));
   });
 });
 

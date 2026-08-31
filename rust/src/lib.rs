@@ -35,8 +35,9 @@ pub use protocol::{
         Visibility,
     },
     terminal::{
-        TerminalInputEvent, TerminalOutputEvent, TerminalProtocolError, decode_terminal_input,
-        decode_terminal_output, encode_terminal_input, encode_terminal_output,
+        MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TerminalInputEvent,
+        TerminalOutputEvent, TerminalProtocolError, decode_terminal_input, decode_terminal_output,
+        encode_terminal_input, encode_terminal_output, validate_terminal_size,
     },
     ws::{
         MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteSessionOptions,
