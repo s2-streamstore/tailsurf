@@ -167,6 +167,7 @@ impl TerminalCheckpointEmitter {
                 };
 
                 self.process_segment(&[byte]);
+                self.translate_unsupported_alternate_mode(mode, true);
                 if !self.parser.screen().alternate_screen() {
                     self.compatibility.reject();
                 }
@@ -195,6 +196,7 @@ impl TerminalCheckpointEmitter {
                 }
 
                 self.process_segment(&[byte]);
+                self.translate_unsupported_alternate_mode(mode, false);
                 self.alternate_restore = None;
                 if self.parser.screen().alternate_screen() {
                     self.compatibility.reject();
@@ -244,18 +246,28 @@ impl TerminalCheckpointEmitter {
     fn can_compact(&self) -> bool {
         self.parser.callbacks().compatible && self.compatibility.compatible
     }
+
+    fn translate_unsupported_alternate_mode(&mut self, mode: AlternateScreenMode, enter: bool) {
+        if mode != AlternateScreenMode::Switch1047 {
+            return;
+        }
+        self.parser
+            .process(if enter { b"\x1b[?47h" } else { b"\x1b[?47l" });
+        self.parser.callbacks_mut().compatible = true;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AlternateScreenMode {
-    Switch,
+    Switch47,
+    Switch1047,
     SaveCursor,
 }
 
 impl AlternateScreenMode {
     fn enter_sequence(self) -> &'static [u8] {
         match self {
-            Self::Switch => b"\x1b[?47h",
+            Self::Switch47 | Self::Switch1047 => b"\x1b[?47h",
             Self::SaveCursor => b"\x1b[?1049h",
         }
     }
@@ -393,7 +405,8 @@ impl vte::Perform for CheckpointCompatibility {
                     count += 1;
                     match param {
                         [6] => self.reject(),
-                        [47] => mode = Some(AlternateScreenMode::Switch),
+                        [47] => mode = Some(AlternateScreenMode::Switch47),
+                        [1047] => mode = Some(AlternateScreenMode::Switch1047),
                         [1049] => mode = Some(AlternateScreenMode::SaveCursor),
                         _ => {}
                     }
@@ -513,6 +526,28 @@ mod tests {
         emitter.process(b"\x1b[?104");
         emitter.process(b"9l");
         restored.process(b"\x1b[?1049l");
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+    }
+
+    #[test]
+    fn checkpoint_normalizes_alternate_screen_mode_1047() {
+        let mut emitter = TerminalCheckpointEmitter::new(80, 24);
+        emitter.process(b"shell\x1b[?1047hfull screen");
+        let checkpoint = emitter.flush().expect("checkpoint");
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
+
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+
+        emitter.process(b"\x1b[?1047l");
+        restored.process(b"\x1b[?47l");
         assert_eq!(
             restored.screen().state_formatted(),
             emitter.parser.screen().state_formatted()
