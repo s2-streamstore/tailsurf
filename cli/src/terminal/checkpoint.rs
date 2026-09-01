@@ -3,7 +3,7 @@ use tailsurf::{
     protocol::ws::frame::MAX_RECORD_PAYLOAD_BYTES,
 };
 
-const CHECKPOINT_BYTE_INTERVAL: usize = 4 * 1024 * 1024;
+const CHECKPOINT_BYTE_INTERVAL: usize = 256 * 1024;
 const MAX_CHECKPOINT_STATE_BYTES: usize =
     MAX_RECORD_PAYLOAD_BYTES - TERMINAL_CHECKPOINT_EVENT_HEADER_BYTES;
 
@@ -20,6 +20,7 @@ pub(super) struct TerminalCheckpointEmitter {
     restore_columns: u16,
     restore_rows: u16,
     restore_state: Option<Vec<u8>>,
+    alternate_restore: Option<AlternateRestore>,
     pending_bytes: usize,
     pending_records: usize,
 }
@@ -38,16 +39,38 @@ impl TerminalCheckpointEmitter {
             restore_columns: columns,
             restore_rows: rows,
             restore_state: Some(Vec::new()),
+            alternate_restore: None,
             pending_bytes: 0,
             pending_records: 0,
         }
     }
 
     pub(super) fn process(&mut self, data: &[u8]) -> Option<TerminalStateCheckpoint> {
-        self.parser.process(data);
+        // Alternate-screen mode changes end in `h` or `l`. Stop at those boundaries so the
+        // primary screen can be serialized immediately before the parser switches buffers.
+        let mut compatibility_start = 0;
+        let mut terminal_start = 0;
+        for (index, byte) in data.iter().enumerate() {
+            if !matches!(byte, b'h' | b'l') {
+                continue;
+            }
+
+            self.compatibility.transition = None;
+            self.compatibility_parser
+                .advance(&mut self.compatibility, &data[compatibility_start..=index]);
+            compatibility_start = index + 1;
+
+            let Some(transition) = self.compatibility.transition.take() else {
+                continue;
+            };
+            self.process_segment(&data[terminal_start..index]);
+            self.process_alternate_transition(transition, *byte);
+            terminal_start = index + 1;
+        }
+        self.compatibility.transition = None;
         self.compatibility_parser
-            .advance(&mut self.compatibility, data);
-        self.append_restore_data(data);
+            .advance(&mut self.compatibility, &data[compatibility_start..]);
+        self.process_segment(&data[terminal_start..]);
         self.pending_bytes = self.pending_bytes.saturating_add(data.len());
         self.pending_records = self.pending_records.saturating_add(1);
         if self.pending_bytes >= CHECKPOINT_BYTE_INTERVAL
@@ -60,7 +83,19 @@ impl TerminalCheckpointEmitter {
 
     pub(super) fn resize(&mut self, columns: u16, rows: u16) -> Option<TerminalStateCheckpoint> {
         if self.parser.screen().size() != (rows, columns) {
-            self.restore_state = None;
+            let alternate_screen = self.parser.screen().alternate_screen();
+            if alternate_screen && self.can_compact() {
+                if let Some(restore) = &mut self.alternate_restore {
+                    if !restore.resize(columns, rows) {
+                        self.restore_state = None;
+                        self.compatibility.reject();
+                    }
+                } else {
+                    self.restore_state = None;
+                }
+            } else if alternate_screen || !self.can_compact() {
+                self.restore_state = None;
+            }
         }
         self.parser.screen_mut().set_size(rows, columns);
         self.pending_records = self.pending_records.saturating_add(1);
@@ -82,16 +117,11 @@ impl TerminalCheckpointEmitter {
         self.pending_bytes = 0;
         self.pending_records = 0;
 
-        if !self.parser.screen().alternate_screen()
-            && self.parser.callbacks().compatible
-            && self.compatibility.compatible
-        {
-            let (rows, columns) = self.parser.screen().size();
-            let state = self.parser.screen().state_formatted();
-            if state.len() > MAX_CHECKPOINT_STATE_BYTES {
+        if self.can_compact() {
+            let Some((columns, rows, state)) = self.compact_state() else {
                 self.restore_state = None;
                 return None;
-            }
+            };
             self.restore_columns = columns;
             self.restore_rows = rows;
             self.restore_state = Some(state.clone());
@@ -118,6 +148,157 @@ impl TerminalCheckpointEmitter {
             return;
         }
         state.extend_from_slice(data);
+    }
+
+    fn process_segment(&mut self, data: &[u8]) {
+        self.parser.process(data);
+        self.append_restore_data(data);
+    }
+
+    fn process_alternate_transition(&mut self, transition: AlternateTransition, byte: u8) {
+        let can_compact = self.can_compact();
+        match transition {
+            AlternateTransition::Enter(mode) => {
+                let primary_state = if can_compact && !self.parser.screen().alternate_screen() {
+                    Some(self.parser.screen().state_formatted())
+                } else {
+                    self.compatibility.reject();
+                    None
+                };
+
+                self.process_segment(&[byte]);
+                self.translate_unsupported_alternate_mode(mode, true);
+                if !self.parser.screen().alternate_screen() {
+                    self.compatibility.reject();
+                }
+                self.alternate_restore = primary_state.and_then(|primary_state| {
+                    self.parser.screen().alternate_screen().then(|| {
+                        let (rows, columns) = self.parser.screen().size();
+                        AlternateRestore {
+                            primary_state,
+                            columns,
+                            rows,
+                            mode,
+                        }
+                    })
+                });
+                self.rebase_restore_state();
+            }
+            AlternateTransition::Exit(mode) => {
+                let matching_restore = can_compact
+                    && self.parser.screen().alternate_screen()
+                    && self
+                        .alternate_restore
+                        .as_ref()
+                        .is_some_and(|restore| restore.mode == mode);
+                if !matching_restore {
+                    self.compatibility.reject();
+                }
+
+                self.process_segment(&[byte]);
+                self.translate_unsupported_alternate_mode(mode, false);
+                self.alternate_restore = None;
+                if self.parser.screen().alternate_screen() {
+                    self.compatibility.reject();
+                }
+                self.rebase_restore_state();
+            }
+        }
+    }
+
+    fn compact_state(&self) -> Option<(u16, u16, Vec<u8>)> {
+        if !self.can_compact() {
+            return None;
+        }
+
+        let (rows, columns) = self.parser.screen().size();
+        let state = if self.parser.screen().alternate_screen() {
+            let restore = self.alternate_restore.as_ref()?;
+            let active_state = self.parser.screen().state_formatted();
+            let mut state = Vec::with_capacity(
+                restore.primary_state.len()
+                    + restore.mode.enter_sequence().len()
+                    + active_state.len(),
+            );
+            state.extend_from_slice(&restore.primary_state);
+            state.extend_from_slice(restore.mode.enter_sequence());
+            state.extend_from_slice(&active_state);
+            state
+        } else {
+            self.parser.screen().state_formatted()
+        };
+
+        (state.len() <= MAX_CHECKPOINT_STATE_BYTES).then_some((columns, rows, state))
+    }
+
+    fn rebase_restore_state(&mut self) {
+        let Some((columns, rows, state)) = self.compact_state() else {
+            if self.can_compact() {
+                self.restore_state = None;
+            }
+            return;
+        };
+        self.restore_columns = columns;
+        self.restore_rows = rows;
+        self.restore_state = Some(state);
+    }
+
+    fn can_compact(&self) -> bool {
+        self.parser.callbacks().compatible && self.compatibility.compatible
+    }
+
+    fn translate_unsupported_alternate_mode(&mut self, mode: AlternateScreenMode, enter: bool) {
+        if mode != AlternateScreenMode::Switch1047 {
+            return;
+        }
+        self.parser
+            .process(if enter { b"\x1b[?47h" } else { b"\x1b[?47l" });
+        self.parser.callbacks_mut().compatible = true;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlternateScreenMode {
+    Switch47,
+    Switch1047,
+    SaveCursor,
+}
+
+impl AlternateScreenMode {
+    fn enter_sequence(self) -> &'static [u8] {
+        match self {
+            Self::Switch47 | Self::Switch1047 => b"\x1b[?47h",
+            Self::SaveCursor => b"\x1b[?1049h",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AlternateTransition {
+    Enter(AlternateScreenMode),
+    Exit(AlternateScreenMode),
+}
+
+struct AlternateRestore {
+    primary_state: Vec<u8>,
+    columns: u16,
+    rows: u16,
+    mode: AlternateScreenMode,
+}
+
+impl AlternateRestore {
+    fn resize(&mut self, columns: u16, rows: u16) -> bool {
+        let mut parser = vt100::Parser::new(self.rows, self.columns, 0);
+        parser.process(&self.primary_state);
+        parser.screen_mut().set_size(rows, columns);
+        let state = parser.screen().state_formatted();
+        if state.len() > MAX_CHECKPOINT_STATE_BYTES {
+            return false;
+        }
+        self.primary_state = state;
+        self.columns = columns;
+        self.rows = rows;
+        true
     }
 }
 
@@ -168,28 +349,39 @@ impl vt100::Callbacks for CheckpointCallbacks {
 
 struct CheckpointCompatibility {
     compatible: bool,
+    transition: Option<AlternateTransition>,
 }
 
 impl Default for CheckpointCompatibility {
     fn default() -> Self {
-        Self { compatible: true }
+        Self {
+            compatible: true,
+            transition: None,
+        }
+    }
+}
+
+impl CheckpointCompatibility {
+    fn reject(&mut self) {
+        self.compatible = false;
+        self.transition = None;
     }
 }
 
 impl vte::Perform for CheckpointCompatibility {
     fn execute(&mut self, byte: u8) {
         if !matches!(byte, 7..=13) {
-            self.compatible = false;
+            self.reject();
         }
     }
 
     fn hook(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
-        self.compatible = false;
+        self.reject();
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         if ignore || !intermediates.is_empty() || matches!(byte, b'7' | b'8') {
-            self.compatible = false;
+            self.reject();
         }
     }
 
@@ -201,17 +393,35 @@ impl vte::Perform for CheckpointCompatibility {
         action: char,
     ) {
         if ignore {
-            self.compatible = false;
+            self.reject();
             return;
         }
         match (intermediates, action) {
-            ([], 'r') => self.compatible = false,
-            ([b'?'], 'h' | 'l')
-                if params
-                    .iter()
-                    .any(|param| matches!(param, [6] | [47] | [1049])) =>
-            {
-                self.compatible = false;
+            ([], 'r') => self.reject(),
+            ([b'?'], 'h' | 'l') => {
+                let mut mode = None;
+                let mut count = 0;
+                for param in params.iter() {
+                    count += 1;
+                    match param {
+                        [6] => self.reject(),
+                        [47] => mode = Some(AlternateScreenMode::Switch47),
+                        [1047] => mode = Some(AlternateScreenMode::Switch1047),
+                        [1049] => mode = Some(AlternateScreenMode::SaveCursor),
+                        _ => {}
+                    }
+                }
+                if let Some(mode) = mode {
+                    if count == 1 && self.compatible {
+                        self.transition = Some(if action == 'h' {
+                            AlternateTransition::Enter(mode)
+                        } else {
+                            AlternateTransition::Exit(mode)
+                        });
+                    } else {
+                        self.reject();
+                    }
+                }
             }
             _ => {}
         }
@@ -262,14 +472,86 @@ mod tests {
             restored.screen().state_formatted(),
             emitter.parser.screen().state_formatted()
         );
+
+        assert!(emitter.resize(120, 40).is_none());
     }
 
     #[test]
-    fn resize_discards_an_unsafe_replay_program() {
+    fn checkpoint_preserves_both_screens_across_a_resize() {
         let mut emitter = TerminalCheckpointEmitter::new(80, 24);
         emitter.process(b"shell\x1b[?1049hfull screen");
+        let checkpoint = emitter.resize(120, 40).expect("resized checkpoint");
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
 
-        assert!(emitter.resize(120, 40).is_none());
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+
+        emitter.process(b"\x1b[?1049l");
+        restored.process(b"\x1b[?1049l");
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+    }
+
+    #[test]
+    fn alternate_screen_checkpoints_stay_compact() {
+        let mut emitter = TerminalCheckpointEmitter::new(80, 24);
+        emitter.process(b"shell\x1b[?10");
+        emitter.process(b"49h");
+        let output = vec![b'x'; 8 * 1024];
+        let mut checkpoints = Vec::new();
+        for _ in 0..(3 * CHECKPOINT_BYTE_INTERVAL / output.len()) {
+            if let Some(checkpoint) = emitter.process(&output) {
+                checkpoints.push(checkpoint);
+            }
+        }
+
+        assert_eq!(checkpoints.len(), 3);
+        let checkpoint = checkpoints.pop().expect("checkpoint");
+        assert!(checkpoint.state.len() < MAX_CHECKPOINT_STATE_BYTES);
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
+
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+
+        emitter.process(b"\x1b[?104");
+        emitter.process(b"9l");
+        restored.process(b"\x1b[?1049l");
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+    }
+
+    #[test]
+    fn checkpoint_normalizes_alternate_screen_mode_1047() {
+        let mut emitter = TerminalCheckpointEmitter::new(80, 24);
+        emitter.process(b"shell\x1b[?1047hfull screen");
+        let checkpoint = emitter.flush().expect("checkpoint");
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
+
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+
+        emitter.process(b"\x1b[?1047l");
+        restored.process(b"\x1b[?47l");
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
     }
 
     #[test]
