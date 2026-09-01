@@ -37,8 +37,15 @@ export const MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES = 5 * 1024 * 1024;
 export const MAX_WRITER_IN_FLIGHT_RECORDS = 1_024;
 const FRAME_OPERATION_BYTES = 1;
 const RECORD_LENGTH_BYTES = 4;
-const APPEND_RECORD_HEADER_BYTES = 8 + 4;
-const READ_RECORD_HEADER_BYTES = 8 + 8 + WRITER_ID_BYTE_LENGTH + 8 + 4;
+const APPEND_WRITER_SEQ_NUM_OFFSET = 0;
+const APPEND_PART_OFFSET = APPEND_WRITER_SEQ_NUM_OFFSET + 8;
+const APPEND_RECORD_HEADER_BYTES = APPEND_PART_OFFSET + 4;
+const READ_SEQ_NUM_OFFSET = 0;
+const READ_TIMESTAMP_MS_OFFSET = READ_SEQ_NUM_OFFSET + 8;
+const READ_WRITER_ID_OFFSET = READ_TIMESTAMP_MS_OFFSET + 8;
+const READ_WRITER_SEQ_NUM_OFFSET = READ_WRITER_ID_OFFSET + WRITER_ID_BYTE_LENGTH;
+const READ_PART_OFFSET = READ_WRITER_SEQ_NUM_OFFSET + 8;
+const READ_RECORD_HEADER_BYTES = READ_PART_OFFSET + 4;
 /** Maximum encoded size of any TSF protocol frame. */
 export const MAX_ENCODED_FRAME_BYTES =
   FRAME_OPERATION_BYTES +
@@ -205,12 +212,17 @@ export function encodeClientFrame(frame: ClientFrame): Uint8Array {
           offset,
           APPEND_RECORD_HEADER_BYTES + record.data.byteLength,
         );
-        writeU64(view, offset + RECORD_LENGTH_BYTES, record.writerSeqNum);
+        const bodyOffset = offset + RECORD_LENGTH_BYTES;
+        writeU64(
+          view,
+          bodyOffset + APPEND_WRITER_SEQ_NUM_OFFSET,
+          record.writerSeqNum,
+        );
         view.setUint32(
-          offset + RECORD_LENGTH_BYTES + 8,
+          bodyOffset + APPEND_PART_OFFSET,
           partHeaderRaw(record.part),
         );
-        const dataOffset = offset + RECORD_LENGTH_BYTES + APPEND_RECORD_HEADER_BYTES;
+        const dataOffset = bodyOffset + APPEND_RECORD_HEADER_BYTES;
         output.set(record.data, dataOffset);
         offset = dataOffset + record.data.byteLength;
       }
@@ -265,13 +277,13 @@ export function decodeClientFrame(input: Uint8Array | ArrayBuffer): ClientFrame 
         requireLength(body, APPEND_RECORD_HEADER_BYTES);
         const bodyView = dataView(body);
         const data = body.slice(APPEND_RECORD_HEADER_BYTES);
-        const writerSeqNum = bodyView.getBigUint64(0);
+        const writerSeqNum = bodyView.getBigUint64(APPEND_WRITER_SEQ_NUM_OFFSET);
         validateAppendWriterSeqNum(writerSeqNum);
         validateRecordLength(data.byteLength);
         payloadBytes += data.byteLength;
         records.push({
           writerSeqNum,
-          part: partHeaderFromRaw(bodyView.getUint32(8)),
+          part: partHeaderFromRaw(bodyView.getUint32(APPEND_PART_OFFSET)),
           data,
         });
       }
@@ -364,12 +376,16 @@ export function encodeServerFrame(frame: ServerFrame): Uint8Array {
         validateWriterIdLength(record.writerId, "writer ID", "invalid_writer_id");
         view.setUint32(offset, READ_RECORD_HEADER_BYTES + record.data.byteLength);
         const bodyOffset = offset + RECORD_LENGTH_BYTES;
-        writeU64(view, bodyOffset, record.seqNum);
-        writeU64(view, bodyOffset + 8, record.timestampMs);
-        output.set(record.writerId, bodyOffset + 16);
-        writeU64(view, bodyOffset + 16 + WRITER_ID_BYTE_LENGTH, record.writerSeqNum);
+        writeU64(view, bodyOffset + READ_SEQ_NUM_OFFSET, record.seqNum);
+        writeU64(view, bodyOffset + READ_TIMESTAMP_MS_OFFSET, record.timestampMs);
+        output.set(record.writerId, bodyOffset + READ_WRITER_ID_OFFSET);
+        writeU64(
+          view,
+          bodyOffset + READ_WRITER_SEQ_NUM_OFFSET,
+          record.writerSeqNum,
+        );
         view.setUint32(
-          bodyOffset + READ_RECORD_HEADER_BYTES - 4,
+          bodyOffset + READ_PART_OFFSET,
           partHeaderRaw(record.part),
         );
         const dataOffset = bodyOffset + READ_RECORD_HEADER_BYTES;
@@ -426,11 +442,14 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
         validateRecordLength(data.byteLength);
         payloadBytes += data.byteLength;
         records.push({
-          seqNum: bodyView.getBigUint64(0),
-          timestampMs: bodyView.getBigUint64(8),
-          writerId: parseWriterId(body.subarray(16, 32)),
-          writerSeqNum: bodyView.getBigUint64(32),
-          part: partHeaderFromRaw(bodyView.getUint32(40)),
+          seqNum: bodyView.getBigUint64(READ_SEQ_NUM_OFFSET),
+          timestampMs: bodyView.getBigUint64(READ_TIMESTAMP_MS_OFFSET),
+          writerId: parseWriterId(body.subarray(
+            READ_WRITER_ID_OFFSET,
+            READ_WRITER_ID_OFFSET + WRITER_ID_BYTE_LENGTH,
+          )),
+          writerSeqNum: bodyView.getBigUint64(READ_WRITER_SEQ_NUM_OFFSET),
+          part: partHeaderFromRaw(bodyView.getUint32(READ_PART_OFFSET)),
           data,
         });
       }
