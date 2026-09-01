@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildPublicTerminalUrl,
+  buildPublicStreamUrl,
   buildStreamLink,
   buildTerminalLink,
   generateStreamId,
@@ -121,6 +122,12 @@ describe("stream URLs", () => {
   );
 
   it("builds a canonical stream link and removes the base query", () => {
+    expect(
+      buildPublicStreamUrl(
+        "http://user:password@localhost:3000/?ignored=true#fragment",
+        STREAM_ID,
+      ).toString(),
+    ).toBe(`http://localhost:3000/s/${STREAM_ID}`);
     expect(
       buildStreamLink(
         "http://user:password@localhost:3000/?ignored=true",

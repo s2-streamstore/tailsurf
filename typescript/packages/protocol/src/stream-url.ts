@@ -150,6 +150,15 @@ export function buildTerminalLink(
   return buildLink(baseUrl, "t", streamId, permissions, secret);
 }
 
+export function buildPublicStreamUrl(
+  baseUrl: string | URL,
+  streamId: StreamId,
+): URL {
+  const url = normalizedStreamUrl(baseUrl, "s", streamId);
+  url.hash = "";
+  return url;
+}
+
 export function buildPublicTerminalUrl(
   baseUrl: string | URL,
   streamId: StreamId,

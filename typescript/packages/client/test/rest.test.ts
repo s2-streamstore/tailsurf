@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   generateIdempotencyKey,
   parseIdempotencyKey,
+  parsePreparedCreateStreamRequest,
   prepareCreateStreamRequest,
   TsfClient,
   TsfHttpError,
@@ -22,6 +23,13 @@ import {
 const LINK_SECRET = "A".repeat(32);
 
 describe("TsfClient REST API", () => {
+  it("requires kind in a prepared creation request", () => {
+    expect(() => parsePreparedCreateStreamRequest({
+      visibility: "private",
+      links: [{ linkId: "owner", permissions: "o" }],
+    })).toThrow(expect.objectContaining({ code: "invalid_client_option" }));
+  });
+
   it("rejects an invalid bounded operation attempt count", () => {
     expect(() => new TsfClient({ boundedOperationAttempts: 0 })).toThrow(
       expect.objectContaining({ code: "invalid_client_option" }),

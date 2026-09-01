@@ -4,10 +4,10 @@ export const TERMINAL_EVENT_VERSION = 0x01;
 export const MAX_TERMINAL_COLUMNS = 1_000;
 export const MAX_TERMINAL_ROWS = 500;
 export const MAX_TERMINAL_CELLS = 131_072;
+export const TERMINAL_EVENT_HEADER_BYTES = 2;
 
-const HEADER_BYTES = 2;
-const SIZE_EVENT_BYTES = HEADER_BYTES + 4;
-const EXITED_EVENT_BYTES = HEADER_BYTES + 5;
+const SIZE_EVENT_BYTES = TERMINAL_EVENT_HEADER_BYTES + 4;
+const EXITED_EVENT_BYTES = TERMINAL_EVENT_HEADER_BYTES + 5;
 
 const DATA = 0x01;
 const RESIZE = 0x02;
@@ -43,7 +43,7 @@ export function decodeTerminalInputEvent(payload: Uint8Array): TerminalInputEven
   const type = terminalEventType(payload);
   switch (type) {
     case DATA:
-      return { type: "data", data: payload.slice(HEADER_BYTES) };
+      return { type: "data", data: payload.subarray(TERMINAL_EVENT_HEADER_BYTES) };
     case RESIZE:
       return { type: "resize", ...decodeSize(payload, "resize") };
     default:
@@ -62,12 +62,12 @@ export function encodeTerminalOutputEvent(event: TerminalOutputEvent): Uint8Arra
     case "exited": {
       requireInt32(event.status, "terminal exit status");
       const payload = eventHeader(EXITED, EXITED_EVENT_BYTES);
-      new DataView(payload.buffer).setInt32(HEADER_BYTES, event.status);
-      payload[HEADER_BYTES + 4] = event.outputTruncated ? 1 : 0;
+      new DataView(payload.buffer).setInt32(TERMINAL_EVENT_HEADER_BYTES, event.status);
+      payload[TERMINAL_EVENT_HEADER_BYTES + 4] = event.outputTruncated ? 1 : 0;
       return payload;
     }
     case "heartbeat":
-      return eventHeader(HEARTBEAT, HEADER_BYTES);
+      return eventHeader(HEARTBEAT, TERMINAL_EVENT_HEADER_BYTES);
   }
 }
 
@@ -75,17 +75,17 @@ export function decodeTerminalOutputEvent(payload: Uint8Array): TerminalOutputEv
   const type = terminalEventType(payload);
   switch (type) {
     case DATA:
-      return { type: "data", data: payload.slice(HEADER_BYTES) };
+      return { type: "data", data: payload.subarray(TERMINAL_EVENT_HEADER_BYTES) };
     case RESIZE:
       return { type: "resize", ...decodeSize(payload, "resize") };
     case STARTED:
       return { type: "started", ...decodeSize(payload, "started") };
     case EXITED:
       requireLength(payload, EXITED_EVENT_BYTES, "exited");
-      if (payload[HEADER_BYTES + 4]! > 1) {
+      if (payload[TERMINAL_EVENT_HEADER_BYTES + 4]! > 1) {
         throw new ProtocolError(
           "invalid_terminal_exit_flags",
-          `invalid terminal exited flags 0x${hex(payload[HEADER_BYTES + 4])}`,
+          `invalid terminal exited flags 0x${hex(payload[TERMINAL_EVENT_HEADER_BYTES + 4])}`,
         );
       }
       return {
@@ -94,11 +94,11 @@ export function decodeTerminalOutputEvent(payload: Uint8Array): TerminalOutputEv
           payload.buffer,
           payload.byteOffset,
           payload.byteLength,
-        ).getInt32(HEADER_BYTES),
-        outputTruncated: payload[HEADER_BYTES + 4] === 1,
+        ).getInt32(TERMINAL_EVENT_HEADER_BYTES),
+        outputTruncated: payload[TERMINAL_EVENT_HEADER_BYTES + 4] === 1,
       };
     case HEARTBEAT:
-      requireLength(payload, HEADER_BYTES, "heartbeat");
+      requireLength(payload, TERMINAL_EVENT_HEADER_BYTES, "heartbeat");
       return { type: "heartbeat" };
     default:
       throw unknownType("output", type);
@@ -106,8 +106,8 @@ export function decodeTerminalOutputEvent(payload: Uint8Array): TerminalOutputEv
 }
 
 function encodeData(type: number, data: Uint8Array): Uint8Array {
-  const payload = eventHeader(type, HEADER_BYTES + data.byteLength);
-  payload.set(data, HEADER_BYTES);
+  const payload = eventHeader(type, TERMINAL_EVENT_HEADER_BYTES + data.byteLength);
+  payload.set(data, TERMINAL_EVENT_HEADER_BYTES);
   return payload;
 }
 
@@ -119,8 +119,8 @@ function encodeSize(
   validateTerminalSize(columns, rows);
   const payload = eventHeader(type, SIZE_EVENT_BYTES);
   const view = new DataView(payload.buffer);
-  view.setUint16(HEADER_BYTES, columns);
-  view.setUint16(HEADER_BYTES + 2, rows);
+  view.setUint16(TERMINAL_EVENT_HEADER_BYTES, columns);
+  view.setUint16(TERMINAL_EVENT_HEADER_BYTES + 2, rows);
   return payload;
 }
 
@@ -134,8 +134,8 @@ function decodeSize(
     payload.byteOffset,
     payload.byteLength,
   );
-  const columns = view.getUint16(HEADER_BYTES);
-  const rows = view.getUint16(HEADER_BYTES + 2);
+  const columns = view.getUint16(TERMINAL_EVENT_HEADER_BYTES);
+  const rows = view.getUint16(TERMINAL_EVENT_HEADER_BYTES + 2);
   validateTerminalSize(columns, rows);
   return { columns, rows };
 }
@@ -148,7 +148,7 @@ function eventHeader(type: number, length: number): Uint8Array {
 }
 
 function terminalEventType(payload: Uint8Array): number {
-  if (payload.byteLength < HEADER_BYTES) {
+  if (payload.byteLength < TERMINAL_EVENT_HEADER_BYTES) {
     throw new ProtocolError(
       "terminal_event_truncated",
       "terminal event must contain a version and type",

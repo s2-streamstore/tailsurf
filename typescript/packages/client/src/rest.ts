@@ -7,6 +7,7 @@ import {
   parseStreamId,
   parseLinkId,
   parseStreamTitle,
+  streamKindSchema,
   streamMetadataSchema,
   updateStreamRequestSchema,
   appendRecordsRequestSchema,
@@ -748,14 +749,19 @@ export function prepareCreateStreamRequest(
 export function parsePreparedCreateStreamRequest(
   input: unknown,
 ): PreparedCreateStreamRequest {
-  if (!isRecord(input) || !Array.isArray(input.links)) {
+  if (
+    !isRecord(input) ||
+    input.kind === undefined ||
+    !Array.isArray(input.links)
+  ) {
     throw new TsfClientError(
       "invalid_client_option",
       "normalized stream request is invalid",
     );
   }
+  const kind = streamKindSchema.parse(input.kind);
   const wire = createStreamRequestSchema.parse({
-    ...(input.kind === undefined ? {} : { kind: input.kind }),
+    kind,
     ...(input.title === undefined ? {} : { title: input.title }),
     ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
     ...(input.expiresInSeconds === undefined
@@ -775,7 +781,7 @@ export function parsePreparedCreateStreamRequest(
     }),
   });
   return {
-    kind: wire.kind ?? "transcript",
+    kind,
     ...(wire.title === undefined ? {} : { title: wire.title }),
     visibility: wire.visibility,
     ...(wire.expires_in_seconds === undefined

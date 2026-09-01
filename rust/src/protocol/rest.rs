@@ -1,6 +1,12 @@
 //! JSON models for the REST v1 management and HTTP data planes.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
+
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as _, IgnoredAny, MapAccess, Visitor},
+    ser::SerializeMap,
+};
 use url::Url;
 
 use crate::{
@@ -307,6 +313,82 @@ pub struct RestRecordPart {
     pub is_final: bool,
 }
 
+/// Exact JSON representation of one record payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsonRecordPayload {
+    /// UTF-8 payload carried directly as JSON text.
+    Text(String),
+    /// Payload carried as canonical unpadded base64url.
+    Bytes(String),
+}
+
+impl Serialize for JsonRecordPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Text(text) => map.serialize_entry("text", text)?,
+            Self::Bytes(bytes) => map.serialize_entry("bytes", bytes)?,
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonRecordPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(JsonRecordPayloadVisitor)
+    }
+}
+
+struct JsonRecordPayloadVisitor;
+
+impl<'de> Visitor<'de> for JsonRecordPayloadVisitor {
+    type Value = JsonRecordPayload;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("exactly one text or bytes record payload")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut text = None;
+        let mut bytes = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "text" => {
+                    if text.is_some() {
+                        return Err(A::Error::duplicate_field("text"));
+                    }
+                    text = Some(map.next_value()?);
+                }
+                "bytes" => {
+                    if bytes.is_some() {
+                        return Err(A::Error::duplicate_field("bytes"));
+                    }
+                    bytes = Some(map.next_value()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        match (text, bytes) {
+            (Some(text), None) => Ok(JsonRecordPayload::Text(text)),
+            (None, Some(bytes)) => Ok(JsonRecordPayload::Bytes(bytes)),
+            _ => Err(A::Error::custom(
+                "a record carries exactly one of text or bytes",
+            )),
+        }
+    }
+}
+
 /// One record in a stateless atomic append.
 ///
 /// The payload key is the JSON representation: `text` carries UTF-8
@@ -317,12 +399,9 @@ pub struct AppendJsonRecord {
     /// Split-part metadata, or an implicit unsplit record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<RestRecordPart>,
-    /// UTF-8 payload text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// Canonical unpadded base64url payload bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<String>,
+    /// Exact payload representation.
+    #[serde(flatten)]
+    pub payload: JsonRecordPayload,
 }
 
 /// Writer identity for a stateless append: the id and the writer-local
@@ -513,12 +592,9 @@ pub struct SseReadRecord {
     /// Split-part metadata, or an implicit unsplit record.
     #[serde(default)]
     pub part: Option<RestRecordPart>,
-    /// UTF-8 payload text.
-    #[serde(default)]
-    pub text: Option<String>,
-    /// Canonical unpadded base64url payload bytes.
-    #[serde(default)]
-    pub bytes: Option<String>,
+    /// Exact payload representation.
+    #[serde(flatten)]
+    pub payload: JsonRecordPayload,
 }
 
 /// Payload of a batched SSE `read_batch` event.
@@ -824,6 +900,42 @@ mod tests {
                 .expect("deserialize absent title update")
                 .title,
             StreamTitleUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn record_payloads_require_exactly_one_encoding() {
+        let base = json!({
+            "seq_num": "1",
+            "timestamp_ms": "2",
+            "writer": {
+                "id": "AAAAAAAAAAAAAAAAAAAAAA",
+                "seq_num": "3"
+            },
+            "future_field": true
+        });
+        let mut text = base.clone();
+        text["text"] = json!("hello");
+        assert_eq!(
+            serde_json::from_value::<SseReadRecord>(text)
+                .expect("text record")
+                .payload,
+            JsonRecordPayload::Text("hello".to_owned())
+        );
+
+        let mut both = base.clone();
+        both["text"] = json!("hello");
+        both["bytes"] = json!("aGVsbG8");
+        assert!(serde_json::from_value::<SseReadRecord>(both).is_err());
+        assert!(serde_json::from_value::<SseReadRecord>(base).is_err());
+
+        let append = AppendJsonRecord {
+            part: None,
+            payload: JsonRecordPayload::Bytes("AP8".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(append).expect("serialize byte record"),
+            json!({ "bytes": "AP8" })
         );
     }
 

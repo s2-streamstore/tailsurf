@@ -52,6 +52,17 @@ describe("terminal event protocol", () => {
     }
   });
 
+  it("decodes data as a zero-copy view", () => {
+    const payload = Uint8Array.of(1, 1, 0x61);
+    const event = decodeTerminalOutputEvent(payload);
+    expect(event.type).toBe("data");
+    if (event.type !== "data") {
+      throw new Error("expected data event");
+    }
+    payload[2] = 0x62;
+    expect(event.data).toEqual(Uint8Array.of(0x62));
+  });
+
   it("rejects invalid events", () => {
     expect(() => decodeTerminalInputEvent(Uint8Array.of(1))).toThrow(ProtocolError);
     expect(() => decodeTerminalOutputEvent(Uint8Array.of(2, 1))).toThrow(

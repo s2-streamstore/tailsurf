@@ -3,7 +3,7 @@
 use serde_json::Value;
 use tailsurf::protocol::rest::{
     ApiErrorResponse, AppendRange, AppendRecordsRequest, CreateLinkResponse, CreateStreamRequest,
-    CreateStreamResponse, MAX_INITIAL_STREAM_LINKS, MAX_LINK_PAGE_ITEMS,
+    CreateStreamResponse, JsonRecordPayload, MAX_INITIAL_STREAM_LINKS, MAX_LINK_PAGE_ITEMS,
     MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
     MAX_SSE_READ_BATCH_PAYLOAD_BYTES, MAX_SSE_READ_BATCH_RECORDS, MAX_SSE_UNTERMINATED_EVENT_BYTES,
     MAX_STATELESS_APPEND_JSON_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
@@ -73,8 +73,14 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     assert_eq!(writer.id, "AAECAwQFBgcICQoLDA0ODw");
     assert_eq!(writer.seq_num, 41);
     assert_eq!(append.records.len(), 2);
-    assert_eq!(append.records[0].text.as_deref(), Some("hello\n"));
-    assert_eq!(append.records[1].bytes.as_deref(), Some("AP8"));
+    assert_eq!(
+        append.records[0].payload,
+        JsonRecordPayload::Text("hello\n".to_owned())
+    );
+    assert_eq!(
+        append.records[1].payload,
+        JsonRecordPayload::Bytes("AP8".to_owned())
+    );
     let acknowledgement: AppendRange = fixture(&fixtures, "append_response");
     assert_eq!(
         (acknowledgement.start_seq_num, acknowledgement.end_seq_num),
@@ -86,8 +92,14 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     let records: SseReadBatchData = fixture(&fixtures, "sse_read_batch");
     assert_eq!(records.records.len(), 2);
     assert!(records.records[0].part.is_none());
-    assert_eq!(records.records[0].text.as_deref(), Some("hello\n"));
-    assert_eq!(records.records[1].bytes.as_deref(), Some("AP8"));
+    assert_eq!(
+        records.records[0].payload,
+        JsonRecordPayload::Text("hello\n".to_owned())
+    );
+    assert_eq!(
+        records.records[1].payload,
+        JsonRecordPayload::Bytes("AP8".to_owned())
+    );
     assert_eq!(fixtures["sse_resume_cursor"].as_str(), Some("v1,2,2"));
     let caught_up: SseCaughtUpData = fixture(&fixtures, "sse_caught_up");
     assert_eq!(caught_up.next_seq_num, 8);

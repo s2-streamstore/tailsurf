@@ -21,9 +21,14 @@ pub const MAX_APPEND_FRAME_RECORDS: usize = 128;
 pub const MAX_READ_FRAME_RECORDS: usize = 1_000;
 /// Maximum aggregate record payload carried by one append or read protocol frame.
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024;
+const FRAME_OPERATION_LEN: usize = 1;
+const RECORD_LENGTH_LEN: usize = 4;
+const APPEND_RECORD_HEADER_LEN: usize = 8 + 4;
+const READ_RECORD_HEADER_LEN: usize = 8 + 8 + WriterId::BYTE_LEN + 8 + 4;
 /// Maximum encoded size of any TSF protocol frame.
-pub const MAX_ENCODED_FRAME_BYTES: usize =
-    1 + MAX_READ_FRAME_RECORDS * (4 + 44) + MAX_FRAME_PAYLOAD_BYTES;
+pub const MAX_ENCODED_FRAME_BYTES: usize = FRAME_OPERATION_LEN
+    + MAX_READ_FRAME_RECORDS * (RECORD_LENGTH_LEN + READ_RECORD_HEADER_LEN)
+    + MAX_FRAME_PAYLOAD_BYTES;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -640,7 +645,6 @@ pub enum ServerFrame {
 }
 
 impl ClientFrame {
-    const APPEND_BODY_HEADER_LEN: usize = 8 + 4;
     const OPEN_READ_FIXED_LEN: usize = 1 + 1;
 
     /// Returns the exact wire length of this frame, validating the payload size for records.
@@ -671,7 +675,7 @@ impl ClientFrame {
         }
         batch_encoded_len(
             records.iter().map(|record| record.borrow().data.len()),
-            Self::APPEND_BODY_HEADER_LEN,
+            APPEND_RECORD_HEADER_LEN,
             MAX_APPEND_FRAME_RECORDS,
         )
     }
@@ -680,7 +684,7 @@ impl ClientFrame {
         output.put_u8(ClientOp::AppendBatch.byte());
         for record in records {
             let record = record.borrow();
-            output.put_u32((Self::APPEND_BODY_HEADER_LEN + record.data.len()) as u32);
+            output.put_u32((APPEND_RECORD_HEADER_LEN + record.data.len()) as u32);
             output.put_u64(record.writer_seq_num);
             output.put_u32(record.part.raw());
             output.put_slice(&record.data);
@@ -746,7 +750,6 @@ impl ClientFrame {
 }
 
 impl ServerFrame {
-    const READ_BODY_HEADER_LEN: usize = 8 + 8 + WriterId::BYTE_LEN + 8 + 4;
     /// Largest encoded size among the fixed-width frames, set by [`ServerFrame::AppendAck`].
     const MAX_FIXED_FRAME_LEN: usize = 1 + 4 * 8;
 
@@ -759,7 +762,7 @@ impl ServerFrame {
     fn encoded_len(&self) -> Result<usize, FrameCodecError> {
         match self {
             Self::ReadBatch(batch) => Ok(1
-                + batch.records.len() * (4 + Self::READ_BODY_HEADER_LEN)
+                + batch.records.len() * (RECORD_LENGTH_LEN + READ_RECORD_HEADER_LEN)
                 + batch
                     .records
                     .iter()
@@ -796,7 +799,7 @@ impl ServerFrame {
                 for record in &batch.records {
                     let data_start = record.data_start as usize;
                     let data_len = record.data_len as usize;
-                    output.put_u32((Self::READ_BODY_HEADER_LEN + data_len) as u32);
+                    output.put_u32((READ_RECORD_HEADER_LEN + data_len) as u32);
                     output.put_u64(record.seq_num);
                     output.put_u64(record.timestamp_ms);
                     output.put_slice(record.writer_id.as_bytes());
@@ -961,8 +964,8 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
         ServerOp::ReadBatch => {
             // Every record costs a 4-byte length prefix plus the fixed header on the wire, so
             // the frame length bounds the record count.
-            let max_records =
-                (body.len() / (4 + ServerFrame::READ_BODY_HEADER_LEN)).min(MAX_READ_FRAME_RECORDS);
+            let max_records = (body.len() / (RECORD_LENGTH_LEN + READ_RECORD_HEADER_LEN))
+                .min(MAX_READ_FRAME_RECORDS);
             let mut records = Vec::with_capacity(max_records);
             let mut payload_bytes = 0;
             for range in record_body_ranges(bytes, MAX_READ_FRAME_RECORDS) {
@@ -1563,7 +1566,7 @@ mod tests {
 
     #[test]
     fn multi_record_batches_round_trip_and_enforce_bounds() {
-        // Varied part headers, formats, and payload lengths so field-for-field equality can
+        // Varied part headers and payload lengths so field-for-field equality can
         // catch any record-boundary or header mix-up in either direction.
         let records: Vec<AppendRecord> = vec![
             AppendRecord {
@@ -1641,8 +1644,8 @@ mod tests {
     /// defect that a round trip would cancel out.
     ///
     /// Layout: op byte `0x03` (AppendBatch), then per record a big-endian u32 body length
-    /// (13-byte header plus payload), a big-endian u64 writer sequence number, a big-endian
-    /// u32 packed part header, a one-byte format, and the payload bytes.
+    /// (12-byte header plus payload), a big-endian u64 writer sequence number, a big-endian
+    /// u32 packed part header, and the payload bytes.
     #[test]
     fn append_batch_decodes_a_canonical_wire_fixture() {
         #[rustfmt::skip]
@@ -1857,7 +1860,7 @@ mod tests {
     fn encoded_append_data_with_len(data_len: usize) -> Bytes {
         let mut frame = BytesMut::new();
         frame.extend_from_slice(&[ClientOp::AppendBatch.byte()]);
-        frame.extend_from_slice(&((12 + data_len) as u32).to_be_bytes());
+        frame.extend_from_slice(&((APPEND_RECORD_HEADER_LEN + data_len) as u32).to_be_bytes());
         frame.extend_from_slice(&0_u64.to_be_bytes());
         frame.extend_from_slice(&PartHeader::unsplit().raw().to_be_bytes());
         frame.extend(std::iter::repeat_n(0, data_len));
