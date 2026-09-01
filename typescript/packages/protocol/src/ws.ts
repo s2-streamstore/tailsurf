@@ -10,7 +10,11 @@ import {
   MAX_SAFE_INTEGER_U64,
   MAX_U64,
 } from "./primitives.js";
-import { streamMetadataSchema, type StreamMetadata } from "./rest.js";
+import {
+  streamMetadataSchema,
+  type StreamKind,
+  type StreamMetadata,
+} from "./rest.js";
 import {
   LINK_SECRET_ENCODED_LENGTH,
   parseLinkSecret,
@@ -33,7 +37,7 @@ export const MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES = 5 * 1024 * 1024;
 export const MAX_WRITER_IN_FLIGHT_RECORDS = 1_024;
 /** Maximum encoded size of any TSF protocol frame. */
 export const MAX_ENCODED_FRAME_BYTES =
-  1 + MAX_READ_FRAME_RECORDS * (4 + 45) + MAX_FRAME_PAYLOAD_BYTES;
+  1 + MAX_READ_FRAME_RECORDS * (4 + 44) + MAX_FRAME_PAYLOAD_BYTES;
 export const PART_FINAL_BIT = 0x8000_0000;
 export const MAX_PART_INDEX = 0x7fff_ffff;
 
@@ -67,13 +71,6 @@ const ServerOp = {
   StreamMetadata: 0x85,
 } as const;
 
-export const RecordFormat = {
-  Bytes: 0x00,
-  Transcript: 0x01,
-} as const;
-
-export type RecordFormat = (typeof RecordFormat)[keyof typeof RecordFormat];
-
 export interface PartHeader {
   readonly index: number;
   readonly isFinal: boolean;
@@ -84,7 +81,6 @@ export const UNSPLIT_PART: PartHeader = Object.freeze({ index: 0, isFinal: true 
 export interface AppendRecord {
   readonly writerSeqNum: bigint;
   readonly part: PartHeader;
-  readonly format: RecordFormat;
   readonly data: Uint8Array;
 }
 
@@ -107,7 +103,6 @@ export interface ReadRecord {
   readonly writerId: WriterId;
   readonly writerSeqNum: bigint;
   readonly part: PartHeader;
-  readonly format: RecordFormat;
   readonly data: Uint8Array;
 }
 
@@ -117,7 +112,7 @@ export interface CaughtUpPosition {
 }
 
 export type ServerFrame =
-  | { readonly type: "ready" }
+  | { readonly type: "ready"; readonly kind: StreamKind }
   | {
       readonly type: "appendAck";
       readonly writerStartSeqNum: bigint;
@@ -189,19 +184,18 @@ export function encodeClientFrame(frame: ClientFrame): Uint8Array {
     }
     case "appendBatch": {
       const output = new Uint8Array(
-        batchFrameLength(frame.records, 13, MAX_APPEND_FRAME_RECORDS),
+        batchFrameLength(frame.records, 12, MAX_APPEND_FRAME_RECORDS),
       );
       const view = new DataView(output.buffer);
       output[0] = ClientOp.AppendBatch;
       let offset = 1;
       for (const record of frame.records) {
         validateAppendWriterSeqNum(record.writerSeqNum);
-        view.setUint32(offset, 13 + record.data.byteLength);
+        view.setUint32(offset, 12 + record.data.byteLength);
         writeU64(view, offset + 4, record.writerSeqNum);
         view.setUint32(offset + 12, partHeaderRaw(record.part));
-        output[offset + 16] = validateRecordFormat(record.format);
-        output.set(record.data, offset + 17);
-        offset += 17 + record.data.byteLength;
+        output.set(record.data, offset + 16);
+        offset += 16 + record.data.byteLength;
       }
       return output;
     }
@@ -251,9 +245,9 @@ export function decodeClientFrame(input: Uint8Array | ArrayBuffer): ClientFrame 
       const records: AppendRecord[] = [];
       let payloadBytes = 0;
       for (const body of recordBodies(bytes, view, MAX_APPEND_FRAME_RECORDS)) {
-        requireLength(body, 13);
+        requireLength(body, 12);
         const bodyView = dataView(body);
-        const data = body.slice(13);
+        const data = body.slice(12);
         const writerSeqNum = bodyView.getBigUint64(0);
         validateAppendWriterSeqNum(writerSeqNum);
         validateRecordLength(data.byteLength);
@@ -261,7 +255,6 @@ export function decodeClientFrame(input: Uint8Array | ArrayBuffer): ClientFrame 
         records.push({
           writerSeqNum,
           part: partHeaderFromRaw(bodyView.getUint32(8)),
-          format: validateRecordFormat(body[12]),
           data,
         });
       }
@@ -327,7 +320,7 @@ function decodeOpenRead(bytes: Uint8Array): Extract<
 export function encodeServerFrame(frame: ServerFrame): Uint8Array {
   switch (frame.type) {
     case "ready":
-      return Uint8Array.of(ServerOp.Ready);
+      return Uint8Array.of(ServerOp.Ready, streamKindByte(frame.kind));
     case "appendAck": {
       const output = new Uint8Array(33);
       const view = new DataView(output.buffer);
@@ -340,7 +333,7 @@ export function encodeServerFrame(frame: ServerFrame): Uint8Array {
     }
     case "readBatch": {
       const output = new Uint8Array(
-        batchFrameLength(frame.records, 45, MAX_READ_FRAME_RECORDS),
+        batchFrameLength(frame.records, 44, MAX_READ_FRAME_RECORDS),
       );
       validateReadBatchSequence(frame.records);
       const view = new DataView(output.buffer);
@@ -348,15 +341,14 @@ export function encodeServerFrame(frame: ServerFrame): Uint8Array {
       let offset = 1;
       for (const record of frame.records) {
         validateWriterIdLength(record.writerId, "writer ID", "invalid_writer_id");
-        view.setUint32(offset, 45 + record.data.byteLength);
+        view.setUint32(offset, 44 + record.data.byteLength);
         writeU64(view, offset + 4, record.seqNum);
         writeU64(view, offset + 12, record.timestampMs);
         output.set(record.writerId, offset + 20);
         writeU64(view, offset + 36, record.writerSeqNum);
         view.setUint32(offset + 44, partHeaderRaw(record.part));
-        output[offset + 48] = validateRecordFormat(record.format);
-        output.set(record.data, offset + 49);
-        offset += 49 + record.data.byteLength;
+        output.set(record.data, offset + 48);
+        offset += 48 + record.data.byteLength;
       }
       return output;
     }
@@ -387,8 +379,8 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
   const view = dataView(bytes);
   switch (op) {
     case ServerOp.Ready:
-      requireExactLength(bytes, 1, op);
-      return { type: "ready" };
+      requireExactLength(bytes, 2, op);
+      return { type: "ready", kind: streamKindFromByte(bytes[1]!) };
     case ServerOp.AppendAck:
       requireExactLength(bytes, 33, op);
       return {
@@ -402,9 +394,9 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
       const records: ReadRecord[] = [];
       let payloadBytes = 0;
       for (const body of recordBodies(bytes, view, MAX_READ_FRAME_RECORDS)) {
-        requireLength(body, 45);
+        requireLength(body, 44);
         const bodyView = dataView(body);
-        const data = body.slice(45);
+        const data = body.slice(44);
         validateRecordLength(data.byteLength);
         payloadBytes += data.byteLength;
         records.push({
@@ -413,7 +405,6 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
           writerId: parseWriterId(body.subarray(16, 32)),
           writerSeqNum: bodyView.getBigUint64(32),
           part: partHeaderFromRaw(bodyView.getUint32(40)),
-          format: validateRecordFormat(body[44]),
           data,
         });
       }
@@ -586,14 +577,31 @@ function validateRecordLength(length: number): void {
   }
 }
 
-function validateRecordFormat(value: number | undefined): RecordFormat {
-  if (value !== RecordFormat.Bytes && value !== RecordFormat.Transcript) {
-    throw new ProtocolError(
-      "unknown_record_format",
-      `unknown record format ${String(value)}`,
-    );
+function streamKindByte(kind: StreamKind): number {
+  switch (kind) {
+    case "transcript":
+      return 0;
+    case "bytes":
+      return 1;
+    case "terminal":
+      return 2;
   }
-  return value;
+}
+
+function streamKindFromByte(value: number): StreamKind {
+  switch (value) {
+    case 0:
+      return "transcript";
+    case 1:
+      return "bytes";
+    case 2:
+      return "terminal";
+    default:
+      throw new ProtocolError(
+        "unknown_stream_kind",
+        `unknown stream kind ${value}`,
+      );
+  }
 }
 
 function validateAppendWriterSeqNum(value: bigint): void {

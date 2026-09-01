@@ -6,9 +6,9 @@ import {
   MAX_WRITER_IN_FLIGHT_RECORDS,
   MAX_U64,
   partHeader,
-  RecordFormat,
   UNSPLIT_PART,
   type PartHeader,
+  type StreamKind,
 } from "@tailsurf/protocol";
 
 import { TsfClientError, TsfWebSocketClosedError } from "./errors.js";
@@ -26,13 +26,11 @@ const textEncoder = new TextEncoder();
 
 export interface AppendInput {
   readonly data: string | Uint8Array;
-  readonly format?: RecordFormat;
   readonly part?: PartHeader;
 }
 
 export interface LogicalAppendInput {
   readonly data: string | Uint8Array;
-  readonly format?: RecordFormat;
 }
 
 export interface AppendReceipt {
@@ -41,6 +39,7 @@ export interface AppendReceipt {
 }
 
 export interface TsfWriter {
+  readonly streamKind: StreamKind;
   append(input: AppendInput): Promise<AppendReceipt>;
   appendBatch(inputs: readonly AppendInput[]): Promise<readonly AppendReceipt[]>;
   appendLogical(input: LogicalAppendInput): Promise<readonly AppendReceipt[]>;
@@ -66,6 +65,7 @@ export class DefaultTsfWriter implements TsfWriter {
     socket: FrameSocket,
     private readonly connect: () => Promise<FrameSocket>,
     private readonly policy: SocketPolicy,
+    public readonly streamKind: StreamKind,
   ) {
     this.#socket = socket;
   }
@@ -143,17 +143,14 @@ export class DefaultTsfWriter implements TsfWriter {
       return Promise.reject(asAppendInputError(error));
     }
     const partCount = Math.max(1, Math.ceil(data.byteLength / MAX_RECORD_PAYLOAD_BYTES));
-    const format = input.format ??
-      (typeof input.data === "string" ? RecordFormat.Transcript : RecordFormat.Bytes);
     if (partCount === 1) {
-      return this.appendBatch([{ data, format }]);
+      return this.appendBatch([{ data }]);
     }
     return this.appendBatch(Array.from({ length: partCount }, (_, index) => ({
       data: data.subarray(
         index * MAX_RECORD_PAYLOAD_BYTES,
         Math.min((index + 1) * MAX_RECORD_PAYLOAD_BYTES, data.byteLength),
       ),
-      format,
       part: partHeader(index, index + 1 === partCount),
     })));
   }
@@ -319,7 +316,6 @@ export class DefaultTsfWriter implements TsfWriter {
       records: selected.map(({ call, index, record }) => ({
         writerSeqNum: call.writerStartSeqNum + BigInt(index),
         part: record.part,
-        format: record.format,
         data: record.data,
       })),
     });
@@ -473,7 +469,6 @@ export class DefaultTsfWriter implements TsfWriter {
 
 interface PendingAppend {
   readonly data: Uint8Array;
-  readonly format: RecordFormat;
   readonly part: PartHeader;
 }
 
@@ -515,8 +510,6 @@ function prepareAppend(input: AppendInput): PendingAppend {
   }
   return {
     data,
-    format: input.format ??
-      (typeof input.data === "string" ? RecordFormat.Transcript : RecordFormat.Bytes),
     part: input.part === undefined
       ? UNSPLIT_PART
       : partHeader(input.part.index, input.part.isFinal),

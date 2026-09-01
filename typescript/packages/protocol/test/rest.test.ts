@@ -18,7 +18,6 @@ import {
   apiErrorResponseSchema,
   compactRecordPayload,
   recordPayloadBytes,
-  resolvedRecordFormat,
   sseReadBatchDataSchema,
   sseCaughtUpDataSchema,
   MAX_SSE_EVENT_BYTES,
@@ -77,13 +76,6 @@ describe("REST schemas", () => {
     }
   });
 
-  it("implies the format from the payload key", () => {
-    expect(resolvedRecordFormat({ text: "hello\n" })).toBe("transcript");
-    expect(resolvedRecordFormat({ bytes: "AP8" } as never)).toBe("bytes");
-    expect(resolvedRecordFormat({ format: "transcript", bytes: "AP8" } as never))
-      .toBe("transcript");
-  });
-
   it("decodes shared additive response fixtures", () => {
     expect(createStreamRequestSchema.parse(fixtures.create_request).links)
       .toHaveLength(2);
@@ -111,8 +103,11 @@ describe("REST schemas", () => {
         records: [{ text: "both", bytes: "AP8" }],
       })
     ).toThrow();
+    expect(() => appendRecordsRequestSchema.parse({ records: [{}] })).toThrow();
     expect(() =>
-      appendRecordsRequestSchema.parse({ records: [{ format: "bytes" }] })
+      appendRecordsRequestSchema.parse({
+        records: [{ text: "legacy", format: "transcript" }],
+      })
     ).toThrow();
     expect(appendRangeSchema.parse(fixtures.append_response)).not
       .toHaveProperty("future_field");
@@ -127,8 +122,8 @@ describe("REST schemas", () => {
     const batch = sseReadBatchDataSchema.parse(fixtures.sse_read_batch);
     expect(batch.records).toHaveLength(2);
     expect(batch.records[0]?.part).toBeUndefined();
-    expect(resolvedRecordFormat(batch.records[0]!)).toBe("transcript");
-    expect(resolvedRecordFormat(batch.records[1]!)).toBe("bytes");
+    expect(batch.records[0]!.text).toBe("hello\n");
+    expect(batch.records[1]!.bytes).toBe("AP8");
     expect(sseCaughtUpDataSchema.parse(fixtures.sse_caught_up).next_seq_num).toBe("8");
     expect(decodeSseResumeCursor(String(fixtures.sse_resume_cursor))).toEqual({
       nextSeqNum: 2n,
@@ -244,7 +239,7 @@ describe("REST schemas", () => {
   it("keeps management stream metadata lean and forward-compatible", () => {
     const stream = {
       stream_id: "0123456789abcdefghjkmnpqrstvwxyz",
-      kind: "records" as const,
+      kind: "transcript" as const,
       title: null,
       visibility: "private",
       created_at: "2026-08-13T00:00:00Z",
@@ -253,8 +248,8 @@ describe("REST schemas", () => {
     expect(streamMetadataSchema.parse(stream)).toEqual(stream);
     expect(streamMetadataSchema.parse({ ...stream, future_field: true }))
       .toEqual(stream);
-    const { kind: _kind, ...legacyStream } = stream;
-    expect(streamMetadataSchema.parse(legacyStream)).toEqual(stream);
+    const { kind: _kind, ...missingKind } = stream;
+    expect(() => streamMetadataSchema.parse(missingKind)).toThrow();
     expect(() => updateStreamRequestSchema.parse({})).toThrow();
   });
 });

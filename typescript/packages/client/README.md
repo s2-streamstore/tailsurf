@@ -72,6 +72,8 @@ Management methods require an owner link secret. `listLinks` returns one page. `
 
 `connectWriter` creates a fresh writer identity and starts its sequence at zero. It keeps that identity and sequence progress across reconnects.
 
+The writer handshake exposes the immutable `streamKind`. A reconnect must report the same kind.
+
 Concurrent append calls receive contiguous sequence ranges in call order. The writer coalesces them into bounded protocol frames. It retains acknowledged progress and resends only the unacknowledged suffix after a reconnect.
 
 Retryable interruptions keep recovering until the records are acknowledged. This preserves the exact writer identity, sequence numbers, and payloads needed for logical deduplication. `close` waits through retryable outages. Call `abort` to stop recovery immediately.
@@ -138,7 +140,7 @@ Established SSE bodies are not timed out. WebSocket read-idle detection is deriv
 
 The client uses global `fetch`, `crypto`, and `WebSocket` implementations. Override `fetch` or `webSocketFactory` for tests and custom runtimes.
 
-Common IDs, permissions, stream-link helpers, record types, and transcript reconstruction are re-exported from this package. Use `@tailsurf/protocol` directly for raw frame codecs, wire schemas, or conformance fixtures.
+Common IDs, permissions, stream-link helpers, record types, and logical-record reconstruction are re-exported from this package. Use `@tailsurf/protocol` directly for raw frame codecs, wire schemas, or conformance fixtures.
 
 ## License
 

@@ -55,7 +55,7 @@ use crate::{
             MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
             MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
             MAX_STATELESS_APPEND_RECORDS, RestRecordPart, SseCaughtUpData, SseReadBatchData,
-            StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
+            StreamKind, StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
         },
         ws::{
             MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
@@ -167,7 +167,7 @@ fn jittered_backoff(backoff: Duration) -> Duration {
 /// Cloneable TSF REST, SSE, and v1 WebSocket client.
 ///
 /// REST operations preserve their retry identity. Stateless append retries can create physical
-/// duplicates, which logical transcript readers suppress. Durable WebSocket writer recovery is
+/// duplicates, which logical-record readers suppress. Durable WebSocket writer recovery is
 /// owned by [`TsfWriter`].
 #[derive(Clone)]
 pub struct TsfClient {
@@ -531,11 +531,9 @@ impl TsfClient {
                 ));
             }
             let (text, bytes) = compact_record_payload(&record.data);
-            // The SDK states the format even when the payload key implies it.
             json_records.push(AppendJsonRecord {
                 text,
                 bytes,
-                format: Some(record.format),
                 part: Some(RestRecordPart {
                     index: record.part.index(),
                     is_final: record.part.is_final(),
@@ -657,11 +655,13 @@ impl TsfClient {
 
         let mut ws =
             connect_websocket(url, connect_timeout, progress_timeout, opening_frame).await?;
-        with_timeout(progress_timeout, "writer ready", expect_ready(&mut ws)).await?;
+        let stream_kind =
+            with_timeout(progress_timeout, "writer ready", expect_ready(&mut ws)).await?;
 
         Ok(TsfWriteSession {
             ws,
             progress_timeout,
+            stream_kind,
         })
     }
 
@@ -1026,11 +1026,12 @@ pub struct InvalidIdempotencyKey;
 ///
 /// Records are manually numbered: the caller owns `writer_seq_num` assignment and contiguous
 /// split-part layout via [`AppendRecord`] and
-/// [`split_logical_record`](crate::transcript::split_logical_record). [`TsfWriter`] is the
+/// [`split_logical_record`](crate::logical_records::split_logical_record). [`TsfWriter`] is the
 /// actor-sequenced alternative with reconnect resend.
 pub struct TsfWriteSession {
     ws: ClientWebSocket,
     progress_timeout: Duration,
+    stream_kind: StreamKind,
 }
 
 /// Stream, credentials, and sequence precondition for one durable [`TsfWriter`].
@@ -1258,6 +1259,7 @@ impl TsfProducer {
 pub struct TsfWriter {
     producer: TsfProducer,
     task: Option<JoinHandle<()>>,
+    stream_kind: StreamKind,
 }
 
 impl fmt::Debug for TsfWriter {
@@ -1275,6 +1277,7 @@ impl TsfWriter {
         route: DataPlaneRoute,
         session: TsfWriteSession,
     ) -> Self {
+        let stream_kind = session.stream_kind;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(WriterShared {
             terminal_error: Arc::new(OnceLock::new()),
@@ -1293,12 +1296,18 @@ impl TsfWriter {
         Self {
             producer: TsfProducer { cmd_tx, shared },
             task: Some(task),
+            stream_kind,
         }
     }
 
     /// Returns a cloneable submission handle for this writer.
     pub fn producer(&self) -> TsfProducer {
         self.producer.clone()
+    }
+
+    /// Returns the immutable kind reported by the stream.
+    pub const fn stream_kind(&self) -> StreamKind {
+        self.stream_kind
     }
 
     /// Queues the batch and returns its durability ticket.
@@ -1418,6 +1427,11 @@ impl Drop for TsfWriter {
 }
 
 impl TsfWriteSession {
+    /// Returns the immutable kind reported by the stream.
+    pub const fn stream_kind(&self) -> StreamKind {
+        self.stream_kind
+    }
+
     /// Sends one physical record under the progress timeout.
     pub async fn send(&mut self, record: AppendRecord) -> Result<(), TsfClientError> {
         let progress_timeout = self.progress_timeout;
@@ -1512,7 +1526,6 @@ impl PendingSubmission {
         AppendRecord {
             writer_seq_num: self.start_seq_num + index as u64,
             part: payload.part,
-            format: payload.format,
             data: payload.data.clone(),
         }
     }
@@ -1854,6 +1867,9 @@ async fn recover_pending_appends(
             .await
         {
             Ok(connected) => {
+                if connected.stream_kind != session.stream_kind {
+                    return Err(TsfClientError::StreamKindChanged);
+                }
                 *session = connected;
                 for submission in pending.iter_mut() {
                     submission.sent = submission.acked;
@@ -2736,7 +2752,6 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
         if decoded_len != WriterId::BYTE_LEN {
             return Err(TsfClientError::InvalidSse("invalid writer id length"));
         }
-        let format = record.resolved_format();
         let data_start = payload.len();
         match (record.text, record.bytes) {
             (Some(text), None) => payload.extend_from_slice(text.as_bytes()),
@@ -2761,7 +2776,6 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
             writer_id: WriterId::from_bytes(writer),
             writer_seq_num: record.writer.seq_num,
             part,
-            format,
             data_start: data_start as u32,
             data_len: (payload.len() - data_start) as u32,
         });
@@ -3056,26 +3070,30 @@ async fn expect_frame<T>(
     }
 }
 
-async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
+async fn expect_ready(ws: &mut ClientWebSocket) -> Result<StreamKind, TsfClientError> {
     expect_frame(ws, |frame| match frame {
-        ServerFrame::Ready => Ok(()),
+        ServerFrame::Ready(kind) => Ok(kind),
         other => Err(other),
     })
     .await
 }
 
 async fn expect_read_handshake(ws: &mut ClientWebSocket) -> Result<StreamMetadata, TsfClientError> {
-    expect_ready(ws).await?;
-    expect_frame(ws, |frame| match frame {
+    let kind = expect_ready(ws).await?;
+    let metadata = expect_frame(ws, |frame| match frame {
         ServerFrame::StreamMetadata(stream_metadata) => Ok(stream_metadata),
         other => Err(other),
     })
-    .await
+    .await?;
+    if metadata.kind != kind {
+        return Err(TsfClientError::StreamKindChanged);
+    }
+    Ok(metadata)
 }
 
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
     match frame {
-        ServerFrame::Ready => "ready",
+        ServerFrame::Ready(_) => "ready",
         ServerFrame::AppendAck { .. } => "append_ack",
         ServerFrame::ReadBatch(_) => "read_batch",
         ServerFrame::Heartbeat => "heartbeat",
@@ -3203,6 +3221,9 @@ pub enum TsfClientError {
     /// WebSocket read response violated the requested stream contract.
     #[error("invalid WebSocket read response: {0}")]
     InvalidReadResponse(&'static str),
+    /// A reconnect or metadata frame reported a different immutable stream kind.
+    #[error("server reported inconsistent stream kinds")]
+    StreamKindChanged,
     /// The server ended an SSE session with a stable terminal error event.
     #[error("SSE terminal error: {0}")]
     SseTerminal(String),
@@ -3453,7 +3474,7 @@ mod tests {
     use crate::protocol::{
         read::ReadStop,
         rest::{SseReadRecord, SseReadWriter},
-        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, RecordFormat},
+        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord},
     };
 
     #[test]
@@ -3653,7 +3674,7 @@ mod tests {
             stream_id: "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
-            kind: crate::protocol::rest::StreamKind::Records,
+            kind: crate::protocol::rest::StreamKind::Transcript,
             title: None,
             visibility: crate::protocol::rest::Visibility::Private,
             created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -3662,7 +3683,7 @@ mod tests {
         let expected_stream_metadata = stream_metadata.clone();
         let sender = tokio::spawn(async move {
             for frame in [
-                ServerFrame::Ready,
+                ServerFrame::Ready(crate::protocol::rest::StreamKind::Transcript),
                 ServerFrame::StreamMetadata(stream_metadata),
             ] {
                 server
@@ -4050,6 +4071,7 @@ mod tests {
         let writer = TsfWriter {
             producer: TsfProducer { cmd_tx, shared },
             task: Some(task),
+            stream_kind: StreamKind::Transcript,
         };
 
         let error = writer.close().await.expect_err("close must fail");
@@ -4080,6 +4102,7 @@ mod tests {
         let writer = TsfWriter {
             producer: TsfProducer { cmd_tx, shared },
             task: Some(tokio::spawn(std::future::pending())),
+            stream_kind: StreamKind::Transcript,
         };
 
         writer.abort();
@@ -4138,7 +4161,7 @@ mod tests {
     ) {
         let (ack_tx, ack_rx) = oneshot::channel();
         let payloads = (0..count)
-            .map(|_| RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new()))
+            .map(|_| RecordPayload::new(PartHeader::unsplit(), Bytes::new()))
             .collect::<Vec<_>>();
         let submission = PendingSubmission {
             start_seq_num,
@@ -4168,9 +4191,7 @@ mod tests {
         let data = Bytes::from(vec![0_u8; payload_bytes]);
         AppendBatch::from_records(
             (0..record_count)
-                .map(|_| {
-                    RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, data.clone())
-                })
+                .map(|_| RecordPayload::new(PartHeader::unsplit(), data.clone()))
                 .collect(),
         )
         .expect("append batch")
@@ -4628,7 +4649,7 @@ mod tests {
                 let _ = stream.read(&mut request).await;
                 let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
                     event: stream_metadata\n\
-                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"kind\":\"records\",\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
+                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"kind\":\"transcript\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
                 let _ = stream.write_all(response.as_bytes()).await;
             }
         });
@@ -4787,7 +4808,6 @@ mod tests {
                 seq_num: 0,
             },
             part: None,
-            format: Some(RecordFormat::Bytes),
             text: Some(String::new()),
             bytes: None,
         };
@@ -4859,7 +4879,6 @@ mod tests {
             writer_id: WriterId::from_bytes([0_u8; 16]),
             writer_seq_num: seq_num,
             part: PartHeader::unsplit(),
-            format: RecordFormat::Bytes,
             data: Bytes::from(vec![0_u8; payload_bytes]),
         }
     }
@@ -4873,7 +4892,6 @@ mod tests {
                 seq_num,
             },
             part: None,
-            format: None,
             text: None,
             bytes: Some(URL_SAFE_NO_PAD.encode(vec![0_u8; payload_bytes])),
         }
@@ -4889,7 +4907,6 @@ mod tests {
                 seq_num: 30,
             },
             part: None,
-            format: None,
             text: Some("héllo".to_owned()),
             bytes: None,
         };
@@ -4904,7 +4921,6 @@ mod tests {
                 index: 0,
                 is_final: true,
             }),
-            format: None,
             text: None,
             bytes: Some(URL_SAFE_NO_PAD.encode([0_u8, 159, 146, 150])),
         };
@@ -4916,7 +4932,6 @@ mod tests {
         assert_eq!(batch.record_count(), 2);
         let first = batch.first();
         assert_eq!(first.data, "héllo".as_bytes());
-        assert_eq!(first.format, RecordFormat::Transcript);
         assert_eq!(first.writer_id, WriterId::from_bytes([7_u8; 16]));
         assert_eq!(first.writer_seq_num, 30);
         let last = batch.last();
@@ -4943,7 +4958,6 @@ mod tests {
             }),
             records: vec![AppendJsonRecord {
                 part: None,
-                format: Some(RecordFormat::Transcript),
                 text,
                 bytes,
             }],
@@ -4961,18 +4975,8 @@ mod tests {
             .expect("stream ID");
         let secret: LinkSecret = "A".repeat(32).parse().expect("canonical secret");
         let large = vec![
-            AppendRecord::new(
-                0,
-                PartHeader::unsplit(),
-                RecordFormat::Bytes,
-                Bytes::from(vec![0; 500 * 1024]),
-            ),
-            AppendRecord::new(
-                1,
-                PartHeader::unsplit(),
-                RecordFormat::Bytes,
-                Bytes::from(vec![0; 500 * 1024]),
-            ),
+            AppendRecord::new(0, PartHeader::unsplit(), Bytes::from(vec![0; 500 * 1024])),
+            AppendRecord::new(1, PartHeader::unsplit(), Bytes::from(vec![0; 500 * 1024])),
         ];
         assert!(matches!(
             client
@@ -4992,7 +4996,6 @@ mod tests {
         let endpoint = [AppendRecord::new(
             u64::MAX,
             PartHeader::unsplit(),
-            RecordFormat::Bytes,
             Bytes::new(),
         )];
         assert!(matches!(
@@ -5010,12 +5013,7 @@ mod tests {
             ))
         ));
 
-        let valid = [AppendRecord::new(
-            0,
-            PartHeader::unsplit(),
-            RecordFormat::Bytes,
-            Bytes::new(),
-        )];
+        let valid = [AppendRecord::new(0, PartHeader::unsplit(), Bytes::new())];
         assert!(matches!(
             client
                 .append_records(

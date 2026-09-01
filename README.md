@@ -113,23 +113,25 @@ Observers see terminal output. Controllers can also send input and resize the PT
 
 Closing a browser does not stop the command. Ctrl-C in the host stops it.
 
-By default, `tsf` makes line boundaries transcript record boundaries and marks records as transcript-oriented:
+By default, `tsf new` creates a transcript stream. It makes input line boundaries record boundaries:
 
 ```sh
 make test | tsf
 make test | tsf write '{write-link}'
 ```
 
-The delimiting newline is not stored; reads append one newline after each transcript record.
+The delimiting newline is not stored. Transcript reads append one newline after each logical record.
 
 The writer splits a logical line into physical records and applies backpressure at its fixed in-flight window. A single larger logical line remains contiguous. `tail` and `replay` retain a 16 MiB reassembly safety bound by default. Raise `--max-reassembly-bytes` when reading larger logical records.
 
-Use `--bytes` when you want to send stdin as byte records instead of line-framed transcript records. Byte records flush at the physical record size limit, after a short linger, and at EOF:
+Use `tsf new --bytes` to create an opaque byte stream. Byte records flush at the physical record size limit, after a short linger, and at EOF:
 
 ```sh
 cat artifact.bin | tsf new --bytes
-cat artifact.bin | tsf write '{write-link}' --bytes
+cat artifact.bin | tsf write '{byte-stream-write-link}'
 ```
+
+`tsf write` learns the immutable stream kind during its handshake. It line-frames transcript input and byte-frames byte-stream input.
 
 On Ctrl-C, `tsf` stops input, flushes the current input chunk, waits for durability acknowledgements, closes the writer, and exits with status 130. Press Ctrl-C again to stop immediately without waiting for pending acknowledgements.
 
@@ -150,7 +152,7 @@ tsf tail --sse '{url}'
 
 `--sse` uses the resumable HTTP event-stream transport. The default binary WebSocket transport remains best for interactive CLI use.
 
-Both commands preserve payload bytes. They exit successfully when a downstream pipe closes normally.
+Both commands preserve payload bytes. Transcript streams add one newline after each logical record. Byte streams add nothing. Both commands exit successfully when a downstream pipe closes normally.
 
 Inspect stream metadata:
 

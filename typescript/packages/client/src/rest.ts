@@ -26,7 +26,6 @@ import {
   parseClientWriterId,
   partHeader,
   randomBytes,
-  RecordFormat,
   type PartHeader,
   type ClientWriterId,
   type CreateStreamRequest as WireCreateStreamRequest,
@@ -152,7 +151,6 @@ export interface AppendRange {
 
 export interface StatelessAppendRecord {
   readonly part?: PartHeader;
-  readonly format: RecordFormat;
   readonly data: Uint8Array | string;
 }
 
@@ -430,11 +428,7 @@ export class BaseTsfClient {
         : record.data;
       validateStatelessRecordBytes(bytes.byteLength);
       payloadBytes += bytes.byteLength;
-      // The SDK states the format even when the payload key implies it.
       return {
-        format: record.format === RecordFormat.Transcript
-          ? "transcript" as const
-          : "bytes" as const,
         ...compactRecordPayload(bytes),
         ...(part === undefined
           ? {}
@@ -741,7 +735,7 @@ export function prepareCreateStreamRequest(
     ? requestedLinks
     : [{ linkId: parseLinkId("owner"), permissions: "o" as const }, ...requestedLinks];
   return parsePreparedCreateStreamRequest({
-    kind: request.kind ?? "records",
+    kind: request.kind ?? "transcript",
     ...(request.title === undefined ? {} : { title: request.title }),
     visibility: request.visibility ?? "private",
     ...(request.expiresInSeconds === undefined
@@ -781,7 +775,7 @@ export function parsePreparedCreateStreamRequest(
     }),
   });
   return {
-    kind: wire.kind ?? "records",
+    kind: wire.kind ?? "transcript",
     ...(wire.title === undefined ? {} : { title: wire.title }),
     visibility: wire.visibility,
     ...(wire.expires_in_seconds === undefined
@@ -798,7 +792,7 @@ function createStreamRequestToWire(
   request: PreparedCreateStreamRequest,
 ): WireCreateStreamRequest {
   return {
-    ...(request.kind === "terminal" ? { kind: request.kind } : {}),
+    ...(request.kind === "transcript" ? {} : { kind: request.kind }),
     ...(request.title === undefined
       ? {}
       : { title: parseStreamTitle(request.title) }),

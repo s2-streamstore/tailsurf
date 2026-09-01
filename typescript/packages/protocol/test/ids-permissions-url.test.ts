@@ -72,7 +72,7 @@ describe("stream URLs", () => {
       ),
     ).toEqual({
       streamId: STREAM_ID,
-      kind: "records",
+      route: "stream",
       link: { declaredPermissions: "o", secret: OWNER_SECRET },
     });
   });
@@ -84,13 +84,13 @@ describe("stream URLs", () => {
       ),
     ).toEqual({
       streamId: STREAM_ID,
-      kind: "records",
+      route: "stream",
       link: { declaredPermissions: "r", secret: WRITE_SECRET },
       anchor: { seqNum: 1234n },
     });
     expect(parseStreamUrl(`https://tail.surf/s/${STREAM_ID}#at=0`)).toEqual({
       streamId: STREAM_ID,
-      kind: "records",
+      route: "stream",
       anchor: { seqNum: 0n },
     });
   });
@@ -100,7 +100,7 @@ describe("stream URLs", () => {
       parseStreamUrl(`https://tail.surf/t/${STREAM_ID}#rw=${WRITE_SECRET}`),
     ).toEqual({
       streamId: STREAM_ID,
-      kind: "terminal",
+      route: "terminal",
       link: { declaredPermissions: "rw", secret: WRITE_SECRET },
     });
     expect(

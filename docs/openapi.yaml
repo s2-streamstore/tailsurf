@@ -271,8 +271,8 @@ components:
       description: Human-facing Unicode title. Code-point length is at most 120. Leading or trailing whitespace, control characters, and line breaks are invalid.
     StreamKind:
       type: string
-      enum: [records, terminal]
-      description: Immutable resource shape. Records use one log. Terminals use separate input and output logs.
+      enum: [transcript, bytes, terminal]
+      description: Immutable stream semantics. Transcript and byte streams use one log. Terminals use separate input and output logs.
     StreamMetadata:
       type: object
       required: [stream_id, kind, title, visibility, created_at, expires_at]
@@ -298,7 +298,7 @@ components:
       properties:
         kind:
           $ref: '#/components/schemas/StreamKind'
-          default: records
+          default: transcript
         title: { $ref: '#/components/schemas/StreamTitle' }
         visibility: { enum: [private, public], default: private }
         expires_in_seconds: { type: integer, minimum: 1, maximum: 864000 }
@@ -355,12 +355,11 @@ components:
       properties: { index: { type: integer, minimum: 0, maximum: 2147483647 }, is_final: { type: boolean } }
     AppendRecord:
       type: object
-      description: Exactly one of text or bytes carries the payload. The payload key implies the format when it is absent, text as transcript and bytes as bytes; an explicit format covers the cross cases. Producers may use either valid payload representation.
+      description: Exactly one of text or bytes carries the payload. The keys are JSON encodings and do not change the immutable stream kind. Producers may use either valid representation.
       additionalProperties: false
       minProperties: 1
       properties:
         part: { $ref: '#/components/schemas/RecordPart' }
-        format: { enum: [bytes, transcript] }
         text: { type: string }
         bytes: { $ref: '#/components/schemas/BytesBase64url' }
       oneOf:
@@ -400,7 +399,7 @@ components:
         last_timestamp_ms: { $ref: '#/components/schemas/DecimalSafeU64' }
     ReadRecord:
       type: object
-      description: Exactly one of text or bytes carries the payload, chosen as the smaller JSON representation. An omitted part is an unsplit record. An omitted format follows the payload key, text as transcript and bytes as bytes.
+      description: Exactly one of text or bytes carries the payload, chosen as the smaller JSON representation while preserving the exact bytes. An omitted part is an unsplit record. The immutable stream kind defines the payload semantics.
       required: [seq_num, timestamp_ms, writer]
       properties:
         seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
@@ -412,7 +411,6 @@ components:
             id: { $ref: '#/components/schemas/WriterId' }
             seq_num: { $ref: '#/components/schemas/DecimalU64' }
         part: { $ref: '#/components/schemas/RecordPart' }
-        format: { enum: [bytes, transcript] }
         text: { type: string }
         bytes: { $ref: '#/components/schemas/BytesBase64url' }
       oneOf:

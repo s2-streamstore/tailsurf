@@ -114,7 +114,6 @@ assert.equal(AliasTsfClient, TsfClient);
 
   await writeFile(join(consumer, "type-smoke.ts"), `
 import {
-  RecordFormat,
   TsfClient,
   parseStreamId,
   type ReadRecord,
@@ -130,9 +129,7 @@ async function collect(): Promise<readonly ReadRecord[]> {
   const records: ReadRecord[] = [];
   const session = await client.connectReader({ streamId });
   for await (const record of session) {
-    if (record.format === RecordFormat.Transcript) {
-      records.push(record);
-    }
+    records.push(record);
   }
   return records;
 }

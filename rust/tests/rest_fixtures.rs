@@ -74,7 +74,6 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     assert_eq!(writer.seq_num, 41);
     assert_eq!(append.records.len(), 2);
     assert_eq!(append.records[0].text.as_deref(), Some("hello\n"));
-    assert_eq!(append.records[0].format, None);
     assert_eq!(append.records[1].bytes.as_deref(), Some("AP8"));
     let acknowledgement: AppendRange = fixture(&fixtures, "append_response");
     assert_eq!(
@@ -87,14 +86,8 @@ fn rest_v1_fixtures_decode_forward_compatibly() {
     let records: SseReadBatchData = fixture(&fixtures, "sse_read_batch");
     assert_eq!(records.records.len(), 2);
     assert!(records.records[0].part.is_none());
-    assert_eq!(
-        records.records[0].resolved_format(),
-        tailsurf::protocol::ws::frame::RecordFormat::Transcript
-    );
-    assert_eq!(
-        records.records[1].resolved_format(),
-        tailsurf::protocol::ws::frame::RecordFormat::Bytes
-    );
+    assert_eq!(records.records[0].text.as_deref(), Some("hello\n"));
+    assert_eq!(records.records[1].bytes.as_deref(), Some("AP8"));
     assert_eq!(fixtures["sse_resume_cursor"].as_str(), Some("v1,2,2"));
     let caught_up: SseCaughtUpData = fixture(&fixtures, "sse_caught_up");
     assert_eq!(caught_up.next_seq_num, 8);

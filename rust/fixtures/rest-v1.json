@@ -20,7 +20,7 @@
   },
   "stream_resource": {
     "stream_id": "00000000000000000000000000000000",
-    "kind": "records",
+    "kind": "transcript",
     "title": "Deploy log",
     "visibility": "private",
     "created_at": "2026-08-13T00:00:00Z",
@@ -29,7 +29,7 @@
   },
   "create_response": {
     "stream_id": "00000000000000000000000000000000",
-    "kind": "records",
+    "kind": "transcript",
     "title": "Deploy log",
     "visibility": "private",
     "created_at": "2026-08-13T00:00:00Z",
@@ -51,7 +51,7 @@
     "writer": { "id": "AAECAwQFBgcICQoLDA0ODw", "seq_num": "41" },
     "records": [
       { "part": { "index": 0, "is_final": true }, "text": "hello\n" },
-      { "format": "bytes", "bytes": "AP8" }
+      { "bytes": "AP8" }
     ],
     "expected_next_seq_num": "7"
   },
@@ -80,7 +80,6 @@
         "timestamp_ms": "1786579200001",
         "writer": { "id": "AAECAwQFBgcICQoLDA0ODw", "seq_num": "42", "future_field": true },
         "part": { "index": 0, "is_final": true, "future_field": true },
-        "format": "bytes",
         "bytes": "AP8",
         "future_field": true
       }

@@ -14,7 +14,7 @@ use tailsurf::{
     TsfClient, TsfWriter, WriterId, decode_terminal_input, encode_terminal_output,
     protocol::{
         rest::{CreateStreamRequest, Visibility},
-        ws::frame::{PartHeader, RecordFormat},
+        ws::frame::PartHeader,
     },
     validate_terminal_size,
 };
@@ -251,12 +251,10 @@ impl OutputPublisher {
             self.wait_for_oldest().await?;
         }
         let payload = encode_terminal_output(event).context("failed to encode terminal output")?;
-        self.pending
-            .push_back(self.writer.submit(AppendBatch::single(
-                PartHeader::unsplit(),
-                RecordFormat::Bytes,
-                payload,
-            )?)?);
+        self.pending.push_back(
+            self.writer
+                .submit(AppendBatch::single(PartHeader::unsplit(), payload)?)?,
+        );
         Ok(())
     }
 
@@ -327,8 +325,8 @@ async fn forward_terminal_input(
                 continue;
             }
             writer_positions.insert(record.writer_id, record.writer_seq_num);
-            if record.format != RecordFormat::Bytes || record.part != PartHeader::unsplit() {
-                bail!("terminal input must use unsplit byte records");
+            if record.part != PartHeader::unsplit() {
+                bail!("terminal input must use unsplit records");
             }
             match decode_terminal_input(record.data).context("invalid terminal input event")? {
                 TerminalInputEvent::Data(data) => {

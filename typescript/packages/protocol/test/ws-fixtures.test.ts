@@ -22,7 +22,6 @@ import {
   TSF_WEBSOCKET_PROTOCOL,
   WEBSOCKET_HEARTBEAT_INTERVAL_MS,
   type ClientFrame,
-  type RecordFormat,
   type ServerFrame,
 } from "../src/index.js";
 
@@ -109,7 +108,6 @@ describe("TSF v1 wire fixtures", () => {
       records: [0n, 1n].map((writerSeqNum) => ({
         writerSeqNum,
         part: partHeaderFromRaw(0x8000_0000),
-        format: 0,
         data: Uint8Array.of(Number(writerSeqNum)),
       })),
     };
@@ -134,7 +132,6 @@ describe("TSF v1 wire fixtures", () => {
     const appendRecord = {
       writerSeqNum: 0n,
       part: partHeaderFromRaw(0x8000_0000),
-      format: 0 as RecordFormat,
       data: new Uint8Array(),
     };
     const readRecord = {
@@ -186,7 +183,10 @@ describe("TSF v1 wire fixtures", () => {
     expect(() => decodeClientFrame(Uint8Array.of(0x03, 0, 0, 0, 0))).toThrow(
       ProtocolError,
     );
-    expect(() => decodeServerFrame(Uint8Array.of(0x80, 0))).toThrow(ProtocolError);
+    expect(() => decodeServerFrame(Uint8Array.of(0x80))).toThrow(ProtocolError);
+    expect(() => decodeServerFrame(Uint8Array.of(0x80, 0, 0))).toThrow(
+      ProtocolError,
+    );
     expect(() =>
       decodeServerFrame(Uint8Array.of(0x84, ...new Uint8Array(8)))
     ).toThrow(ProtocolError);
@@ -199,7 +199,6 @@ describe("TSF v1 wire fixtures", () => {
         records: [{
           writerSeqNum: 0n,
           part: partHeaderFromRaw(0x8000_0000),
-          format: 0,
           data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES + 1),
         }],
       }),
@@ -279,7 +278,6 @@ function clientFrame(frame: FrameFixture["frame"]): ClientFrame {
         records: [{
           writerSeqNum: BigInt(requiredString(frame, "writer_seq_num")),
           part: partHeaderFromRaw(Number.parseInt(requiredString(frame, "part_raw"), 16)),
-          format: requiredNumber(frame, "format") as RecordFormat,
           data: fromHex(requiredString(frame, "data_hex")),
         }],
       };
@@ -309,7 +307,10 @@ function optionalString(
 function serverFrame(frame: FrameFixture["frame"]): ServerFrame {
   switch (frame.type) {
     case "ready":
-      return { type: "ready" };
+      return {
+        type: "ready",
+        kind: requiredString(frame, "kind") as "transcript" | "bytes" | "terminal",
+      };
     case "append_ack":
       return {
         type: "appendAck",
@@ -329,7 +330,6 @@ function serverFrame(frame: FrameFixture["frame"]): ServerFrame {
           ),
           writerSeqNum: BigInt(requiredString(frame, "writer_seq_num")),
           part: partHeaderFromRaw(Number.parseInt(requiredString(frame, "part_raw"), 16)),
-          format: requiredNumber(frame, "format") as RecordFormat,
           data: fromHex(requiredString(frame, "data_hex")),
         }],
       };
@@ -365,17 +365,6 @@ function requiredString(
   const field = value[key];
   if (typeof field !== "string") {
     throw new Error(`fixture field ${key} must be a string`);
-  }
-  return field;
-}
-
-function requiredNumber(
-  value: FrameFixture["frame"],
-  key: string,
-): number {
-  const field = value[key];
-  if (typeof field !== "number") {
-    throw new Error(`fixture field ${key} must be a number`);
   }
   return field;
 }

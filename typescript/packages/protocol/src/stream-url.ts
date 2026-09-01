@@ -4,7 +4,6 @@ import type { LinkPermissions } from "./permissions.js";
 import { parseLinkPermissions } from "./permissions.js";
 import { ProtocolError } from "./errors.js";
 import { canonicalBase64url, MAX_SAFE_INTEGER_U64, U64_PATTERN } from "./primitives.js";
-import type { StreamKind } from "./rest.js";
 
 export const LINK_SECRET_BYTES = 24;
 export const LINK_SECRET_ENCODED_LENGTH = Math.ceil(
@@ -22,9 +21,11 @@ export interface StreamAnchor {
   readonly seqNum: bigint;
 }
 
+export type StreamRoute = "stream" | "terminal";
+
 export interface StreamLocator {
   readonly streamId: StreamId;
-  readonly kind: StreamKind;
+  readonly route: StreamRoute;
   readonly link?: StreamLinkParam;
   readonly anchor?: StreamAnchor;
 }
@@ -60,9 +61,9 @@ export function parseStreamUrl(input: string): StreamLocator {
   }
 
   const streamId = parseStreamId(rawStreamId);
-  const kind: StreamKind = prefix === "t" ? "terminal" : "records";
+  const route: StreamRoute = prefix === "t" ? "terminal" : "stream";
   if (fragmentIndex === -1) {
-    return { streamId, kind };
+    return { streamId, route };
   }
   const fragment = url.hash.slice(1);
   const parameters = Array.from(new URLSearchParams(fragment));
@@ -99,7 +100,7 @@ export function parseStreamUrl(input: string): StreamLocator {
       secret: parseLinkSecret(value),
     };
   }
-  if (kind === "terminal" && anchor !== undefined) {
+  if (route === "terminal" && anchor !== undefined) {
     throw new ProtocolError(
       "terminal_anchor_not_allowed",
       "terminal URLs do not accept record anchors",
@@ -107,7 +108,7 @@ export function parseStreamUrl(input: string): StreamLocator {
   }
   return {
     streamId,
-    kind,
+    route,
     ...(link === undefined ? {} : { link }),
     ...(anchor === undefined ? {} : { anchor }),
   };

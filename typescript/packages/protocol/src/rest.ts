@@ -56,7 +56,7 @@ export const linkIdSchema = transformedString(parseLinkId);
 export const streamTitleSchema = transformedString(parseStreamTitle);
 export const linkPermissionsSchema = transformedString(parseLinkPermissions);
 export const visibilitySchema = z.enum(["private", "public"]);
-export const streamKindSchema = z.enum(["records", "terminal"]);
+export const streamKindSchema = z.enum(["transcript", "bytes", "terminal"]);
 export const jsonU64Schema = z.number().check(
   z.int(),
   z.nonnegative(),
@@ -140,7 +140,7 @@ export const streamLinkCredentialSchema = z.object({
 
 export const streamMetadataSchema = z.object({
   stream_id: streamIdSchema,
-  kind: z._default(streamKindSchema, "records"),
+  kind: streamKindSchema,
   title: z.nullable(streamTitleSchema),
   visibility: visibilitySchema,
   created_at: streamTimestampSchema,
@@ -198,13 +198,11 @@ const ssePartSchema = z.object({
   is_final: z.boolean(),
 });
 
-// A record's payload key is its JSON representation: `text` carries UTF-8
-// directly, `bytes` carries canonical base64url. The key also implies the
-// presentation format (text -> transcript, bytes -> bytes); an explicit
-// `format` field covers the rare cross case.
+// A record's payload key is only its JSON representation: `text` carries UTF-8
+// directly and `bytes` carries canonical base64url. The stream kind defines
+// how consumers interpret the decoded bytes.
 export const appendJsonRecordSchema = z.strictObject({
   part: z.optional(appendPartSchema),
-  format: z.optional(z.enum(["bytes", "transcript"])),
   text: z.optional(z.string()),
   bytes: z.optional(bytesBase64urlSchema),
 }).check(z.refine(
@@ -253,7 +251,6 @@ export const sseReadRecordSchema = z.object({
     seq_num: decimalU64Schema,
   }),
   part: z.optional(ssePartSchema),
-  format: z.optional(z.enum(["bytes", "transcript"])),
   text: z.optional(z.string()),
   bytes: z.optional(bytesBase64urlSchema),
 }).check(z.refine(
@@ -311,14 +308,6 @@ export function compactRecordPayload(bytes: Uint8Array): RecordPayload {
   return textByteLength <= bytesByteLength
     ? { text }
     : { bytes: encodeBase64url(bytes) };
-}
-
-/** The presentation format a payload key implies when `format` is absent. */
-export function resolvedRecordFormat(record: {
-  readonly format?: "bytes" | "transcript" | undefined;
-  readonly text?: string | undefined;
-}): "bytes" | "transcript" {
-  return record.format ?? (record.text === undefined ? "bytes" : "transcript");
 }
 
 /** The exact payload bytes named by a record's `text` or `bytes` key. */

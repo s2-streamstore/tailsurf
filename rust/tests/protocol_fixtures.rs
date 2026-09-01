@@ -5,15 +5,15 @@ use serde::Deserialize;
 use tailsurf::{
     ClientWriterId, WriterId,
     protocol::{
-        rest::{StreamMetadata, Visibility},
+        rest::{StreamKind, StreamMetadata, Visibility},
         ws::{
             MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
             WEBSOCKET_HEARTBEAT_INTERVAL_MS,
             frame::{
                 AppendRecord, CaughtUpPosition, ClientFrame, MAX_APPEND_FRAME_RECORDS,
                 MAX_ENCODED_FRAME_BYTES, MAX_FRAME_PAYLOAD_BYTES, MAX_READ_FRAME_RECORDS,
-                MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, PartHeader, ReadBatch, RecordFormat,
-                ServerFrame, TSF_WEBSOCKET_PROTOCOL,
+                MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, PartHeader, ReadBatch, ServerFrame,
+                TSF_WEBSOCKET_PROTOCOL,
             },
         },
     },
@@ -57,7 +57,6 @@ enum ClientFixture {
     AppendBatch {
         writer_seq_num: String,
         part_raw: String,
-        format: u8,
         data_hex: String,
     },
 }
@@ -65,7 +64,9 @@ enum ClientFixture {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerFixture {
-    Ready,
+    Ready {
+        kind: StreamKind,
+    },
     AppendAck {
         writer_start_seq_num: String,
         writer_end_seq_num: String,
@@ -78,7 +79,6 @@ enum ServerFixture {
         writer_id_hex: String,
         writer_seq_num: String,
         part_raw: String,
-        format: u8,
         data_hex: String,
     },
     Heartbeat,
@@ -88,6 +88,7 @@ enum ServerFixture {
     },
     StreamMetadata {
         stream_id: String,
+        kind: StreamKind,
         title: Option<String>,
         visibility: Visibility,
         created_at: String,
@@ -181,12 +182,10 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
         ClientFixture::AppendBatch {
             writer_seq_num,
             part_raw,
-            format,
             data_hex,
         } => ClientFrame::AppendBatch(vec![AppendRecord {
             writer_seq_num: parse_u64(&writer_seq_num),
             part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
-            format: parse_format(format),
             data: Bytes::from(decode_hex(&data_hex)),
         }]),
     }
@@ -194,7 +193,7 @@ fn client_frame(fixture: ClientFixture) -> ClientFrame {
 
 fn server_frame(fixture: ServerFixture) -> ServerFrame {
     match fixture {
-        ServerFixture::Ready => ServerFrame::Ready,
+        ServerFixture::Ready { kind } => ServerFrame::Ready(kind),
         ServerFixture::AppendAck {
             writer_start_seq_num,
             writer_end_seq_num,
@@ -212,7 +211,6 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
             writer_id_hex,
             writer_seq_num,
             part_raw,
-            format,
             data_hex,
         } => ServerFrame::ReadBatch(
             ReadBatch::try_from_records(vec![OwnedReadRecord {
@@ -221,7 +219,6 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
                 writer_id: decode_writer_id(&writer_id_hex),
                 writer_seq_num: parse_u64(&writer_seq_num),
                 part: PartHeader::from_raw(parse_hex_u32(&part_raw)),
-                format: parse_format(format),
                 data: Bytes::from(decode_hex(&data_hex)),
             }])
             .expect("fixture record within batch bounds"),
@@ -236,13 +233,14 @@ fn server_frame(fixture: ServerFixture) -> ServerFrame {
         }),
         ServerFixture::StreamMetadata {
             stream_id,
+            kind,
             title,
             visibility,
             created_at,
             expires_at,
         } => ServerFrame::StreamMetadata(StreamMetadata {
             stream_id: stream_id.parse().expect("fixture stream ID"),
-            kind: tailsurf::StreamKind::Records,
+            kind,
             title: title.map(|title| title.parse().expect("fixture stream title")),
             visibility,
             created_at,
@@ -257,10 +255,6 @@ fn parse_u64(value: &str) -> u64 {
 
 fn parse_hex_u32(value: &str) -> u32 {
     u32::from_str_radix(value, 16).expect("fixture value is a hexadecimal u32")
-}
-
-fn parse_format(value: u8) -> RecordFormat {
-    RecordFormat::try_from(value).expect("fixture record format is valid")
 }
 
 fn decode_writer_id(value: &str) -> WriterId {

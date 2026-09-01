@@ -2,7 +2,7 @@
 
 use url::{Url, form_urlencoded};
 
-use crate::{LinkPermissions, LinkSecret, StreamId, StreamKind, protocol::MAX_SAFE_INTEGER_U64};
+use crate::{LinkPermissions, LinkSecret, StreamId, protocol::MAX_SAFE_INTEGER_U64};
 
 /// Encoded length of a 24-byte stream link credential.
 pub const LINK_SECRET_ENCODED_LENGTH: usize = LinkSecret::ENCODED_LEN;
@@ -22,13 +22,22 @@ pub struct StreamAnchor {
     pub seq_num: u64,
 }
 
+/// Browser workspace selected by a stream link path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamRoute {
+    /// The ordinary `/s/{stream_id}` workspace.
+    Stream,
+    /// The terminal `/t/{stream_id}` workspace.
+    Terminal,
+}
+
 /// Stream ID and optional client-only state extracted from a stream link.
 #[derive(Clone, Debug)]
 pub struct StreamLocator {
     /// Stream named by the browser path.
     pub stream_id: StreamId,
-    /// Resource kind selected by the browser path.
-    pub kind: StreamKind,
+    /// Browser workspace selected by the path.
+    pub route: StreamRoute,
     /// Optional single link fragment.
     pub link: Option<StreamLinkParam>,
     /// Optional browser record anchor.
@@ -43,7 +52,7 @@ impl StreamLocator {
         if url.query().is_some() {
             return Err(StreamLinkError::QueryNotAllowed);
         }
-        let (kind, stream_id) = parse_stream_path(&url)?;
+        let (route, stream_id) = parse_stream_path(&url)?;
 
         let (link, anchor) = url
             .fragment()
@@ -51,13 +60,13 @@ impl StreamLocator {
             .transpose()?
             .unwrap_or((None, None));
 
-        if kind == StreamKind::Terminal && anchor.is_some() {
+        if route == StreamRoute::Terminal && anchor.is_some() {
             return Err(StreamLinkError::TerminalAnchorNotAllowed);
         }
 
         Ok(Self {
             stream_id,
-            kind,
+            route,
             link,
             anchor,
         })
@@ -143,7 +152,7 @@ fn public_resource_url(
     Ok(url)
 }
 
-fn parse_stream_path(url: &Url) -> Result<(StreamKind, StreamId), StreamLinkError> {
+fn parse_stream_path(url: &Url) -> Result<(StreamRoute, StreamId), StreamLinkError> {
     let mut segments = url
         .path_segments()
         .ok_or(StreamLinkError::InvalidStreamPath)?;
@@ -151,12 +160,12 @@ fn parse_stream_path(url: &Url) -> Result<(StreamKind, StreamId), StreamLinkErro
     match (segments.next(), segments.next(), segments.next()) {
         (Some(prefix @ ("s" | "t")), Some(stream_id), None) => StreamId::decode(stream_id)
             .map(|stream_id| {
-                let kind = if prefix == "t" {
-                    StreamKind::Terminal
+                let route = if prefix == "t" {
+                    StreamRoute::Terminal
                 } else {
-                    StreamKind::Records
+                    StreamRoute::Stream
                 };
-                (kind, stream_id)
+                (route, stream_id)
             })
             .map_err(|source| StreamLinkError::InvalidStreamId { source }),
         _ => Err(StreamLinkError::InvalidStreamPath),
@@ -279,7 +288,7 @@ mod tests {
             locator.stream_id,
             STREAM_ID.parse::<StreamId>().expect("stream id")
         );
-        assert_eq!(locator.kind, StreamKind::Records);
+        assert_eq!(locator.route, StreamRoute::Stream);
         let link = locator.link.expect("link");
         assert_eq!(link.declared_permissions.to_string(), "w");
         assert_eq!(link.secret.expose_secret(), SECRET);
@@ -424,7 +433,7 @@ mod tests {
             format!("https://tail.surf/t/{STREAM_ID}#rw={SECRET}")
         );
         let locator = StreamLocator::parse(url.as_str()).expect("terminal URL");
-        assert_eq!(locator.kind, StreamKind::Terminal);
+        assert_eq!(locator.route, StreamRoute::Terminal);
         assert_eq!(locator.stream_id, stream_id);
         assert_eq!(
             public_terminal_url(&base_url, &stream_id)

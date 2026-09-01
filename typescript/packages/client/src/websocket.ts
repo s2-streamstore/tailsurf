@@ -3,6 +3,7 @@ import {
   generateClientWriterId,
   parseStreamId,
   type ClientWriterId,
+  type StreamKind,
   type StreamId,
 } from "@tailsurf/protocol";
 
@@ -55,6 +56,7 @@ interface NormalizedWriteOptions {
   readonly linkSecret: string;
   readonly clientWriterId: ClientWriterId;
   expectedNextSeqNum?: bigint;
+  streamKind?: StreamKind;
 }
 
 type ReadOperation = "read" | "terminal/input/read" | "terminal/output/read";
@@ -160,10 +162,17 @@ export class TsfClient extends BaseTsfClient {
         }),
     };
     const connect = () => this.#connectAppendSocket(normalized, operation);
+    const socket = await connectInitialSocket(connect, this.#socketPolicy);
+    const streamKind = normalized.streamKind;
+    if (streamKind === undefined) {
+      socket.close();
+      throw new TsfClientError("invalid_api_response", "writer handshake omitted stream kind");
+    }
     return new DefaultTsfWriter(
-      await connectInitialSocket(connect, this.#socketPolicy),
+      socket,
       connect,
       this.#socketPolicy,
+      streamKind,
     );
   }
 
@@ -217,11 +226,18 @@ export class TsfClient extends BaseTsfClient {
       },
     );
     try {
-      await withTimeout(
+      const kind = await withTimeout(
         expectReady(socket),
         this.#socketPolicy.webSocketProgressTimeoutMs,
         "writer authentication",
       );
+      if (options.streamKind !== undefined && options.streamKind !== kind) {
+        throw new TsfClientError(
+          "invalid_api_response",
+          "stream kind changed while reconnecting the writer",
+        );
+      }
+      options.streamKind = kind;
       delete options.expectedNextSeqNum;
       return socket;
     } catch (error) {

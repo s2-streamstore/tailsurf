@@ -5,10 +5,7 @@ use url::Url;
 
 use crate::{
     LinkId, LinkPermissions, LinkSecret, StreamId, StreamTitle,
-    protocol::{
-        MAX_SAFE_INTEGER_U64,
-        ws::frame::{self, RecordFormat},
-    },
+    protocol::{MAX_SAFE_INTEGER_U64, ws::frame},
 };
 
 /// Maximum records in one stateless atomic append.
@@ -38,9 +35,11 @@ pub const MAX_INITIAL_STREAM_LINKS: usize = 3;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
-    /// One ordinary append-only record log.
+    /// A line-oriented transcript stream.
     #[default]
-    Records,
+    Transcript,
+    /// An opaque byte stream.
+    Bytes,
     /// A terminal session with independent input and output logs.
     Terminal,
 }
@@ -49,13 +48,14 @@ impl StreamKind {
     /// Returns the canonical lowercase wire form.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Records => "records",
+            Self::Transcript => "transcript",
+            Self::Bytes => "bytes",
             Self::Terminal => "terminal",
         }
     }
 
-    const fn is_records(&self) -> bool {
-        matches!(self, Self::Records)
+    const fn is_transcript(&self) -> bool {
+        matches!(self, Self::Transcript)
     }
 }
 
@@ -95,8 +95,8 @@ impl std::fmt::Display for Visibility {
 /// Options for creating a stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateStreamRequest {
-    /// Immutable resource kind. Defaults to an ordinary record stream.
-    #[serde(default, skip_serializing_if = "StreamKind::is_records")]
+    /// Immutable resource kind. Defaults to a transcript stream.
+    #[serde(default, skip_serializing_if = "StreamKind::is_transcript")]
     pub kind: StreamKind,
     /// Optional human-facing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,7 +115,7 @@ pub struct CreateStreamRequest {
 impl Default for CreateStreamRequest {
     fn default() -> Self {
         Self {
-            kind: StreamKind::Records,
+            kind: StreamKind::Transcript,
             title: None,
             visibility: Visibility::Private,
             expires_in_seconds: None,
@@ -167,7 +167,6 @@ pub struct CreateStreamResponse {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Immutable resource kind.
-    #[serde(default)]
     pub kind: StreamKind,
     /// Human-facing title when one has been set.
     pub title: Option<StreamTitle>,
@@ -286,7 +285,6 @@ pub struct StreamMetadata {
     /// Stable stream identifier.
     pub stream_id: StreamId,
     /// Immutable resource kind.
-    #[serde(default)]
     pub kind: StreamKind,
     /// Human-facing title when one has been set.
     pub title: Option<StreamTitle>,
@@ -313,16 +311,12 @@ pub struct RestRecordPart {
 ///
 /// The payload key is the JSON representation: `text` carries UTF-8
 /// directly and `bytes` carries canonical unpadded base64url. Exactly one
-/// is present. The key implies the presentation format; an explicit
-/// `format` covers the cross cases.
+/// is present. The stream kind defines how consumers interpret the bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppendJsonRecord {
     /// Split-part metadata, or an implicit unsplit record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<RestRecordPart>,
-    /// Presentation hint when it differs from the payload key's default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<RecordFormat>,
     /// UTF-8 payload text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -505,8 +499,7 @@ pub struct SseReadWriter {
 /// One record in a batched SSE `read_batch` event.
 ///
 /// Exactly one of `text` or `bytes` carries the payload. An omitted
-/// `part` is an unsplit record. An omitted `format` follows the payload
-/// key: `text` is a transcript record and `bytes` is a byte record.
+/// `part` is an unsplit record. The payload key is only its JSON encoding.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct SseReadRecord {
     /// Absolute physical sequence number.
@@ -520,26 +513,12 @@ pub struct SseReadRecord {
     /// Split-part metadata, or an implicit unsplit record.
     #[serde(default)]
     pub part: Option<RestRecordPart>,
-    /// Presentation hint when it differs from the payload key's default.
-    #[serde(default)]
-    pub format: Option<RecordFormat>,
     /// UTF-8 payload text.
     #[serde(default)]
     pub text: Option<String>,
     /// Canonical unpadded base64url payload bytes.
     #[serde(default)]
     pub bytes: Option<String>,
-}
-
-impl SseReadRecord {
-    /// The presentation format: explicit, else implied by the payload key.
-    pub fn resolved_format(&self) -> RecordFormat {
-        self.format.unwrap_or(if self.text.is_some() {
-            RecordFormat::Transcript
-        } else {
-            RecordFormat::Bytes
-        })
-    }
 }
 
 /// Payload of a batched SSE `read_batch` event.
@@ -849,20 +828,22 @@ mod tests {
     }
 
     #[test]
-    fn response_models_tolerate_absent_titles_and_validate_rfc3339_timestamps() {
+    fn response_models_require_kind_and_validate_rfc3339_timestamps() {
         let stream = json!({
             "stream_id": "00000000000000000000000000000000",
+            "kind": "transcript",
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z"
         });
-        let stream = serde_json::from_value::<StreamMetadata>(stream)
-            .expect("deserialize legacy stream metadata");
-        assert_eq!(stream.kind, StreamKind::Records);
+        let stream =
+            serde_json::from_value::<StreamMetadata>(stream).expect("deserialize stream metadata");
+        assert_eq!(stream.kind, StreamKind::Transcript);
         assert_eq!(stream.title, None);
 
         let created = json!({
             "stream_id": "00000000000000000000000000000000",
+            "kind": "transcript",
             "visibility": "private",
             "created_at": "2026-08-13T00:00:00Z",
             "expires_at": "2026-08-23T00:00:00Z",
@@ -870,8 +851,8 @@ mod tests {
             "links": []
         });
         let created = serde_json::from_value::<CreateStreamResponse>(created)
-            .expect("deserialize legacy create response");
-        assert_eq!(created.kind, StreamKind::Records);
+            .expect("deserialize create response");
+        assert_eq!(created.kind, StreamKind::Transcript);
         assert!(created.title.is_none());
         assert_eq!(created.web_origin.as_str(), "https://tail.surf/");
 
@@ -888,7 +869,7 @@ mod tests {
 
         let invalid_time = json!({
             "stream_id": "00000000000000000000000000000000",
-            "kind": "records",
+            "kind": "transcript",
             "title": null,
             "visibility": "private",
             "created_at": "2026-02-30T00:00:00Z",
@@ -905,7 +886,7 @@ mod tests {
         ] {
             let signed_time = json!({
                 "stream_id": "00000000000000000000000000000000",
-                "kind": "records",
+                "kind": "transcript",
                 "title": null,
                 "visibility": "private",
                 "created_at": signed,

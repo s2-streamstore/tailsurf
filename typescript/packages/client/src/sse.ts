@@ -7,11 +7,9 @@ import {
   MAX_SSE_UNTERMINATED_EVENT_BYTES,
   MAX_SSE_READ_BATCH_PAYLOAD_BYTES,
   MAX_RECORD_PAYLOAD_BYTES,
-  RecordFormat,
   decodeBase64url,
   parseWriterId,
   recordPayloadBytes,
-  resolvedRecordFormat,
   decodeSseResumeCursor,
   type CaughtUpPosition,
   type ReadRecord,
@@ -715,9 +713,6 @@ function invalidResumeEventId(event: string): TsfClientError {
 }
 
 function readRecord(record: ReturnType<typeof sseReadBatchDataSchema.parse>["records"][number]): ReadRecord {
-  const format = resolvedRecordFormat(record) === "transcript"
-    ? RecordFormat.Transcript
-    : RecordFormat.Bytes;
   return {
     seqNum: BigInt(record.seq_num),
     timestampMs: BigInt(record.timestamp_ms),
@@ -727,7 +722,6 @@ function readRecord(record: ReturnType<typeof sseReadBatchDataSchema.parse>["rec
     part: record.part === undefined
       ? { index: 0, isFinal: true }
       : { index: record.part.index, isFinal: record.part.is_final },
-    format,
     data: recordPayloadBytes(record),
   };
 }

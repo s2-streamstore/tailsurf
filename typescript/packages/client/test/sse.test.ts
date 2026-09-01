@@ -596,7 +596,7 @@ function sseResponseText(
 ): string {
   return `${options.streamMetadataCursor === undefined ? "" : `id: ${options.streamMetadataCursor}\n`}event: stream_metadata\ndata: ${JSON.stringify({
       stream_id: streamId,
-      kind: "records",
+      kind: "transcript",
       title: null,
       visibility: "public",
       created_at: "2026-08-13T00:00:00Z",
@@ -615,7 +615,7 @@ function interruptedSseResponseAfter(streamId: string, events: string): Response
       controller.enqueue(encoder.encode(
         `event: stream_metadata\ndata: ${JSON.stringify({
           stream_id: streamId,
-          kind: "records",
+          kind: "transcript",
           title: null,
           visibility: "public",
           created_at: "2026-08-13T00:00:00Z",
@@ -661,7 +661,6 @@ function readRecordWire(
     seq_num: seqNum.toString(),
     timestamp_ms: (1_786_579_200_000 + seqNum).toString(),
     writer: { id: "AAAAAAAAAAAAAAAAAAAAAA", seq_num: seqNum.toString() },
-    format: "transcript",
     ...payload,
   } as const;
 }

@@ -60,6 +60,8 @@ The session reconnects from the latest record or caught-up position after transi
 
 `TsfWriter` creates a fresh writer identity and starts its sequence at zero. It retains that identity, acknowledged progress, and unacknowledged records across reconnects. It resends only the unacknowledged suffix.
 
+The writer handshake exposes the immutable `stream_kind`. A reconnect must report the same kind.
+
 Retryable interruptions keep recovering until the records are acknowledged. This preserves the exact writer identity, sequence numbers, and payloads needed for logical deduplication. `close` waits through retryable outages. `abort`, dropping the writer, or dropping its close future stops recovery.
 
 Records are submitted as a non-empty `AppendBatch`. The writer assigns writer sequence numbers in submission order, so cloned `TsfProducer` handles can submit concurrently without interleaving. `AppendBatch::split_logical` keeps the parts of an oversized logical record contiguous.
@@ -71,7 +73,7 @@ The writer queues submitted input and sends it through a fixed socket window of 
 Await each `AppendTicket` when you need its durable sequence numbers. A terminal `AppendDurabilityUnknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Submitting that record under a new writer identity may duplicate it.
 
 ```rust,no_run
-use tailsurf::{AppendBatch, DurableWriterOptions, LinkSecret, RecordFormat, StreamId, TsfClient};
+use tailsurf::{AppendBatch, DurableWriterOptions, LinkSecret, StreamId, TsfClient};
 
 async fn write_stream(
     client: &TsfClient,
@@ -82,7 +84,6 @@ async fn write_stream(
         .connect_writer(DurableWriterOptions::new(stream_id, write_link_secret))
         .await?;
     let ticket = writer.submit(AppendBatch::split_logical(
-        RecordFormat::Transcript,
         b"deploy started\n".as_slice(),
     )?)?;
     let receipts = ticket.await?;
@@ -123,7 +124,7 @@ Established SSE bodies are not timed out. WebSocket read-idle detection is deriv
 
 ## Modules
 
-Common client types are re-exported from the crate root. Lower-level codecs, wire models, URL helpers, permissions, and transcript reconstruction remain available in their named modules.
+Common client types are re-exported from the crate root. Lower-level codecs, wire models, URL helpers, permissions, and logical-record reconstruction remain available in their named modules.
 
 ## License
 
