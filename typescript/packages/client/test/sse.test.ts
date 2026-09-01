@@ -3,6 +3,7 @@ import {
   MAX_RECORD_PAYLOAD_BYTES,
   MAX_SSE_EVENT_BYTES,
   MAX_SSE_UNTERMINATED_EVENT_BYTES,
+  type StreamKind,
 } from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
 
@@ -469,6 +470,30 @@ describe("SSE reader resume", () => {
     expect(calls[1]?.headers.get("last-event-id")).toBe(CURSOR_ONE);
   });
 
+  it("rejects a stream kind change while reconnecting", async () => {
+    const streamId = generateStreamId();
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(interruptedSseResponseAfter(
+        streamId,
+        recordsEvent(CURSOR_ONE, 0),
+      ))
+      .mockResolvedValueOnce(sseResponse(
+        streamId,
+        recordsEvent(CURSOR_TWO, 1),
+        { kind: "bytes" },
+      ));
+    const session = await new TsfClient({ fetch }).connectSseReader({
+      streamId,
+      start: { type: "seqNum", seqNum: 0n },
+    });
+
+    expect((await session.nextRecord())?.seqNum).toBe(0n);
+    await expect(session.nextRecord()).rejects.toMatchObject({
+      code: "invalid_api_response",
+      message: "stream kind changed while reconnecting the reader",
+    });
+  });
+
   it("treats clean finite completion as terminal", async () => {
     const streamId = generateStreamId();
     const calls: Headers[] = [];
@@ -580,6 +605,7 @@ function sseResponse(
   events: string,
   options: {
     readonly streamMetadataCursor?: string;
+    readonly kind?: StreamKind;
   } = {},
 ): Response {
   return new Response(sseResponseText(streamId, events, options), {
@@ -592,11 +618,12 @@ function sseResponseText(
   events: string,
   options: {
     readonly streamMetadataCursor?: string;
+    readonly kind?: StreamKind;
   } = {},
 ): string {
   return `${options.streamMetadataCursor === undefined ? "" : `id: ${options.streamMetadataCursor}\n`}event: stream_metadata\ndata: ${JSON.stringify({
       stream_id: streamId,
-      kind: "transcript",
+      kind: options.kind ?? "transcript",
       title: null,
       visibility: "public",
       created_at: "2026-08-13T00:00:00Z",

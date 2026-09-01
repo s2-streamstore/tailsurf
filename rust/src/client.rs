@@ -725,6 +725,7 @@ impl TsfClient {
                 .ok_or(TsfClientError::InvalidSse(
                     "initial read completed without stream_metadata",
                 ))?;
+        validate_read_stream_metadata(&options.stream_id, None, &connection.stream_metadata)?;
         Ok(TsfSseReadSession {
             client: self.clone(),
             options,
@@ -846,6 +847,7 @@ impl TsfClient {
                     expect_read_handshake(&mut ws),
                 )
                 .await?;
+                validate_read_stream_metadata(&options.stream_id, None, &stream_metadata)?;
 
                 Ok(ConnectedReadSocket {
                     socket: ReadSocket {
@@ -2084,6 +2086,11 @@ impl TsfSseReadSession {
                     self.finished = true;
                     return Ok(None);
                 };
+                validate_read_stream_metadata(
+                    &self.options.stream_id,
+                    Some(self.stream_metadata.kind),
+                    &connection.stream_metadata,
+                )?;
                 if connection.resume_event.is_some() {
                     self.last_event = connection.resume_event;
                 }
@@ -2123,8 +2130,14 @@ impl TsfSseReadSession {
                 }
                 "error" => return Err(TsfClientError::SseTerminal(event.data)),
                 "stream_metadata" => {
-                    self.stream_metadata = serde_json::from_str(&event.data)
-                        .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?
+                    let stream_metadata = serde_json::from_str(&event.data)
+                        .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?;
+                    validate_read_stream_metadata(
+                        &self.options.stream_id,
+                        Some(self.stream_metadata.kind),
+                        &stream_metadata,
+                    )?;
+                    self.stream_metadata = stream_metadata;
                 }
                 _ => {}
             }
@@ -2240,6 +2253,11 @@ impl TsfReadSession {
             .client
             .connect_read_socket(&self.options, self.route)
             .await?;
+        validate_read_stream_metadata(
+            &self.options.stream_id,
+            Some(self.stream_metadata.kind),
+            &stream_metadata,
+        )?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
         self.no_progress_reconnects = 0;
@@ -3083,6 +3101,20 @@ async fn expect_read_handshake(ws: &mut ClientWebSocket) -> Result<StreamMetadat
     Ok(metadata)
 }
 
+fn validate_read_stream_metadata(
+    expected_stream_id: &StreamId,
+    expected_kind: Option<StreamKind>,
+    metadata: &StreamMetadata,
+) -> Result<(), TsfClientError> {
+    if metadata.stream_id != *expected_stream_id {
+        return Err(TsfClientError::StreamIdChanged);
+    }
+    if expected_kind.is_some_and(|kind| metadata.kind != kind) {
+        return Err(TsfClientError::StreamKindChanged);
+    }
+    Ok(())
+}
+
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
     match frame {
         ServerFrame::Ready(_) => "ready",
@@ -3216,6 +3248,9 @@ pub enum TsfClientError {
     /// A reconnect or metadata frame reported a different immutable stream kind.
     #[error("server reported inconsistent stream kinds")]
     StreamKindChanged,
+    /// A reader handshake or metadata frame reported a different stream identity.
+    #[error("server reported a different stream ID")]
+    StreamIdChanged,
     /// The server ended an SSE session with a stable terminal error event.
     #[error("SSE terminal error: {0}")]
     SseTerminal(String),
@@ -3693,6 +3728,37 @@ mod tests {
 
         assert_eq!(stream_metadata, expected_stream_metadata);
         sender.await.expect("join handshake sender");
+    }
+
+    #[test]
+    fn read_metadata_keeps_stream_identity_and_kind_stable() {
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let mut metadata = StreamMetadata {
+            stream_id,
+            kind: StreamKind::Transcript,
+            title: None,
+            visibility: crate::protocol::rest::Visibility::Private,
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+            expires_at: "2026-08-23T00:00:00Z".to_owned(),
+        };
+
+        validate_read_stream_metadata(&stream_id, Some(StreamKind::Transcript), &metadata)
+            .expect("matching metadata");
+        metadata.kind = StreamKind::Bytes;
+        assert!(matches!(
+            validate_read_stream_metadata(&stream_id, Some(StreamKind::Transcript), &metadata),
+            Err(TsfClientError::StreamKindChanged)
+        ));
+        metadata.kind = StreamKind::Transcript;
+        metadata.stream_id = "10000000000000000000000000000000"
+            .parse()
+            .expect("different stream ID");
+        assert!(matches!(
+            validate_read_stream_metadata(&stream_id, None, &metadata),
+            Err(TsfClientError::StreamIdChanged)
+        ));
     }
 
     #[tokio::test]

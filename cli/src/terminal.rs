@@ -20,7 +20,7 @@ use tailsurf::{
     validate_terminal_size,
 };
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     time::{Duration, Instant, sleep_until},
 };
 use url::Url;
@@ -170,6 +170,7 @@ struct PtyOutputHandoffState {
 struct PtyOutputHandoff {
     state: Mutex<PtyOutputHandoffState>,
     changed: Condvar,
+    send_finished: Notify,
 }
 
 struct PtyWrite {
@@ -792,6 +793,9 @@ async fn pause_and_queue_pty_output(
         state.resizing = true;
     }
     loop {
+        let send_finished = handoff.send_finished.notified();
+        tokio::pin!(send_finished);
+        send_finished.as_mut().enable();
         let sending = handoff
             .state
             .lock()
@@ -800,10 +804,13 @@ async fn pause_and_queue_pty_output(
         if !sending {
             break;
         }
-        match output.recv().await {
-            Some(Ok(data)) => pending.push_back(OwnedTerminalOutput::Data(data)),
-            Some(Err(error)) => return Err(error).context("failed to read PTY output"),
-            None => return Ok(false),
+        tokio::select! {
+            result = output.recv() => match result {
+                Some(Ok(data)) => pending.push_back(OwnedTerminalOutput::Data(data)),
+                Some(Err(error)) => return Err(error).context("failed to read PTY output"),
+                None => return Ok(false),
+            },
+            () = &mut send_finished => {}
         }
     }
     loop {
@@ -853,6 +860,7 @@ fn send_pty_output(
         .lock()
         .expect("PTY output handoff lock poisoned");
     state.sending = false;
+    handoff.send_finished.notify_one();
     if state.closing {
         let unsent = result.err().map(|error| error.0);
         drop(state);
@@ -986,9 +994,13 @@ mod tests {
 
         let mut pending = VecDeque::new();
         assert!(
-            pause_and_queue_pty_output(&mut receiver, &handoff, &mut pending)
-                .await
-                .expect("PTY output should pause")
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                pause_and_queue_pty_output(&mut receiver, &handoff, &mut pending),
+            )
+            .await
+            .expect("PTY output pause should not stall after a send finishes")
+            .expect("PTY output should pause")
         );
         assert!(blocked_send.join().expect("blocked send should finish"));
         pending.push_back(OwnedTerminalOutput::Resize {

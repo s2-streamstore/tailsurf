@@ -13,6 +13,7 @@ import {
   normalizeReadOptions,
   openReadFrame,
   readRequestForConnection,
+  validateReadStreamMetadata,
   type NormalizedReadOptions,
   type ReadOptions,
   type TsfReadSession,
@@ -198,6 +199,7 @@ export class TsfClient extends BaseTsfClient {
         signal,
       );
       const stream = streamMetadataFromWire(metadata);
+      validateReadStreamMetadata(options, stream);
       options.streamMetadata = stream;
       options.onStreamMetadata?.(stream);
       signal?.throwIfAborted();

@@ -161,6 +161,24 @@ describe("TsfClient configuration", () => {
 });
 
 describe("TsfReadSession", () => {
+  it("rejects a reader handshake for a different stream", async () => {
+    const streamId = generateStreamId();
+    const socket = new ScriptedWebSocket(
+      [
+        { type: "ready", kind: "transcript" },
+        streamMetadataFrame(generateStreamId()),
+      ],
+      1000,
+    );
+    const client = new TsfClient({ webSocketFactory: () => socket });
+
+    await expect(client.connectReader({ streamId })).rejects.toMatchObject({
+      code: "invalid_api_response",
+      message: "reader handshake returned a different stream ID",
+    });
+    expect(socket.closed).toBe(true);
+  });
+
   it("drains a maximum read batch in order", async () => {
     const streamId = generateStreamId();
     const records = Array.from(
@@ -513,6 +531,35 @@ describe("TsfReadSession", () => {
       [{ type: "openRead" }],
       [{ type: "openRead" }],
     ]);
+  });
+
+  it("rejects a stream kind change while reconnecting a reader", async () => {
+    const streamId = generateStreamId();
+    let connection = 0;
+    const client = new TsfClient({
+      webSocketFactory: () => {
+        const initial = connection++ === 0;
+        const kind: StreamKind = initial ? "transcript" : "bytes";
+        return new ScriptedWebSocket(
+          [
+            { type: "ready", kind },
+            streamMetadataFrame(streamId, kind),
+            ...(initial ? [readBatch(record(0n, "first"))] : []),
+          ],
+          initial ? 1013 : 1000,
+        );
+      },
+    });
+    const reader = await client.connectReader({
+      streamId,
+      start: { type: "seqNum", seqNum: 0n },
+    });
+
+    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 0n });
+    await expect(reader.nextRecord()).rejects.toMatchObject({
+      code: "invalid_api_response",
+      message: "stream kind changed while reconnecting the reader",
+    });
   });
 
   it("opens one bounded paced read", async () => {
@@ -1471,6 +1518,10 @@ class ScriptedWebSocket extends EventTarget {
   public readyState = 0;
   public binaryType: BinaryType = "blob";
   #closed = false;
+
+  public get closed(): boolean {
+    return this.#closed;
+  }
 
   public constructor(
     private readonly frames: readonly ServerFrame[],

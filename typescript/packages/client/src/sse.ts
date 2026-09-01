@@ -26,6 +26,7 @@ import {
   BaseTsfReadSession,
   normalizeReadOptions,
   readExhausted,
+  validateReadStreamMetadata,
   type NormalizedReadOptions,
   type ReadOptions,
   type TsfReadSession,
@@ -89,8 +90,9 @@ export async function connectSseReader(
       "initial SSE read completed without stream metadata",
     );
   }
-  normalized.streamMetadata = connection.stream;
   try {
+    validateReadStreamMetadata(normalized, connection.stream);
+    normalized.streamMetadata = connection.stream;
     normalized.onStreamMetadata?.(connection.stream);
   } catch (error) {
     connection.close();
@@ -172,6 +174,12 @@ class SseReadSession extends BaseTsfReadSession {
           this.finished = true;
           return undefined;
         }
+        try {
+          validateReadStreamMetadata(this.options, connection.stream);
+        } catch (error) {
+          connection.close();
+          throw error;
+        }
         this.#connection = connection;
         if (connection.resumeEventId !== undefined) {
           this.#lastEventId = connection.resumeEventId;
@@ -209,6 +217,12 @@ class SseReadSession extends BaseTsfReadSession {
       }
       if (event.event === "stream_metadata") {
         const stream = streamMetadataFromWire(parseJsonEvent(event, streamMetadataSchema));
+        try {
+          validateReadStreamMetadata(this.options, stream);
+        } catch (error) {
+          this.close();
+          throw error;
+        }
         this.options.streamMetadata = stream;
         this.notify(this.options.onStreamMetadata, stream);
         continue;
