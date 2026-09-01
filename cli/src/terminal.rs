@@ -30,6 +30,10 @@ use super::{
     print_created_stream, resource_link,
 };
 
+mod checkpoint;
+
+use checkpoint::{TerminalCheckpointEmitter, resembles_checkpoint};
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_INPUT_WRITERS: usize = 4_096;
 const MAX_PENDING_OUTPUT_RECORDS: usize = 32;
@@ -643,6 +647,7 @@ async fn host(
     let mut output_truncated = false;
     let mut interrupted = false;
     let mut pending_output = VecDeque::new();
+    let mut checkpoints = TerminalCheckpointEmitter::new(columns, rows);
 
     while exit_status.is_none() || output_open {
         tokio::select! {
@@ -656,7 +661,11 @@ async fn host(
             chunk = output_rx.recv(), if output_open && pending_output.is_empty() => {
                 match chunk {
                     Some(Ok(data)) => {
-                        pending_output.push_back(OwnedTerminalOutput::Data(data));
+                        let checkpoint = checkpoints.process(&data);
+                        queue_pty_data(&mut pending_output, data);
+                        if let Some(checkpoint) = checkpoint {
+                            pending_output.push_back(OwnedTerminalOutput::Data(checkpoint));
+                        }
                         if let Some(max_deadline) = output_drain_max_deadline {
                             output_drain_deadline = Some(std::cmp::min(
                                 Instant::now() + PTY_EXIT_DRAIN_IDLE_TIMEOUT,
@@ -670,11 +679,17 @@ async fn host(
             }
             resize = pty_resize_rx.recv(), if exit_status.is_none() && pending_output.is_empty() => {
                 let resize = resize.context("terminal input forwarder stopped")?;
+                let pending_start = pending_output.len();
                 output_open = pause_and_queue_pty_output(
                     &mut output_rx,
                     &output_handoff_state,
                     &mut pending_output,
                 ).await?;
+                ingest_queued_pty_output(
+                    &mut checkpoints,
+                    &pending_output,
+                    pending_start,
+                );
                 let result = master
                     .resize(PtySize {
                         rows: resize.rows,
@@ -688,6 +703,12 @@ async fn host(
                         columns: resize.columns,
                         rows: resize.rows,
                     });
+                    if let Some(checkpoint) = checkpoints.resize(
+                        resize.columns,
+                        resize.rows,
+                    ) {
+                        pending_output.push_back(OwnedTerminalOutput::Data(checkpoint));
+                    }
                 }
                 resume_pty_output(&output_handoff_state);
                 let _ = resize.applied.send(result);
@@ -716,27 +737,42 @@ async fn host(
                 output_drain_max_deadline = Some(now + PTY_EXIT_DRAIN_MAX_TIMEOUT);
             }
             _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() && pty_output_is_idle(&pending_output, &output_rx) => {
+                let pending_start = pending_output.len();
                 close_and_queue_pty_output(
                     &mut output_rx,
                     &output_handoff_state,
                     &mut output_close_rx,
                     &mut pending_output,
                 ).await?;
+                ingest_queued_pty_output(
+                    &mut checkpoints,
+                    &pending_output,
+                    pending_start,
+                );
                 output_open = false;
                 output_truncated = true;
             }
             _ = wait_for_deadline(output_drain_max_deadline), if output_open && exit_status.is_some() => {
+                let pending_start = pending_output.len();
                 close_and_queue_pty_output(
                     &mut output_rx,
                     &output_handoff_state,
                     &mut output_close_rx,
                     &mut pending_output,
                 ).await?;
+                ingest_queued_pty_output(
+                    &mut checkpoints,
+                    &pending_output,
+                    pending_start,
+                );
                 output_open = false;
                 output_truncated = true;
             }
             _ = heartbeat.tick(), if exit_status.is_none() && pending_output.is_empty() => {
                 pending_output.push_back(OwnedTerminalOutput::Heartbeat);
+                if let Some(checkpoint) = checkpoints.heartbeat() {
+                    pending_output.push_back(OwnedTerminalOutput::Data(checkpoint));
+                }
             }
             interrupt = tokio::signal::ctrl_c(), if exit_status.is_none() => {
                 interrupt.context("failed to listen for interrupt signal")?;
@@ -755,6 +791,14 @@ async fn host(
     drop(output_rx);
     while let Some(event) = pending_output.pop_front() {
         enqueue_final_output(&output_command_tx, &mut output_task, event).await?;
+    }
+    if let Some(checkpoint) = checkpoints.flush() {
+        enqueue_final_output(
+            &output_command_tx,
+            &mut output_task,
+            OwnedTerminalOutput::Data(checkpoint),
+        )
+        .await?;
     }
     enqueue_final_output(
         &output_command_tx,
@@ -807,6 +851,28 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     }
 }
 
+fn ingest_queued_pty_output(
+    checkpoints: &mut TerminalCheckpointEmitter,
+    pending: &VecDeque<OwnedTerminalOutput>,
+    start: usize,
+) {
+    for event in pending.iter().skip(start) {
+        if let OwnedTerminalOutput::Data(data) = event {
+            checkpoints.ingest(data);
+        }
+    }
+}
+
+fn queue_pty_data(pending: &mut VecDeque<OwnedTerminalOutput>, mut data: Vec<u8>) {
+    if resembles_checkpoint(&data) {
+        let remainder = data.split_off(1);
+        pending.push_back(OwnedTerminalOutput::Data(data));
+        pending.push_back(OwnedTerminalOutput::Data(remainder));
+    } else {
+        pending.push_back(OwnedTerminalOutput::Data(data));
+    }
+}
+
 async fn pause_and_queue_pty_output(
     output: &mut mpsc::Receiver<PtyOutput>,
     handoff: &Arc<PtyOutputHandoff>,
@@ -833,7 +899,7 @@ async fn pause_and_queue_pty_output(
         }
         tokio::select! {
             result = output.recv() => match result {
-                Some(Ok(data)) => pending.push_back(OwnedTerminalOutput::Data(data)),
+                Some(Ok(data)) => queue_pty_data(pending, data),
                 Some(Err(error)) => return Err(error).context("failed to read PTY output"),
                 None => return Ok(false),
             },
@@ -842,7 +908,7 @@ async fn pause_and_queue_pty_output(
     }
     loop {
         match output.try_recv() {
-            Ok(Ok(data)) => pending.push_back(OwnedTerminalOutput::Data(data)),
+            Ok(Ok(data)) => queue_pty_data(pending, data),
             Ok(Err(error)) => return Err(error).context("failed to read PTY output"),
             Err(mpsc::error::TryRecvError::Empty) => return Ok(true),
             Err(mpsc::error::TryRecvError::Disconnected) => return Ok(false),
@@ -917,18 +983,14 @@ async fn close_and_queue_pty_output(
     };
     output.close();
     while let Some(result) = output.recv().await {
-        pending.push_back(OwnedTerminalOutput::Data(
-            result.context("failed to read PTY output")?,
-        ));
+        queue_pty_data(pending, result.context("failed to read PTY output")?);
     }
     if wait_for_in_flight
         && let Some(result) = close_ack
             .await
             .context("PTY output thread stopped during shutdown")?
     {
-        pending.push_back(OwnedTerminalOutput::Data(
-            result.context("failed to read PTY output")?,
-        ));
+        queue_pty_data(pending, result.context("failed to read PTY output")?);
     }
     Ok(())
 }
@@ -943,6 +1005,24 @@ fn pty_output_is_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_output_cannot_impersonate_a_host_checkpoint() {
+        let output = b"\x1b]9999;tailsurf-checkpoint-v1;AAAA\x07".to_vec();
+        let mut pending = VecDeque::new();
+
+        queue_pty_data(&mut pending, output.clone());
+
+        let parts = pending
+            .into_iter()
+            .map(|event| match event {
+                OwnedTerminalOutput::Data(data) => data,
+                _ => panic!("unexpected terminal output"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.concat(), output);
+    }
 
     #[tokio::test]
     async fn queues_buffered_pty_bytes_before_a_resize() {

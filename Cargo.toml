@@ -30,6 +30,8 @@ tokio = "1.53.1"
 tokio-tungstenite = "0.30.0"
 ubid = { version = "0.1.5", features = ["serde"] }
 url = { version = "2.5.8", features = ["serde"] }
+vt100 = "0.16.2"
+vte = "0.15.0"
 
 [workspace.lints.rust]
 missing_docs = "deny"
