@@ -111,6 +111,8 @@ Private sessions print separate observer, controller, and owner links. Public se
 
 Observers see terminal output. Controllers can also send input and resize the PTY. Only the local host can publish terminal output.
 
+Terminal output is durable. The browser timeline can pause, seek, and replay it. Input is enabled only at the live edge.
+
 Closing a browser does not stop the command. Ctrl-C in the host stops it.
 
 By default, `tsf new` creates a transcript stream. It makes input line boundaries record boundaries:

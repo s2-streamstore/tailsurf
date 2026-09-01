@@ -6,15 +6,19 @@ This document defines the public TSF v1 wire contract across REST, Server-Sent E
 
 ## Stream model
 
-A stream has an immutable kind. A `transcript` stream is a line-oriented record log. A `bytes` stream is an opaque byte record log. A `terminal` stream is a terminal session with independent input and output logs.
+A TSF stream is a logical resource with an immutable kind.
 
-The default kind is `transcript`.
+- `transcript` is a line-oriented record log.
+- `bytes` is an opaque byte record log.
+- `terminal` is a terminal session with independent input and output channels.
 
-Clients may omit `kind` when creating a transcript stream. They send `kind: bytes` for an opaque byte stream or `kind: terminal` for a terminal session.
+The default kind is `transcript`. Clients may omit `kind` when creating a transcript stream. They set it to `bytes` or `terminal` to select another kind.
 
 Servers include `kind` in stream metadata, creation responses, and WebSocket `Ready` frames. Clients do not infer it from record data.
 
-A stream's complete retained history remains readable until the stream expires or an owner deletes it.
+Transcript records, byte records, and terminal output remain readable until the stream expires or an owner deletes it. Terminal input has one-hour age retention.
+
+The following ordering and identity rules apply independently to each record log.
 
 The service assigns each physical record a zero-based `seq_num` in append order. Sequence numbers are contiguous. The stream's `next_seq_num` is the sequence number that the next appended record will receive.
 
@@ -53,9 +57,7 @@ Private reads require read permission. Public reads require no link. All writes 
 
 ## Stream links
 
-A stream page uses `/s/{stream_id}`.
-
-A terminal page uses `/t/{stream_id}`. The distinct path names the terminal workspace. Read-capable browser workspaces verify it against the immutable stream kind.
+Transcript and byte stream pages use `/s/{stream_id}`. Terminal pages use `/t/{stream_id}`. Read-capable browser workspaces verify the path against the immutable stream kind.
 
 A link secret is carried in one URL fragment parameter:
 
@@ -113,9 +115,11 @@ Stream creation does not use a link secret and may be disabled by deployment pol
 
 ### Creation retries
 
-Transcript stream, byte stream, and link creation accept an optional `Idempotency-Key`. Terminal stream creation requires it because the operation provisions metadata and two physical streams. A key is 32 random bytes encoded as exactly 43 unpadded base64url characters. One logical creation uses the same key, method, path, and body for every retry.
+Stream and link creation use `Idempotency-Key` for retry recovery. The header is optional when creating a transcript stream, byte stream, or link. It is required when creating a terminal because that operation provisions metadata and two physical streams.
 
-Omitting the header requests one-shot transcript stream, byte stream, or link creation. Retrying stream creation can create another stream. Retrying link creation cannot recover a committed credential and may conflict with the existing Link ID.
+A key is 32 random bytes encoded as exactly 43 unpadded base64url characters. One logical creation uses the same key, method, path, and body for every retry.
+
+Without the header, transcript stream, byte stream, and link creation are one-shot operations. Retrying stream creation can create another stream. Retrying link creation cannot recover a committed credential and may conflict with the existing Link ID.
 
 An exact stream-creation replay returns the same Stream ID and initial credentials while the stream remains active. Reusing the key with a different request returns `409 conflict`.
 
@@ -260,11 +264,16 @@ A non-retryable failure after the response opens sends a terminal `error` event 
 
 ## Terminal sessions
 
-A terminal stream has independent `input` and `output` logs. Each log follows the ordinary record ordering, durability, retry, and read semantics.
+A terminal stream has independent `input` and `output` channels. Each channel is backed by a separate record log and follows the ordinary ordering, durability, retry, and read semantics.
 
-The generic read route selects terminal output. The generic write route selects terminal input. Explicit routes select either log for hosts and specialized clients.
+Generic data-plane routes provide the observer and controller paths:
 
-The explicit terminal routes are WebSocket-only. Generic HTTP append and SSE read routes select terminal input and output using the same defaults as generic WebSocket routes.
+| Operation | Selected channel | Required permission |
+| --- | --- | --- |
+| WebSocket `/read` or SSE `GET /records` | `output` | Read, or public visibility |
+| WebSocket `/write` or HTTP `POST /records` | `input` | Write |
+
+The following WebSocket-only routes select a channel explicitly:
 
 ```txt
 /api/v1/streams/{stream_id}/terminal/input/read
@@ -273,9 +282,7 @@ The explicit terminal routes are WebSocket-only. Generic HTTP append and SSE rea
 /api/v1/streams/{stream_id}/terminal/output/write
 ```
 
-Read permission authorizes output reads. Write permission authorizes input writes. Owner permission authorizes every terminal route. Public visibility authorizes output reads without a link.
-
-Only an owner can read the input log or write the output log. Terminal routes reject transcript and byte streams.
+Only an owner can read input or write output. Owner permission authorizes every terminal route. Explicit terminal routes reject transcript and byte streams.
 
 Terminal events use unsplit byte records. Every payload begins with a version byte and a type byte. The version is `0x01`.
 
@@ -300,9 +307,11 @@ Output event types are:
 
 Terminal dimensions are between 1 and 1,000 columns, between 1 and 500 rows, and at most 131,072 cells. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors. Servers validate the record envelope and direction-specific event before append.
 
-The host writes one `started` event before other output. It writes data, resize, and heartbeat events while the child runs. A session ends with one `exited` event. `output_truncated` is true when the direct child exits but another process keeps the PTY open past the bounded drain. Full-history browser reconstruction rejects an event before `started` or a second `started`. Bounded live-tail recovery may join after `started`. Both stop reading at `exited`.
+A complete output history begins with one `started` event. Data, resize, and heartbeat events may follow while the child runs. One `exited` event ends the lifecycle. A consumer that starts from an arbitrary tail may join after `started`.
 
-The `started` event is the host's first output append and requires sequence zero. The host stops its child if that precondition fails. This prevents multiple hosts from publishing to the same output log. The host applies a requested resize before publishing the output resize event.
+`output_truncated` is true when the direct child exits but another process keeps the PTY open past the bounded drain. The host applies a requested resize before publishing the corresponding output resize event.
+
+The host appends `started` with an expected sequence of zero. A failed precondition prevents a second host from claiming the output channel.
 
 ## History export
 
@@ -414,7 +423,7 @@ Malformed lengths and unknown stream-kind values are protocol errors.
 
 Record data may contain at most 512 KiB.
 
-The stream-kind byte uses `0x00` for transcript, `0x01` for bytes, and `0x02` for terminal.
+The stream-kind byte in `Ready` uses `0x00` for transcript, `0x01` for bytes, and `0x02` for terminal.
 
 Transcript consumers preserve payload bytes. Line-oriented presentation may add one separator after each logical record. Byte-stream consumers preserve the byte sequence without adding separators.
 

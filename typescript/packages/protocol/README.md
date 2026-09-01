@@ -2,7 +2,7 @@
 
 `@tailsurf/protocol` contains the low-level TypeScript implementation of the public TSF v1 contract.
 
-It exports IDs, permissions, stream URLs, REST and SSE schemas, read-query helpers, binary WebSocket frames, and logical-record reconstruction.
+It exports IDs, permissions, stream URLs, REST and SSE schemas, read-query helpers, binary WebSocket frames, terminal event codecs, and logical-record reconstruction.
 
 Most applications should use `@tailsurf/client` instead.
 

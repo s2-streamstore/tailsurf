@@ -116,7 +116,7 @@ await writer.close();
 
 Create a terminal resource with `kind: "terminal"`.
 
-Terminal sessions have separate input and output logs. `connectWriter` and `connectReader` use the controller-input and observer-output defaults. The terminal-specific methods make the selected log explicit. A host with an owner link uses `connectTerminalInputReader` and `connectTerminalOutputWriter`.
+Terminal sessions have separate input and output channels. `connectWriter` selects input, and `connectReader` selects output. The terminal-specific methods make that choice explicit. A host with an owner link uses `connectTerminalInputReader` and `connectTerminalOutputWriter`.
 
 `buildTerminalLink` and `buildPublicTerminalUrl` build the canonical `/t/{streamId}` browser URLs.
 

@@ -272,7 +272,7 @@ components:
     StreamKind:
       type: string
       enum: [transcript, bytes, terminal]
-      description: Immutable stream semantics. Transcript and byte streams use one log. Terminals use separate input and output logs.
+      description: Immutable stream semantics. Transcript and byte streams use one record log. Terminals use separate input and output channels.
     StreamMetadata:
       type: object
       required: [stream_id, kind, title, visibility, created_at, expires_at]

@@ -100,7 +100,7 @@ The [complete example](https://github.com/s2-streamstore/tailsurf/blob/main/rust
 
 Create a terminal resource with `StreamKind::Terminal`.
 
-Terminal sessions have separate input and output logs. Controllers use `connect_terminal_input_writer`. Observers use `connect_terminal_output_reader`.
+Terminal sessions have separate input and output channels. For a terminal stream, `connect_writer` selects input and `connect_reader` selects output. Controllers may use `connect_terminal_input_writer` to make that choice explicit. Observers may use `connect_terminal_output_reader`.
 
 A host with an owner link uses `connect_terminal_input_reader` and `connect_terminal_output_writer`.
 
