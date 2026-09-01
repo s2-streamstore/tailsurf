@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use super::ws::frame::MAX_RECORD_PAYLOAD_BYTES;
+
 /// Current terminal event payload version.
 pub const TERMINAL_EVENT_VERSION: u8 = 0x01;
 /// Largest supported terminal width.
@@ -205,6 +207,12 @@ fn encode_checkpoint(
     state: &[u8],
 ) -> Result<Vec<u8>, TerminalProtocolError> {
     validate_terminal_size(columns, rows)?;
+    if state.len() > MAX_RECORD_PAYLOAD_BYTES - SIZE_EVENT_LEN {
+        return Err(TerminalProtocolError::EventTooLarge {
+            actual: state.len().saturating_add(SIZE_EVENT_LEN),
+            maximum: MAX_RECORD_PAYLOAD_BYTES,
+        });
+    }
     let mut payload = event_header(CHECKPOINT, SIZE_EVENT_LEN + state.len());
     payload[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&columns.to_be_bytes());
     payload[HEADER_LEN + 2..SIZE_EVENT_LEN].copy_from_slice(&rows.to_be_bytes());
@@ -325,6 +333,14 @@ pub enum TerminalProtocolError {
         actual: usize,
         /// Minimum encoded length.
         minimum: usize,
+    },
+    /// An event exceeds the physical record payload limit.
+    #[error("terminal event is {actual} bytes; maximum is {maximum}")]
+    EventTooLarge {
+        /// Actual encoded length.
+        actual: usize,
+        /// Maximum encoded length.
+        maximum: usize,
     },
     /// An exited event uses unsupported flag bits.
     #[error("invalid terminal exited flags 0x{0:02x}")]
@@ -466,6 +482,14 @@ mod tests {
         assert!(matches!(
             decode_terminal_output(&[TERMINAL_EVENT_VERSION, CHECKPOINT, 0, 80, 0]),
             Err(TerminalProtocolError::InvalidMinimumLength { .. })
+        ));
+        assert!(matches!(
+            encode_terminal_output(TerminalOutputEvent::Checkpoint {
+                columns: 80,
+                rows: 24,
+                state: &vec![0; MAX_RECORD_PAYLOAD_BYTES],
+            }),
+            Err(TerminalProtocolError::EventTooLarge { .. })
         ));
         assert_eq!(
             encode_terminal_input(TerminalInputEvent::Resize {

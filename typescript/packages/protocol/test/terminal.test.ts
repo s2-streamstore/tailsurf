@@ -10,6 +10,7 @@ import {
   MAX_TERMINAL_CELLS,
   MAX_TERMINAL_COLUMNS,
   MAX_TERMINAL_ROWS,
+  MAX_RECORD_PAYLOAD_BYTES,
   ProtocolError,
 } from "../src/index.js";
 
@@ -97,6 +98,12 @@ describe("terminal event protocol", () => {
       columns: MAX_TERMINAL_COLUMNS,
       rows: MAX_TERMINAL_ROWS,
     })).toThrow(new RegExp(`${MAX_TERMINAL_CELLS} cells`));
+    expect(() => encodeTerminalOutputEvent({
+      type: "checkpoint",
+      columns: 80,
+      rows: 24,
+      state: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES),
+    })).toThrow(/maximum/);
   });
 });
 

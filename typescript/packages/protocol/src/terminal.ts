@@ -1,4 +1,5 @@
 import { ProtocolError } from "./errors.js";
+import { MAX_RECORD_PAYLOAD_BYTES } from "./ws.js";
 
 export const TERMINAL_EVENT_VERSION = 0x01;
 export const MAX_TERMINAL_COLUMNS = 1_000;
@@ -152,6 +153,12 @@ function encodeCheckpoint(
   state: Uint8Array,
 ): Uint8Array {
   validateTerminalSize(columns, rows);
+  if (state.byteLength > MAX_RECORD_PAYLOAD_BYTES - SIZE_EVENT_BYTES) {
+    throw new ProtocolError(
+      "terminal_event_too_large",
+      `terminal event is ${SIZE_EVENT_BYTES + state.byteLength} bytes; maximum is ${MAX_RECORD_PAYLOAD_BYTES}`,
+    );
+  }
   const payload = eventHeader(CHECKPOINT, SIZE_EVENT_BYTES + state.byteLength);
   const view = new DataView(payload.buffer);
   view.setUint16(TERMINAL_EVENT_HEADER_BYTES, columns);
