@@ -27,7 +27,7 @@ use url::Url;
 
 use super::{
     INTERRUPT_EXIT_CODE, STDIN_READ_BYTES, StreamExpiryArg, exit_interrupted, initial_link,
-    print_created_stream,
+    print_created_stream, resource_link,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -46,6 +46,9 @@ pub(super) struct TerminalArgs {
     /// Allow anonymous observers.
     #[arg(long)]
     public: bool,
+    /// Print the owner link for later administration. Keep it private.
+    #[arg(long)]
+    show_owner_link: bool,
     #[arg(
         long,
         value_name = "DURATION",
@@ -89,18 +92,31 @@ pub(super) async fn run(origin: Url, args: TerminalArgs) -> eyre::Result<()> {
         })
         .await
         .context("failed to create terminal session")?;
-    let owner_secret = created
+    let owner = created
         .links
         .iter()
         .find(|link| link.permissions.allows_owner())
-        .context("created terminal did not include an owner link")?
-        .secret
-        .clone();
+        .context("created terminal did not include an owner link")?;
+    let owner_link = resource_link(
+        &created.web_origin,
+        &created.stream_id,
+        created.kind,
+        owner.permissions,
+        &owner.secret,
+    )
+    .context("failed to build terminal owner link")?;
+    let owner_secret = owner.secret.clone();
     let stream_id = created.stream_id;
     let cleanup_client = client.clone();
     let cleanup_owner_secret = owner_secret.clone();
-    if let Err(error) = print_created_stream(&created, false) {
-        cleanup_failed_start(&cleanup_client, &stream_id, &cleanup_owner_secret).await;
+    if let Err(error) = print_created_stream(&created, false, args.show_owner_link) {
+        cleanup_failed_start(
+            &cleanup_client,
+            &stream_id,
+            &cleanup_owner_secret,
+            &owner_link,
+        )
+        .await;
         return Err(error);
     }
     let mut started = false;
@@ -115,7 +131,13 @@ pub(super) async fn run(origin: Url, args: TerminalArgs) -> eyre::Result<()> {
     )
     .await;
     if result.is_err() && !started {
-        cleanup_failed_start(&cleanup_client, &stream_id, &cleanup_owner_secret).await;
+        cleanup_failed_start(
+            &cleanup_client,
+            &stream_id,
+            &cleanup_owner_secret,
+            &owner_link,
+        )
+        .await;
     }
     if result
         .as_ref()
@@ -137,7 +159,12 @@ impl fmt::Display for TerminalStartupInterrupted {
 
 impl std::error::Error for TerminalStartupInterrupted {}
 
-async fn cleanup_failed_start(client: &TsfClient, stream_id: &StreamId, owner_secret: &LinkSecret) {
+async fn cleanup_failed_start(
+    client: &TsfClient,
+    stream_id: &StreamId,
+    owner_secret: &LinkSecret,
+    owner_link: &Url,
+) {
     match client.delete_stream(stream_id, owner_secret).await {
         Ok(()) => {
             eprintln!("Removed terminal {stream_id} after startup failed. It cannot be recovered.");
@@ -146,7 +173,7 @@ async fn cleanup_failed_start(client: &TsfClient, stream_id: &StreamId, owner_se
             eprintln!(
                 "Terminal {stream_id} may still be active because startup cleanup failed: {error}"
             );
-            eprintln!("Use the owner link printed above to delete it.");
+            eprintln!("Delete it with this private owner link: {owner_link}");
         }
     }
 }

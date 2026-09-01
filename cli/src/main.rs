@@ -807,7 +807,7 @@ async fn new_stream(origin: Url, args: NewArgs) -> eyre::Result<()> {
         })
         .await
         .context("failed to create stream")?;
-    print_created_stream(&created, args.json)?;
+    print_created_stream(&created, args.json, true)?;
     write_link_files(&created, &args)?;
 
     if args.input.program.is_empty() && std::io::stdin().is_terminal() {
@@ -1962,7 +1962,11 @@ fn public_resource_url(
     }
 }
 
-fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Result<()> {
+fn print_created_stream(
+    created: &CreateStreamResponse,
+    json: bool,
+    show_owner_link: bool,
+) -> eyre::Result<()> {
     let web_origin = &created.web_origin;
     if !json {
         let resource = match created.kind {
@@ -1985,6 +1989,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
         let mut links = created
             .links
             .iter()
+            .filter(|credential| show_owner_link || !credential.permissions.allows_owner())
             .map(|credential| {
                 Ok((
                     credential.link_id.as_str(),

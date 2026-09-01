@@ -103,11 +103,14 @@ Host an interactive command in a multiplayer web terminal:
 tsf terminal
 tsf terminal -- htop
 tsf terminal --public -- bash
+tsf terminal --show-owner-link
 ```
 
 The command runs in a local PTY. The hosted service does not run it.
 
-Private sessions print separate observer, controller, and owner links. Public sessions print a public observer URL plus controller and owner links.
+Private sessions print separate observer and controller links. Public sessions print a public observer URL plus a controller link.
+
+Pass `--show-owner-link` to print the private owner link for later administration. The owner link can change visibility, manage links, update metadata, and delete the session.
 
 Observers see terminal output. Controllers can also send input and resize the PTY. Only an owner can publish terminal output. `tsf terminal` is the normal host.
 
