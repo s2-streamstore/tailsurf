@@ -304,10 +304,13 @@ Output event types are:
 | `0x03` | `started` | Initial columns and rows as big-endian `uint16` values |
 | `0x04` | `exited` | Signed exit status as a big-endian `int32`, then `output_truncated` as `0x00` or `0x01` |
 | `0x05` | `heartbeat` | Empty |
+| `0x06` | `checkpoint` | Columns as a big-endian `uint16`, rows as a big-endian `uint16`, then a terminal restoration program |
 
 Terminal dimensions are between 1 and 1,000 columns, between 1 and 500 rows, and at most 131,072 cells. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors. Servers validate the record envelope and direction-specific event before append.
 
-A complete output history begins with one `started` event. Data, resize, and heartbeat events may follow while the child runs. One `exited` event ends the lifecycle. A consumer that starts from an arbitrary tail may join after `started`.
+A complete output history begins with one `started` event. Data, resize, heartbeat, and checkpoint events may follow while the child runs. One `exited` event ends the lifecycle. A consumer that starts from an arbitrary tail may join after `started`.
+
+The host attempts a checkpoint after at most 512 ordinary output events. Checkpoint events do not count toward this interval. For checkpointable output, a consumer reads the latest 513 events to cover a checkpoint appended immediately after the boundary event.
 
 `output_truncated` is true when the direct child exits but another process keeps the PTY open past the bounded drain. The host applies a requested resize before publishing the corresponding output resize event.
 

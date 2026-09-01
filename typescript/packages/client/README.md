@@ -122,6 +122,8 @@ Terminal sessions have separate input and output channels. `connectWriter` selec
 
 `encodeTerminalInputEvent`, `decodeTerminalInputEvent`, `encodeTerminalOutputEvent`, and `decodeTerminalOutputEvent` implement the versioned terminal event payloads. Events remain ordinary unsplit byte records, so terminal clients retain the normal durability and reconnect behavior.
 
+Terminal output checkpoints are self-contained restoration programs. Hosts attempt them after at most `TERMINAL_CHECKPOINT_RECORD_INTERVAL` ordinary output events. Readers can restore the latest checkpoint and replay later events instead of reconstructing the full output history.
+
 ## Retries and errors
 
 REST mutations use idempotency keys. Pass a caller-owned key as the second argument when a creation must survive page reloads.
