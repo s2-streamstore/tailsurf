@@ -108,6 +108,8 @@ A host with an owner link uses `connect_terminal_input_reader` and `connect_term
 
 `encode_terminal_input`, `decode_terminal_input`, `encode_terminal_output`, and `decode_terminal_output` implement the versioned terminal event payloads. Events remain ordinary unsplit byte records, so terminal clients retain the normal durability and reconnect behavior.
 
+Terminal output checkpoints are self-contained restoration programs. Hosts attempt them after at most `TERMINAL_CHECKPOINT_RECORD_INTERVAL` ordinary output events. Readers can restore the latest checkpoint and replay later events instead of reconstructing the full output history.
+
 ## Manage
 
 Management methods require an owner link secret. `list_links` returns one page. `list_all_links` follows pagination and validates the complete inventory.

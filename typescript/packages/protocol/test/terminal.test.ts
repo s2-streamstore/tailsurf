@@ -45,6 +45,12 @@ describe("terminal event protocol", () => {
       { type: "exited", status: -1, outputTruncated: false },
       { type: "exited", status: 0, outputTruncated: true },
       { type: "heartbeat" },
+      {
+        type: "checkpoint",
+        columns: 80,
+        rows: 24,
+        state: Uint8Array.of(27, 91, 109),
+      },
     ] as const;
     for (const event of events) {
       expect(decodeTerminalOutputEvent(encodeTerminalOutputEvent(event)))
@@ -73,6 +79,9 @@ describe("terminal event protocol", () => {
     expect(() => decodeTerminalOutputEvent(
       Uint8Array.of(1, 4, 0, 0, 0, 0, 2),
     )).toThrow(/invalid terminal exited flags/);
+    expect(() => decodeTerminalOutputEvent(
+      Uint8Array.of(1, 6, 0, 80, 0),
+    )).toThrow(/expected at least 6/);
     expect(() => encodeTerminalInputEvent({
       type: "resize",
       columns: 0,
@@ -123,6 +132,13 @@ function encodeVector(name: string): Uint8Array {
       });
     case "output-heartbeat":
       return encodeTerminalOutputEvent({ type: "heartbeat" });
+    case "output-checkpoint":
+      return encodeTerminalOutputEvent({
+        type: "checkpoint",
+        columns: 80,
+        rows: 24,
+        state: Uint8Array.of(27, 91, 109),
+      });
     default:
       throw new Error(`unknown terminal test vector ${name}`);
   }

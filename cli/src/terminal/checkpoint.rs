@@ -1,20 +1,25 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use tailsurf::protocol::ws::frame::MAX_RECORD_PAYLOAD_BYTES;
+use tailsurf::{
+    TERMINAL_CHECKPOINT_EVENT_HEADER_BYTES, TERMINAL_CHECKPOINT_RECORD_INTERVAL,
+    protocol::ws::frame::MAX_RECORD_PAYLOAD_BYTES,
+};
 
 const CHECKPOINT_BYTE_INTERVAL: usize = 4 * 1024 * 1024;
-const CHECKPOINT_RECORD_INTERVAL: usize = 512;
-const CHECKPOINT_PREFIX: &[u8] = b"\x1b]9999;tailsurf-checkpoint-v1;";
-const CHECKPOINT_SUFFIX: u8 = 0x07;
-const TERMINAL_DATA_EVENT_HEADER_BYTES: usize = 2;
+const MAX_CHECKPOINT_STATE_BYTES: usize =
+    MAX_RECORD_PAYLOAD_BYTES - TERMINAL_CHECKPOINT_EVENT_HEADER_BYTES;
 
-pub(super) fn resembles_checkpoint(data: &[u8]) -> bool {
-    data.starts_with(CHECKPOINT_PREFIX) && data.ends_with(&[CHECKPOINT_SUFFIX])
+pub(super) struct TerminalStateCheckpoint {
+    pub(super) columns: u16,
+    pub(super) rows: u16,
+    pub(super) state: Vec<u8>,
 }
 
 pub(super) struct TerminalCheckpointEmitter {
     parser: vt100::Parser<CheckpointCallbacks>,
     compatibility_parser: vte::Parser,
     compatibility: CheckpointCompatibility,
+    restore_columns: u16,
+    restore_rows: u16,
+    restore_state: Option<Vec<u8>>,
     pending_bytes: usize,
     pending_records: usize,
 }
@@ -30,54 +35,89 @@ impl TerminalCheckpointEmitter {
             ),
             compatibility_parser: vte::Parser::new(),
             compatibility: CheckpointCompatibility::default(),
+            restore_columns: columns,
+            restore_rows: rows,
+            restore_state: Some(Vec::new()),
             pending_bytes: 0,
             pending_records: 0,
         }
     }
 
-    pub(super) fn process(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        self.ingest(data);
+    pub(super) fn process(&mut self, data: &[u8]) -> Option<TerminalStateCheckpoint> {
+        self.parser.process(data);
+        self.compatibility_parser
+            .advance(&mut self.compatibility, data);
+        self.append_restore_data(data);
+        self.pending_bytes = self.pending_bytes.saturating_add(data.len());
+        self.pending_records = self.pending_records.saturating_add(1);
         if self.pending_bytes >= CHECKPOINT_BYTE_INTERVAL
-            || self.pending_records >= CHECKPOINT_RECORD_INTERVAL
+            || self.pending_records >= TERMINAL_CHECKPOINT_RECORD_INTERVAL
         {
             return self.flush();
         }
         None
     }
 
-    pub(super) fn ingest(&mut self, data: &[u8]) {
-        self.parser.process(data);
-        self.compatibility_parser
-            .advance(&mut self.compatibility, data);
-        self.pending_bytes = self.pending_bytes.saturating_add(data.len());
-        self.pending_records = self.pending_records.saturating_add(1);
-    }
-
-    pub(super) fn resize(&mut self, columns: u16, rows: u16) -> Option<Vec<u8>> {
+    pub(super) fn resize(&mut self, columns: u16, rows: u16) -> Option<TerminalStateCheckpoint> {
+        if self.parser.screen().size() != (rows, columns) {
+            self.restore_state = None;
+        }
         self.parser.screen_mut().set_size(rows, columns);
         self.pending_records = self.pending_records.saturating_add(1);
         self.flush()
     }
 
-    pub(super) fn heartbeat(&mut self) -> Option<Vec<u8>> {
+    pub(super) fn heartbeat(&mut self) -> Option<TerminalStateCheckpoint> {
         self.pending_records = self.pending_records.saturating_add(1);
-        if self.pending_records >= CHECKPOINT_RECORD_INTERVAL {
+        if self.pending_records >= TERMINAL_CHECKPOINT_RECORD_INTERVAL {
             return self.flush();
         }
         None
     }
 
-    pub(super) fn flush(&mut self) -> Option<Vec<u8>> {
-        if self.pending_records == 0
-            || self.parser.screen().alternate_screen()
-            || !self.parser.callbacks().compatible
-            || !self.compatibility.compatible
-        {
+    pub(super) fn flush(&mut self) -> Option<TerminalStateCheckpoint> {
+        if self.pending_records == 0 {
             return None;
         }
         self.pending_bytes = 0;
         self.pending_records = 0;
-        encode_checkpoint(self.parser.screen())
+
+        if !self.parser.screen().alternate_screen()
+            && self.parser.callbacks().compatible
+            && self.compatibility.compatible
+        {
+            let (rows, columns) = self.parser.screen().size();
+            let state = self.parser.screen().state_formatted();
+            if state.len() > MAX_CHECKPOINT_STATE_BYTES {
+                self.restore_state = None;
+                return None;
+            }
+            self.restore_columns = columns;
+            self.restore_rows = rows;
+            self.restore_state = Some(state.clone());
+            return Some(TerminalStateCheckpoint {
+                columns,
+                rows,
+                state,
+            });
+        }
+
+        Some(TerminalStateCheckpoint {
+            columns: self.restore_columns,
+            rows: self.restore_rows,
+            state: self.restore_state.clone()?,
+        })
+    }
+
+    fn append_restore_data(&mut self, data: &[u8]) {
+        let Some(state) = &mut self.restore_state else {
+            return;
+        };
+        if data.len() > MAX_CHECKPOINT_STATE_BYTES.saturating_sub(state.len()) {
+            self.restore_state = None;
+            return;
+        }
+        state.extend_from_slice(data);
     }
 }
 
@@ -178,28 +218,6 @@ impl vte::Perform for CheckpointCompatibility {
     }
 }
 
-fn encode_checkpoint(screen: &vt100::Screen) -> Option<Vec<u8>> {
-    let (rows, columns) = screen.size();
-    let state = screen.state_formatted();
-    let mut payload = Vec::with_capacity(4 + state.len());
-    payload.extend_from_slice(&columns.to_be_bytes());
-    payload.extend_from_slice(&rows.to_be_bytes());
-    payload.extend_from_slice(&state);
-
-    let encoded_len = payload.len().div_ceil(3) * 4;
-    let checkpoint_len = CHECKPOINT_PREFIX.len() + encoded_len + 1;
-    if checkpoint_len + TERMINAL_DATA_EVENT_HEADER_BYTES > MAX_RECORD_PAYLOAD_BYTES {
-        return None;
-    }
-
-    let encoded = URL_SAFE_NO_PAD.encode(payload);
-    let mut checkpoint = Vec::with_capacity(checkpoint_len);
-    checkpoint.extend_from_slice(CHECKPOINT_PREFIX);
-    checkpoint.extend_from_slice(encoded.as_bytes());
-    checkpoint.push(CHECKPOINT_SUFFIX);
-    Some(checkpoint)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,15 +232,8 @@ mod tests {
         );
         assert!(emitter.process(b"\x1b[?1h\x1b[?2004h").is_none());
         let checkpoint = emitter.flush().expect("checkpoint");
-        let encoded = checkpoint
-            .strip_prefix(CHECKPOINT_PREFIX)
-            .and_then(|value| value.strip_suffix(&[CHECKPOINT_SUFFIX]))
-            .expect("checkpoint envelope");
-        let payload = URL_SAFE_NO_PAD.decode(encoded).expect("checkpoint payload");
-        let columns = u16::from_be_bytes([payload[0], payload[1]]);
-        let rows = u16::from_be_bytes([payload[2], payload[3]]);
-        let mut restored = vt100::Parser::new(rows, columns, 0);
-        restored.process(&payload[4..]);
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
 
         assert_eq!(restored.screen().size(), emitter.parser.screen().size());
         assert_eq!(
@@ -232,27 +243,39 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_rejects_state_that_cannot_be_reproduced_exactly() {
+    fn checkpoint_replays_state_that_cannot_be_compacted() {
         let mut emitter = TerminalCheckpointEmitter::new(80, 24);
-        assert!(emitter.process(b"shell\x1b[?1049hfull screen").is_none());
-        assert!(emitter.flush().is_none());
-        emitter.process(b"\x1b[?1049l");
+        emitter.process(b"shell\x1b[7m\x1b7\x1b[?1049hfull screen");
+        let checkpoint = emitter.flush().expect("fallback checkpoint");
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
 
-        assert!(emitter.flush().is_none());
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
 
+        emitter.process(b"\x1b[?1049l\x1b8restored");
+        restored.process(b"\x1b[?1049l\x1b8restored");
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+    }
+
+    #[test]
+    fn resize_discards_an_unsafe_replay_program() {
         let mut emitter = TerminalCheckpointEmitter::new(80, 24);
-        emitter.process(b"\x1b[5;20rscroll region");
-        assert!(emitter.flush().is_none());
+        emitter.process(b"shell\x1b[?1049hfull screen");
 
-        let mut emitter = TerminalCheckpointEmitter::new(80, 24);
-        emitter.process(b"\x1b[9munsupported attribute");
-        assert!(emitter.flush().is_none());
+        assert!(emitter.resize(120, 40).is_none());
     }
 
     #[test]
     fn idle_heartbeats_cannot_push_the_checkpoint_out_of_the_record_window() {
         let mut emitter = TerminalCheckpointEmitter::new(80, 24);
-        for _ in 1..CHECKPOINT_RECORD_INTERVAL {
+        for _ in 1..TERMINAL_CHECKPOINT_RECORD_INTERVAL {
             assert!(emitter.heartbeat().is_none());
         }
 

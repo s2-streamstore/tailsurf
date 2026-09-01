@@ -10,6 +10,10 @@ pub const MAX_TERMINAL_COLUMNS: u16 = 1_000;
 pub const MAX_TERMINAL_ROWS: u16 = 500;
 /// Largest supported terminal viewport area.
 pub const MAX_TERMINAL_CELLS: u32 = 131_072;
+/// Ordinary output records between deterministic terminal checkpoints.
+pub const TERMINAL_CHECKPOINT_RECORD_INTERVAL: usize = 512;
+/// Fixed bytes before the state in an encoded checkpoint event.
+pub const TERMINAL_CHECKPOINT_EVENT_HEADER_BYTES: usize = SIZE_EVENT_LEN;
 
 const HEADER_LEN: usize = 2;
 const SIZE_EVENT_LEN: usize = HEADER_LEN + 4;
@@ -19,6 +23,7 @@ const RESIZE: u8 = 0x02;
 const STARTED: u8 = 0x03;
 const EXITED: u8 = 0x04;
 const HEARTBEAT: u8 = 0x05;
+const CHECKPOINT: u8 = 0x06;
 
 /// One event sent from a terminal controller to its PTY host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +67,15 @@ pub enum TerminalOutputEvent<'a> {
     },
     /// The PTY host is still connected.
     Heartbeat,
+    /// A self-contained program that restores the terminal emulator state.
+    Checkpoint {
+        /// Terminal columns at the start of the restoration program.
+        columns: u16,
+        /// Terminal rows at the start of the restoration program.
+        rows: u16,
+        /// Bytes to write to a reset terminal emulator.
+        state: &'a [u8],
+    },
 }
 
 /// Encodes one terminal input event.
@@ -109,6 +123,11 @@ pub fn encode_terminal_output(
             Ok(payload)
         }
         TerminalOutputEvent::Heartbeat => Ok(event_header(HEARTBEAT, HEADER_LEN)),
+        TerminalOutputEvent::Checkpoint {
+            columns,
+            rows,
+            state,
+        } => encode_checkpoint(columns, rows, state),
     }
 }
 
@@ -148,6 +167,17 @@ pub fn decode_terminal_output(
             require_length(payload, HEADER_LEN, "heartbeat")?;
             Ok(TerminalOutputEvent::Heartbeat)
         }
+        CHECKPOINT => {
+            require_minimum_length(payload, SIZE_EVENT_LEN, "checkpoint")?;
+            let columns = u16::from_be_bytes([payload[HEADER_LEN], payload[HEADER_LEN + 1]]);
+            let rows = u16::from_be_bytes([payload[HEADER_LEN + 2], payload[HEADER_LEN + 3]]);
+            validate_terminal_size(columns, rows)?;
+            Ok(TerminalOutputEvent::Checkpoint {
+                columns,
+                rows,
+                state: &payload[SIZE_EVENT_LEN..],
+            })
+        }
         event_type => Err(TerminalProtocolError::UnknownType {
             direction: "output",
             event_type,
@@ -166,6 +196,19 @@ fn encode_size(event_type: u8, columns: u16, rows: u16) -> Result<Vec<u8>, Termi
     let mut payload = event_header(event_type, SIZE_EVENT_LEN);
     payload[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&columns.to_be_bytes());
     payload[HEADER_LEN + 2..].copy_from_slice(&rows.to_be_bytes());
+    Ok(payload)
+}
+
+fn encode_checkpoint(
+    columns: u16,
+    rows: u16,
+    state: &[u8],
+) -> Result<Vec<u8>, TerminalProtocolError> {
+    validate_terminal_size(columns, rows)?;
+    let mut payload = event_header(CHECKPOINT, SIZE_EVENT_LEN + state.len());
+    payload[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&columns.to_be_bytes());
+    payload[HEADER_LEN + 2..SIZE_EVENT_LEN].copy_from_slice(&rows.to_be_bytes());
+    payload[SIZE_EVENT_LEN..].copy_from_slice(state);
     Ok(payload)
 }
 
@@ -204,6 +247,21 @@ fn require_length(
             name,
             actual: payload.len(),
             expected,
+        });
+    }
+    Ok(())
+}
+
+fn require_minimum_length(
+    payload: &[u8],
+    minimum: usize,
+    name: &'static str,
+) -> Result<(), TerminalProtocolError> {
+    if payload.len() < minimum {
+        return Err(TerminalProtocolError::InvalidMinimumLength {
+            name,
+            actual: payload.len(),
+            minimum,
         });
     }
     Ok(())
@@ -257,6 +315,16 @@ pub enum TerminalProtocolError {
         actual: usize,
         /// Required encoded length.
         expected: usize,
+    },
+    /// A variable-width event is too short to contain its fixed fields.
+    #[error("{name} terminal event is {actual} bytes; expected at least {minimum}")]
+    InvalidMinimumLength {
+        /// Event name.
+        name: &'static str,
+        /// Actual encoded length.
+        actual: usize,
+        /// Minimum encoded length.
+        minimum: usize,
     },
     /// An exited event uses unsupported flag bits.
     #[error("invalid terminal exited flags 0x{0:02x}")]
@@ -319,6 +387,11 @@ mod tests {
                     output_truncated: true,
                 }),
                 "output-heartbeat" => encode_terminal_output(TerminalOutputEvent::Heartbeat),
+                "output-checkpoint" => encode_terminal_output(TerminalOutputEvent::Checkpoint {
+                    columns: 80,
+                    rows: 24,
+                    state: &[27, 91, 109],
+                }),
                 name => panic!("unknown terminal test vector {name}"),
             }
             .expect("encode terminal event");
@@ -361,6 +434,11 @@ mod tests {
                 output_truncated: true,
             },
             TerminalOutputEvent::Heartbeat,
+            TerminalOutputEvent::Checkpoint {
+                columns: 80,
+                rows: 24,
+                state: &[27, 91, 109],
+            },
         ] {
             let encoded = encode_terminal_output(event).expect("encode output event");
             assert_eq!(decode_terminal_output(&encoded), Ok(event));
@@ -385,6 +463,10 @@ mod tests {
             decode_terminal_output(&[TERMINAL_EVENT_VERSION, EXITED, 0, 0, 0, 0, 2]),
             Err(TerminalProtocolError::InvalidExitFlags(2))
         );
+        assert!(matches!(
+            decode_terminal_output(&[TERMINAL_EVENT_VERSION, CHECKPOINT, 0, 80, 0]),
+            Err(TerminalProtocolError::InvalidMinimumLength { .. })
+        ));
         assert_eq!(
             encode_terminal_input(TerminalInputEvent::Resize {
                 columns: 0,

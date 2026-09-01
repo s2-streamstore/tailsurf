@@ -5,8 +5,10 @@ export const MAX_TERMINAL_COLUMNS = 1_000;
 export const MAX_TERMINAL_ROWS = 500;
 export const MAX_TERMINAL_CELLS = 131_072;
 export const TERMINAL_EVENT_HEADER_BYTES = 2;
+export const TERMINAL_CHECKPOINT_RECORD_INTERVAL = 512;
 
 const SIZE_EVENT_BYTES = TERMINAL_EVENT_HEADER_BYTES + 4;
+export const TERMINAL_CHECKPOINT_EVENT_HEADER_BYTES = SIZE_EVENT_BYTES;
 const EXITED_EVENT_BYTES = TERMINAL_EVENT_HEADER_BYTES + 5;
 
 const DATA = 0x01;
@@ -14,6 +16,7 @@ const RESIZE = 0x02;
 const STARTED = 0x03;
 const EXITED = 0x04;
 const HEARTBEAT = 0x05;
+const CHECKPOINT = 0x06;
 
 export type TerminalInputEvent =
   | { readonly type: "data"; readonly data: Uint8Array }
@@ -28,7 +31,13 @@ export type TerminalOutputEvent =
     readonly status: number;
     readonly outputTruncated: boolean;
   }
-  | { readonly type: "heartbeat" };
+  | { readonly type: "heartbeat" }
+  | {
+    readonly type: "checkpoint";
+    readonly columns: number;
+    readonly rows: number;
+    readonly state: Uint8Array;
+  };
 
 export function encodeTerminalInputEvent(event: TerminalInputEvent): Uint8Array {
   switch (event.type) {
@@ -68,6 +77,8 @@ export function encodeTerminalOutputEvent(event: TerminalOutputEvent): Uint8Arra
     }
     case "heartbeat":
       return eventHeader(HEARTBEAT, TERMINAL_EVENT_HEADER_BYTES);
+    case "checkpoint":
+      return encodeCheckpoint(event.columns, event.rows, event.state);
   }
 }
 
@@ -100,6 +111,17 @@ export function decodeTerminalOutputEvent(payload: Uint8Array): TerminalOutputEv
     case HEARTBEAT:
       requireLength(payload, TERMINAL_EVENT_HEADER_BYTES, "heartbeat");
       return { type: "heartbeat" };
+    case CHECKPOINT: {
+      requireMinimumLength(payload, SIZE_EVENT_BYTES, "checkpoint");
+      const { columns, rows } = decodeSizeFields(payload);
+      validateTerminalSize(columns, rows);
+      return {
+        type: "checkpoint",
+        columns,
+        rows,
+        state: payload.subarray(SIZE_EVENT_BYTES),
+      };
+    }
     default:
       throw unknownType("output", type);
   }
@@ -124,20 +146,42 @@ function encodeSize(
   return payload;
 }
 
+function encodeCheckpoint(
+  columns: number,
+  rows: number,
+  state: Uint8Array,
+): Uint8Array {
+  validateTerminalSize(columns, rows);
+  const payload = eventHeader(CHECKPOINT, SIZE_EVENT_BYTES + state.byteLength);
+  const view = new DataView(payload.buffer);
+  view.setUint16(TERMINAL_EVENT_HEADER_BYTES, columns);
+  view.setUint16(TERMINAL_EVENT_HEADER_BYTES + 2, rows);
+  payload.set(state, SIZE_EVENT_BYTES);
+  return payload;
+}
+
 function decodeSize(
   payload: Uint8Array,
   name: string,
 ): { readonly columns: number; readonly rows: number } {
   requireLength(payload, SIZE_EVENT_BYTES, name);
+  const { columns, rows } = decodeSizeFields(payload);
+  validateTerminalSize(columns, rows);
+  return { columns, rows };
+}
+
+function decodeSizeFields(
+  payload: Uint8Array,
+): { readonly columns: number; readonly rows: number } {
   const view = new DataView(
     payload.buffer,
     payload.byteOffset,
     payload.byteLength,
   );
-  const columns = view.getUint16(TERMINAL_EVENT_HEADER_BYTES);
-  const rows = view.getUint16(TERMINAL_EVENT_HEADER_BYTES + 2);
-  validateTerminalSize(columns, rows);
-  return { columns, rows };
+  return {
+    columns: view.getUint16(TERMINAL_EVENT_HEADER_BYTES),
+    rows: view.getUint16(TERMINAL_EVENT_HEADER_BYTES + 2),
+  };
 }
 
 function eventHeader(type: number, length: number): Uint8Array {
@@ -169,6 +213,19 @@ function requireLength(payload: Uint8Array, expected: number, name: string): voi
     throw new ProtocolError(
       "invalid_terminal_event_length",
       `${name} terminal event is ${payload.byteLength} bytes; expected ${expected}`,
+    );
+  }
+}
+
+function requireMinimumLength(
+  payload: Uint8Array,
+  minimum: number,
+  name: string,
+): void {
+  if (payload.byteLength < minimum) {
+    throw new ProtocolError(
+      "invalid_terminal_event_length",
+      `${name} terminal event is ${payload.byteLength} bytes; expected at least ${minimum}`,
     );
   }
 }
