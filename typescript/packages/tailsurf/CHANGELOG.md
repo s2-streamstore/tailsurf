@@ -1,5 +1,12 @@
 # tailsurf
 
+## 0.2.1
+
+### Patch Changes
+
+- Updated dependencies [7513439]
+  - @tailsurf/client@0.6.0
+
 ## 0.2.0
 
 ### Minor Changes
