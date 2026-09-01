@@ -1,5 +1,11 @@
 # @tailsurf/protocol
 
+## 0.6.0
+
+### Minor Changes
+
+- 7513439: Add first-class terminal state checkpoint output events and the deterministic checkpoint interval.
+
 ## 0.5.0
 
 ### Minor Changes
