@@ -60,6 +60,8 @@ The session reconnects from the latest record or caught-up position after transi
 
 `TsfWriter` creates a fresh writer identity and starts its sequence at zero. It retains that identity, acknowledged progress, and unacknowledged records across reconnects. It resends only the unacknowledged suffix.
 
+The writer handshake exposes the immutable `stream_kind`. A reconnect must report the same kind.
+
 Retryable interruptions keep recovering until the records are acknowledged. This preserves the exact writer identity, sequence numbers, and payloads needed for logical deduplication. `close` waits through retryable outages. `abort`, dropping the writer, or dropping its close future stops recovery.
 
 Records are submitted as a non-empty `AppendBatch`. The writer assigns writer sequence numbers in submission order, so cloned `TsfProducer` handles can submit concurrently without interleaving. `AppendBatch::split_logical` keeps the parts of an oversized logical record contiguous.
@@ -71,7 +73,7 @@ The writer queues submitted input and sends it through a fixed socket window of 
 Await each `AppendTicket` when you need its durable sequence numbers. A terminal `AppendDurabilityUnknown` means a non-retryable failure or explicit cancellation left an accepted append without a recovered acknowledgement. Submitting that record under a new writer identity may duplicate it.
 
 ```rust,no_run
-use tailsurf::{AppendBatch, DurableWriterOptions, LinkSecret, RecordFormat, StreamId, TsfClient};
+use tailsurf::{AppendBatch, DurableWriterOptions, LinkSecret, StreamId, TsfClient};
 
 async fn write_stream(
     client: &TsfClient,
@@ -82,7 +84,6 @@ async fn write_stream(
         .connect_writer(DurableWriterOptions::new(stream_id, write_link_secret))
         .await?;
     let ticket = writer.submit(AppendBatch::split_logical(
-        RecordFormat::Transcript,
         b"deploy started\n".as_slice(),
     )?)?;
     let receipts = ticket.await?;
@@ -94,6 +95,18 @@ async fn write_stream(
 ```
 
 The [complete example](https://github.com/s2-streamstore/tailsurf/blob/main/rust/examples/create_write_read_delete.rs) creates, writes, reads, and deletes a stream.
+
+## Terminal sessions
+
+Create a terminal resource with `StreamKind::Terminal`.
+
+Terminal sessions have separate input and output channels. For a terminal stream, `connect_writer` selects input and `connect_reader` selects output. Controllers may use `connect_terminal_input_writer` to make that choice explicit. Observers may use `connect_terminal_output_reader`.
+
+A host with an owner link uses `connect_terminal_input_reader` and `connect_terminal_output_writer`.
+
+`terminal_link` and `public_terminal_url` build the canonical `/t/{stream_id}` browser URLs.
+
+`encode_terminal_input`, `decode_terminal_input`, `encode_terminal_output`, and `decode_terminal_output` implement the versioned terminal event payloads. Events remain ordinary unsplit byte records, so terminal clients retain the normal durability and reconnect behavior.
 
 ## Manage
 
@@ -111,7 +124,7 @@ Established SSE bodies are not timed out. WebSocket read-idle detection is deriv
 
 ## Modules
 
-Common client types are re-exported from the crate root. Lower-level codecs, wire models, URL helpers, permissions, and transcript reconstruction remain available in their named modules.
+Common client types are re-exported from the crate root. Lower-level codecs, wire models, URL helpers, permissions, and logical-record reconstruction remain available in their named modules.
 
 ## License
 

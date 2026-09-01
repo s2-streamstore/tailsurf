@@ -4,6 +4,8 @@
 pub mod client;
 /// Stream and link IDs, link secrets, and writer identities.
 pub mod ids;
+/// Duplicate suppression and split-record reconstruction.
+pub mod logical_records;
 /// Stream-link permission parsing and validation.
 pub mod permissions;
 /// TSF read options, REST models, and v1 binary WebSocket protocol types.
@@ -12,8 +14,6 @@ pub mod protocol;
 pub mod stream_title;
 /// Human-facing stream link parsing and construction.
 pub mod stream_url;
-/// Duplicate suppression and split-record transcript reconstruction.
-pub mod transcript;
 
 pub use client::{
     AppendAck, AppendReceipt, AppendTicket, DEFAULT_API_ORIGIN, DurableWriterOptions,
@@ -31,14 +31,21 @@ pub use protocol::{
     rest::{
         AppendRange, CreateLinkInput, CreateLinkResponse, CreateStreamRequest,
         CreateStreamResponse, InitialStreamLink, ListLinksResponse, MAX_INITIAL_STREAM_LINKS,
-        StreamLinkCredential, StreamLinkSummary, StreamMetadata, UpdateStreamRequest, Visibility,
+        StreamKind, StreamLinkCredential, StreamLinkSummary, StreamMetadata, UpdateStreamRequest,
+        Visibility,
+    },
+    terminal::{
+        MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TerminalInputEvent,
+        TerminalOutputEvent, TerminalProtocolError, decode_terminal_input, decode_terminal_output,
+        encode_terminal_input, encode_terminal_output, validate_terminal_size,
     },
     ws::{
         MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, WriteSessionOptions,
         frame::{
             AppendBatch, AppendRecord, CaughtUpPosition, IntoRecordData, OwnedReadRecord,
-            PartHeader, ReadBatch, ReadRecord, RecordFormat, RecordPayload,
+            PartHeader, ReadBatch, ReadRecord, RecordPayload,
         },
     },
 };
 pub use stream_title::{MAX_STREAM_TITLE_CODE_POINTS, StreamTitle, StreamTitleError};
+pub use stream_url::StreamRoute;

@@ -2,7 +2,7 @@
 
 `@tailsurf/protocol` contains the low-level TypeScript implementation of the public TSF v1 contract.
 
-It exports IDs, permissions, stream URLs, REST and SSE schemas, read-query helpers, binary WebSocket frames, and transcript reconstruction.
+It exports IDs, permissions, stream URLs, REST and SSE schemas, read-query helpers, binary WebSocket frames, terminal event codecs, and logical-record reconstruction.
 
 Most applications should use `@tailsurf/client` instead.
 
@@ -27,7 +27,7 @@ function readLink(rawStreamId: string, linkSecret: string): URL {
 
 The package also exports its language-neutral fixtures at `@tailsurf/protocol/fixtures/v1.json` and `@tailsurf/protocol/fixtures/rest-v1.json`.
 
-`LogicalTranscript` uses one 16 MiB `maxReassemblyBytes` limit. It bounds bytes retained across unfinished split records and the size of one completed split-record assembly. Unsplit records borrow their input payload and do not consume this budget.
+`LogicalRecordAssembler` uses one 16 MiB `maxReassemblyBytes` limit. It bounds bytes retained across unfinished split records and the size of one completed split-record assembly. Unsplit records borrow their input payload and do not consume this budget.
 
 SDK durable writers use the shared `MAX_WRITER_IN_FLIGHT_RECORDS` and `MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES` window. It bounds records that have been sent but not acknowledged.
 

@@ -9,11 +9,13 @@ import type {
   StreamMetadata as WireStreamMetadata,
   StreamLinkSummary as WireStreamLinkSummary,
   StreamTitle,
+  StreamKind,
   Visibility,
 } from "@tailsurf/protocol";
 
 export interface StreamMetadata {
   readonly streamId: StreamId;
+  readonly kind: StreamKind;
   readonly title: StreamTitle | null;
   readonly visibility: Visibility;
   readonly createdAt: string;
@@ -55,6 +57,7 @@ export function streamMetadataFromWire(
 ): StreamMetadata {
   return {
     streamId: stream.stream_id,
+    kind: stream.kind,
     title: stream.title,
     visibility: stream.visibility,
     createdAt: stream.created_at,

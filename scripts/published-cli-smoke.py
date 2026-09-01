@@ -201,16 +201,18 @@ def require(value: str | None, name: str) -> None:
 
 
 def redact(text: str) -> str:
-    text = re.sub(r"(https?://[^\s#'\"]+/s/[^\s#'\"]+)#[^\s'\"]+", r"\1#<redacted>", text)
+    text = re.sub(r"(https?://[^\s#'\"]+/[st]/[^\s#'\"]+)#[^\s'\"]+", r"\1#<redacted>", text)
     text = re.sub(r"Bearer\s+[^\s]+", "Bearer <redacted>", text)
     return text
 
 
 def self_test() -> None:
     redacted = redact(
-        "https://tailsurf.example/s/stream#o=owner-secret Authorization: Bearer bearer-secret"
+        "https://tailsurf.example/s/stream#o=owner-secret "
+        "https://tailsurf.example/t/terminal#rw=terminal-secret "
+        "Authorization: Bearer bearer-secret"
     )
-    if "owner-secret" in redacted or "bearer-secret" in redacted:
+    if any(secret in redacted for secret in ("owner-secret", "terminal-secret", "bearer-secret")):
         raise PublishedCliSmokeError("redaction self-test failed")
 
     payload = b'{"links":[{"permissions":"owner","url":"owner"},{"permissions":"write","url":"write"},{"permissions":"read","url":"read"}]}'

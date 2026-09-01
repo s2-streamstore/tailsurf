@@ -1,5 +1,6 @@
 export * from "./errors.js";
 export * from "./ids.js";
+export * from "./logical-records.js";
 export * from "./permissions.js";
 export * from "./primitives.js";
 export * from "./read-query.js";
@@ -7,5 +8,5 @@ export * from "./rest.js";
 export * from "./sse-resume-cursor.js";
 export * from "./stream-title.js";
 export * from "./stream-url.js";
-export * from "./transcript.js";
+export * from "./terminal.js";
 export * from "./ws.js";

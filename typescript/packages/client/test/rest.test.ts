@@ -8,13 +8,13 @@ import {
   MAX_STATELESS_APPEND_JSON_BYTES,
   parseLinkId,
   parseClientWriterId,
-  RecordFormat,
 } from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import {
   generateIdempotencyKey,
   parseIdempotencyKey,
+  parsePreparedCreateStreamRequest,
   prepareCreateStreamRequest,
   TsfClient,
   TsfHttpError,
@@ -23,6 +23,13 @@ import {
 const LINK_SECRET = "A".repeat(32);
 
 describe("TsfClient REST API", () => {
+  it("requires kind in a prepared creation request", () => {
+    expect(() => parsePreparedCreateStreamRequest({
+      visibility: "private",
+      links: [{ linkId: "owner", permissions: "o" }],
+    })).toThrow(expect.objectContaining({ code: "invalid_client_option" }));
+  });
+
   it("rejects an invalid bounded operation attempt count", () => {
     expect(() => new TsfClient({ boundedOperationAttempts: 0 })).toThrow(
       expect.objectContaining({ code: "invalid_client_option" }),
@@ -136,7 +143,6 @@ describe("TsfClient REST API", () => {
     expect(() => client.appendRecords(generateStreamId(), {
       ...base,
       records: [{
-        format: RecordFormat.Bytes,
         data: new Uint8Array(512 * 1024 + 1),
       }],
     }, { linkSecret: LINK_SECRET })).toThrow(expect.objectContaining({
@@ -145,7 +151,6 @@ describe("TsfClient REST API", () => {
     expect(() => client.appendRecords(generateStreamId(), {
       ...base,
       records: [500 * 1024, 500 * 1024].map((size) => ({
-        format: RecordFormat.Bytes,
         data: new Uint8Array(size),
       })),
     }, { linkSecret: LINK_SECRET })).toThrow(expect.objectContaining({
@@ -154,7 +159,7 @@ describe("TsfClient REST API", () => {
     expect(() => client.appendRecords(generateStreamId(), {
       ...base,
       expectedNextSeqNum: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
-      records: [{ format: RecordFormat.Bytes, data: new Uint8Array() }],
+      records: [{ data: new Uint8Array() }],
     }, { linkSecret: LINK_SECRET })).toThrow(expect.objectContaining({
       code: "invalid_client_option",
     }));
@@ -171,7 +176,7 @@ describe("TsfClient REST API", () => {
     await expect(client.appendRecords(generateStreamId(), {
       clientWriterId: parseClientWriterId(new Uint8Array(16)),
       writerStartSeqNum: 0n,
-      records: [{ format: RecordFormat.Bytes, data: new Uint8Array() }],
+      records: [{ data: new Uint8Array() }],
     }, { linkSecret: LINK_SECRET })).rejects.toMatchObject({
       code: "invalid_api_response",
     });
@@ -187,7 +192,6 @@ describe("TsfClient REST API", () => {
       clientWriterId: parseClientWriterId(new Uint8Array(16)),
       writerStartSeqNum: 0n,
       records: [{
-        format: RecordFormat.Transcript,
         data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES),
       }],
     }, { linkSecret: LINK_SECRET });
@@ -217,6 +221,7 @@ describe("TsfClient REST API", () => {
     expect(input).toBe("http://localhost:8787/api/v1/streams");
     expect(init?.method).toBe("POST");
     const createBody = jsonRequestBody(init?.body);
+    expect(createBody).not.toHaveProperty("kind");
     expect(createBody.visibility).toBe("private");
     expect(createBody.links).toHaveLength(1);
     expect(createBody.links[0]).toMatchObject({
@@ -256,9 +261,23 @@ describe("TsfClient REST API", () => {
       idempotencyKey,
     );
     const createBody = jsonRequestBody(init?.body);
+    expect(createBody).not.toHaveProperty("kind");
     expect(createBody.title).toBe("Deploy log");
     expect(createBody.visibility).toBe("public");
     expect(createBody.links).toHaveLength(1);
+  });
+
+  it("requires stream kind in create responses", async () => {
+    const streamId = generateStreamId();
+    const request = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(jsonRequestBody(init?.body)).not.toHaveProperty("kind");
+      return createResponse(streamId, "private", null);
+    });
+    const client = new TsfClient({ fetch: request, boundedOperationAttempts: 1 });
+
+    await expect(client.createStream()).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
   });
 
   it.each([
@@ -795,9 +814,11 @@ function linkSummary(linkId: string) {
 function createResponse(
   streamId: string,
   visibility: "private" | "public" = "private",
+  kind: "transcript" | "bytes" | "terminal" | null = "transcript",
 ): Response {
   return Response.json({
     stream_id: streamId,
+    ...(kind === null ? {} : { kind }),
     title: null,
     visibility,
     created_at: "2026-08-11T00:00:00Z",

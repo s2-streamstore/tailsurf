@@ -23,6 +23,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true
 humantime.workspace = true
 memchr.workspace = true
+portable-pty.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

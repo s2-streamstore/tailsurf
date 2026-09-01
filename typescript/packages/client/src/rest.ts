@@ -7,6 +7,7 @@ import {
   parseStreamId,
   parseLinkId,
   parseStreamTitle,
+  streamKindSchema,
   streamMetadataSchema,
   updateStreamRequestSchema,
   appendRecordsRequestSchema,
@@ -26,7 +27,6 @@ import {
   parseClientWriterId,
   partHeader,
   randomBytes,
-  RecordFormat,
   type PartHeader,
   type ClientWriterId,
   type CreateStreamRequest as WireCreateStreamRequest,
@@ -35,6 +35,7 @@ import {
   type LinkId,
   type LinkPermissions,
   type Visibility,
+  type StreamKind,
 } from "@tailsurf/protocol";
 
 import {
@@ -95,6 +96,7 @@ export interface InitialStreamLinkOptions {
 }
 
 export interface CreateStreamInput {
+  readonly kind?: StreamKind;
   readonly title?: string;
   readonly visibility?: Visibility;
   readonly expiresInSeconds?: number;
@@ -102,6 +104,7 @@ export interface CreateStreamInput {
 }
 
 export interface PreparedCreateStreamRequest {
+  readonly kind: StreamKind;
   readonly title?: string;
   readonly visibility: Visibility;
   readonly expiresInSeconds?: number;
@@ -149,7 +152,6 @@ export interface AppendRange {
 
 export interface StatelessAppendRecord {
   readonly part?: PartHeader;
-  readonly format: RecordFormat;
   readonly data: Uint8Array | string;
 }
 
@@ -427,11 +429,7 @@ export class BaseTsfClient {
         : record.data;
       validateStatelessRecordBytes(bytes.byteLength);
       payloadBytes += bytes.byteLength;
-      // The SDK states the format even when the payload key implies it.
       return {
-        format: record.format === RecordFormat.Transcript
-          ? "transcript" as const
-          : "bytes" as const,
         ...compactRecordPayload(bytes),
         ...(part === undefined
           ? {}
@@ -738,6 +736,7 @@ export function prepareCreateStreamRequest(
     ? requestedLinks
     : [{ linkId: parseLinkId("owner"), permissions: "o" as const }, ...requestedLinks];
   return parsePreparedCreateStreamRequest({
+    kind: request.kind ?? "transcript",
     ...(request.title === undefined ? {} : { title: request.title }),
     visibility: request.visibility ?? "private",
     ...(request.expiresInSeconds === undefined
@@ -750,13 +749,19 @@ export function prepareCreateStreamRequest(
 export function parsePreparedCreateStreamRequest(
   input: unknown,
 ): PreparedCreateStreamRequest {
-  if (!isRecord(input) || !Array.isArray(input.links)) {
+  if (
+    !isRecord(input) ||
+    input.kind === undefined ||
+    !Array.isArray(input.links)
+  ) {
     throw new TsfClientError(
       "invalid_client_option",
       "normalized stream request is invalid",
     );
   }
+  const kind = streamKindSchema.parse(input.kind);
   const wire = createStreamRequestSchema.parse({
+    kind,
     ...(input.title === undefined ? {} : { title: input.title }),
     ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
     ...(input.expiresInSeconds === undefined
@@ -776,6 +781,7 @@ export function parsePreparedCreateStreamRequest(
     }),
   });
   return {
+    kind,
     ...(wire.title === undefined ? {} : { title: wire.title }),
     visibility: wire.visibility,
     ...(wire.expires_in_seconds === undefined
@@ -792,6 +798,7 @@ function createStreamRequestToWire(
   request: PreparedCreateStreamRequest,
 ): WireCreateStreamRequest {
   return {
+    ...(request.kind === "transcript" ? {} : { kind: request.kind }),
     ...(request.title === undefined
       ? {}
       : { title: parseStreamTitle(request.title) }),

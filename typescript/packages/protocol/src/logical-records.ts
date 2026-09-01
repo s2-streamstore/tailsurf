@@ -4,28 +4,25 @@ import {
   isUnsplitPart,
   MAX_RECORD_PAYLOAD_BYTES,
   type ReadRecord,
-  type RecordFormat,
 } from "./ws.js";
 
 /** Default maximum bytes used for split-record reassembly. */
-export const DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES = MAX_RECORD_PAYLOAD_BYTES * 32;
-const MAX_TRANSCRIPT_WRITER_STATES = 4_096;
-const MAX_TRANSCRIPT_TOTAL_PENDING_PARTS = 16_384;
+export const DEFAULT_MAX_RECORD_REASSEMBLY_BYTES = MAX_RECORD_PAYLOAD_BYTES * 32;
+const MAX_RECORD_WRITER_STATES = 4_096;
+const MAX_RECORD_TOTAL_PENDING_PARTS = 16_384;
 
-export interface LogicalTranscriptOptions {
+export interface LogicalRecordAssemblerOptions {
   /** Maximum bytes retained across unfinished split records or assembled for one completed split record. */
   readonly maxReassemblyBytes?: number;
 }
 
-export interface TranscriptRecord {
-  readonly format: RecordFormat;
+export interface LogicalRecord {
   readonly data: Uint8Array;
 }
 
 interface PendingRecord {
   readonly startSeqNum: bigint;
   nextPartIndex: number;
-  readonly format: RecordFormat;
   length: number;
   partCount: number;
   readonly chunks: Uint8Array[];
@@ -36,27 +33,27 @@ interface WriterState {
   pending?: PendingRecord;
 }
 
-export class LogicalTranscript {
+export class LogicalRecordAssembler {
   readonly #writers = new Map<string, WriterState>();
   #totalPendingBytes = 0;
   #totalPendingParts = 0;
   public readonly maxReassemblyBytes: number;
 
-  public constructor(options: LogicalTranscriptOptions = {}) {
-    this.maxReassemblyBytes = transcriptLimit(
-      options.maxReassemblyBytes ?? DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
+  public constructor(options: LogicalRecordAssemblerOptions = {}) {
+    this.maxReassemblyBytes = recordLimit(
+      options.maxReassemblyBytes ?? DEFAULT_MAX_RECORD_REASSEMBLY_BYTES,
       "reassembly bytes",
     );
   }
 
-  public pushRecord(record: ReadRecord): TranscriptRecord | undefined {
+  public pushRecord(record: ReadRecord): LogicalRecord | undefined {
     const key = writerIdKey(record.writerId);
     let writer = this.#writers.get(key);
     if (writer === undefined) {
-      if (this.#writers.size >= MAX_TRANSCRIPT_WRITER_STATES) {
+      if (this.#writers.size >= MAX_RECORD_WRITER_STATES) {
         throw new ProtocolError(
-          "transcript_writer_limit",
-          `transcript has reached its ${MAX_TRANSCRIPT_WRITER_STATES} writer-state limit`,
+          "record_writer_limit",
+          `record assembler has reached its ${MAX_RECORD_WRITER_STATES} writer-state limit`,
         );
       }
       writer = {};
@@ -70,7 +67,7 @@ export class LogicalTranscript {
 
     if (isUnsplitPart(record.part)) {
       this.#clearPending(writer);
-      return { format: record.format, data: record.data };
+      return { data: record.data };
     }
 
     const startSeqNum = record.writerSeqNum - BigInt(record.part.index);
@@ -84,7 +81,6 @@ export class LogicalTranscript {
       this.#setPending(writer, {
         startSeqNum,
         nextPartIndex: 1,
-        format: record.format,
         length: record.data.byteLength,
         partCount: 1,
         chunks: record.data.byteLength === 0 ? [] : [record.data],
@@ -96,8 +92,7 @@ export class LogicalTranscript {
     if (
       pending === undefined ||
       pending.startSeqNum !== startSeqNum ||
-      pending.nextPartIndex !== record.part.index ||
-      pending.format !== record.format
+      pending.nextPartIndex !== record.part.index
     ) {
       return undefined;
     }
@@ -110,10 +105,7 @@ export class LogicalTranscript {
       pending.chunks.push(record.data);
     }
     if (record.part.isFinal) {
-      return {
-        format: pending.format,
-        data: concatenate(pending.chunks, pending.length),
-      };
+      return { data: concatenate(pending.chunks, pending.length) };
     }
 
     pending.nextPartIndex = record.part.index + 1;
@@ -124,8 +116,8 @@ export class LogicalTranscript {
   #checkReassemblyBytes(length: number): void {
     if (length > this.maxReassemblyBytes) {
       throw new ProtocolError(
-        "transcript_reassembly_limit",
-        `transcript reassembly would use ${length} bytes; maximum is ${this.maxReassemblyBytes}`,
+        "record_reassembly_limit",
+        `record reassembly would use ${length} bytes; maximum is ${this.maxReassemblyBytes}`,
       );
     }
   }
@@ -134,14 +126,14 @@ export class LogicalTranscript {
     const reassemblyBytes = this.#totalPendingBytes + pending.length;
     if (reassemblyBytes > this.maxReassemblyBytes) {
       throw new ProtocolError(
-        "transcript_reassembly_limit",
-        `transcript reassembly would use ${reassemblyBytes} bytes; maximum is ${this.maxReassemblyBytes}`,
+        "record_reassembly_limit",
+        `record reassembly would use ${reassemblyBytes} bytes; maximum is ${this.maxReassemblyBytes}`,
       );
     }
-    if (pending.partCount > MAX_TRANSCRIPT_TOTAL_PENDING_PARTS - this.#totalPendingParts) {
+    if (pending.partCount > MAX_RECORD_TOTAL_PENDING_PARTS - this.#totalPendingParts) {
       throw new ProtocolError(
-        "transcript_total_pending_parts_limit",
-        `transcript has reached its ${MAX_TRANSCRIPT_TOTAL_PENDING_PARTS} total pending-part limit`,
+        "record_total_pending_parts_limit",
+        `record assembler has reached its ${MAX_RECORD_TOTAL_PENDING_PARTS} total pending-part limit`,
       );
     }
     writer.pending = pending;
@@ -165,10 +157,10 @@ export class LogicalTranscript {
   }
 }
 
-function transcriptLimit(value: number, name: string): number {
+function recordLimit(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new ProtocolError(
-      "invalid_transcript_limit",
+      "invalid_record_limit",
       `${name} limit must be a non-negative safe integer`,
     );
   }

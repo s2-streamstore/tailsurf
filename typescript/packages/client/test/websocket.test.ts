@@ -7,7 +7,6 @@ import {
   MAX_FRAME_PAYLOAD_BYTES,
   MAX_READ_FRAME_RECORDS,
   MAX_RECORD_PAYLOAD_BYTES,
-  RecordFormat,
   TSF_WEBSOCKET_PROTOCOL,
   UNSPLIT_PART,
   type CaughtUpPosition,
@@ -15,6 +14,7 @@ import {
   type ClientFrame,
   type ServerFrame,
   type StreamId,
+  type StreamKind,
 } from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
 
@@ -44,7 +44,7 @@ describe("FrameSocket", () => {
     const frameBounded = new FrameSocket(
       new ScriptedWebSocket(
         [
-          { type: "ready" },
+          { type: "ready", kind: "transcript" },
           { type: "heartbeat" },
           { type: "heartbeat" },
         ],
@@ -54,7 +54,7 @@ describe("FrameSocket", () => {
     );
     await frameBounded.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
-    await expect(frameBounded.nextFrame()).resolves.toMatchObject({ type: "ready" });
+    await expect(frameBounded.nextFrame()).resolves.toMatchObject({ type: "ready", kind: "transcript" });
     await expect(frameBounded.nextFrame()).resolves.toMatchObject({ type: "heartbeat" });
     await expect(frameBounded.nextFrame()).rejects.toMatchObject({
       code: "client_receive_overload",
@@ -63,7 +63,7 @@ describe("FrameSocket", () => {
     const byteBounded = new FrameSocket(
       new ScriptedWebSocket(
         [
-          { type: "ready" },
+          { type: "ready", kind: "transcript" },
           readBatch(record(0n, "too large")),
         ],
         1000,
@@ -72,7 +72,7 @@ describe("FrameSocket", () => {
     );
     await byteBounded.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
-    await expect(byteBounded.nextFrame()).resolves.toMatchObject({ type: "ready" });
+    await expect(byteBounded.nextFrame()).resolves.toMatchObject({ type: "ready", kind: "transcript" });
     await expect(byteBounded.nextFrame()).rejects.toMatchObject({
       code: "client_receive_overload",
     });
@@ -86,7 +86,7 @@ describe("FrameSocket", () => {
     const socket = new FrameSocket(
       new ScriptedWebSocket(
         [
-          { type: "ready" },
+          { type: "ready", kind: "transcript" },
           { type: "readBatch", records },
           {
             type: "readBatch",
@@ -104,7 +104,7 @@ describe("FrameSocket", () => {
     await socket.opened;
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    await expect(socket.nextFrame()).resolves.toMatchObject({ type: "ready" });
+    await expect(socket.nextFrame()).resolves.toMatchObject({ type: "ready", kind: "transcript" });
     await expect(socket.nextFrame()).resolves.toMatchObject({
       type: "readBatch",
       records: { length: MAX_READ_FRAME_RECORDS },
@@ -121,9 +121,64 @@ describe("TsfClient configuration", () => {
       webSocketConnectTimeoutMs: 2_147_483_648,
     })).toThrow(expect.objectContaining({ code: "invalid_client_option" }));
   });
+
+  it("routes terminal readers and writers to separate channels", async () => {
+    const streamId = generateStreamId();
+    const urls: string[] = [];
+    const client = new TsfClient({
+      apiOrigin: "http://localhost:8787",
+      webSocketFactory: (url) => {
+        urls.push(url);
+        return new ScriptedWebSocket(
+          new URL(url).pathname.endsWith("/read")
+            ? [{ type: "ready", kind: "terminal" }, streamMetadataFrame(streamId, "terminal")]
+            : [{ type: "ready", kind: "terminal" }],
+          1000,
+        );
+      },
+    });
+    const options = {
+      streamId,
+      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+
+    const outputReader = await client.connectTerminalOutputReader(options);
+    outputReader.close();
+    const inputReader = await client.connectTerminalInputReader(options);
+    inputReader.close();
+    const inputWriter = await client.connectTerminalInputWriter(options);
+    await inputWriter.close();
+    const outputWriter = await client.connectTerminalOutputWriter(options);
+    await outputWriter.close();
+
+    expect(urls.map((url) => new URL(url).pathname)).toEqual([
+      `/api/v1/streams/${streamId}/terminal/output/read`,
+      `/api/v1/streams/${streamId}/terminal/input/read`,
+      `/api/v1/streams/${streamId}/terminal/input/write`,
+      `/api/v1/streams/${streamId}/terminal/output/write`,
+    ]);
+  });
 });
 
 describe("TsfReadSession", () => {
+  it("rejects a reader handshake for a different stream", async () => {
+    const streamId = generateStreamId();
+    const socket = new ScriptedWebSocket(
+      [
+        { type: "ready", kind: "transcript" },
+        streamMetadataFrame(generateStreamId()),
+      ],
+      1000,
+    );
+    const client = new TsfClient({ webSocketFactory: () => socket });
+
+    await expect(client.connectReader({ streamId })).rejects.toMatchObject({
+      code: "invalid_api_response",
+      message: "reader handshake returned a different stream ID",
+    });
+    expect(socket.closed).toBe(true);
+  });
+
   it("drains a maximum read batch in order", async () => {
     const streamId = generateStreamId();
     const records = Array.from(
@@ -134,7 +189,7 @@ describe("TsfReadSession", () => {
       webSocketFactory: () =>
         new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
             { type: "readBatch", records },
           ],
@@ -158,7 +213,7 @@ describe("TsfReadSession", () => {
   it("is async iterable and closes when iteration stops early", async () => {
     const streamId = generateStreamId();
     const socket = new HangingWebSocket(true, [
-      { type: "ready" },
+      { type: "ready", kind: "transcript" },
       streamMetadataFrame(streamId),
       { type: "readBatch", records: [record(0n, "first"), record(1n, "second")] },
     ], false);
@@ -212,7 +267,7 @@ describe("TsfReadSession", () => {
         connectionCount += 1;
         return new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
           ],
           1006,
@@ -238,7 +293,7 @@ describe("TsfReadSession", () => {
     const socket = new HangingWebSocket(
       true,
       [
-        { type: "ready" },
+        { type: "ready", kind: "transcript" },
         streamMetadataFrame(streamId),
       ],
       false,
@@ -266,7 +321,7 @@ describe("TsfReadSession", () => {
       const streamId = generateStreamId();
       const socket = new HangingWebSocket(
         true,
-        [{ type: "ready" }, streamMetadataFrame(streamId)],
+        [{ type: "ready", kind: "transcript" }, streamMetadataFrame(streamId)],
         false,
       );
       const client = new TsfClient({
@@ -298,7 +353,7 @@ describe("TsfReadSession", () => {
           ? abandoned
           : new ScriptedWebSocket(
               [
-                { type: "ready" },
+                { type: "ready", kind: "transcript" },
                 streamMetadataFrame(streamId),
                 readBatch(record(0n, "recovered")),
               ],
@@ -327,7 +382,7 @@ describe("TsfReadSession", () => {
         connections += 1;
         return connections === 1
           ? new ScriptedWebSocket(
-              [{ type: "ready" }, streamMetadataFrame(streamId)],
+              [{ type: "ready", kind: "transcript" }, streamMetadataFrame(streamId)],
               1006,
             )
           : new HangingWebSocket(false);
@@ -346,7 +401,7 @@ describe("TsfReadSession", () => {
   it("closes the read transport when an observer throws", async () => {
     const streamId = generateStreamId();
     const socket = new HangingWebSocket(true, [
-      { type: "ready" },
+      { type: "ready", kind: "transcript" },
       streamMetadataFrame(streamId),
       { type: "caughtUp", nextSeqNum: 0n, lastTimestampMs: 0n },
     ], false);
@@ -371,7 +426,7 @@ describe("TsfReadSession", () => {
       webSocketFactory: () =>
         new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
             {
               type: "caughtUp",
@@ -407,7 +462,7 @@ describe("TsfReadSession", () => {
       webSocketFactory: () =>
         new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
             {
               type: "caughtUp",
@@ -441,12 +496,12 @@ describe("TsfReadSession", () => {
         return new ScriptedWebSocket(
           index === 0
             ? [
-                { type: "ready" },
+                { type: "ready", kind: "transcript" },
                 streamMetadataFrame(streamId),
                 readBatch(record(0n, "first")),
               ]
             : [
-                { type: "ready" },
+                { type: "ready", kind: "transcript" },
                 streamMetadataFrame(streamId),
                 {
                   type: "readBatch",
@@ -478,6 +533,35 @@ describe("TsfReadSession", () => {
     ]);
   });
 
+  it("rejects a stream kind change while reconnecting a reader", async () => {
+    const streamId = generateStreamId();
+    let connection = 0;
+    const client = new TsfClient({
+      webSocketFactory: () => {
+        const initial = connection++ === 0;
+        const kind: StreamKind = initial ? "transcript" : "bytes";
+        return new ScriptedWebSocket(
+          [
+            { type: "ready", kind },
+            streamMetadataFrame(streamId, kind),
+            ...(initial ? [readBatch(record(0n, "first"))] : []),
+          ],
+          initial ? 1013 : 1000,
+        );
+      },
+    });
+    const reader = await client.connectReader({
+      streamId,
+      start: { type: "seqNum", seqNum: 0n },
+    });
+
+    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 0n });
+    await expect(reader.nextRecord()).rejects.toMatchObject({
+      code: "invalid_api_response",
+      message: "stream kind changed while reconnecting the reader",
+    });
+  });
+
   it("opens one bounded paced read", async () => {
     const streamId = generateStreamId();
     const urls: string[] = [];
@@ -488,7 +572,7 @@ describe("TsfReadSession", () => {
         urls.push(url);
         return new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
             readBatch(record(9n, "paced")),
           ],
@@ -522,12 +606,12 @@ describe("TsfReadSession", () => {
     const clientFrames: ClientFrame[][] = [];
     const scripts: readonly (readonly ServerFrame[])[] = [
       [
-        { type: "ready" },
+        { type: "ready", kind: "transcript" },
         streamMetadataFrame(streamId),
         readBatch(record(5n, "first")),
       ],
       [
-        { type: "ready" },
+        { type: "ready", kind: "transcript" },
         streamMetadataFrame(streamId),
         readBatch(record(6n, "second")),
       ],
@@ -580,7 +664,7 @@ describe("TsfReadSession", () => {
         urls.push(url);
         return new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
             readBatch(record(connection === 0 ? 8n : 9n, "record")),
           ],
@@ -622,7 +706,7 @@ describe("TsfReadSession", () => {
         return new ScriptedWebSocket(
           connection === 0
             ? [
-                { type: "ready" },
+                { type: "ready", kind: "transcript" },
                 streamMetadataFrame(streamId),
                 {
                   type: "caughtUp",
@@ -631,7 +715,7 @@ describe("TsfReadSession", () => {
                 },
               ]
             : [
-                { type: "ready" },
+                { type: "ready", kind: "transcript" },
                 streamMetadataFrame(streamId),
                 readBatch(record(10n, "stable")),
               ],
@@ -678,7 +762,7 @@ describe("TsfReadSession", () => {
         urls.push(url);
         return new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
             ...(connection === 0
               ? []
@@ -718,7 +802,7 @@ describe("TsfReadSession", () => {
         socketUrl = url;
         return new ScriptedWebSocket(
           [
-            { type: "ready" },
+            { type: "ready", kind: "transcript" },
             streamMetadataFrame(streamId),
             readBatch(record(20n, "default")),
           ],
@@ -750,11 +834,11 @@ describe("TsfReadSession", () => {
           return new ScriptedWebSocket(
             connection < 2
               ? [
-                  { type: "ready" },
+                  { type: "ready", kind: "transcript" },
                   streamMetadataFrame(streamId),
                 ]
               : [
-                  { type: "ready" },
+                  { type: "ready", kind: "transcript" },
                   streamMetadataFrame(streamId),
                   readBatch(record(0n, "recovered")),
                 ],
@@ -786,7 +870,7 @@ describe("TsfReadSession", () => {
           connectionCount += 1;
           return new ScriptedWebSocket(
             [
-              { type: "ready" },
+              { type: "ready", kind: "transcript" },
               streamMetadataFrame(streamId),
             ],
             closeCode,
@@ -856,6 +940,7 @@ describe("TsfWriter", () => {
       streamId: generateStreamId(),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     });
+    expect(writer.streamKind).toBe("transcript");
 
     const first = writer.append({ data: "first" });
     await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(1));
@@ -1434,6 +1519,10 @@ class ScriptedWebSocket extends EventTarget {
   public binaryType: BinaryType = "blob";
   #closed = false;
 
+  public get closed(): boolean {
+    return this.#closed;
+  }
+
   public constructor(
     private readonly frames: readonly ServerFrame[],
     private readonly closeCode: number,
@@ -1523,7 +1612,7 @@ class WriterWebSocket extends EventTarget {
     const frame = decodeClientFrame(data);
     if (frame.type === "openWrite") {
       this.openFrames.push(frame);
-      this.#emit({ type: "ready" });
+      this.#emit({ type: "ready", kind: "transcript" });
       return;
     }
     if (frame.type !== "appendBatch") {
@@ -1627,7 +1716,7 @@ class ControlledWriterWebSocket extends EventTarget {
   public send(data: Uint8Array<ArrayBuffer>): void {
     const frame = decodeClientFrame(data);
     if (frame.type === "openWrite") {
-      this.#emit({ type: "ready" });
+      this.#emit({ type: "ready", kind: "transcript" });
       return;
     }
     if (frame.type !== "appendBatch" || frame.records.length === 0) {
@@ -1697,7 +1786,6 @@ function record(seqNum: bigint, text: string): ReadRecord {
     writerId: parseWriterId(new Uint8Array(16)),
     writerSeqNum: seqNum,
     part: UNSPLIT_PART,
-    format: RecordFormat.Transcript,
     data: new TextEncoder().encode(text),
   };
 }
@@ -1712,11 +1800,13 @@ function readQuery(url: string): string {
 
 function streamMetadataFrame(
   streamId: StreamId,
+  kind: StreamKind = "transcript",
 ): Extract<ServerFrame, { readonly type: "streamMetadata" }> {
   return {
     type: "streamMetadata",
     stream: {
       stream_id: streamId,
+      kind,
       title: null,
       visibility: "public",
       created_at: "2026-08-13T00:00:00Z",

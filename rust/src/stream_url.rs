@@ -1,4 +1,4 @@
-//! Parsing and construction for human-facing `/s/{stream_id}` stream links.
+//! Parsing and construction for human-facing record and terminal links.
 
 use url::{Url, form_urlencoded};
 
@@ -22,11 +22,22 @@ pub struct StreamAnchor {
     pub seq_num: u64,
 }
 
+/// Browser workspace selected by a stream link path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamRoute {
+    /// The ordinary `/s/{stream_id}` workspace.
+    Stream,
+    /// The terminal `/t/{stream_id}` workspace.
+    Terminal,
+}
+
 /// Stream ID and optional client-only state extracted from a stream link.
 #[derive(Clone, Debug)]
 pub struct StreamLocator {
-    /// Stream named by the `/s/{stream_id}` path.
+    /// Stream named by the browser path.
     pub stream_id: StreamId,
+    /// Browser workspace selected by the path.
+    pub route: StreamRoute,
     /// Optional single link fragment.
     pub link: Option<StreamLinkParam>,
     /// Optional browser record anchor.
@@ -41,7 +52,7 @@ impl StreamLocator {
         if url.query().is_some() {
             return Err(StreamLinkError::QueryNotAllowed);
         }
-        let stream_id = parse_stream_id(&url)?;
+        let (route, stream_id) = parse_stream_path(&url)?;
 
         let (link, anchor) = url
             .fragment()
@@ -49,8 +60,13 @@ impl StreamLocator {
             .transpose()?
             .unwrap_or((None, None));
 
+        if route == StreamRoute::Terminal && anchor.is_some() {
+            return Err(StreamLinkError::TerminalAnchorNotAllowed);
+        }
+
         Ok(Self {
             stream_id,
+            route,
             link,
             anchor,
         })
@@ -78,7 +94,27 @@ pub fn stream_link(
     permissions: LinkPermissions,
     secret: &LinkSecret,
 ) -> Result<Url, StreamLinkError> {
-    let mut url = public_stream_url(base_url, stream_id)?;
+    build_link(base_url, stream_id, permissions, secret, "s")
+}
+
+/// Builds a terminal link after validating the canonical unpadded base64url secret.
+pub fn terminal_link(
+    base_url: &Url,
+    stream_id: &StreamId,
+    permissions: LinkPermissions,
+    secret: &LinkSecret,
+) -> Result<Url, StreamLinkError> {
+    build_link(base_url, stream_id, permissions, secret, "t")
+}
+
+fn build_link(
+    base_url: &Url,
+    stream_id: &StreamId,
+    permissions: LinkPermissions,
+    secret: &LinkSecret,
+    prefix: &str,
+) -> Result<Url, StreamLinkError> {
+    let mut url = public_resource_url(base_url, stream_id, prefix)?;
 
     let fragment = form_urlencoded::Serializer::new(String::new())
         .append_pair(permissions.as_str(), secret.expose_secret())
@@ -90,26 +126,47 @@ pub fn stream_link(
 
 /// Builds the fragment-less `/s/{stream_id}` URL, normalizing the base like [`stream_link`].
 pub fn public_stream_url(base_url: &Url, stream_id: &StreamId) -> Result<Url, StreamLinkError> {
+    public_resource_url(base_url, stream_id, "s")
+}
+
+/// Builds the fragment-less `/t/{stream_id}` URL for a public terminal session.
+pub fn public_terminal_url(base_url: &Url, stream_id: &StreamId) -> Result<Url, StreamLinkError> {
+    public_resource_url(base_url, stream_id, "t")
+}
+
+fn public_resource_url(
+    base_url: &Url,
+    stream_id: &StreamId,
+    prefix: &str,
+) -> Result<Url, StreamLinkError> {
     let mut url = base_url.clone();
     validate_web_scheme(&url)?;
     url.set_username("")
         .map_err(|()| StreamLinkError::InvalidBaseUrl)?;
     url.set_password(None)
         .map_err(|()| StreamLinkError::InvalidBaseUrl)?;
-    url.set_path(&format!("/s/{stream_id}"));
+    url.set_path(&format!("/{prefix}/{stream_id}"));
     url.set_query(None);
     url.set_fragment(None);
 
     Ok(url)
 }
 
-fn parse_stream_id(url: &Url) -> Result<StreamId, StreamLinkError> {
+fn parse_stream_path(url: &Url) -> Result<(StreamRoute, StreamId), StreamLinkError> {
     let mut segments = url
         .path_segments()
         .ok_or(StreamLinkError::InvalidStreamPath)?;
 
     match (segments.next(), segments.next(), segments.next()) {
-        (Some("s"), Some(stream_id), None) => StreamId::decode(stream_id)
+        (Some(prefix @ ("s" | "t")), Some(stream_id), None) => StreamId::decode(stream_id)
+            .map(|stream_id| {
+                let route = if prefix == "t" {
+                    StreamRoute::Terminal
+                } else {
+                    StreamRoute::Stream
+                };
+                (route, stream_id)
+            })
             .map_err(|source| StreamLinkError::InvalidStreamId { source }),
         _ => Err(StreamLinkError::InvalidStreamPath),
     }
@@ -177,8 +234,8 @@ pub enum StreamLinkError {
     /// The validated HTTP(S) base URL could not be normalized for output.
     #[error("stream URL base could not be normalized")]
     InvalidBaseUrl,
-    /// The path is not exactly `/s/{stream_id}`.
-    #[error("stream URL path must be /s/{{stream_id}}")]
+    /// The path is not exactly `/s/{stream_id}` or `/t/{stream_id}`.
+    #[error("stream URL path must be /s/{{stream_id}} or /t/{{stream_id}}")]
     InvalidStreamPath,
     /// The path contains a malformed stream identifier.
     #[error("stream URL has invalid stream id")]
@@ -208,6 +265,9 @@ pub enum StreamLinkError {
     /// More than one `at` parameter appears in the fragment.
     #[error("stream URL fragment contains multiple at parameters")]
     MultipleAnchors,
+    /// Record anchors do not apply to terminal sessions.
+    #[error("terminal URLs do not accept record anchors")]
+    TerminalAnchorNotAllowed,
 }
 
 #[cfg(test)]
@@ -228,6 +288,7 @@ mod tests {
             locator.stream_id,
             STREAM_ID.parse::<StreamId>().expect("stream id")
         );
+        assert_eq!(locator.route, StreamRoute::Stream);
         let link = locator.link.expect("link");
         assert_eq!(link.declared_permissions.to_string(), "w");
         assert_eq!(link.secret.expose_secret(), SECRET);
@@ -352,6 +413,38 @@ mod tests {
             url.as_str(),
             format!("http://localhost:8787/s/0123456789abcdefghjkmnpqrstvwxyz#o={SECRET}")
         );
+    }
+
+    #[test]
+    fn parses_and_builds_terminal_links() {
+        let base_url = Url::parse("https://tail.surf/ignored").expect("base URL");
+        let stream_id = STREAM_ID.parse::<StreamId>().expect("stream id");
+        let secret = SECRET.parse::<LinkSecret>().expect("secret");
+        let url = terminal_link(
+            &base_url,
+            &stream_id,
+            LinkPermissions::read_write(),
+            &secret,
+        )
+        .expect("terminal link");
+
+        assert_eq!(
+            url.as_str(),
+            format!("https://tail.surf/t/{STREAM_ID}#rw={SECRET}")
+        );
+        let locator = StreamLocator::parse(url.as_str()).expect("terminal URL");
+        assert_eq!(locator.route, StreamRoute::Terminal);
+        assert_eq!(locator.stream_id, stream_id);
+        assert_eq!(
+            public_terminal_url(&base_url, &stream_id)
+                .expect("public terminal URL")
+                .as_str(),
+            format!("https://tail.surf/t/{STREAM_ID}")
+        );
+        assert!(matches!(
+            StreamLocator::parse(&format!("https://tail.surf/t/{STREAM_ID}#at=1")),
+            Err(StreamLinkError::TerminalAnchorNotAllowed)
+        ));
     }
 
     #[test]

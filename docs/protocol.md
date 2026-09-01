@@ -6,15 +6,29 @@ This document defines the public TSF v1 wire contract across REST, Server-Sent E
 
 ## Stream model
 
-A stream is an append-only sequence of physical records. Its complete history remains readable until the stream expires or an owner deletes it.
+A TSF stream is a logical resource with an immutable kind.
+
+- `transcript` is a line-oriented record log.
+- `bytes` is an opaque byte record log.
+- `terminal` is a terminal session with independent input and output channels.
+
+The default kind is `transcript`. Clients may omit `kind` when creating a transcript stream. They set it to `bytes` or `terminal` to select another kind.
+
+Servers include `kind` in stream metadata, creation responses, and WebSocket `Ready` frames. Clients do not infer it from record data.
+
+Transcript records, byte records, and terminal output remain readable until the stream expires or an owner deletes it. Terminal input has one-hour age retention.
+
+The following ordering and identity rules apply independently to each record log.
 
 The service assigns each physical record a zero-based `seq_num` in append order. Sequence numbers are contiguous. The stream's `next_seq_num` is the sequence number that the next appended record will receive.
 
 Writers identify physical records with `(client_writer_id, writer_seq_num)`. A client writer ID is 16 bytes. A writer sequence number is an unsigned 64-bit integer chosen by that writer. A writer normally increments it for each new record.
 
-A retry uses the same writer identity, writer sequence number, and payload. Retries can create physical duplicates. Logical transcript consumers suppress a record when its writer sequence number is not greater than the highest value already accepted for that writer.
+A retry uses the same writer identity, writer sequence number, and payload. Retries can create physical duplicates. Logical-record consumers suppress a record when its writer sequence number is not greater than the highest value already accepted for that writer.
 
 One logical record may span multiple physical records. Each part has a zero-based index and a final bit.
+
+Every physical record body is an arbitrary byte sequence. The stream kind defines how clients frame and present logical records.
 
 ## Identifiers
 
@@ -43,7 +57,7 @@ Private reads require read permission. Public reads require no link. All writes 
 
 ## Stream links
 
-A stream page uses `/s/{stream_id}`.
+Transcript and byte stream pages use `/s/{stream_id}`. Terminal pages use `/t/{stream_id}`. Read-capable browser workspaces verify the path against the immutable stream kind.
 
 A link secret is carried in one URL fragment parameter:
 
@@ -68,6 +82,12 @@ Browser stream URLs do not accept query parameters. API read controls such as `s
 Changing the fragment key does not change the secret's authority. The server rejects any operation that the secret does not authorize.
 
 Browsers do not send URL fragments in HTTP requests. Clients extract the secret and send it in a bearer header or WebSocket opening frame.
+
+Terminal links use the same fragment format:
+
+```txt
+https://tail.surf/t/{stream_id}#rw={secret}
+```
 
 The API origin and web origin are independent deployment settings. Responses that mint credentials include the canonical `web_origin` used to present stream links. A stream link never selects the API backend.
 
@@ -95,9 +115,11 @@ Stream creation does not use a link secret and may be disabled by deployment pol
 
 ### Creation retries
 
-Stream and link creation accept an optional `Idempotency-Key`. A key is 32 random bytes encoded as exactly 43 unpadded base64url characters. One logical creation uses the same key, method, path, and body for every retry.
+Stream and link creation use `Idempotency-Key` for retry recovery. The header is optional when creating a transcript stream, byte stream, or link. It is required when creating a terminal because that operation provisions metadata and two physical streams.
 
-Omitting the header requests one-shot creation. Retrying stream creation can create another stream. Retrying link creation cannot recover a committed credential and may conflict with the existing Link ID.
+A key is 32 random bytes encoded as exactly 43 unpadded base64url characters. One logical creation uses the same key, method, path, and body for every retry.
+
+Without the header, transcript stream, byte stream, and link creation are one-shot operations. Retrying stream creation can create another stream. Retrying link creation cannot recover a committed credential and may conflict with the existing Link ID.
 
 An exact stream-creation replay returns the same Stream ID and initial credentials while the stream remains active. Reusing the key with a different request returns `409 conflict`.
 
@@ -115,7 +137,7 @@ An exact link-creation replay returns the same credential while the link row is 
 
 The server rejects unknown request fields. Clients ignore unknown response fields. [openapi.yaml](openapi.yaml) defines the exact OpenAPI 3.1 schemas.
 
-Stream metadata includes `created_at` and `expires_at` as RFC 3339 timestamps. Responses that create a stream or link also include `web_origin`.
+Stream metadata includes `kind`, `created_at`, and `expires_at`. The timestamps use RFC 3339. Responses that create a stream or link also include `web_origin`.
 
 Link creation uses `PUT /streams/{stream_id}/links/{link_id}`. The body carries `permissions` and an optional RFC 3339 `expires_at`.
 
@@ -123,7 +145,7 @@ A request that would mint a different credential or change the attributes of a r
 
 The Link ID is immutable. It identifies the link in owner interfaces, management paths, authorization state, rate limits, and derived writer identity.
 
-Stream creation defaults to private visibility and expiry 10 days after creation. A request creates one to three initial, non-expiring links. Each link has a unique `link_id` and permissions. At least one must be an owner.
+Stream creation defaults to the `transcript` kind, private visibility, and expiry 10 days after creation. A request creates one to three initial, non-expiring links. Each link has a unique `link_id` and permissions. At least one must be an owner.
 
 Stream creation accepts an optional `title`. Creation and metadata responses always contain `title`, using `null` for an untitled stream.
 
@@ -151,9 +173,9 @@ Title visibility follows stream visibility. A public title is public. A private 
 
 A JSON record carries its payload under exactly one key. `text` contains UTF-8. `bytes` contains canonical unpadded base64url.
 
-The payload key implies the presentation format. `text` means `transcript`. `bytes` means `bytes`. An explicit `format` supplies the cross cases, such as transcript data that is not valid UTF-8.
+These keys are transport encodings. They do not change the stream kind or the record's semantics.
 
-Requests may use either valid payload representation. Read responses use whichever representation produces smaller JSON.
+Requests may use either valid payload representation. Read responses use whichever representation produces smaller JSON while preserving the exact payload bytes.
 
 An omitted `part` means final part zero, which is an unsplit record.
 
@@ -226,7 +248,7 @@ The first event is `stream_metadata`. Its data matches the REST stream metadata 
 
 `read_batch` events contain up to 1,000 records and 1 MiB of decoded record data. A complete event is at most 2 MiB including its terminator.
 
-Each record contains `seq_num`, `timestamp_ms`, and a `writer` object with the server-derived ID and writer-local sequence number. The payload appears under `text` or `bytes`. An omitted `part` means an unsplit record. An omitted `format` follows the payload key.
+Each record contains `seq_num`, `timestamp_ms`, and a `writer` object with the server-derived ID and writer-local sequence number. The payload appears under `text` or `bytes`. An omitted `part` means an unsplit record.
 
 Every `read_batch` and `caught_up` event has an ID of `v1,<next_seq_num>,<consumed_count>`. Both values are canonical decimal unsigned 64-bit integers. `consumed_count` is the number of physical records delivered in this logical read and cannot exceed `next_seq_num`.
 
@@ -240,15 +262,66 @@ A retryable interruption aborts the response. A client resumes with the unchange
 
 A non-retryable failure after the response opens sends a terminal `error` event and ends the response. Its data is `{ "error": { "code": "...", "message": "..." } }`. It has no resume ID.
 
+## Terminal sessions
+
+A terminal stream has independent `input` and `output` channels. Each channel is backed by a separate record log and follows the ordinary ordering, durability, retry, and read semantics.
+
+Generic data-plane routes provide the observer and controller paths:
+
+| Operation | Selected channel | Required permission |
+| --- | --- | --- |
+| WebSocket `/read` or SSE `GET /records` | `output` | Read, or public visibility |
+| WebSocket `/write` or HTTP `POST /records` | `input` | Write |
+
+The following WebSocket-only routes select a channel explicitly:
+
+```txt
+/api/v1/streams/{stream_id}/terminal/input/read
+/api/v1/streams/{stream_id}/terminal/input/write
+/api/v1/streams/{stream_id}/terminal/output/read
+/api/v1/streams/{stream_id}/terminal/output/write
+```
+
+Only an owner can read input or write output. Owner permission authorizes every terminal route. Explicit terminal routes reject transcript and byte streams.
+
+Terminal events use unsplit byte records. Every payload begins with a version byte and a type byte. The version is `0x01`.
+
+Terminal consumers suppress physical retries by writer identity and writer sequence number. This preserves one logical input or output event when an acknowledgement is lost.
+
+Input event types are:
+
+| Type | Name | Body |
+| --- | --- | --- |
+| `0x01` | `data` | PTY input bytes |
+| `0x02` | `resize` | Columns and rows as big-endian `uint16` values |
+
+Output event types are:
+
+| Type | Name | Body |
+| --- | --- | --- |
+| `0x01` | `data` | PTY output bytes |
+| `0x02` | `resize` | Accepted columns and rows as big-endian `uint16` values |
+| `0x03` | `started` | Initial columns and rows as big-endian `uint16` values |
+| `0x04` | `exited` | Signed exit status as a big-endian `int32`, then `output_truncated` as `0x00` or `0x01` |
+| `0x05` | `heartbeat` | Empty |
+
+Terminal dimensions are between 1 and 1,000 columns, between 1 and 500 rows, and at most 131,072 cells. Fixed-width events reject truncation and trailing bytes. Unknown versions and types are terminal protocol errors. Servers validate the record envelope and direction-specific event before append.
+
+A complete output history begins with one `started` event. Data, resize, and heartbeat events may follow while the child runs. One `exited` event ends the lifecycle. A consumer that starts from an arbitrary tail may join after `started`.
+
+`output_truncated` is true when the direct child exits but another process keeps the PTY open past the bounded drain. The host applies a requested resize before publishing the corresponding output resize event.
+
+The host appends `started` with an expected sequence of zero. A failed precondition prevents a second host from claiming the output channel.
+
 ## History export
 
 A history export reads from sequence zero with `wait=0` and writes `application/x-ndjson`. It finishes when the read catches up.
 
-The first line has `type` set to `tailsurf_export`, `version` set to `2`, and the `stream_id`.
+The first line has `type` set to `tailsurf_export`, `version` set to `3`, the `stream_id`, and the immutable stream `kind`.
 
 Each later line has `type` set to `record` and uses the read-record shape. Sequence values are decimal strings.
 
-A valid UTF-8 transcript record exports under `text`. Opaque bytes and invalid UTF-8 transcript records export under `bytes` as canonical unpadded base64url.
+Each record payload exports under `text` or `bytes`, whichever produces smaller JSON while preserving the exact bytes. The header supplies the semantics once for the whole stream.
 
 A resumed export starts at the next sequence number and may observe a newer tail. Records appended during an interrupted export can therefore be included. Stream expiry or owner deletion can terminate an export.
 
@@ -323,7 +396,7 @@ Record batch frames contain one or more records. Each record starts with a `uint
 | --- | --- | --- |
 | `OpenRead` | `0x01` | flags, then an optional 32-byte encoded link secret |
 | `OpenWrite` | `0x02` | flags, 16-byte client writer ID, optional expected next sequence `uint64`, then a 32-byte encoded link secret |
-| `AppendBatch` | `0x03` | records containing body length `uint32`, writer sequence `uint64`, part `uint32`, format `uint8`, and data |
+| `AppendBatch` | `0x03` | records containing body length `uint32`, writer sequence `uint64`, part `uint32`, and data |
 
 `OpenRead` starts with one flags byte. Bit `0x01` means that a link secret follows as exactly 32 canonical unpadded base64url bytes.
 
@@ -335,27 +408,24 @@ Unknown flags, truncation, trailing bytes, and malformed or non-canonical creden
 
 | Operation | ID | Body |
 | --- | --- | --- |
-| `Ready` | `0x80` | empty |
+| `Ready` | `0x80` | stream kind `uint8` |
 | `AppendAck` | `0x81` | writer start `uint64`, writer end `uint64`, durable start `uint64`, durable end `uint64` |
-| `ReadBatch` | `0x82` | records containing body length `uint32`, sequence `uint64`, timestamp milliseconds `uint64`, 16-byte writer ID, writer sequence `uint64`, part `uint32`, format `uint8`, and data |
+| `ReadBatch` | `0x82` | records containing body length `uint32`, sequence `uint64`, timestamp milliseconds `uint64`, 16-byte writer ID, writer sequence `uint64`, part `uint32`, and data |
 | `Heartbeat` | `0x83` | empty |
 | `CaughtUp` | `0x84` | next sequence `uint64`, last-record timestamp milliseconds `uint64` |
 | `StreamMetadata` | `0x85` | UTF-8 JSON matching the REST stream metadata schema |
 
 An empty stream has position `(0, 0)`. A non-empty stream may also have a last timestamp of zero. The next sequence disambiguates them.
 
-Malformed lengths and unknown formats are protocol errors.
+Malformed lengths and unknown stream-kind values are protocol errors.
 
-### Binary record format
+### Binary records
 
 Record data may contain at most 512 KiB.
 
-The format byte is a presentation hint. It does not transform bytes.
+The stream-kind byte in `Ready` uses `0x00` for transcript, `0x01` for bytes, and `0x02` for terminal.
 
-- `0x00` means opaque bytes.
-- `0x01` means transcript text.
-
-Transcript consumers preserve payload bytes. They do not add separators or remove newlines.
+Transcript consumers preserve payload bytes. Line-oriented presentation may add one separator after each logical record. Byte-stream consumers preserve the byte sequence without adding separators.
 
 The part header uses bit 31 as the final bit. Bits 0 through 30 contain the part index. An unsplit record is final part zero.
 
@@ -398,7 +468,7 @@ A reader puts the shared read query in the WebSocket URL. It sends `OpenRead` im
 
 The server sends `Ready` only after accepting the request and authorization. An authorization failure closes without `Ready`.
 
-`StreamMetadata` follows `Ready`. It contains `stream_id`, `title`, `visibility`, `created_at`, and `expires_at`. Clients ignore unknown fields.
+`StreamMetadata` follows `Ready`. It contains `stream_id`, `kind`, `title`, `visibility`, `created_at`, and `expires_at`. Its kind must match `Ready`. Clients ignore unknown fields.
 
 The server then sends `ReadBatch`, `CaughtUp`, and `Heartbeat` frames. A reader sends no frames after `OpenRead`.
 
@@ -414,7 +484,7 @@ A resumed finite read preserves `until` and reduces `count` by the number of rec
 
 When an unbounded backing read ends or fails transiently, the server closes with `1013 upstream_unavailable`. A finite read closes normally when its condition is met or it catches up.
 
-A transcript consumer reassembles parts in delivery order. A read that starts in the middle of a split record skips that partial logical record. Consumers should bound incomplete reassembly according to their resource limits.
+A logical-record consumer reassembles parts in delivery order. A read that starts in the middle of a split record skips that partial logical record. Consumers should bound incomplete reassembly according to their resource limits.
 
 ### Close behavior
 
@@ -433,9 +503,11 @@ Close reasons under `1013` are temporary. Protocol and policy failures under `10
 
 ## Compatibility
 
-REST and SSE use the `/api/v1` route prefix. A breaking change requires a new route version.
+TSF is pre-1.0. `/api/v1` and `tsf.v1` name the current protocol generation. They do not promise interoperability across pre-1.0 package releases.
 
-Binary clients and the server select the exact `tsf.v1` subprotocol. A breaking binary change requires a new subprotocol.
+A pre-1.0 breaking change replaces the current contract through a coordinated SDK and service cutover. Old and new versions do not interoperate during that cutover.
+
+After the v1 contract is declared stable, a breaking REST or SSE change requires a new route version. A breaking binary change requires a new WebSocket subprotocol.
 
 Additive REST and SSE fields must remain ignorable by v1 clients. Additive binary behavior must remain ignorable under `tsf.v1`. Otherwise it requires capability negotiation or a new version.
 

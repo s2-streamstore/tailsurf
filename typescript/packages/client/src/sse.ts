@@ -7,11 +7,9 @@ import {
   MAX_SSE_UNTERMINATED_EVENT_BYTES,
   MAX_SSE_READ_BATCH_PAYLOAD_BYTES,
   MAX_RECORD_PAYLOAD_BYTES,
-  RecordFormat,
   decodeBase64url,
   parseWriterId,
   recordPayloadBytes,
-  resolvedRecordFormat,
   decodeSseResumeCursor,
   type CaughtUpPosition,
   type ReadRecord,
@@ -28,6 +26,7 @@ import {
   BaseTsfReadSession,
   normalizeReadOptions,
   readExhausted,
+  validateReadStreamMetadata,
   type NormalizedReadOptions,
   type ReadOptions,
   type TsfReadSession,
@@ -91,8 +90,9 @@ export async function connectSseReader(
       "initial SSE read completed without stream metadata",
     );
   }
-  normalized.streamMetadata = connection.stream;
   try {
+    validateReadStreamMetadata(normalized, connection.stream);
+    normalized.streamMetadata = connection.stream;
     normalized.onStreamMetadata?.(connection.stream);
   } catch (error) {
     connection.close();
@@ -174,6 +174,12 @@ class SseReadSession extends BaseTsfReadSession {
           this.finished = true;
           return undefined;
         }
+        try {
+          validateReadStreamMetadata(this.options, connection.stream);
+        } catch (error) {
+          connection.close();
+          throw error;
+        }
         this.#connection = connection;
         if (connection.resumeEventId !== undefined) {
           this.#lastEventId = connection.resumeEventId;
@@ -211,6 +217,12 @@ class SseReadSession extends BaseTsfReadSession {
       }
       if (event.event === "stream_metadata") {
         const stream = streamMetadataFromWire(parseJsonEvent(event, streamMetadataSchema));
+        try {
+          validateReadStreamMetadata(this.options, stream);
+        } catch (error) {
+          this.close();
+          throw error;
+        }
         this.options.streamMetadata = stream;
         this.notify(this.options.onStreamMetadata, stream);
         continue;
@@ -715,9 +727,6 @@ function invalidResumeEventId(event: string): TsfClientError {
 }
 
 function readRecord(record: ReturnType<typeof sseReadBatchDataSchema.parse>["records"][number]): ReadRecord {
-  const format = resolvedRecordFormat(record) === "transcript"
-    ? RecordFormat.Transcript
-    : RecordFormat.Bytes;
   return {
     seqNum: BigInt(record.seq_num),
     timestampMs: BigInt(record.timestamp_ms),
@@ -727,7 +736,6 @@ function readRecord(record: ReturnType<typeof sseReadBatchDataSchema.parse>["rec
     part: record.part === undefined
       ? { index: 0, isFinal: true }
       : { index: record.part.index, isFinal: record.part.is_final },
-    format,
     data: recordPayloadBytes(record),
   };
 }

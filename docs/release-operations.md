@@ -20,13 +20,17 @@ Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamst
 
 Public protocol changes start in this repository. Update the Rust and TypeScript implementations and both fixture copies in one pull request.
 
-Additive response fields can ship in the service first when every released client ignores them. Request changes, frame changes, and stricter validation require compatible client releases before the service uses them.
+Additive response fields can ship in the service first when every released client ignores them. Compatible request changes, frame changes, and stricter validation require client releases before the service uses them.
+
+The current protocol is pre-1.0. A breaking pre-1.0 release is a hard cutover. Its pull requests and release notes must say that old and new clients do not interoperate.
 
 The TypeScript release workflow publishes `@tailsurf/protocol` before `@tailsurf/client` when both change. Publish the Rust SDK and CLI through the Rust release flow when they change.
 
-After the required client versions are public, update `tailsurf-web` to exact released versions and run its full check, cross-client test, and browser suite. Deploy the service only after those checks pass.
+For a compatible change, publish the required client versions first. Then update `tailsurf-web` to exact released versions and run its full check, cross-client test, and browser suite. Deploy the service only after those checks pass.
 
-Keep the preceding service version deployable until the new clients and service have completed production probes. Roll the service back independently if the public wire behavior remains compatible.
+For a hard cutover, build and test the service against packed candidate SDK packages before publishing. Publish the SDK packages, update the exact service pins, and deploy immediately after the required checks pass. Minimize and announce the interval in which the published client and deployed service differ.
+
+Keep the preceding service version deployable until the new clients and service have completed production probes. Roll the service back independently only when the public wire behavior remains compatible. A hard cutover rolls the clients and service forward or back together.
 
 Release builds, macOS signing and notarization, hosting, and artifact attestations run on GitHub-hosted runners. The release workflow accepts only tags reachable from the default branch. It carries the validated commit SHA through every build and checks that the tag has not moved before hosting.
 

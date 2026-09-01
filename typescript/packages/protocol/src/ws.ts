@@ -10,7 +10,11 @@ import {
   MAX_SAFE_INTEGER_U64,
   MAX_U64,
 } from "./primitives.js";
-import { streamMetadataSchema, type StreamMetadata } from "./rest.js";
+import {
+  streamMetadataSchema,
+  type StreamKind,
+  type StreamMetadata,
+} from "./rest.js";
 import {
   LINK_SECRET_ENCODED_LENGTH,
   parseLinkSecret,
@@ -31,9 +35,22 @@ export const MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024;
 export const MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES = 5 * 1024 * 1024;
 /** Maximum physical records an SDK durable writer keeps sent but unacknowledged. */
 export const MAX_WRITER_IN_FLIGHT_RECORDS = 1_024;
+const FRAME_OPERATION_BYTES = 1;
+const RECORD_LENGTH_BYTES = 4;
+const APPEND_WRITER_SEQ_NUM_OFFSET = 0;
+const APPEND_PART_OFFSET = APPEND_WRITER_SEQ_NUM_OFFSET + 8;
+const APPEND_RECORD_HEADER_BYTES = APPEND_PART_OFFSET + 4;
+const READ_SEQ_NUM_OFFSET = 0;
+const READ_TIMESTAMP_MS_OFFSET = READ_SEQ_NUM_OFFSET + 8;
+const READ_WRITER_ID_OFFSET = READ_TIMESTAMP_MS_OFFSET + 8;
+const READ_WRITER_SEQ_NUM_OFFSET = READ_WRITER_ID_OFFSET + WRITER_ID_BYTE_LENGTH;
+const READ_PART_OFFSET = READ_WRITER_SEQ_NUM_OFFSET + 8;
+const READ_RECORD_HEADER_BYTES = READ_PART_OFFSET + 4;
 /** Maximum encoded size of any TSF protocol frame. */
 export const MAX_ENCODED_FRAME_BYTES =
-  1 + MAX_READ_FRAME_RECORDS * (4 + 45) + MAX_FRAME_PAYLOAD_BYTES;
+  FRAME_OPERATION_BYTES +
+  MAX_READ_FRAME_RECORDS * (RECORD_LENGTH_BYTES + READ_RECORD_HEADER_BYTES) +
+  MAX_FRAME_PAYLOAD_BYTES;
 export const PART_FINAL_BIT = 0x8000_0000;
 export const MAX_PART_INDEX = 0x7fff_ffff;
 
@@ -67,13 +84,6 @@ const ServerOp = {
   StreamMetadata: 0x85,
 } as const;
 
-export const RecordFormat = {
-  Bytes: 0x00,
-  Transcript: 0x01,
-} as const;
-
-export type RecordFormat = (typeof RecordFormat)[keyof typeof RecordFormat];
-
 export interface PartHeader {
   readonly index: number;
   readonly isFinal: boolean;
@@ -84,7 +94,6 @@ export const UNSPLIT_PART: PartHeader = Object.freeze({ index: 0, isFinal: true 
 export interface AppendRecord {
   readonly writerSeqNum: bigint;
   readonly part: PartHeader;
-  readonly format: RecordFormat;
   readonly data: Uint8Array;
 }
 
@@ -107,7 +116,6 @@ export interface ReadRecord {
   readonly writerId: WriterId;
   readonly writerSeqNum: bigint;
   readonly part: PartHeader;
-  readonly format: RecordFormat;
   readonly data: Uint8Array;
 }
 
@@ -117,7 +125,7 @@ export interface CaughtUpPosition {
 }
 
 export type ServerFrame =
-  | { readonly type: "ready" }
+  | { readonly type: "ready"; readonly kind: StreamKind }
   | {
       readonly type: "appendAck";
       readonly writerStartSeqNum: bigint;
@@ -189,19 +197,34 @@ export function encodeClientFrame(frame: ClientFrame): Uint8Array {
     }
     case "appendBatch": {
       const output = new Uint8Array(
-        batchFrameLength(frame.records, 13, MAX_APPEND_FRAME_RECORDS),
+        batchFrameLength(
+          frame.records,
+          APPEND_RECORD_HEADER_BYTES,
+          MAX_APPEND_FRAME_RECORDS,
+        ),
       );
       const view = new DataView(output.buffer);
       output[0] = ClientOp.AppendBatch;
       let offset = 1;
       for (const record of frame.records) {
         validateAppendWriterSeqNum(record.writerSeqNum);
-        view.setUint32(offset, 13 + record.data.byteLength);
-        writeU64(view, offset + 4, record.writerSeqNum);
-        view.setUint32(offset + 12, partHeaderRaw(record.part));
-        output[offset + 16] = validateRecordFormat(record.format);
-        output.set(record.data, offset + 17);
-        offset += 17 + record.data.byteLength;
+        view.setUint32(
+          offset,
+          APPEND_RECORD_HEADER_BYTES + record.data.byteLength,
+        );
+        const bodyOffset = offset + RECORD_LENGTH_BYTES;
+        writeU64(
+          view,
+          bodyOffset + APPEND_WRITER_SEQ_NUM_OFFSET,
+          record.writerSeqNum,
+        );
+        view.setUint32(
+          bodyOffset + APPEND_PART_OFFSET,
+          partHeaderRaw(record.part),
+        );
+        const dataOffset = bodyOffset + APPEND_RECORD_HEADER_BYTES;
+        output.set(record.data, dataOffset);
+        offset = dataOffset + record.data.byteLength;
       }
       return output;
     }
@@ -251,17 +274,16 @@ export function decodeClientFrame(input: Uint8Array | ArrayBuffer): ClientFrame 
       const records: AppendRecord[] = [];
       let payloadBytes = 0;
       for (const body of recordBodies(bytes, view, MAX_APPEND_FRAME_RECORDS)) {
-        requireLength(body, 13);
+        requireLength(body, APPEND_RECORD_HEADER_BYTES);
         const bodyView = dataView(body);
-        const data = body.slice(13);
-        const writerSeqNum = bodyView.getBigUint64(0);
+        const data = body.slice(APPEND_RECORD_HEADER_BYTES);
+        const writerSeqNum = bodyView.getBigUint64(APPEND_WRITER_SEQ_NUM_OFFSET);
         validateAppendWriterSeqNum(writerSeqNum);
         validateRecordLength(data.byteLength);
         payloadBytes += data.byteLength;
         records.push({
           writerSeqNum,
-          part: partHeaderFromRaw(bodyView.getUint32(8)),
-          format: validateRecordFormat(body[12]),
+          part: partHeaderFromRaw(bodyView.getUint32(APPEND_PART_OFFSET)),
           data,
         });
       }
@@ -327,7 +349,7 @@ function decodeOpenRead(bytes: Uint8Array): Extract<
 export function encodeServerFrame(frame: ServerFrame): Uint8Array {
   switch (frame.type) {
     case "ready":
-      return Uint8Array.of(ServerOp.Ready);
+      return Uint8Array.of(ServerOp.Ready, streamKindByte(frame.kind));
     case "appendAck": {
       const output = new Uint8Array(33);
       const view = new DataView(output.buffer);
@@ -340,7 +362,11 @@ export function encodeServerFrame(frame: ServerFrame): Uint8Array {
     }
     case "readBatch": {
       const output = new Uint8Array(
-        batchFrameLength(frame.records, 45, MAX_READ_FRAME_RECORDS),
+        batchFrameLength(
+          frame.records,
+          READ_RECORD_HEADER_BYTES,
+          MAX_READ_FRAME_RECORDS,
+        ),
       );
       validateReadBatchSequence(frame.records);
       const view = new DataView(output.buffer);
@@ -348,15 +374,23 @@ export function encodeServerFrame(frame: ServerFrame): Uint8Array {
       let offset = 1;
       for (const record of frame.records) {
         validateWriterIdLength(record.writerId, "writer ID", "invalid_writer_id");
-        view.setUint32(offset, 45 + record.data.byteLength);
-        writeU64(view, offset + 4, record.seqNum);
-        writeU64(view, offset + 12, record.timestampMs);
-        output.set(record.writerId, offset + 20);
-        writeU64(view, offset + 36, record.writerSeqNum);
-        view.setUint32(offset + 44, partHeaderRaw(record.part));
-        output[offset + 48] = validateRecordFormat(record.format);
-        output.set(record.data, offset + 49);
-        offset += 49 + record.data.byteLength;
+        view.setUint32(offset, READ_RECORD_HEADER_BYTES + record.data.byteLength);
+        const bodyOffset = offset + RECORD_LENGTH_BYTES;
+        writeU64(view, bodyOffset + READ_SEQ_NUM_OFFSET, record.seqNum);
+        writeU64(view, bodyOffset + READ_TIMESTAMP_MS_OFFSET, record.timestampMs);
+        output.set(record.writerId, bodyOffset + READ_WRITER_ID_OFFSET);
+        writeU64(
+          view,
+          bodyOffset + READ_WRITER_SEQ_NUM_OFFSET,
+          record.writerSeqNum,
+        );
+        view.setUint32(
+          bodyOffset + READ_PART_OFFSET,
+          partHeaderRaw(record.part),
+        );
+        const dataOffset = bodyOffset + READ_RECORD_HEADER_BYTES;
+        output.set(record.data, dataOffset);
+        offset = dataOffset + record.data.byteLength;
       }
       return output;
     }
@@ -387,8 +421,8 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
   const view = dataView(bytes);
   switch (op) {
     case ServerOp.Ready:
-      requireExactLength(bytes, 1, op);
-      return { type: "ready" };
+      requireExactLength(bytes, 2, op);
+      return { type: "ready", kind: streamKindFromByte(bytes[1]!) };
     case ServerOp.AppendAck:
       requireExactLength(bytes, 33, op);
       return {
@@ -402,18 +436,20 @@ export function decodeServerFrame(input: Uint8Array | ArrayBuffer): ServerFrame 
       const records: ReadRecord[] = [];
       let payloadBytes = 0;
       for (const body of recordBodies(bytes, view, MAX_READ_FRAME_RECORDS)) {
-        requireLength(body, 45);
+        requireLength(body, READ_RECORD_HEADER_BYTES);
         const bodyView = dataView(body);
-        const data = body.slice(45);
+        const data = body.slice(READ_RECORD_HEADER_BYTES);
         validateRecordLength(data.byteLength);
         payloadBytes += data.byteLength;
         records.push({
-          seqNum: bodyView.getBigUint64(0),
-          timestampMs: bodyView.getBigUint64(8),
-          writerId: parseWriterId(body.subarray(16, 32)),
-          writerSeqNum: bodyView.getBigUint64(32),
-          part: partHeaderFromRaw(bodyView.getUint32(40)),
-          format: validateRecordFormat(body[44]),
+          seqNum: bodyView.getBigUint64(READ_SEQ_NUM_OFFSET),
+          timestampMs: bodyView.getBigUint64(READ_TIMESTAMP_MS_OFFSET),
+          writerId: parseWriterId(body.subarray(
+            READ_WRITER_ID_OFFSET,
+            READ_WRITER_ID_OFFSET + WRITER_ID_BYTE_LENGTH,
+          )),
+          writerSeqNum: bodyView.getBigUint64(READ_WRITER_SEQ_NUM_OFFSET),
+          part: partHeaderFromRaw(bodyView.getUint32(READ_PART_OFFSET)),
           data,
         });
       }
@@ -500,7 +536,9 @@ function batchFrameLength(
     payloadBytes += record.data.byteLength;
   }
   validateBatchBounds(records.length, payloadBytes, maximumRecords);
-  return 1 + records.length * (4 + recordHeaderBytes) + payloadBytes;
+  return FRAME_OPERATION_BYTES +
+    records.length * (RECORD_LENGTH_BYTES + recordHeaderBytes) +
+    payloadBytes;
 }
 
 function validateBatchBounds(
@@ -550,11 +588,11 @@ function recordBodies(
         `batch must contain at most ${maximumRecords} records`,
       );
     }
-    if (bytes.byteLength - offset < 4) {
+    if (bytes.byteLength - offset < RECORD_LENGTH_BYTES) {
       throw new ProtocolError("truncated_frame", "record length is truncated");
     }
     const length = view.getUint32(offset);
-    offset += 4;
+    offset += RECORD_LENGTH_BYTES;
     if (length === 0 || length > bytes.byteLength - offset) {
       throw new ProtocolError("invalid_record_length", "record length is invalid");
     }
@@ -586,14 +624,31 @@ function validateRecordLength(length: number): void {
   }
 }
 
-function validateRecordFormat(value: number | undefined): RecordFormat {
-  if (value !== RecordFormat.Bytes && value !== RecordFormat.Transcript) {
-    throw new ProtocolError(
-      "unknown_record_format",
-      `unknown record format ${String(value)}`,
-    );
+function streamKindByte(kind: StreamKind): number {
+  switch (kind) {
+    case "transcript":
+      return 0;
+    case "bytes":
+      return 1;
+    case "terminal":
+      return 2;
   }
-  return value;
+}
+
+function streamKindFromByte(value: number): StreamKind {
+  switch (value) {
+    case 0:
+      return "transcript";
+    case 1:
+      return "bytes";
+    case 2:
+      return "terminal";
+    default:
+      throw new ProtocolError(
+        "unknown_stream_kind",
+        `unknown stream kind ${value}`,
+      );
+  }
 }
 
 function validateAppendWriterSeqNum(value: bigint): void {

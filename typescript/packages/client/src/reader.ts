@@ -332,6 +332,12 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
       }
       if (frame.type === "streamMetadata") {
         const stream = streamMetadataFromWire(frame.stream);
+        try {
+          validateReadStreamMetadata(this.options, stream);
+        } catch (error) {
+          this.close();
+          throw error;
+        }
         this.options.streamMetadata = stream;
         this.notify(this.options.onStreamMetadata, stream);
         continue;
@@ -423,6 +429,27 @@ export function readRequestForConnection(
     ...(options.stop === undefined ? {} : { stop: options.stop }),
     ...(options.rate === undefined ? {} : { rate: options.rate }),
   };
+}
+
+export function validateReadStreamMetadata(
+  options: NormalizedReadOptions,
+  stream: StreamMetadata,
+): void {
+  if (stream.streamId !== options.streamId) {
+    throw new TsfClientError(
+      "invalid_api_response",
+      "reader handshake returned a different stream ID",
+    );
+  }
+  if (
+    options.streamMetadata !== undefined &&
+    stream.kind !== options.streamMetadata.kind
+  ) {
+    throw new TsfClientError(
+      "invalid_api_response",
+      "stream kind changed while reconnecting the reader",
+    );
+  }
 }
 
 export function advanceReadOptions(

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildPublicTerminalUrl,
+  buildPublicStreamUrl,
   buildStreamLink,
+  buildTerminalLink,
   generateStreamId,
   generateClientWriterId,
   parseStreamId,
@@ -70,6 +73,7 @@ describe("stream URLs", () => {
       ),
     ).toEqual({
       streamId: STREAM_ID,
+      route: "stream",
       link: { declaredPermissions: "o", secret: OWNER_SECRET },
     });
   });
@@ -81,13 +85,31 @@ describe("stream URLs", () => {
       ),
     ).toEqual({
       streamId: STREAM_ID,
+      route: "stream",
       link: { declaredPermissions: "r", secret: WRITE_SECRET },
       anchor: { seqNum: 1234n },
     });
     expect(parseStreamUrl(`https://tail.surf/s/${STREAM_ID}#at=0`)).toEqual({
       streamId: STREAM_ID,
+      route: "stream",
       anchor: { seqNum: 0n },
     });
+  });
+
+  it("parses and builds canonical terminal links", () => {
+    expect(
+      parseStreamUrl(`https://tail.surf/t/${STREAM_ID}#rw=${WRITE_SECRET}`),
+    ).toEqual({
+      streamId: STREAM_ID,
+      route: "terminal",
+      link: { declaredPermissions: "rw", secret: WRITE_SECRET },
+    });
+    expect(
+      buildTerminalLink("https://tail.surf/ignored", STREAM_ID, "rw", WRITE_SECRET)
+        .toString(),
+    ).toBe(`https://tail.surf/t/${STREAM_ID}#rw=${WRITE_SECRET}`);
+    expect(buildPublicTerminalUrl("https://tail.surf/ignored", STREAM_ID).toString())
+      .toBe(`https://tail.surf/t/${STREAM_ID}`);
   });
 
   it.each(["", "-1", "01", "12a", "1.5", "9007199254740992"])(
@@ -100,6 +122,12 @@ describe("stream URLs", () => {
   );
 
   it("builds a canonical stream link and removes the base query", () => {
+    expect(
+      buildPublicStreamUrl(
+        "http://user:password@localhost:3000/?ignored=true#fragment",
+        STREAM_ID,
+      ).toString(),
+    ).toBe(`http://localhost:3000/s/${STREAM_ID}`);
     expect(
       buildStreamLink(
         "http://user:password@localhost:3000/?ignored=true",
@@ -132,6 +160,7 @@ describe("stream URLs", () => {
     `https://tail.surf/s/${STREAM_ID}?seq_num=100#at=50`,
     `https://tail.surf/s/${STREAM_ID}?view=raw`,
     `https://tail.surf/s/${STREAM_ID}?`,
+    `https://tail.surf/t/${STREAM_ID}#at=1`,
     `https://tail.surf/s/${STREAM_ID}#`,
     `https://tail.surf/s/${STREAM_ID}#&`,
     `https://tail.surf/s/${STREAM_ID}#at=1&`,

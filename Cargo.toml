@@ -19,6 +19,7 @@ eyre = "0.6.14"
 futures-util = "0.3.34"
 humantime = "2.4.0"
 memchr = "2.8.3"
+portable-pty = "0.9.0"
 rand = "0.10.2"
 reqwest = "0.13.4"
 secrecy = { version = "0.10.3", features = ["serde"] }

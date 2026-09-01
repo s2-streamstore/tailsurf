@@ -51,11 +51,11 @@ use crate::{
         rest::{
             ApiError, ApiErrorResponse, AppendJsonRecord, AppendRange, AppendRecordsRequest,
             AppendWriter, CreateLinkInput, CreateLinkResponse, CreateStreamRequest,
-            CreateStreamResponse, ListLinksResponse, MAX_LINK_PAGE_ITEMS,
+            CreateStreamResponse, JsonRecordPayload, ListLinksResponse, MAX_LINK_PAGE_ITEMS,
             MAX_REST_ERROR_RESPONSE_BYTES, MAX_REST_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
             MAX_SSE_UNTERMINATED_EVENT_BYTES, MAX_STATELESS_APPEND_PAYLOAD_BYTES,
             MAX_STATELESS_APPEND_RECORDS, RestRecordPart, SseCaughtUpData, SseReadBatchData,
-            StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
+            StreamKind, StreamMetadata, UpdateStreamRequest, parse_canonical_decimal_u64,
         },
         ws::{
             MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS,
@@ -77,6 +77,27 @@ const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const WEBSOCKET_READ_IDLE_TIMEOUT: Duration =
     Duration::from_millis(WEBSOCKET_HEARTBEAT_INTERVAL_MS * 3);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DataPlaneRoute {
+    Records,
+    TerminalInput,
+    TerminalOutput,
+}
+
+impl DataPlaneRoute {
+    fn path(self, stream_id: &StreamId, operation: &str) -> String {
+        match self {
+            Self::Records => format!("/streams/{stream_id}/{operation}"),
+            Self::TerminalInput => {
+                format!("/streams/{stream_id}/terminal/input/{operation}")
+            }
+            Self::TerminalOutput => {
+                format!("/streams/{stream_id}/terminal/output/{operation}")
+            }
+        }
+    }
+}
 
 /// Timeouts, retry behavior, and API origin for [`TsfClient`].
 ///
@@ -146,7 +167,7 @@ fn jittered_backoff(backoff: Duration) -> Duration {
 /// Cloneable TSF REST, SSE, and v1 WebSocket client.
 ///
 /// REST operations preserve their retry identity. Stateless append retries can create physical
-/// duplicates, which logical transcript readers suppress. Durable WebSocket writer recovery is
+/// duplicates, which logical-record readers suppress. Durable WebSocket writer recovery is
 /// owned by [`TsfWriter`].
 #[derive(Clone)]
 pub struct TsfClient {
@@ -509,12 +530,8 @@ impl TsfClient {
                     "writer sequence numbers must be contiguous",
                 ));
             }
-            let (text, bytes) = compact_record_payload(&record.data);
-            // The SDK states the format even when the payload key implies it.
             json_records.push(AppendJsonRecord {
-                text,
-                bytes,
-                format: Some(record.format),
+                payload: compact_record_payload(&record.data),
                 part: Some(RestRecordPart {
                     index: record.part.index(),
                     is_final: record.part.is_final(),
@@ -556,15 +573,47 @@ impl TsfClient {
         &self,
         options: DurableWriterOptions,
     ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_route(options, DataPlaneRoute::Records)
+            .await
+    }
+
+    /// Connects a controller writer to a terminal session's input channel.
+    pub async fn connect_terminal_input_writer(
+        &self,
+        options: DurableWriterOptions,
+    ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_route(options, DataPlaneRoute::TerminalInput)
+            .await
+    }
+
+    /// Connects the terminal host writer to the output channel. The link must be an owner.
+    pub async fn connect_terminal_output_writer(
+        &self,
+        options: DurableWriterOptions,
+    ) -> Result<TsfWriter, TsfClientError> {
+        self.connect_writer_route(options, DataPlaneRoute::TerminalOutput)
+            .await
+    }
+
+    async fn connect_writer_route(
+        &self,
+        options: DurableWriterOptions,
+        route: DataPlaneRoute,
+    ) -> Result<TsfWriter, TsfClientError> {
         let mut session_options = WriteSessionOptions::new(
             options.stream_id,
             ClientWriterId::new_random(),
             options.link_secret,
         );
         session_options.expected_next_seq_num = options.expected_next_seq_num;
-        let session = self.open_write_session(&session_options).await?;
+        let session = self.open_write_session(&session_options, route).await?;
         session_options.expected_next_seq_num = None;
-        Ok(TsfWriter::new(self.clone(), session_options, session))
+        Ok(TsfWriter::new(
+            self.clone(),
+            session_options,
+            route,
+            session,
+        ))
     }
 
     /// Connects a low-level write session that sends records and receives ack ranges directly.
@@ -574,22 +623,25 @@ impl TsfClient {
         &self,
         options: WriteSessionOptions,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        self.open_write_session(&options).await
+        self.open_write_session(&options, DataPlaneRoute::Records)
+            .await
     }
 
     async fn open_write_session(
         &self,
         options: &WriteSessionOptions,
+        route: DataPlaneRoute,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        self.retry_transient(|| self.connect_write_session_once(options))
+        self.retry_transient(|| self.connect_write_session_once(options, route))
             .await
     }
 
     async fn connect_write_session_once(
         &self,
         options: &WriteSessionOptions,
+        route: DataPlaneRoute,
     ) -> Result<TsfWriteSession, TsfClientError> {
-        let url = self.websocket_url(format_args!("/streams/{}/write", options.stream_id))?;
+        let url = self.websocket_url(route.path(&options.stream_id, "write"))?;
         let connect_timeout = self.config.websocket_connect_timeout;
         let progress_timeout = self.config.websocket_progress_timeout;
         let opening_frame = ClientFrame::OpenWrite {
@@ -601,11 +653,13 @@ impl TsfClient {
 
         let mut ws =
             connect_websocket(url, connect_timeout, progress_timeout, opening_frame).await?;
-        with_timeout(progress_timeout, "writer ready", expect_ready(&mut ws)).await?;
+        let stream_kind =
+            with_timeout(progress_timeout, "writer ready", expect_ready(&mut ws)).await?;
 
         Ok(TsfWriteSession {
             ws,
             progress_timeout,
+            stream_kind,
         })
     }
 
@@ -614,13 +668,41 @@ impl TsfClient {
         &self,
         options: ReadOptions,
     ) -> Result<TsfReadSession, TsfClientError> {
+        self.connect_reader_route(options, DataPlaneRoute::Records)
+            .await
+    }
+
+    /// Connects an observer reader to a terminal session's output channel.
+    pub async fn connect_terminal_output_reader(
+        &self,
+        options: ReadOptions,
+    ) -> Result<TsfReadSession, TsfClientError> {
+        self.connect_reader_route(options, DataPlaneRoute::TerminalOutput)
+            .await
+    }
+
+    /// Connects the terminal host to its input channel. The link must be an owner.
+    pub async fn connect_terminal_input_reader(
+        &self,
+        options: ReadOptions,
+    ) -> Result<TsfReadSession, TsfClientError> {
+        self.connect_reader_route(options, DataPlaneRoute::TerminalInput)
+            .await
+    }
+
+    async fn connect_reader_route(
+        &self,
+        options: ReadOptions,
+        route: DataPlaneRoute,
+    ) -> Result<TsfReadSession, TsfClientError> {
         let ConnectedReadSocket {
             socket,
             stream_metadata,
-        } = self.connect_read_socket(&options).await?;
+        } = self.connect_read_socket(&options, route).await?;
         Ok(TsfReadSession::new(
             self.clone(),
             options,
+            route,
             socket,
             stream_metadata,
         ))
@@ -643,6 +725,7 @@ impl TsfClient {
                 .ok_or(TsfClientError::InvalidSse(
                     "initial read completed without stream_metadata",
                 ))?;
+        validate_read_stream_metadata(&options.stream_id, None, &connection.stream_metadata)?;
         Ok(TsfSseReadSession {
             client: self.clone(),
             options,
@@ -739,13 +822,14 @@ impl TsfClient {
     async fn connect_read_socket(
         &self,
         options: &ReadOptions,
+        route: DataPlaneRoute,
     ) -> Result<ConnectedReadSocket, TsfClientError> {
         validate_read_options(options)?;
         let opening_frame = ClientFrame::OpenRead {
             link_secret: options.link_secret.clone(),
         }
         .encode()?;
-        let mut url = self.websocket_url(format_args!("/streams/{}/read", options.stream_id))?;
+        let mut url = self.websocket_url(route.path(&options.stream_id, "read"))?;
         append_read_query(&mut url, options);
         let connect_timeout = self.config.websocket_connect_timeout;
         let progress_timeout = self.config.websocket_progress_timeout;
@@ -763,6 +847,7 @@ impl TsfClient {
                     expect_read_handshake(&mut ws),
                 )
                 .await?;
+                validate_read_stream_metadata(&options.stream_id, None, &stream_metadata)?;
 
                 Ok(ConnectedReadSocket {
                     socket: ReadSocket {
@@ -941,11 +1026,12 @@ pub struct InvalidIdempotencyKey;
 ///
 /// Records are manually numbered: the caller owns `writer_seq_num` assignment and contiguous
 /// split-part layout via [`AppendRecord`] and
-/// [`split_logical_record`](crate::transcript::split_logical_record). [`TsfWriter`] is the
+/// [`split_logical_record`](crate::logical_records::split_logical_record). [`TsfWriter`] is the
 /// actor-sequenced alternative with reconnect resend.
 pub struct TsfWriteSession {
     ws: ClientWebSocket,
     progress_timeout: Duration,
+    stream_kind: StreamKind,
 }
 
 /// Stream, credentials, and sequence precondition for one durable [`TsfWriter`].
@@ -1173,6 +1259,7 @@ impl TsfProducer {
 pub struct TsfWriter {
     producer: TsfProducer,
     task: Option<JoinHandle<()>>,
+    stream_kind: StreamKind,
 }
 
 impl fmt::Debug for TsfWriter {
@@ -1184,7 +1271,13 @@ impl fmt::Debug for TsfWriter {
 }
 
 impl TsfWriter {
-    fn new(client: TsfClient, options: WriteSessionOptions, session: TsfWriteSession) -> Self {
+    fn new(
+        client: TsfClient,
+        options: WriteSessionOptions,
+        route: DataPlaneRoute,
+        session: TsfWriteSession,
+    ) -> Self {
+        let stream_kind = session.stream_kind;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(WriterShared {
             terminal_error: Arc::new(OnceLock::new()),
@@ -1194,6 +1287,7 @@ impl TsfWriter {
         let task = tokio::spawn(run_writer(
             client,
             options,
+            route,
             session,
             cmd_rx,
             Arc::clone(&shared),
@@ -1202,12 +1296,18 @@ impl TsfWriter {
         Self {
             producer: TsfProducer { cmd_tx, shared },
             task: Some(task),
+            stream_kind,
         }
     }
 
     /// Returns a cloneable submission handle for this writer.
     pub fn producer(&self) -> TsfProducer {
         self.producer.clone()
+    }
+
+    /// Returns the immutable kind reported by the stream.
+    pub const fn stream_kind(&self) -> StreamKind {
+        self.stream_kind
     }
 
     /// Queues the batch and returns its durability ticket.
@@ -1327,6 +1427,11 @@ impl Drop for TsfWriter {
 }
 
 impl TsfWriteSession {
+    /// Returns the immutable kind reported by the stream.
+    pub const fn stream_kind(&self) -> StreamKind {
+        self.stream_kind
+    }
+
     /// Sends one physical record under the progress timeout.
     pub async fn send(&mut self, record: AppendRecord) -> Result<(), TsfClientError> {
         let progress_timeout = self.progress_timeout;
@@ -1421,7 +1526,6 @@ impl PendingSubmission {
         AppendRecord {
             writer_seq_num: self.start_seq_num + index as u64,
             part: payload.part,
-            format: payload.format,
             data: payload.data.clone(),
         }
     }
@@ -1479,11 +1583,17 @@ impl WriterCursor {
 async fn run_writer(
     client: TsfClient,
     options: WriteSessionOptions,
+    route: DataPlaneRoute,
     mut session: TsfWriteSession,
     mut cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
     shared: Arc<WriterShared>,
 ) {
     let _shutdown_guard = ShutdownGuard(Arc::clone(&shared));
+    let connection = WriterReconnectContext {
+        client: &client,
+        options: &options,
+        route,
+    };
     let mut pending: VecDeque<PendingSubmission> = VecDeque::new();
     let mut close_tx: Option<oneshot::Sender<Result<(), TsfClientError>>> = None;
     let mut reconnect_attempts = 0;
@@ -1498,8 +1608,7 @@ async fn run_writer(
         {
             match recover_pending_appends(
                 &mut session,
-                &client,
-                &options,
+                &connection,
                 &mut pending,
                 &mut in_flight,
                 &mut reconnect_attempts,
@@ -1575,8 +1684,7 @@ async fn run_writer(
                 if let Some(error) = recover_from
                     && let Err(error) = recover_pending_appends(
                         &mut session,
-                        &client,
-                        &options,
+                        &connection,
                         &mut pending,
                         &mut in_flight,
                         &mut reconnect_attempts,
@@ -1724,6 +1832,12 @@ async fn send_pending(
     .await
 }
 
+struct WriterReconnectContext<'a> {
+    client: &'a TsfClient,
+    options: &'a WriteSessionOptions,
+    route: DataPlaneRoute,
+}
+
 /// Reconnects the write session and marks every unacknowledged record for paced resend.
 ///
 /// The fresh socket carries no in-flight records, so the whole in-flight window is replaced —
@@ -1733,8 +1847,7 @@ async fn send_pending(
 /// exact writer identity, sequence ranges, and payloads.
 async fn recover_pending_appends(
     session: &mut TsfWriteSession,
-    client: &TsfClient,
-    options: &WriteSessionOptions,
+    connection: &WriterReconnectContext<'_>,
     pending: &mut VecDeque<PendingSubmission>,
     in_flight: &mut InFlightWindow,
     reconnect_attempts: &mut usize,
@@ -1748,8 +1861,15 @@ async fn recover_pending_appends(
         let delay = reconnect_delay(*reconnect_attempts);
         sleep(delay).await;
         *reconnect_attempts = (*reconnect_attempts).saturating_add(1);
-        match client.connect_write_session_once(options).await {
+        match connection
+            .client
+            .connect_write_session_once(connection.options, connection.route)
+            .await
+        {
             Ok(connected) => {
+                if connected.stream_kind != session.stream_kind {
+                    return Err(TsfClientError::StreamKindChanged);
+                }
                 *session = connected;
                 for submission in pending.iter_mut() {
                     submission.sent = submission.acked;
@@ -1966,6 +2086,11 @@ impl TsfSseReadSession {
                     self.finished = true;
                     return Ok(None);
                 };
+                validate_read_stream_metadata(
+                    &self.options.stream_id,
+                    Some(self.stream_metadata.kind),
+                    &connection.stream_metadata,
+                )?;
                 if connection.resume_event.is_some() {
                     self.last_event = connection.resume_event;
                 }
@@ -2005,8 +2130,14 @@ impl TsfSseReadSession {
                 }
                 "error" => return Err(TsfClientError::SseTerminal(event.data)),
                 "stream_metadata" => {
-                    self.stream_metadata = serde_json::from_str(&event.data)
-                        .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?
+                    let stream_metadata = serde_json::from_str(&event.data)
+                        .map_err(|_| TsfClientError::InvalidSse("invalid stream_metadata event"))?;
+                    validate_read_stream_metadata(
+                        &self.options.stream_id,
+                        Some(self.stream_metadata.kind),
+                        &stream_metadata,
+                    )?;
+                    self.stream_metadata = stream_metadata;
                 }
                 _ => {}
             }
@@ -2022,6 +2153,7 @@ impl TsfSseReadSession {
 pub struct TsfReadSession {
     client: TsfClient,
     options: ReadOptions,
+    route: DataPlaneRoute,
     socket: ReadSocket,
     stream_metadata: StreamMetadata,
     finished: bool,
@@ -2034,12 +2166,14 @@ impl TsfReadSession {
     fn new(
         client: TsfClient,
         options: ReadOptions,
+        route: DataPlaneRoute,
         socket: ReadSocket,
         stream_metadata: StreamMetadata,
     ) -> Self {
         Self {
             client,
             options,
+            route,
             socket,
             stream_metadata,
             finished: false,
@@ -2115,7 +2249,15 @@ impl TsfReadSession {
         let ConnectedReadSocket {
             socket,
             stream_metadata,
-        } = self.client.connect_read_socket(&self.options).await?;
+        } = self
+            .client
+            .connect_read_socket(&self.options, self.route)
+            .await?;
+        validate_read_stream_metadata(
+            &self.options.stream_id,
+            Some(self.stream_metadata.kind),
+            &stream_metadata,
+        )?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
         self.no_progress_reconnects = 0;
@@ -2587,9 +2729,9 @@ const JSON_ESCAPED_LEN: [u8; 256] = {
 };
 
 /// Chooses the smaller JSON payload key while preserving the exact record bytes.
-fn compact_record_payload(bytes: &[u8]) -> (Option<String>, Option<String>) {
+fn compact_record_payload(bytes: &[u8]) -> JsonRecordPayload {
     let Ok(text) = std::str::from_utf8(bytes) else {
-        return (None, Some(URL_SAFE_NO_PAD.encode(bytes)));
+        return JsonRecordPayload::Bytes(URL_SAFE_NO_PAD.encode(bytes));
     };
     let escaped_len = bytes.iter().fold(0usize, |total, byte| {
         total + JSON_ESCAPED_LEN[*byte as usize] as usize
@@ -2597,9 +2739,9 @@ fn compact_record_payload(bytes: &[u8]) -> (Option<String>, Option<String>) {
     let text_len = br#""text":""#.len() + escaped_len;
     let bytes_len = br#""bytes":""#.len() + bytes.len().saturating_mul(4).div_ceil(3);
     if text_len <= bytes_len {
-        (Some(text.to_owned()), None)
+        JsonRecordPayload::Text(text.to_owned())
     } else {
-        (None, Some(URL_SAFE_NO_PAD.encode(bytes)))
+        JsonRecordPayload::Bytes(URL_SAFE_NO_PAD.encode(bytes))
     }
 }
 
@@ -2610,10 +2752,9 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
     let capacity: usize = batch
         .records
         .iter()
-        .map(|record| match (&record.text, &record.bytes) {
-            (Some(text), _) => text.len(),
-            (None, Some(bytes)) => base64::decoded_len_estimate(bytes.len()),
-            (None, None) => 0,
+        .map(|record| match &record.payload {
+            JsonRecordPayload::Text(text) => text.len(),
+            JsonRecordPayload::Bytes(bytes) => base64::decoded_len_estimate(bytes.len()),
         })
         .sum();
     let mut payload = Vec::with_capacity(capacity);
@@ -2626,18 +2767,12 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
         if decoded_len != WriterId::BYTE_LEN {
             return Err(TsfClientError::InvalidSse("invalid writer id length"));
         }
-        let format = record.resolved_format();
         let data_start = payload.len();
-        match (record.text, record.bytes) {
-            (Some(text), None) => payload.extend_from_slice(text.as_bytes()),
-            (None, Some(bytes)) => URL_SAFE_NO_PAD
+        match record.payload {
+            JsonRecordPayload::Text(text) => payload.extend_from_slice(text.as_bytes()),
+            JsonRecordPayload::Bytes(bytes) => URL_SAFE_NO_PAD
                 .decode_vec(&bytes, &mut payload)
                 .map_err(|_| TsfClientError::InvalidSse("invalid record base64url"))?,
-            _ => {
-                return Err(TsfClientError::InvalidSse(
-                    "a record carries exactly one of text or bytes",
-                ));
-            }
         }
         // An omitted part header is an unsplit record. The SSE event bound
         // caps the buffer well inside u32, so these narrows cannot truncate.
@@ -2651,7 +2786,6 @@ fn sse_read_batch(batch: SseReadBatchData) -> Result<ReadBatch, TsfClientError> 
             writer_id: WriterId::from_bytes(writer),
             writer_seq_num: record.writer.seq_num,
             part,
-            format,
             data_start: data_start as u32,
             data_len: (payload.len() - data_start) as u32,
         });
@@ -2946,26 +3080,44 @@ async fn expect_frame<T>(
     }
 }
 
-async fn expect_ready(ws: &mut ClientWebSocket) -> Result<(), TsfClientError> {
+async fn expect_ready(ws: &mut ClientWebSocket) -> Result<StreamKind, TsfClientError> {
     expect_frame(ws, |frame| match frame {
-        ServerFrame::Ready => Ok(()),
+        ServerFrame::Ready(kind) => Ok(kind),
         other => Err(other),
     })
     .await
 }
 
 async fn expect_read_handshake(ws: &mut ClientWebSocket) -> Result<StreamMetadata, TsfClientError> {
-    expect_ready(ws).await?;
-    expect_frame(ws, |frame| match frame {
+    let kind = expect_ready(ws).await?;
+    let metadata = expect_frame(ws, |frame| match frame {
         ServerFrame::StreamMetadata(stream_metadata) => Ok(stream_metadata),
         other => Err(other),
     })
-    .await
+    .await?;
+    if metadata.kind != kind {
+        return Err(TsfClientError::StreamKindChanged);
+    }
+    Ok(metadata)
+}
+
+fn validate_read_stream_metadata(
+    expected_stream_id: &StreamId,
+    expected_kind: Option<StreamKind>,
+    metadata: &StreamMetadata,
+) -> Result<(), TsfClientError> {
+    if metadata.stream_id != *expected_stream_id {
+        return Err(TsfClientError::StreamIdChanged);
+    }
+    if expected_kind.is_some_and(|kind| metadata.kind != kind) {
+        return Err(TsfClientError::StreamKindChanged);
+    }
+    Ok(())
 }
 
 fn server_frame_name(frame: &ServerFrame) -> &'static str {
     match frame {
-        ServerFrame::Ready => "ready",
+        ServerFrame::Ready(_) => "ready",
         ServerFrame::AppendAck { .. } => "append_ack",
         ServerFrame::ReadBatch(_) => "read_batch",
         ServerFrame::Heartbeat => "heartbeat",
@@ -3093,6 +3245,12 @@ pub enum TsfClientError {
     /// WebSocket read response violated the requested stream contract.
     #[error("invalid WebSocket read response: {0}")]
     InvalidReadResponse(&'static str),
+    /// A reconnect or metadata frame reported a different immutable stream kind.
+    #[error("server reported inconsistent stream kinds")]
+    StreamKindChanged,
+    /// A reader handshake or metadata frame reported a different stream identity.
+    #[error("server reported a different stream ID")]
+    StreamIdChanged,
     /// The server ended an SSE session with a stable terminal error event.
     #[error("SSE terminal error: {0}")]
     SseTerminal(String),
@@ -3343,8 +3501,24 @@ mod tests {
     use crate::protocol::{
         read::ReadStop,
         rest::{SseReadRecord, SseReadWriter},
-        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord, RecordFormat},
+        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, OwnedReadRecord},
     };
+
+    #[test]
+    fn terminal_data_plane_routes_are_distinct() {
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+
+        assert_eq!(
+            DataPlaneRoute::TerminalInput.path(&stream_id, "read"),
+            "/streams/00000000000000000000000000000000/terminal/input/read"
+        );
+        assert_eq!(
+            DataPlaneRoute::TerminalOutput.path(&stream_id, "write"),
+            "/streams/00000000000000000000000000000000/terminal/output/write"
+        );
+    }
 
     #[test]
     fn parses_structured_http_error_details() {
@@ -3527,6 +3701,7 @@ mod tests {
             stream_id: "00000000000000000000000000000000"
                 .parse()
                 .expect("stream ID"),
+            kind: crate::protocol::rest::StreamKind::Transcript,
             title: None,
             visibility: crate::protocol::rest::Visibility::Private,
             created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -3535,7 +3710,7 @@ mod tests {
         let expected_stream_metadata = stream_metadata.clone();
         let sender = tokio::spawn(async move {
             for frame in [
-                ServerFrame::Ready,
+                ServerFrame::Ready(crate::protocol::rest::StreamKind::Transcript),
                 ServerFrame::StreamMetadata(stream_metadata),
             ] {
                 server
@@ -3553,6 +3728,37 @@ mod tests {
 
         assert_eq!(stream_metadata, expected_stream_metadata);
         sender.await.expect("join handshake sender");
+    }
+
+    #[test]
+    fn read_metadata_keeps_stream_identity_and_kind_stable() {
+        let stream_id = "00000000000000000000000000000000"
+            .parse()
+            .expect("stream ID");
+        let mut metadata = StreamMetadata {
+            stream_id,
+            kind: StreamKind::Transcript,
+            title: None,
+            visibility: crate::protocol::rest::Visibility::Private,
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+            expires_at: "2026-08-23T00:00:00Z".to_owned(),
+        };
+
+        validate_read_stream_metadata(&stream_id, Some(StreamKind::Transcript), &metadata)
+            .expect("matching metadata");
+        metadata.kind = StreamKind::Bytes;
+        assert!(matches!(
+            validate_read_stream_metadata(&stream_id, Some(StreamKind::Transcript), &metadata),
+            Err(TsfClientError::StreamKindChanged)
+        ));
+        metadata.kind = StreamKind::Transcript;
+        metadata.stream_id = "10000000000000000000000000000000"
+            .parse()
+            .expect("different stream ID");
+        assert!(matches!(
+            validate_read_stream_metadata(&stream_id, None, &metadata),
+            Err(TsfClientError::StreamIdChanged)
+        ));
     }
 
     #[tokio::test]
@@ -3923,6 +4129,7 @@ mod tests {
         let writer = TsfWriter {
             producer: TsfProducer { cmd_tx, shared },
             task: Some(task),
+            stream_kind: StreamKind::Transcript,
         };
 
         let error = writer.close().await.expect_err("close must fail");
@@ -3953,6 +4160,7 @@ mod tests {
         let writer = TsfWriter {
             producer: TsfProducer { cmd_tx, shared },
             task: Some(tokio::spawn(std::future::pending())),
+            stream_kind: StreamKind::Transcript,
         };
 
         writer.abort();
@@ -4011,7 +4219,7 @@ mod tests {
     ) {
         let (ack_tx, ack_rx) = oneshot::channel();
         let payloads = (0..count)
-            .map(|_| RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, Bytes::new()))
+            .map(|_| RecordPayload::new(PartHeader::unsplit(), Bytes::new()))
             .collect::<Vec<_>>();
         let submission = PendingSubmission {
             start_seq_num,
@@ -4041,9 +4249,7 @@ mod tests {
         let data = Bytes::from(vec![0_u8; payload_bytes]);
         AppendBatch::from_records(
             (0..record_count)
-                .map(|_| {
-                    RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, data.clone())
-                })
+                .map(|_| RecordPayload::new(PartHeader::unsplit(), data.clone()))
                 .collect(),
         )
         .expect("append batch")
@@ -4501,7 +4707,7 @@ mod tests {
                 let _ = stream.read(&mut request).await;
                 let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
                     event: stream_metadata\n\
-                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
+                    data: {\"stream_id\":\"00000000000000000000000000000000\",\"kind\":\"transcript\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}\n\n";
                 let _ = stream.write_all(response.as_bytes()).await;
             }
         });
@@ -4590,20 +4796,23 @@ mod tests {
             vec![0xff; 32],
         ];
         for bytes in cases {
-            let (text, encoded) = compact_record_payload(&bytes);
+            let payload = compact_record_payload(&bytes);
             if let Ok(value) = std::str::from_utf8(&bytes) {
                 let text_len = br#""text":""#.len()
                     + serde_json::to_vec(value).expect("measure text").len()
                     - 2;
                 let bytes_len = br#""bytes":""#.len() + bytes.len().saturating_mul(4).div_ceil(3);
-                assert_eq!(text.is_some(), text_len <= bytes_len, "bytes={bytes:?}");
+                assert_eq!(
+                    matches!(payload, JsonRecordPayload::Text(_)),
+                    text_len <= bytes_len,
+                    "bytes={bytes:?}"
+                );
             } else {
-                assert!(text.is_none());
+                assert!(matches!(payload, JsonRecordPayload::Bytes(_)));
             }
-            let round_tripped = match (&text, &encoded) {
-                (Some(value), None) => value.as_bytes().to_vec(),
-                (None, Some(value)) => URL_SAFE_NO_PAD.decode(value).expect("decode"),
-                _ => unreachable!("exactly one payload key"),
+            let round_tripped = match payload {
+                JsonRecordPayload::Text(value) => value.into_bytes(),
+                JsonRecordPayload::Bytes(value) => URL_SAFE_NO_PAD.decode(value).expect("decode"),
             };
             assert_eq!(round_tripped, bytes);
         }
@@ -4660,9 +4869,7 @@ mod tests {
                 seq_num: 0,
             },
             part: None,
-            format: Some(RecordFormat::Bytes),
-            text: Some(String::new()),
-            bytes: None,
+            payload: JsonRecordPayload::Text(String::new()),
         };
         assert!(matches!(
             sse_read_batch(SseReadBatchData {
@@ -4672,8 +4879,10 @@ mod tests {
         ));
 
         wire_record.writer.id = URL_SAFE_NO_PAD.encode([0_u8; WriterId::BYTE_LEN]);
-        wire_record.text = None;
-        wire_record.bytes = Some(URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES + 1]));
+        wire_record.payload =
+            JsonRecordPayload::Bytes(
+                URL_SAFE_NO_PAD.encode(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES + 1]),
+            );
         assert!(
             sse_read_batch(SseReadBatchData {
                 records: vec![wire_record],
@@ -4732,7 +4941,6 @@ mod tests {
             writer_id: WriterId::from_bytes([0_u8; 16]),
             writer_seq_num: seq_num,
             part: PartHeader::unsplit(),
-            format: RecordFormat::Bytes,
             data: Bytes::from(vec![0_u8; payload_bytes]),
         }
     }
@@ -4746,9 +4954,7 @@ mod tests {
                 seq_num,
             },
             part: None,
-            format: None,
-            text: None,
-            bytes: Some(URL_SAFE_NO_PAD.encode(vec![0_u8; payload_bytes])),
+            payload: JsonRecordPayload::Bytes(URL_SAFE_NO_PAD.encode(vec![0_u8; payload_bytes])),
         }
     }
 
@@ -4762,9 +4968,7 @@ mod tests {
                 seq_num: 30,
             },
             part: None,
-            format: None,
-            text: Some("héllo".to_owned()),
-            bytes: None,
+            payload: JsonRecordPayload::Text("héllo".to_owned()),
         };
         let binary = SseReadRecord {
             seq_num: 4,
@@ -4777,9 +4981,7 @@ mod tests {
                 index: 0,
                 is_final: true,
             }),
-            format: None,
-            text: None,
-            bytes: Some(URL_SAFE_NO_PAD.encode([0_u8, 159, 146, 150])),
+            payload: JsonRecordPayload::Bytes(URL_SAFE_NO_PAD.encode([0_u8, 159, 146, 150])),
         };
         let batch = sse_read_batch(SseReadBatchData {
             records: vec![text, binary],
@@ -4789,7 +4991,6 @@ mod tests {
         assert_eq!(batch.record_count(), 2);
         let first = batch.first();
         assert_eq!(first.data, "héllo".as_bytes());
-        assert_eq!(first.format, RecordFormat::Transcript);
         assert_eq!(first.writer_id, WriterId::from_bytes([7_u8; 16]));
         assert_eq!(first.writer_seq_num, 30);
         let last = batch.last();
@@ -4807,8 +5008,8 @@ mod tests {
     #[test]
     fn stateless_append_compacts_an_escape_heavy_maximum_record() {
         let data = vec![0_u8; MAX_RECORD_PAYLOAD_BYTES];
-        let (text, bytes) = compact_record_payload(&data);
-        assert!(text.is_none());
+        let payload = compact_record_payload(&data);
+        assert!(matches!(payload, JsonRecordPayload::Bytes(_)));
         let request = AppendRecordsRequest {
             writer: Some(AppendWriter {
                 id: URL_SAFE_NO_PAD.encode([0_u8; 16]),
@@ -4816,9 +5017,7 @@ mod tests {
             }),
             records: vec![AppendJsonRecord {
                 part: None,
-                format: Some(RecordFormat::Transcript),
-                text,
-                bytes,
+                payload,
             }],
             expected_next_seq_num: None,
         };
@@ -4834,18 +5033,8 @@ mod tests {
             .expect("stream ID");
         let secret: LinkSecret = "A".repeat(32).parse().expect("canonical secret");
         let large = vec![
-            AppendRecord::new(
-                0,
-                PartHeader::unsplit(),
-                RecordFormat::Bytes,
-                Bytes::from(vec![0; 500 * 1024]),
-            ),
-            AppendRecord::new(
-                1,
-                PartHeader::unsplit(),
-                RecordFormat::Bytes,
-                Bytes::from(vec![0; 500 * 1024]),
-            ),
+            AppendRecord::new(0, PartHeader::unsplit(), Bytes::from(vec![0; 500 * 1024])),
+            AppendRecord::new(1, PartHeader::unsplit(), Bytes::from(vec![0; 500 * 1024])),
         ];
         assert!(matches!(
             client
@@ -4865,7 +5054,6 @@ mod tests {
         let endpoint = [AppendRecord::new(
             u64::MAX,
             PartHeader::unsplit(),
-            RecordFormat::Bytes,
             Bytes::new(),
         )];
         assert!(matches!(
@@ -4883,12 +5071,7 @@ mod tests {
             ))
         ));
 
-        let valid = [AppendRecord::new(
-            0,
-            PartHeader::unsplit(),
-            RecordFormat::Bytes,
-            Bytes::new(),
-        )];
+        let valid = [AppendRecord::new(0, PartHeader::unsplit(), Bytes::new())];
         assert!(matches!(
             client
                 .append_records(

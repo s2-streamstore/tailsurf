@@ -25,18 +25,20 @@ use serde::{Deserialize, Serialize};
 use tailsurf::{
     AppendBatch, AppendTicket, DEFAULT_API_ORIGIN, DurableWriterOptions, LinkId, LinkPermissions,
     LinkSecret, MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES, MAX_WRITER_IN_FLIGHT_RECORDS, ReadOptions,
-    ReadStart, ReadStop, StreamId, StreamTitle, TsfClient, TsfProducer, TsfReadSession,
-    TsfSseReadSession, TsfWriter, default_api_origin,
+    ReadStart, ReadStop, StreamId, StreamKind, StreamRoute, StreamTitle, TsfClient, TsfProducer,
+    TsfReadSession, TsfSseReadSession, TsfWriter, default_api_origin,
+    logical_records::{DEFAULT_MAX_RECORD_REASSEMBLY_BYTES, LogicalRecordAssembler},
     protocol::{
         rest::{
             CreateLinkInput, CreateStreamRequest, CreateStreamResponse, InitialStreamLink,
             MAX_INITIAL_STREAM_LINKS, StreamLinkCredential, StreamMetadata, StreamTitleUpdate,
             UpdateStreamRequest, Visibility,
         },
-        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, PartHeader, RecordFormat},
+        ws::frame::{MAX_RECORD_PAYLOAD_BYTES, PartHeader},
     },
-    stream_url::{StreamLocator, public_stream_url, stream_link},
-    transcript::{DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES, LogicalTranscript},
+    stream_url::{
+        StreamLocator, public_stream_url, public_terminal_url, stream_link, terminal_link,
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
@@ -49,17 +51,21 @@ use url::Url;
 const INTERRUPT_EXIT_CODE: i32 = 130;
 const BYTE_RECORD_LINGER: Duration = Duration::from_millis(10);
 /// Stdout batching window for `tail` and `replay`.
-const TRANSCRIPT_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+const RECORD_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
 /// Read batches held while stdout drains. Each frame carries at most MAX_READ_FRAME_RECORDS
 /// records and about 1 MiB of payload backing, so the queue bounds in-flight output to roughly
 /// 8 MiB plus the batch being printed and transcript split-part pending state.
-const TRANSCRIPT_BATCH_QUEUE: usize = 8;
+const RECORD_BATCH_QUEUE: usize = 8;
 /// Stdin read block size for line-framed and byte-record writes.
 const STDIN_READ_BYTES: usize = 16 * 1024;
 const UPDATE_HINT_CACHE_FILE: &str = ".tailsurf-cli-update-check";
 const UPDATE_HINT_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const UPDATE_HINT_SUCCESS_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_HINT_TIMEOUT: Duration = Duration::from_secs(3);
+
+mod terminal;
+
+use terminal::TerminalArgs;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct UpdateHintCheckCache {
@@ -71,7 +77,7 @@ struct UpdateHintCheckCache {
 #[command(name = "tsf")]
 #[command(version, about = "Create, write, and read tail.surf streams")]
 #[command(
-    after_help = "Create a stream from piped input:\n  anything | tsf\n  anything | tsf new\n\nCapture a program in a new stream:\n  tsf new -- program\n\nWrite to an existing stream:\n  anything | tsf write WRITE_LINK"
+    after_help = "Create a stream from piped input:\n  anything | tsf\n  anything | tsf new\n\nCapture a program in a new stream:\n  tsf new -- program\n\nHost a multiplayer web terminal:\n  tsf terminal\n  tsf terminal -- htop\n\nWrite to an existing stream:\n  anything | tsf write WRITE_LINK"
 )]
 struct Cli {
     /// Tailsurf service origin.
@@ -91,6 +97,8 @@ struct Cli {
 enum Command {
     /// Create a stream and print its links.
     New(NewArgs),
+    /// Host a command in a multiplayer web terminal.
+    Terminal(TerminalArgs),
     /// Write piped input or a program's output to an existing stream.
     Write(WriteArgs),
     /// Follow a stream, optionally starting from existing records.
@@ -149,6 +157,9 @@ struct NewArgs {
     /// Write the complete write-only link to this file. Requires a write link.
     #[arg(long = "write-link-file", value_name = "PATH")]
     write_link_file: Option<PathBuf>,
+    /// Create an opaque byte stream instead of a line-oriented transcript stream.
+    #[arg(long)]
+    bytes: bool,
     #[command(flatten)]
     input: InputArgs,
 }
@@ -167,9 +178,6 @@ struct WriteArgs {
 
 #[derive(Debug, Args)]
 struct InputArgs {
-    /// Preserve input as arbitrary byte records instead of newline-delimited transcript records.
-    #[arg(long)]
-    bytes: bool,
     /// Program to run. Its stdout and stderr are written to the stream.
     #[arg(last = true, value_name = "PROGRAM")]
     program: Vec<String>,
@@ -178,7 +186,6 @@ struct InputArgs {
 impl InputArgs {
     fn piped_defaults() -> Self {
         Self {
-            bytes: false,
             program: Vec::new(),
         }
     }
@@ -195,6 +202,7 @@ impl NewArgs {
             owner_link_file: None,
             read_link_file: None,
             write_link_file: None,
+            bytes: false,
             input: InputArgs::piped_defaults(),
         }
     }
@@ -226,11 +234,11 @@ struct ReadArgs {
     /// Read at most this many records.
     #[arg(long)]
     count: Option<u64>,
-    /// Maximum bytes used to reassemble split transcript records.
+    /// Maximum bytes used to reassemble split records.
     #[arg(
         long,
         value_name = "BYTES",
-        default_value_t = DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
+        default_value_t = DEFAULT_MAX_RECORD_REASSEMBLY_BYTES,
         help_heading = "Advanced"
     )]
     max_reassembly_bytes: usize,
@@ -585,6 +593,14 @@ enum WriteBuffering {
     Lines,
 }
 
+fn write_buffering(kind: StreamKind) -> eyre::Result<WriteBuffering> {
+    match kind {
+        StreamKind::Transcript => Ok(WriteBuffering::Lines),
+        StreamKind::Bytes => Ok(WriteBuffering::Bytes),
+        StreamKind::Terminal => bail!("`tsf write` accepts stream links, not terminal links"),
+    }
+}
+
 // One socket, one stdin, one stdout: worker threads only add wakeup and handoff cost.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -621,6 +637,7 @@ async fn main() -> ExitCode {
 async fn run(origin: Url, command: Command) -> eyre::Result<()> {
     match command {
         Command::New(args) => new_stream(origin, args).await,
+        Command::Terminal(args) => terminal::run(origin, args).await,
         Command::Write(args) => write_stream(origin, args).await,
         Command::Tail(args) => tail_stream(origin, args).await,
         Command::Replay(args) => replay_stream(origin, args).await,
@@ -778,6 +795,11 @@ async fn new_stream(origin: Url, args: NewArgs) -> eyre::Result<()> {
 
     let created = TsfClient::with_api_origin(origin.clone())?
         .create_stream(&CreateStreamRequest {
+            kind: if args.bytes {
+                tailsurf::StreamKind::Bytes
+            } else {
+                tailsurf::StreamKind::Transcript
+            },
             title: args.title.clone(),
             visibility,
             expires_in_seconds: args.expires.map(StreamExpiryArg::seconds),
@@ -785,7 +807,7 @@ async fn new_stream(origin: Url, args: NewArgs) -> eyre::Result<()> {
         })
         .await
         .context("failed to create stream")?;
-    print_created_stream(&created, args.json)?;
+    print_created_stream(&created, args.json, true)?;
     write_link_files(&created, &args)?;
 
     if args.input.program.is_empty() && std::io::stdin().is_terminal() {
@@ -811,6 +833,7 @@ async fn new_stream(origin: Url, args: NewArgs) -> eyre::Result<()> {
 
 async fn write_stream(origin: Url, args: WriteArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream link")?;
+    require_record_stream(&locator, "write")?;
     let link = locator
         .link_declaring(LinkPermissions::allows_write)
         .context("link does not declare write permission")?
@@ -890,20 +913,14 @@ async fn write_input(
     expected_next_seq_num: Option<u64>,
     input: InputArgs,
 ) -> eyre::Result<()> {
-    let buffering = if input.bytes {
-        WriteBuffering::Bytes
-    } else {
-        WriteBuffering::Lines
-    };
     if input.program.is_empty() {
-        stream_stdin_to_writer(origin, stream_id, link, expected_next_seq_num, buffering).await
+        stream_stdin_to_writer(origin, stream_id, link, expected_next_seq_num).await
     } else {
         stream_command_to_writer(
             origin,
             stream_id,
             link,
             expected_next_seq_num,
-            buffering,
             input.program,
         )
         .await
@@ -965,9 +982,9 @@ async fn stream_stdin_to_writer(
     stream_id: StreamId,
     link: LinkSecret,
     expected_next_seq_num: Option<u64>,
-    buffering: WriteBuffering,
 ) -> eyre::Result<()> {
     let writer = connect_session_writer(origin, stream_id, link, expected_next_seq_num).await?;
+    let buffering = write_buffering(writer.stream_kind())?;
     let interrupt = Arc::new(WriteInterrupt::default());
 
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<eyre::Result<Bytes>>(16);
@@ -1006,10 +1023,10 @@ async fn stream_command_to_writer(
     stream_id: StreamId,
     link: LinkSecret,
     expected_next_seq_num: Option<u64>,
-    buffering: WriteBuffering,
     command: Vec<String>,
 ) -> eyre::Result<()> {
     let writer = connect_session_writer(origin, stream_id, link, expected_next_seq_num).await?;
+    let buffering = write_buffering(writer.stream_kind())?;
     let interrupt = Arc::new(WriteInterrupt::default());
     let mut session = WriterSession::new(&writer, Arc::clone(&interrupt));
     let outcome = stream_child_command_output(&mut session, interrupt, buffering, command).await?;
@@ -1187,7 +1204,7 @@ impl ByteRecordAppender {
         let data = self.pending.split().freeze();
         self.deadline = None;
         session
-            .append_physical_record(PartHeader::unsplit(), RecordFormat::Bytes, data)
+            .append_physical_record(PartHeader::unsplit(), data)
             .await
     }
 }
@@ -1289,7 +1306,7 @@ impl LineRecordAppender {
 
     async fn send_line(&mut self, session: &mut WriterSession) -> eyre::Result<()> {
         session
-            .append_logical_record(RecordFormat::Transcript, self.pending.split().freeze())
+            .append_logical_record(self.pending.split().freeze())
             .await
     }
 }
@@ -1354,25 +1371,15 @@ impl WriterSession {
         self.interrupt.triggered().await;
     }
 
-    async fn append_logical_record(
-        &mut self,
-        format: RecordFormat,
-        data: Bytes,
-    ) -> eyre::Result<()> {
+    async fn append_logical_record(&mut self, data: Bytes) -> eyre::Result<()> {
         let payload_bytes = data.len();
-        let batch =
-            AppendBatch::split_logical(format, data).context("failed to split logical record")?;
+        let batch = AppendBatch::split_logical(data).context("failed to split logical record")?;
         self.submit_batch(batch, payload_bytes).await
     }
 
-    async fn append_physical_record(
-        &mut self,
-        part: PartHeader,
-        format: RecordFormat,
-        data: Bytes,
-    ) -> eyre::Result<()> {
+    async fn append_physical_record(&mut self, part: PartHeader, data: Bytes) -> eyre::Result<()> {
         let payload_bytes = data.len();
-        let batch = AppendBatch::single(part, format, data).context("failed to build record")?;
+        let batch = AppendBatch::single(part, data).context("failed to build record")?;
         self.submit_batch(batch, payload_bytes).await
     }
 
@@ -1476,6 +1483,7 @@ fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadSta
 
 async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
+    require_record_stream(&locator, "tail")?;
     let request = read_options(&locator, &args.read, ReadStart::TailOffset(0));
 
     read_transcript(
@@ -1489,6 +1497,7 @@ async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
 
 async fn replay_stream(origin: Url, args: ReplayArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
+    require_record_stream(&locator, "replay")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
     request.stop.get_or_insert(ReadStop {
         wait_seconds: Some(0),
@@ -1663,9 +1672,10 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
         )
         .await
         .context("failed to create link")?;
-    let url = stream_link(
+    let url = resource_link_for_route(
         &created.web_origin,
         &locator.stream_id,
+        locator.route,
         created.credential.permissions,
         &created.credential.secret,
     )?;
@@ -1713,26 +1723,31 @@ async fn read_transcript(
                 .context("failed to connect reader")?,
         ))
     };
-    let (batch_tx, mut batch_rx) = mpsc::channel(TRANSCRIPT_BATCH_QUEUE);
+    let kind = reader.stream_metadata().kind;
+    if kind == StreamKind::Terminal {
+        bail!("`tsf read` accepts stream links, not terminal links");
+    }
+    let (batch_tx, mut batch_rx) = mpsc::channel(RECORD_BATCH_QUEUE);
     let reader_task = tokio::spawn(forward_read_batches(reader, batch_tx));
 
-    let mut stdout = BufWriter::with_capacity(TRANSCRIPT_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
-    let mut transcript = LogicalTranscript::with_max_reassembly_bytes(max_reassembly_bytes);
-    let result = write_transcript_batches(&mut batch_rx, &mut stdout, &mut transcript).await;
+    let mut stdout = BufWriter::with_capacity(RECORD_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
+    let mut records = LogicalRecordAssembler::with_max_reassembly_bytes(max_reassembly_bytes);
+    let result = write_record_batches(&mut batch_rx, &mut stdout, &mut records, kind).await;
     stdout.flush().await.context("failed to flush stdout")?;
     result?;
 
-    reader_task.await.context("transcript reader task panicked")
+    reader_task.await.context("record reader task panicked")
 }
 
 /// Writes decoded batches until the reader finishes, flushing whenever none is already waiting.
 ///
 /// Assembly happens here so transient output borrows payloads straight from each batch instead
-/// of copying every record into an owned transcript record.
-async fn write_transcript_batches(
+/// of copying every record into an owned logical record.
+async fn write_record_batches(
     batch_rx: &mut mpsc::Receiver<eyre::Result<tailsurf::ReadBatch>>,
     stdout: &mut BufWriter<tokio::io::Stdout>,
-    transcript: &mut LogicalTranscript,
+    records: &mut LogicalRecordAssembler,
+    kind: StreamKind,
 ) -> eyre::Result<()> {
     loop {
         let batch = tokio::select! {
@@ -1749,16 +1764,15 @@ async fn write_transcript_batches(
 
         let batch = batch?;
         for record in &batch {
-            let Some(record) = transcript
+            let Some(record) = records
                 .push_record(record)
-                .context("failed to assemble transcript record")?
+                .context("failed to assemble logical record")?
             else {
                 continue;
             };
-            let format = record.format;
-            write_transcript_data(stdout, record.data).await?;
+            write_record_data(stdout, record.data).await?;
             // Transcript records carry no delimiter; the terminator is presentation framing.
-            if format == RecordFormat::Transcript {
+            if kind == StreamKind::Transcript {
                 stdout
                     .write_all(b"\n")
                     .await
@@ -1778,6 +1792,13 @@ enum TranscriptReader {
 }
 
 impl TranscriptReader {
+    fn stream_metadata(&self) -> &StreamMetadata {
+        match self {
+            Self::WebSocket(reader) => reader.stream_metadata(),
+            Self::Sse(reader) => reader.stream_metadata(),
+        }
+    }
+
     async fn next_batch(&mut self) -> eyre::Result<Option<tailsurf::ReadBatch>> {
         match self {
             Self::WebSocket(reader) => reader.next_batch().await.context("failed to read stream"),
@@ -1808,7 +1829,7 @@ async fn forward_read_batches(
         let _ = batch_tx.send(Err(error)).await;
     }
 }
-async fn write_transcript_data(
+async fn write_record_data(
     stdout: &mut (impl AsyncWrite + Unpin),
     mut data: impl Buf,
 ) -> eyre::Result<()> {
@@ -1818,7 +1839,7 @@ async fn write_transcript_data(
         let chunk = data.chunk();
         let chunk_len = chunk.len();
         if chunk_len == 0 {
-            bail!("transcript data returned an empty chunk before EOF");
+            bail!("record data returned an empty chunk before EOF");
         }
         stdout
             .write_all(chunk)
@@ -1843,6 +1864,13 @@ fn owner_client_from_link(
         locator,
         owner_link_secret,
     ))
+}
+
+fn require_record_stream(locator: &StreamLocator, command: &str) -> eyre::Result<()> {
+    if locator.route == StreamRoute::Terminal {
+        bail!("`tsf {command}` accepts stream links, not terminal links");
+    }
+    Ok(())
 }
 
 fn confirm_delete(stream_id: &StreamId, yes: bool) -> eyre::Result<bool> {
@@ -1895,11 +1923,59 @@ fn write_json(writer: impl std::io::Write, value: &impl Serialize) -> eyre::Resu
     Ok(())
 }
 
-fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Result<()> {
+fn resource_link(
+    web_origin: &Url,
+    stream_id: &StreamId,
+    kind: StreamKind,
+    permissions: LinkPermissions,
+    secret: &LinkSecret,
+) -> Result<Url, tailsurf::stream_url::StreamLinkError> {
+    match kind {
+        StreamKind::Transcript | StreamKind::Bytes => {
+            stream_link(web_origin, stream_id, permissions, secret)
+        }
+        StreamKind::Terminal => terminal_link(web_origin, stream_id, permissions, secret),
+    }
+}
+
+fn resource_link_for_route(
+    web_origin: &Url,
+    stream_id: &StreamId,
+    route: StreamRoute,
+    permissions: LinkPermissions,
+    secret: &LinkSecret,
+) -> Result<Url, tailsurf::stream_url::StreamLinkError> {
+    match route {
+        StreamRoute::Stream => stream_link(web_origin, stream_id, permissions, secret),
+        StreamRoute::Terminal => terminal_link(web_origin, stream_id, permissions, secret),
+    }
+}
+
+fn public_resource_url(
+    web_origin: &Url,
+    stream_id: &StreamId,
+    kind: StreamKind,
+) -> Result<Url, tailsurf::stream_url::StreamLinkError> {
+    match kind {
+        StreamKind::Transcript | StreamKind::Bytes => public_stream_url(web_origin, stream_id),
+        StreamKind::Terminal => public_terminal_url(web_origin, stream_id),
+    }
+}
+
+fn print_created_stream(
+    created: &CreateStreamResponse,
+    json: bool,
+    show_owner_link: bool,
+) -> eyre::Result<()> {
     let web_origin = &created.web_origin;
     if !json {
+        let resource = match created.kind {
+            StreamKind::Transcript => "transcript stream",
+            StreamKind::Bytes => "byte stream",
+            StreamKind::Terminal => "terminal",
+        };
         println!(
-            "Created {} stream {}",
+            "Created {} {resource} {}",
             created.visibility, created.stream_id
         );
         println!(
@@ -1907,19 +1983,21 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
             created
                 .title
                 .as_ref()
-                .map_or("Untitled stream", StreamTitle::as_str)
+                .map_or_else(|| format!("Untitled {resource}"), |title| title.to_string())
         );
         println!("Expires: {}", created.expires_at);
         let mut links = created
             .links
             .iter()
+            .filter(|credential| show_owner_link || !credential.permissions.allows_owner())
             .map(|credential| {
                 Ok((
                     credential.link_id.as_str(),
                     credential.permissions,
-                    stream_link(
+                    resource_link(
                         web_origin,
                         &created.stream_id,
+                        created.kind,
                         credential.permissions,
                         &credential.secret,
                     )?,
@@ -1935,7 +2013,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
             links.push((
                 "Public",
                 LinkPermissions::read(),
-                public_stream_url(web_origin, &created.stream_id)?,
+                public_resource_url(web_origin, &created.stream_id, created.kind)?,
                 "  (public)",
             ));
         }
@@ -1957,6 +2035,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
     } else {
         let output = CreatedStreamOutput {
             stream_id: created.stream_id.to_string(),
+            kind: created.kind.as_str(),
             title: created
                 .title
                 .as_ref()
@@ -1970,9 +2049,10 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
                     Ok(CreatedLinkOutput {
                         link_id: credential.link_id.to_string(),
                         permissions: permission_label(credential.permissions),
-                        url: stream_link(
+                        url: resource_link(
                             web_origin,
                             &created.stream_id,
+                            created.kind,
                             credential.permissions,
                             &credential.secret,
                         )?
@@ -1981,9 +2061,9 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
                 })
                 .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?,
             public_url: match created.visibility {
-                Visibility::Public => {
-                    Some(public_stream_url(web_origin, &created.stream_id)?.to_string())
-                }
+                Visibility::Public => Some(
+                    public_resource_url(web_origin, &created.stream_id, created.kind)?.to_string(),
+                ),
                 Visibility::Private => None,
             },
         };
@@ -1995,6 +2075,7 @@ fn print_created_stream(created: &CreateStreamResponse, json: bool) -> eyre::Res
 fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()> {
     if !json {
         println!("Stream {}", stream.stream_id);
+        println!("Kind: {}", stream.kind);
         println!(
             "Title: {}",
             stream
@@ -2072,9 +2153,10 @@ fn write_link_file(
         .iter()
         .find(|link| link.permissions == permissions)
         .with_context(|| format!("created stream did not include a {kind} link"))?;
-    let url = stream_link(
+    let url = resource_link(
         &created.web_origin,
         &created.stream_id,
+        created.kind,
         link.permissions,
         &link.secret,
     )?;
@@ -2164,6 +2246,7 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
 #[derive(Serialize)]
 struct CreatedStreamOutput {
     stream_id: String,
+    kind: &'static str,
     title: Option<String>,
     visibility: &'static str,
     expires_at: String,
@@ -2196,6 +2279,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn record_commands_reject_terminal_links() {
+        let stream_id: StreamId = "00000000000000000000000000000000"
+            .parse()
+            .expect("valid stream ID");
+        let terminal = StreamLocator {
+            stream_id,
+            route: StreamRoute::Terminal,
+            link: None,
+            anchor: None,
+        };
+        let records = StreamLocator {
+            stream_id,
+            route: StreamRoute::Stream,
+            link: None,
+            anchor: None,
+        };
+
+        assert_eq!(
+            require_record_stream(&terminal, "tail")
+                .expect_err("terminal link must be rejected")
+                .to_string(),
+            "`tsf tail` accepts stream links, not terminal links",
+        );
+        require_record_stream(&records, "tail").expect("record link must be accepted");
+    }
+
+    #[test]
     fn initial_links_accept_semantic_ids_and_short_permissions() {
         let parsed = "deploy-bot=read"
             .parse::<InitialLinkArg>()
@@ -2222,6 +2332,7 @@ mod tests {
         let new_args = |links: Vec<InitialLinkArg>| NewArgs {
             title: None,
             public: false,
+            bytes: false,
             links,
             expires: None,
             json: false,
@@ -2229,7 +2340,6 @@ mod tests {
             read_link_file: None,
             write_link_file: None,
             input: InputArgs {
-                bytes: false,
                 program: Vec::new(),
             },
         };

@@ -10,7 +10,7 @@ paths:
     post:
       operationId: createStream
       summary: Create a stream
-      description: The server generates a random Stream ID. When Idempotency-Key is present, an exact key and request replay resolves that ID and returns the original stream and link credentials while the mapped stream remains active. Reusing the key with a different request returns 409. Treat the key and complete request as sensitive recovery material. When the header is absent, creation is one-shot. A retry creates another stream and cannot recover a lost response.
+      description: The server generates a random Stream ID. Terminal creation requires Idempotency-Key. When the header is present, an exact key and request replay resolves that ID and returns the original stream and link credentials while the mapped stream remains active. Reusing the key with a different request returns 409. Treat the key and complete request as sensitive recovery material. Record stream creation without the header is one-shot. A retry creates another stream and cannot recover a lost response.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -132,6 +132,7 @@ paths:
     post:
       operationId: appendRecords
       summary: Append one atomic durable batch
+      description: For a terminal stream, the batch appends validated input events.
       security: [{ linkBearer: [] }]
       requestBody:
         required: true
@@ -149,7 +150,7 @@ paths:
     get:
       operationId: readRecords
       summary: Read resumable batched SSE
-      description: At most one start selector may be present. Omission means tail_offset 0. until is an exclusive timestamp. wait is an integer from 0 through 60. Omitted wait follows indefinitely unless count or until makes it default to zero. Playback requires count, until, or wait=0. The original query must remain valid when Last-Event-ID is present.
+      description: For a terminal stream, this reads output events. At most one start selector may be present. Omission means tail_offset 0. until is an exclusive timestamp. wait is an integer from 0 through 60. Omitted wait follows indefinitely unless count or until makes it default to zero. Playback requires count, until, or wait=0. The original query must remain valid when Last-Event-ID is present.
       security: [{ linkBearer: [] }, {}]
       parameters:
         - { name: seq_num, in: query, schema: { $ref: '#/components/schemas/ReadSelectorValue' } }
@@ -268,11 +269,16 @@ components:
       maxLength: 120
       pattern: '^(?![ \u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF])(?!.*[ \u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF]$)(?!.*[\u0000-\u001F\u007F-\u009F\u2028\u2029])(?:[^\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$'
       description: Human-facing Unicode title. Code-point length is at most 120. Leading or trailing whitespace, control characters, and line breaks are invalid.
+    StreamKind:
+      type: string
+      enum: [transcript, bytes, terminal]
+      description: Immutable stream semantics. Transcript and byte streams use one record log. Terminals use separate input and output channels.
     StreamMetadata:
       type: object
-      required: [stream_id, title, visibility, created_at, expires_at]
+      required: [stream_id, kind, title, visibility, created_at, expires_at]
       properties:
         stream_id: { $ref: '#/components/schemas/StreamId' }
+        kind: { $ref: '#/components/schemas/StreamKind' }
         title: { oneOf: [{ $ref: '#/components/schemas/StreamTitle' }, { type: 'null' }] }
         visibility: { enum: [private, public] }
         created_at: { type: string, format: date-time }
@@ -290,6 +296,9 @@ components:
       additionalProperties: false
       required: [links]
       properties:
+        kind:
+          $ref: '#/components/schemas/StreamKind'
+          default: transcript
         title: { $ref: '#/components/schemas/StreamTitle' }
         visibility: { enum: [private, public], default: private }
         expires_in_seconds: { type: integer, minimum: 1, maximum: 864000 }
@@ -346,12 +355,11 @@ components:
       properties: { index: { type: integer, minimum: 0, maximum: 2147483647 }, is_final: { type: boolean } }
     AppendRecord:
       type: object
-      description: Exactly one of text or bytes carries the payload. The payload key implies the format when it is absent, text as transcript and bytes as bytes; an explicit format covers the cross cases. Producers may use either valid payload representation.
+      description: Exactly one of text or bytes carries the payload. The keys are JSON encodings and do not change the immutable stream kind. Producers may use either valid representation.
       additionalProperties: false
       minProperties: 1
       properties:
         part: { $ref: '#/components/schemas/RecordPart' }
-        format: { enum: [bytes, transcript] }
         text: { type: string }
         bytes: { $ref: '#/components/schemas/BytesBase64url' }
       oneOf:
@@ -391,7 +399,7 @@ components:
         last_timestamp_ms: { $ref: '#/components/schemas/DecimalSafeU64' }
     ReadRecord:
       type: object
-      description: Exactly one of text or bytes carries the payload, chosen as the smaller JSON representation. An omitted part is an unsplit record. An omitted format follows the payload key, text as transcript and bytes as bytes.
+      description: Exactly one of text or bytes carries the payload, chosen as the smaller JSON representation while preserving the exact bytes. An omitted part is an unsplit record. The immutable stream kind defines the payload semantics.
       required: [seq_num, timestamp_ms, writer]
       properties:
         seq_num: { $ref: '#/components/schemas/DecimalSafeU64' }
@@ -403,7 +411,6 @@ components:
             id: { $ref: '#/components/schemas/WriterId' }
             seq_num: { $ref: '#/components/schemas/DecimalU64' }
         part: { $ref: '#/components/schemas/RecordPart' }
-        format: { enum: [bytes, transcript] }
         text: { type: string }
         bytes: { $ref: '#/components/schemas/BytesBase64url' }
       oneOf:

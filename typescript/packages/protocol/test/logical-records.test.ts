@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
-  LogicalTranscript,
+  DEFAULT_MAX_RECORD_REASSEMBLY_BYTES,
+  LogicalRecordAssembler,
   partHeader,
   parseWriterId,
-  RecordFormat,
   UNSPLIT_PART,
   type ReadRecord,
 } from "../src/index.js";
@@ -13,9 +12,9 @@ import {
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-describe("logical transcript", () => {
+describe("logical record assembler", () => {
   it("suppresses duplicate writer sequence numbers", () => {
-    const transcript = new LogicalTranscript();
+    const transcript = new LogicalRecordAssembler();
 
     expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "hello")))).toBe(
       "hello",
@@ -24,7 +23,7 @@ describe("logical transcript", () => {
   });
 
   it("reassembles contiguous split records", () => {
-    const transcript = new LogicalTranscript();
+    const transcript = new LogicalRecordAssembler();
 
     expect(transcript.pushRecord(record(7n, partHeader(0, false), "hel"))).toBeUndefined();
     expect(text(transcript.pushRecord(record(8n, partHeader(1, true), "lo")))).toBe(
@@ -33,7 +32,7 @@ describe("logical transcript", () => {
   });
 
   it("drops split records after gaps and resumes on an unsplit record", () => {
-    const transcript = new LogicalTranscript();
+    const transcript = new LogicalRecordAssembler();
 
     expect(transcript.pushRecord(record(7n, partHeader(0, false), "hel"))).toBeUndefined();
     expect(transcript.pushRecord(record(9n, partHeader(2, true), "lo"))).toBeUndefined();
@@ -43,7 +42,7 @@ describe("logical transcript", () => {
   });
 
   it("tracks writers independently", () => {
-    const transcript = new LogicalTranscript();
+    const transcript = new LogicalRecordAssembler();
 
     expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "first", 1)))).toBe(
       "first",
@@ -54,19 +53,19 @@ describe("logical transcript", () => {
   });
 
   it("enforces the reassembly byte limit and resynchronizes", () => {
-    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
+    const transcript = new LogicalRecordAssembler({ maxReassemblyBytes: 4 });
 
     expect(transcript.pushRecord(record(7n, partHeader(0, false), "hel"))).toBeUndefined();
     expect(() =>
       transcript.pushRecord(record(8n, partHeader(1, true), "lo")),
-    ).toThrowError(expect.objectContaining({ code: "transcript_reassembly_limit" }));
+    ).toThrowError(expect.objectContaining({ code: "record_reassembly_limit" }));
     expect(text(transcript.pushRecord(record(9n, UNSPLIT_PART, "next")))).toBe(
       "next",
     );
   });
 
   it("does not charge borrowed unsplit records to reassembly", () => {
-    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
+    const transcript = new LogicalRecordAssembler({ maxReassemblyBytes: 4 });
 
     expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "hello")))).toBe(
       "hello",
@@ -74,21 +73,21 @@ describe("logical transcript", () => {
   });
 
   it("bounds writer cardinality internally without disturbing known writers", () => {
-    const transcript = new LogicalTranscript();
+    const transcript = new LogicalRecordAssembler();
 
     for (let writer = 0; writer < 4_096; writer += 1) {
       expect(text(transcript.pushRecord(record(0n, UNSPLIT_PART, "value", writer))))
         .toBe("value");
     }
     expect(() => transcript.pushRecord(record(0n, UNSPLIT_PART, "overflow", 4_096)))
-      .toThrowError(expect.objectContaining({ code: "transcript_writer_limit" }));
+      .toThrowError(expect.objectContaining({ code: "record_writer_limit" }));
     expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "next", 0)))).toBe(
       "next",
     );
   });
 
   it("bounds reassembly bytes across writers and releases them", () => {
-    const transcript = new LogicalTranscript({ maxReassemblyBytes: 4 });
+    const transcript = new LogicalRecordAssembler({ maxReassemblyBytes: 4 });
 
     expect(
       transcript.pushRecord(record(0n, partHeader(0, false), "abc", 1)),
@@ -96,7 +95,7 @@ describe("logical transcript", () => {
     expect(() =>
       transcript.pushRecord(record(0n, partHeader(0, false), "de", 2))
     ).toThrowError(
-      expect.objectContaining({ code: "transcript_reassembly_limit" }),
+      expect.objectContaining({ code: "record_reassembly_limit" }),
     );
     expect(text(transcript.pushRecord(record(1n, UNSPLIT_PART, "done", 1)))).toBe(
       "done",
@@ -107,7 +106,7 @@ describe("logical transcript", () => {
   });
 
   it("bounds total pending parts independently of payload bytes", () => {
-    const transcript = new LogicalTranscript();
+    const transcript = new LogicalRecordAssembler();
 
     for (let index = 0; index < 16_384; index += 1) {
       expect(
@@ -117,15 +116,15 @@ describe("logical transcript", () => {
     expect(() =>
       transcript.pushRecord(record(16_384n, partHeader(16_384, false), "", 1))
     ).toThrowError(
-      expect.objectContaining({ code: "transcript_total_pending_parts_limit" }),
+      expect.objectContaining({ code: "record_total_pending_parts_limit" }),
     );
   });
 
   it("uses one shared default reassembly byte limit", () => {
-    const transcript = new LogicalTranscript();
+    const transcript = new LogicalRecordAssembler();
 
-    expect(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES).toBe(16 * 1024 * 1024);
-    expect(transcript.maxReassemblyBytes).toBe(DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES);
+    expect(DEFAULT_MAX_RECORD_REASSEMBLY_BYTES).toBe(16 * 1024 * 1024);
+    expect(transcript.maxReassemblyBytes).toBe(DEFAULT_MAX_RECORD_REASSEMBLY_BYTES);
   });
 });
 
@@ -141,7 +140,6 @@ function record(
     writerId: writerId(writer),
     writerSeqNum,
     part,
-    format: RecordFormat.Transcript,
     data: textEncoder.encode(data),
   };
 }
@@ -152,6 +150,6 @@ function writerId(index: number): ReadRecord["writerId"] {
   return parseWriterId(bytes);
 }
 
-function text(record: ReturnType<LogicalTranscript["pushRecord"]>): string | undefined {
+function text(record: ReturnType<LogicalRecordAssembler["pushRecord"]>): string | undefined {
   return record === undefined ? undefined : textDecoder.decode(record.data);
 }

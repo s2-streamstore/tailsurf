@@ -4,7 +4,7 @@ use std::env;
 
 use tailsurf::{
     CreateStreamRequest, DurableWriterOptions, InitialStreamLink, LinkPermissions, ReadOptions,
-    ReadStart, ReadStop, RecordFormat, TsfClient, Visibility,
+    ReadStart, ReadStop, TsfClient, Visibility,
 };
 use url::Url;
 
@@ -18,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let created = client
         .create_stream(&CreateStreamRequest {
+            kind: tailsurf::StreamKind::Transcript,
             title: Some("SDK lifecycle".parse()?),
             visibility: Visibility::Private,
             expires_in_seconds: None,
@@ -57,7 +58,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     let ticket = writer.submit(tailsurf::AppendBatch::split_logical(
-        RecordFormat::Transcript,
         b"hello from tailsurf\n".as_slice(),
     )?)?;
     let _receipts = ticket.await?;

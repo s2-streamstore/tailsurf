@@ -28,8 +28,9 @@ use bytes::Bytes;
 use secrecy::ExposeSecret;
 use tailsurf::{
     AppendBatch, ClientWriterId, IdempotencyKey, LinkId, LinkPermissions, LinkSecret,
-    MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, StreamId, StreamTitle, TsfClient, TsfClientConfig,
-    TsfClientError, WriterId,
+    MAX_WRITER_IN_FLIGHT_RECORDS, RecordPayload, StreamId, StreamKind, StreamTitle, TsfClient,
+    TsfClientConfig, TsfClientError, WriterId,
+    logical_records::DEFAULT_MAX_RECORD_REASSEMBLY_BYTES,
     protocol::{
         read::{ReadOptions, ReadStart, ReadStop},
         rest::{
@@ -39,12 +40,10 @@ use tailsurf::{
         },
         ws::frame::{
             CaughtUpPosition, ClientFrame, MAX_FRAME_PAYLOAD_BYTES, MAX_RECORD_PAYLOAD_BYTES,
-            OwnedReadRecord, PartHeader, ReadBatch, RecordFormat, ServerFrame,
-            TSF_WEBSOCKET_PROTOCOL,
+            OwnedReadRecord, PartHeader, ReadBatch, ServerFrame, TSF_WEBSOCKET_PROTOCOL,
         },
     },
     stream_url::StreamLocator,
-    transcript::DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -341,7 +340,7 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(private.status.success(), "stderr={}", private.stderr);
     assert_eq!(
         normalize_created_stream_output(&private.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled transcript stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert_created_links_parse(&private.stdout, &[("reader", "r"), ("owner", "o")]);
 
@@ -349,7 +348,7 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(public.status.success(), "stderr={}", public.stderr);
     assert_eq!(
         normalize_created_stream_output(&public.stdout),
-        "Created public stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  Public read <url> (public)\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created public stream <stream_id>\nTitle: Untitled transcript stream\nExpires: <timestamp>\n\n  Public read <url> (public)\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert_created_links_parse(&public.stdout, &[("owner", "o")]);
 
@@ -368,7 +367,7 @@ async fn new_text_output_covers_visibility_and_explicit_links() {
     assert!(explicit.status.success(), "stderr={}", explicit.stderr);
     assert_eq!(
         normalize_created_stream_output(&explicit.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  combined read-write <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled transcript stream\nExpires: <timestamp>\n\n  reader read <url>\n  combined read-write <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert_created_links_parse(
         &explicit.stdout,
@@ -487,7 +486,7 @@ async fn capture_then_replay_round_trips_piped_input() {
     assert!(output.status.success(), "stderr={}", output.stderr);
     assert_eq!(
         normalize_created_stream_output(&output.stdout),
-        "Created private stream <stream_id>\nTitle: Untitled stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
+        "Created private stream <stream_id>\nTitle: Untitled transcript stream\nExpires: <timestamp>\n\n  reader read <url>\n  owner owner <url> (keep private)\n\nLinks are shown once.\n"
     );
     assert!(
         output.stderr.contains("1 record durable"),
@@ -618,23 +617,20 @@ async fn write_defaults_to_lines_and_splits_large_records() {
 
     assert_eq!(records[0].writer_seq_num, 0);
     assert_eq!(records[0].part, PartHeader::new(0, false).expect("part"));
-    assert_eq!(records[0].format, RecordFormat::Transcript);
     assert_eq!(records[0].data.len(), MAX_RECORD_PAYLOAD_BYTES);
     assert_eq!(records[1].writer_seq_num, 1);
     assert_eq!(records[1].part, PartHeader::new(1, true).expect("part"));
-    assert_eq!(records[1].format, RecordFormat::Transcript);
     assert_eq!(records[1].data.len(), 10);
     assert_eq!(records[1].data.last(), Some(&b'x'));
     assert_eq!(records[2].writer_seq_num, 2);
     assert_eq!(records[2].part, PartHeader::unsplit());
-    assert_eq!(records[2].format, RecordFormat::Transcript);
     assert_eq!(records[2].data.as_ref(), b"tail");
 }
 
 #[tokio::test]
 async fn write_line_above_the_default_reader_limit_round_trips_when_the_reader_raises_it() {
     let server = TestServer::start().await;
-    let configured_limit = DEFAULT_MAX_TRANSCRIPT_REASSEMBLY_BYTES + 1;
+    let configured_limit = DEFAULT_MAX_RECORD_REASSEMBLY_BYTES + 1;
     let configured_limit_arg = configured_limit.to_string();
     let mut input = "x".repeat(configured_limit);
     input.push('\n');
@@ -710,11 +706,6 @@ async fn write_bytes_preserves_large_input_across_flush_boundaries() {
     assert!(
         records
             .iter()
-            .all(|record| record.format == RecordFormat::Bytes)
-    );
-    assert!(
-        records
-            .iter()
             .all(|record| record.data.len() <= MAX_RECORD_PAYLOAD_BYTES)
     );
     for (index, record) in records.iter().enumerate() {
@@ -763,7 +754,6 @@ async fn write_bytes_flushes_on_linger() {
         match reader.next_batch().await.expect("event") {
             Some(batch) => {
                 for record in &batch {
-                    assert_eq!(record.format, RecordFormat::Bytes);
                     data.push(Bytes::copy_from_slice(record.data));
                 }
             }
@@ -1006,8 +996,6 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
     assert_eq!(attempts[1].data.as_ref(), b"retry me");
     assert_eq!(attempts[0].part, PartHeader::unsplit());
     assert_eq!(attempts[1].part, PartHeader::unsplit());
-    assert_eq!(attempts[0].format, RecordFormat::Transcript);
-    assert_eq!(attempts[1].format, RecordFormat::Transcript);
 }
 
 #[tokio::test]
@@ -1153,7 +1141,6 @@ async fn writer_reconnect_resends_only_the_unacknowledged_tail() {
             .map(|index| {
                 RecordPayload::new(
                     PartHeader::unsplit(),
-                    RecordFormat::Bytes,
                     Bytes::from(format!("record-{index}")),
                 )
             })
@@ -1214,9 +1201,7 @@ async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
     let payload = Bytes::from(vec![7_u8; MAX_RECORD_PAYLOAD_BYTES]);
     let batch = AppendBatch::from_records(
         (0..12)
-            .map(|_| {
-                RecordPayload::new(PartHeader::unsplit(), RecordFormat::Bytes, payload.clone())
-            })
+            .map(|_| RecordPayload::new(PartHeader::unsplit(), payload.clone()))
             .collect(),
     )
     .expect("oversized batch");
@@ -1288,7 +1273,6 @@ async fn cloned_producers_share_one_contiguous_writer_sequence() {
                         .map(|record_index| {
                             RecordPayload::new(
                                 PartHeader::unsplit(),
-                                RecordFormat::Bytes,
                                 Bytes::from(format!(
                                     "{producer_index}-{batch_index}-{record_index}"
                                 )),
@@ -1861,16 +1845,14 @@ async fn replay_rejects_split_records_above_the_reassembly_limit() {
 
     assert!(!output.status.success(), "stdout={}", output.stdout);
     assert!(
-        output
-            .stderr
-            .contains("failed to assemble transcript record"),
+        output.stderr.contains("failed to assemble logical record"),
         "stderr={}",
         output.stderr
     );
     assert!(
         output
             .stderr
-            .contains("transcript reassembly would use 5 bytes; maximum is 4"),
+            .contains("record reassembly would use 5 bytes; maximum is 4"),
         "stderr={}",
         output.stderr
     );
@@ -2230,6 +2212,7 @@ struct TestApiState {
 
 struct TestStream {
     stream_id: StreamId,
+    kind: StreamKind,
     title: Option<StreamTitle>,
     visibility: Visibility,
     expires_at: String,
@@ -2258,7 +2241,6 @@ struct TestRecord {
     writer_id: WriterId,
     writer_seq_num: u64,
     part: PartHeader,
-    format: RecordFormat,
     data: Bytes,
 }
 
@@ -2351,6 +2333,7 @@ async fn test_create_stream(
         stream_id.to_string(),
         TestStream {
             stream_id,
+            kind: request.kind,
             title: request.title.clone(),
             visibility: request.visibility,
             expires_at: expires_at.clone(),
@@ -2362,6 +2345,7 @@ async fn test_create_stream(
 
     let response = CreateStreamResponse {
         stream_id,
+        kind: request.kind,
         title: request.title,
         visibility: request.visibility,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -2661,7 +2645,7 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
         .lock()
         .expect("write preconditions lock")
         .push(expected_next_seq_num);
-    {
+    let stream_kind = {
         let streams = state.streams.lock().expect("streams lock");
         let Some(stream) = streams.get(&stream_id) else {
             return;
@@ -2675,8 +2659,9 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
         {
             return;
         }
-    }
-    send_server_frame(&mut socket, ServerFrame::Ready)
+        stream.kind
+    };
+    send_server_frame(&mut socket, ServerFrame::Ready(stream_kind))
         .await
         .expect("send ready");
 
@@ -2708,7 +2693,6 @@ async fn test_write_flow(state: Arc<TestApiState>, stream_id: String, mut socket
                     writer_id: WriterId::from_bytes(*client_writer_id.as_bytes()),
                     writer_seq_num: record.writer_seq_num,
                     part: record.part,
-                    format: record.format,
                     data: record.data,
                 });
             }
@@ -2788,7 +2772,7 @@ async fn test_read_flow(
             test_select_records(stream, start, count, until_timestamp_ms),
         )
     };
-    send_server_frame(&mut socket, ServerFrame::Ready)
+    send_server_frame(&mut socket, ServerFrame::Ready(stream_metadata.kind))
         .await
         .expect("send ready");
     send_server_frame(&mut socket, ServerFrame::StreamMetadata(stream_metadata))
@@ -2805,7 +2789,6 @@ async fn test_read_flow(
                 writer_id: record.writer_id,
                 writer_seq_num: record.writer_seq_num,
                 part: record.part,
-                format: record.format,
                 data: record.data,
             })
             .collect::<Vec<_>>();
@@ -2870,6 +2853,7 @@ fn test_minted_link_secret(link_id: &LinkId) -> LinkSecret {
 fn test_get_stream_response(stream: &TestStream) -> StreamMetadata {
     StreamMetadata {
         stream_id: stream.stream_id,
+        kind: stream.kind,
         title: stream.title.clone(),
         visibility: stream.visibility,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -2880,6 +2864,7 @@ fn test_get_stream_response(stream: &TestStream) -> StreamMetadata {
 fn test_read_stream_metadata(stream: &TestStream) -> StreamMetadata {
     StreamMetadata {
         stream_id: stream.stream_id,
+        kind: stream.kind,
         title: stream.title.clone(),
         visibility: stream.visibility,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -3203,7 +3188,7 @@ async fn connect_default_writer(origin: &Url) -> tailsurf::TsfWriter {
 }
 
 fn test_write_batch(data: Bytes) -> AppendBatch {
-    AppendBatch::single(PartHeader::unsplit(), RecordFormat::Bytes, data).expect("valid batch")
+    AppendBatch::single(PartHeader::unsplit(), data).expect("valid batch")
 }
 
 fn assert_sequence_mismatch(error: &TsfClientError) {
@@ -3354,7 +3339,7 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
         *connections += 1;
         connection_index
     };
-    if send_server_frame(&mut socket, ServerFrame::Ready)
+    if send_server_frame(&mut socket, ServerFrame::Ready(StreamKind::Transcript))
         .await
         .is_err()
     {
@@ -3529,7 +3514,7 @@ async fn stalling_write_flow(state: Arc<StallingWriteState>, mut socket: WebSock
         return;
     };
     let first_connection = state.connections.fetch_add(1, Ordering::SeqCst) == 0;
-    if send_server_frame(&mut socket, ServerFrame::Ready)
+    if send_server_frame(&mut socket, ServerFrame::Ready(StreamKind::Transcript))
         .await
         .is_err()
     {
@@ -3573,7 +3558,6 @@ struct AppendAttempt {
     expected_next_seq_num: Option<u64>,
     writer_seq_num: u64,
     part: PartHeader,
-    format: RecordFormat,
     data: Bytes,
 }
 
@@ -3648,7 +3632,7 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     else {
         return;
     };
-    send_server_frame(&mut socket, ServerFrame::Ready)
+    send_server_frame(&mut socket, ServerFrame::Ready(StreamKind::Transcript))
         .await
         .expect("send ready");
 
@@ -3671,7 +3655,6 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
             expected_next_seq_num,
             writer_seq_num: record.writer_seq_num,
             part: record.part,
-            format: record.format,
             data: record.data,
         });
         attempts.len()
@@ -3814,7 +3797,7 @@ async fn fake_sse_read(
         ),
     };
     let body = format!(
-        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{events}"
+        "event: stream_metadata\ndata: {{\"stream_id\":\"{stream_id}\",\"kind\":\"transcript\",\"title\":null,\"visibility\":\"private\",\"created_at\":\"2026-08-13T00:00:00Z\",\"expires_at\":\"2026-08-23T00:00:00Z\"}}\n\n{events}"
     );
     (
         StatusCode::OK,
@@ -3906,9 +3889,10 @@ impl FakeReadServer {
     }
 }
 
-fn fake_stream_metadata(stream_id: &str) -> StreamMetadata {
+fn fake_stream_metadata(stream_id: &str, kind: StreamKind) -> StreamMetadata {
     StreamMetadata {
         stream_id: stream_id.parse().expect("fake stream ID"),
+        kind,
         title: None,
         visibility: Visibility::Private,
         created_at: "2026-08-13T00:00:00Z".to_owned(),
@@ -3958,12 +3942,16 @@ async fn fake_read_flow(
         });
         attempts.len()
     };
-    send_server_frame(&mut socket, ServerFrame::Ready)
+    let stream_kind = match state.mode {
+        FakeReadMode::ReplayBinary => StreamKind::Bytes,
+        _ => StreamKind::Transcript,
+    };
+    send_server_frame(&mut socket, ServerFrame::Ready(stream_kind))
         .await
         .expect("send ready");
     send_server_frame(
         &mut socket,
-        ServerFrame::StreamMetadata(fake_stream_metadata(&stream_id)),
+        ServerFrame::StreamMetadata(fake_stream_metadata(&stream_id, stream_kind)),
     )
     .await
     .expect("send stream metadata");
@@ -4000,7 +3988,6 @@ async fn fake_read_flow(
                                 writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
                                 writer_seq_num,
                                 part: PartHeader::unsplit(),
-                                format: RecordFormat::Transcript,
                                 data: Bytes::copy_from_slice(data),
                             })
                             .collect(),
@@ -4050,21 +4037,19 @@ async fn fake_read_flow(
             close_retryable_read(&mut socket).await;
         }
         FakeReadMode::ReplayBinary => {
-            send_read_record_with_format(
+            send_read_record_with_part(
                 &mut socket,
                 0,
                 0,
                 PartHeader::unsplit(),
-                RecordFormat::Bytes,
                 &[0x00, 0xff, b'b', b'i', b'n', b'\n'],
             )
             .await;
-            send_read_record_with_format(
+            send_read_record_with_part(
                 &mut socket,
                 1,
                 1,
                 PartHeader::unsplit(),
-                RecordFormat::Bytes,
                 &[0xf0, 0x28, 0x8c, 0x28],
             )
             .await;
@@ -4074,21 +4059,19 @@ async fn fake_read_flow(
                 .expect("close binary replay socket");
         }
         FakeReadMode::ReplaySplitRecord => {
-            send_read_record_with_format(
+            send_read_record_with_part(
                 &mut socket,
                 0,
                 0,
                 PartHeader::new(0, false).expect("part"),
-                RecordFormat::Transcript,
                 b"hel",
             )
             .await;
-            send_read_record_with_format(
+            send_read_record_with_part(
                 &mut socket,
                 1,
                 1,
                 PartHeader::new(1, true).expect("part"),
-                RecordFormat::Transcript,
                 b"lo",
             )
             .await;
@@ -4111,23 +4094,14 @@ async fn close_retryable_read(socket: &mut WebSocket) {
 }
 
 async fn send_read_record(socket: &mut WebSocket, seq_num: u64, writer_seq_num: u64, data: &[u8]) {
-    send_read_record_with_format(
-        socket,
-        seq_num,
-        writer_seq_num,
-        PartHeader::unsplit(),
-        RecordFormat::Transcript,
-        data,
-    )
-    .await
+    send_read_record_with_part(socket, seq_num, writer_seq_num, PartHeader::unsplit(), data).await
 }
 
-async fn send_read_record_with_format(
+async fn send_read_record_with_part(
     socket: &mut WebSocket,
     seq_num: u64,
     writer_seq_num: u64,
     part: PartHeader,
-    format: RecordFormat,
     data: &[u8],
 ) {
     send_server_frame(
@@ -4139,7 +4113,6 @@ async fn send_read_record_with_format(
                 writer_id: WriterId::from_bytes([7; WriterId::BYTE_LEN]),
                 writer_seq_num,
                 part,
-                format,
                 data: Bytes::copy_from_slice(data),
             }])
             .expect("test record within batch bounds"),

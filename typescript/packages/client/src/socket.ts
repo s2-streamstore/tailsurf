@@ -8,6 +8,7 @@ import {
   type ClientFrame,
   type ServerFrame,
   type StreamId,
+  type StreamKind,
   type StreamMetadata,
 } from "@tailsurf/protocol";
 
@@ -270,20 +271,27 @@ export class FrameSocket {
   }
 }
 
-export async function expectReady(socket: FrameSocket): Promise<void> {
+export async function expectReady(socket: FrameSocket): Promise<StreamKind> {
   const frame = await socket.nextFrame();
   if (frame.type !== "ready") {
     throw unexpectedFrame(frame);
   }
+  return frame.kind;
 }
 
 export async function expectReadHandshake(
   socket: FrameSocket,
 ): Promise<StreamMetadata> {
-  await expectReady(socket);
+  const kind = await expectReady(socket);
   const info = await socket.nextFrame();
   if (info.type !== "streamMetadata") {
     throw unexpectedFrame(info);
+  }
+  if (info.stream.kind !== kind) {
+    throw new TsfClientError(
+      "invalid_api_response",
+      "ready and stream metadata kinds do not match",
+    );
   }
   return info.stream;
 }
@@ -298,7 +306,13 @@ export function unexpectedFrame(frame: ServerFrame): TsfClientError {
 export function dataPlaneUrl(
   apiOrigin: string,
   streamId: StreamId,
-  operation: "read" | "write",
+  operation:
+    | "read"
+    | "write"
+    | "terminal/input/read"
+    | "terminal/input/write"
+    | "terminal/output/read"
+    | "terminal/output/write",
 ): string {
   const url = new URL(
     `/api/v1/streams/${streamId}/${operation}`,
