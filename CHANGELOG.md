@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.14.4](https://github.com/s2-streamstore/tailsurf/compare/v0.14.3...v0.14.4) - 2026-09-01
+
+### Added
+
+- *(protocol)* add native terminal checkpoints ([#88](https://github.com/s2-streamstore/tailsurf/pull/88))
+
 ## [0.14.3](https://github.com/s2-streamstore/tailsurf/compare/v0.14.2...v0.14.3) - 2026-09-01
 
 ### Added

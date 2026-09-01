@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "tailsurf"
-version = "0.14.3"
+version = "0.14.4"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "tailsurf-cli"
-version = "0.14.3"
+version = "0.14.4"
 dependencies = [
  "axoupdater",
  "axum",
