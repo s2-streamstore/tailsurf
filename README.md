@@ -109,7 +109,7 @@ The command runs in a local PTY. The hosted service does not run it.
 
 Private sessions print separate observer, controller, and owner links. Public sessions print a public observer URL plus controller and owner links.
 
-Observers see terminal output. Controllers can also send input and resize the PTY. Only the local host can publish terminal output.
+Observers see terminal output. Controllers can also send input and resize the PTY. Only an owner can publish terminal output. `tsf terminal` is the normal host.
 
 Terminal output is durable. The browser timeline can pause, seek, and replay it. Input is enabled only at the live edge.
 

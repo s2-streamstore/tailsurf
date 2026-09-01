@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     future::pending,
     io::{Read as _, Write as _},
     sync::{Arc, Condvar, Mutex},
@@ -88,8 +89,6 @@ pub(super) async fn run(origin: Url, args: TerminalArgs) -> eyre::Result<()> {
         })
         .await
         .context("failed to create terminal session")?;
-    print_created_stream(&created, false)?;
-
     let owner_secret = created
         .links
         .iter()
@@ -97,15 +96,59 @@ pub(super) async fn run(origin: Url, args: TerminalArgs) -> eyre::Result<()> {
         .context("created terminal did not include an owner link")?
         .secret
         .clone();
-    host(
+    let stream_id = created.stream_id;
+    let cleanup_client = client.clone();
+    let cleanup_owner_secret = owner_secret.clone();
+    if let Err(error) = print_created_stream(&created, false) {
+        cleanup_failed_start(&cleanup_client, &stream_id, &cleanup_owner_secret).await;
+        return Err(error);
+    }
+    let mut started = false;
+    let result = host(
         client,
-        created.stream_id,
+        stream_id,
         owner_secret,
         args.columns,
         args.rows,
         args.command,
+        &mut started,
     )
-    .await
+    .await;
+    if result.is_err() && !started {
+        cleanup_failed_start(&cleanup_client, &stream_id, &cleanup_owner_secret).await;
+    }
+    if result
+        .as_ref()
+        .is_err_and(|error| error.downcast_ref::<TerminalStartupInterrupted>().is_some())
+    {
+        exit_interrupted();
+    }
+    result
+}
+
+#[derive(Debug)]
+struct TerminalStartupInterrupted;
+
+impl fmt::Display for TerminalStartupInterrupted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("terminal startup interrupted")
+    }
+}
+
+impl std::error::Error for TerminalStartupInterrupted {}
+
+async fn cleanup_failed_start(client: &TsfClient, stream_id: &StreamId, owner_secret: &LinkSecret) {
+    match client.delete_stream(stream_id, owner_secret).await {
+        Ok(()) => {
+            eprintln!("Removed terminal {stream_id} after startup failed. It cannot be recovered.");
+        }
+        Err(error) => {
+            eprintln!(
+                "Terminal {stream_id} may still be active because startup cleanup failed: {error}"
+            );
+            eprintln!("Use the owner link printed above to delete it.");
+        }
+    }
 }
 
 struct PtyResize {
@@ -414,6 +457,7 @@ async fn host(
     columns: u16,
     rows: u16,
     command: Vec<String>,
+    started: &mut bool,
 ) -> eyre::Result<()> {
     let mut input_options = ReadOptions::new(stream_id).with_link_secret(owner_secret.clone());
     input_options.start = Some(ReadStart::SeqNum(0));
@@ -475,6 +519,7 @@ async fn host(
     tokio::select! {
         confirmation = &mut started_rx => {
             confirmation.context("terminal output publisher stopped before startup was durable")?;
+            *started = true;
         }
         result = output_task.handle() => {
             finish_output_task(result)?;
@@ -484,7 +529,7 @@ async fn host(
             interrupt.context("failed to listen for interrupt signal")?;
             output_task.abort();
             stop_child(&mut child_guard).await?;
-            exit_interrupted();
+            return Err(TerminalStartupInterrupted.into());
         }
     }
 

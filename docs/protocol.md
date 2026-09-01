@@ -503,9 +503,11 @@ Close reasons under `1013` are temporary. Protocol and policy failures under `10
 
 ## Compatibility
 
-REST and SSE use the `/api/v1` route prefix. A breaking change requires a new route version.
+TSF is pre-1.0. `/api/v1` and `tsf.v1` name the current protocol generation. They do not promise interoperability across pre-1.0 package releases.
 
-Binary clients and the server select the exact `tsf.v1` subprotocol. A breaking binary change requires a new subprotocol.
+A pre-1.0 breaking change replaces the current contract through a coordinated SDK and service cutover. Old and new versions do not interoperate during that cutover.
+
+After the v1 contract is declared stable, a breaking REST or SSE change requires a new route version. A breaking binary change requires a new WebSocket subprotocol.
 
 Additive REST and SSE fields must remain ignorable by v1 clients. Additive binary behavior must remain ignorable under `tsf.v1`. Otherwise it requires capability negotiation or a new version.
 
