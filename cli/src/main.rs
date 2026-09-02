@@ -241,6 +241,27 @@ struct OwnerArgs {
     json: bool,
 }
 
+impl OwnerArgs {
+    fn resolve(&self, origin: Url) -> eyre::Result<OwnerAccess> {
+        let locator = StreamLocator::parse(self.link.as_str()).context("invalid owner link")?;
+        let link_secret = locator
+            .link_declaring(LinkPermissions::allows_owner)
+            .context("link does not declare owner permission")?
+            .clone();
+        Ok(OwnerAccess {
+            client: TsfClient::with_api_origin(origin)?,
+            locator,
+            link_secret,
+        })
+    }
+}
+
+struct OwnerAccess {
+    client: TsfClient,
+    locator: StreamLocator,
+    link_secret: LinkSecret,
+}
+
 #[derive(Debug, Args)]
 struct DeleteArgs {
     #[command(flatten)]
@@ -1462,75 +1483,69 @@ async fn stream_metadata(origin: Url, args: InfoArgs) -> eyre::Result<()> {
 }
 
 async fn delete_stream(origin: Url, args: DeleteArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner.link.as_str())?;
-    if !confirm_delete(&locator.stream_id, args.yes)? {
+    let owner = args.owner.resolve(origin)?;
+    if !confirm_delete(&owner.locator.stream_id, args.yes)? {
         eprintln!("Deletion cancelled.");
         return Ok(());
     }
-    client
-        .delete_stream(&locator.stream_id, &owner_link_secret)
+    owner
+        .client
+        .delete_stream(&owner.locator.stream_id, &owner.link_secret)
         .await
         .context("failed to delete stream")?;
     if args.owner.json {
         print_json(&DeleteOutput {
-            stream_id: locator.stream_id.to_string(),
+            stream_id: owner.locator.stream_id.to_string(),
             status: "deleted",
         })?;
     } else {
-        println!("Deleted stream {}", locator.stream_id);
+        println!("Deleted stream {}", owner.locator.stream_id);
     }
     Ok(())
 }
 
 async fn update_and_print(
     origin: Url,
-    owner_link: &LinkInput,
+    owner: &OwnerArgs,
     request: &UpdateStreamRequest,
-    json: bool,
-    context: &'static str,
+    failure_context: &'static str,
 ) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) = owner_client_from_link(origin, owner_link.as_str())?;
-    let stream = client
-        .update_stream(&locator.stream_id, request, &owner_link_secret)
+    let access = owner.resolve(origin)?;
+    let stream = access
+        .client
+        .update_stream(&access.locator.stream_id, request, &access.link_secret)
         .await
-        .context(context)?;
-    print_stream_metadata(&stream, json)
+        .context(failure_context)?;
+    print_stream_metadata(&stream, owner.json)
 }
 
 async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()> {
     update_and_print(
         origin,
-        &args.owner.link,
+        &args.owner,
         &UpdateStreamRequest {
             title: StreamTitleUpdate::Unchanged,
             visibility: Some(args.visibility.into()),
             expires_at: None,
         },
-        args.owner.json,
         "failed to update stream visibility",
     )
     .await
 }
 
 async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
-    let (owner_link, title, json) = match command {
-        TitleCommand::Set(args) => (
-            args.owner.link,
-            StreamTitleUpdate::Set(args.title),
-            args.owner.json,
-        ),
-        TitleCommand::Clear(args) => (args.owner.link, StreamTitleUpdate::Clear, args.owner.json),
+    let (owner, title) = match command {
+        TitleCommand::Set(args) => (args.owner, StreamTitleUpdate::Set(args.title)),
+        TitleCommand::Clear(args) => (args.owner, StreamTitleUpdate::Clear),
     };
     update_and_print(
         origin,
-        &owner_link,
+        &owner,
         &UpdateStreamRequest {
             title,
             visibility: None,
             expires_at: None,
         },
-        json,
         "failed to update stream title",
     )
     .await
@@ -1539,13 +1554,12 @@ async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
 async fn renew_stream(origin: Url, args: RenewArgs) -> eyre::Result<()> {
     update_and_print(
         origin,
-        &args.owner.link,
+        &args.owner,
         &UpdateStreamRequest {
             title: StreamTitleUpdate::Unchanged,
             visibility: None,
             expires_at: Some(args.expires.rfc3339()?),
         },
-        args.owner.json,
         "failed to renew stream",
     )
     .await
@@ -1560,10 +1574,10 @@ async fn link_command(origin: Url, command: LinkCommand) -> eyre::Result<()> {
 }
 
 async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner.link.as_str())?;
-    let inventory = client
-        .list_all_links(&locator.stream_id, &owner_link_secret)
+    let owner = args.owner.resolve(origin)?;
+    let inventory = owner
+        .client
+        .list_all_links(&owner.locator.stream_id, &owner.link_secret)
         .await
         .context("failed to list links")?;
     if args.owner.json {
@@ -1588,29 +1602,29 @@ async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
 }
 
 async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner.link.as_str())?;
+    let owner = args.owner.resolve(origin)?;
     let InitialStreamLink {
         link_id,
         permissions,
     } = args.link.0;
     let expires_at = args.expires.rfc3339()?;
-    let created = client
+    let created = owner
+        .client
         .create_link(
-            &locator.stream_id,
+            &owner.locator.stream_id,
             &CreateLinkInput {
                 link_id,
                 permissions,
                 expires_at,
             },
-            &owner_link_secret,
+            &owner.link_secret,
         )
         .await
         .context("failed to create link")?;
     let url = resource_link_for_route(
         &created.web_origin,
-        &locator.stream_id,
-        locator.route,
+        &owner.locator.stream_id,
+        owner.locator.route,
         created.credential.permissions,
         &created.credential.secret,
     )?;
@@ -1623,10 +1637,10 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
 }
 
 async fn revoke_link(origin: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner.link.as_str())?;
-    client
-        .revoke_link(&locator.stream_id, &args.link_id, &owner_link_secret)
+    let owner = args.owner.resolve(origin)?;
+    owner
+        .client
+        .revoke_link(&owner.locator.stream_id, &args.link_id, &owner.link_secret)
         .await
         .context("failed to revoke link")?;
     print_link_revoked(&args.link_id, args.owner.json)
@@ -1783,22 +1797,6 @@ async fn write_record_data(
         data.advance(chunk_len);
     }
     Ok(())
-}
-
-fn owner_client_from_link(
-    origin: Url,
-    link: &str,
-) -> eyre::Result<(TsfClient, StreamLocator, LinkSecret)> {
-    let locator = StreamLocator::parse(link).context("invalid owner link")?;
-    let owner_link_secret = locator
-        .link_declaring(LinkPermissions::allows_owner)
-        .context("link does not declare owner permission")?
-        .clone();
-    Ok((
-        TsfClient::with_api_origin(origin)?,
-        locator,
-        owner_link_secret,
-    ))
 }
 
 fn require_record_stream(locator: &StreamLocator, command: &str) -> eyre::Result<()> {
