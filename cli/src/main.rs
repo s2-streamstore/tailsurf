@@ -232,28 +232,30 @@ struct InfoArgs {
 }
 
 #[derive(Debug, Args)]
-struct DeleteArgs {
+struct OwnerArgs {
     /// Owner link or @path containing one.
     #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
-    /// Skip the interactive confirmation.
-    #[arg(long)]
-    yes: bool,
+    link: LinkInput,
     /// Print one JSON object instead of human-readable output.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
+struct DeleteArgs {
+    #[command(flatten)]
+    owner: OwnerArgs,
+    /// Skip the interactive confirmation.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
 struct VisibilityArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// New visibility.
     visibility: VisibilityArg,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,38 +268,26 @@ enum TitleCommand {
 
 #[derive(Debug, Args)]
 struct SetTitleArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// New stream title.
     #[arg(value_name = "TITLE")]
     title: StreamTitle,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 struct ClearTitleArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
+    #[command(flatten)]
+    owner: OwnerArgs,
 }
 
 #[derive(Debug, Args)]
 struct RenewArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// New lifetime from now, such as 6h or 7d.
     #[arg(value_name = "DURATION")]
     expires: StreamExpiryArg,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -312,28 +302,20 @@ enum LinkCommand {
 
 #[derive(Debug, Args)]
 struct ListLinkArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
+    #[command(flatten)]
+    owner: OwnerArgs,
 }
 
 #[derive(Debug, Args)]
 struct CreateLinkArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// Immutable Link ID and permission, as LINK_ID=PERMISSION.
     #[arg(value_name = "LINK_ID=PERMISSION")]
     link: InitialLinkArg,
     /// Expiry such as 1h, 7d, or never.
     #[arg(long, value_name = "EXPIRY", default_value = "never")]
     expires: ExpiresArg,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
     /// Write the complete new link to this file.
     #[arg(long = "link-file", value_name = "PATH")]
     link_file: Option<PathBuf>,
@@ -341,15 +323,11 @@ struct CreateLinkArgs {
 
 #[derive(Debug, Args)]
 struct RevokeLinkArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// Link ID to revoke.
     #[arg(value_name = "LINK_ID")]
     link_id: LinkId,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1485,7 +1463,7 @@ async fn stream_metadata(origin: Url, args: InfoArgs) -> eyre::Result<()> {
 
 async fn delete_stream(origin: Url, args: DeleteArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner.link.as_str())?;
     if !confirm_delete(&locator.stream_id, args.yes)? {
         eprintln!("Deletion cancelled.");
         return Ok(());
@@ -1494,7 +1472,7 @@ async fn delete_stream(origin: Url, args: DeleteArgs) -> eyre::Result<()> {
         .delete_stream(&locator.stream_id, &owner_link_secret)
         .await
         .context("failed to delete stream")?;
-    if args.json {
+    if args.owner.json {
         print_json(&DeleteOutput {
             stream_id: locator.stream_id.to_string(),
             status: "deleted",
@@ -1523,13 +1501,13 @@ async fn update_and_print(
 async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()> {
     update_and_print(
         origin,
-        &args.owner_link,
+        &args.owner.link,
         &UpdateStreamRequest {
             title: StreamTitleUpdate::Unchanged,
             visibility: Some(args.visibility.into()),
             expires_at: None,
         },
-        args.json,
+        args.owner.json,
         "failed to update stream visibility",
     )
     .await
@@ -1538,11 +1516,11 @@ async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()
 async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
     let (owner_link, title, json) = match command {
         TitleCommand::Set(args) => (
-            args.owner_link,
+            args.owner.link,
             StreamTitleUpdate::Set(args.title),
-            args.json,
+            args.owner.json,
         ),
-        TitleCommand::Clear(args) => (args.owner_link, StreamTitleUpdate::Clear, args.json),
+        TitleCommand::Clear(args) => (args.owner.link, StreamTitleUpdate::Clear, args.owner.json),
     };
     update_and_print(
         origin,
@@ -1561,13 +1539,13 @@ async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
 async fn renew_stream(origin: Url, args: RenewArgs) -> eyre::Result<()> {
     update_and_print(
         origin,
-        &args.owner_link,
+        &args.owner.link,
         &UpdateStreamRequest {
             title: StreamTitleUpdate::Unchanged,
             visibility: None,
             expires_at: Some(args.expires.rfc3339()?),
         },
-        args.json,
+        args.owner.json,
         "failed to renew stream",
     )
     .await
@@ -1583,12 +1561,12 @@ async fn link_command(origin: Url, command: LinkCommand) -> eyre::Result<()> {
 
 async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner.link.as_str())?;
     let inventory = client
         .list_all_links(&locator.stream_id, &owner_link_secret)
         .await
         .context("failed to list links")?;
-    if args.json {
+    if args.owner.json {
         print_json(&inventory)?;
     } else {
         for link in &inventory.links {
@@ -1611,7 +1589,7 @@ async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
 
 async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner.link.as_str())?;
     let InitialStreamLink {
         link_id,
         permissions,
@@ -1640,18 +1618,18 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
         write_private_file(path, url.as_str())
             .with_context(|| format!("failed to write link file {}", path.display()))?;
     }
-    print_created_link(&url, &created.credential, args.json)?;
+    print_created_link(&url, &created.credential, args.owner.json)?;
     Ok(())
 }
 
 async fn revoke_link(origin: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
     let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
+        owner_client_from_link(origin, args.owner.link.as_str())?;
     client
         .revoke_link(&locator.stream_id, &args.link_id, &owner_link_secret)
         .await
         .context("failed to revoke link")?;
-    print_link_revoked(&args.link_id, args.json)
+    print_link_revoked(&args.link_id, args.owner.json)
 }
 
 async fn read_transcript(
