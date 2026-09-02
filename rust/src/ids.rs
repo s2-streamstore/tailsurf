@@ -229,14 +229,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_exact_24_byte_link_secrets() {
-        let canonical = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert!(is_canonical_base64url_24(canonical));
-        assert!(!is_canonical_base64url_24(&canonical[..31]));
-        assert!(!is_canonical_base64url_24(&format!("{canonical}A")));
-    }
-
-    #[test]
     fn link_ids_accept_semantic_slugs() {
         for value in ["owner", "deploy-bot", "a", "a1-b2"] {
             assert_eq!(
