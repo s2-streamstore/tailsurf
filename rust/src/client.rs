@@ -262,11 +262,10 @@ impl TsfClient {
         stream_id: &StreamId,
         link_secret: Option<&LinkSecret>,
     ) -> Result<StreamMetadata, TsfClientError> {
-        self.get_json_with_bearer(
-            format_args!("/streams/{stream_id}"),
-            "get stream",
-            link_secret,
-        )
+        let url = self.rest_url(format_args!("/streams/{stream_id}"));
+        self.retry_transient(|| {
+            self.send_json_with_bearer(self.http.get(url.clone()), "get stream", link_secret)
+        })
         .await
     }
 
@@ -890,19 +889,6 @@ impl TsfClient {
         url.set_scheme(scheme)
             .map_err(|_| TsfClientError::InvalidWebSocketScheme(url.scheme().to_owned()))?;
         Ok(url)
-    }
-
-    async fn get_json_with_bearer<T: DeserializeOwned>(
-        &self,
-        path: impl Display,
-        operation: &'static str,
-        link_secret: Option<&LinkSecret>,
-    ) -> Result<T, TsfClientError> {
-        let url = self.rest_url(path);
-        self.retry_transient(|| {
-            self.send_json_with_bearer(self.http.get(url.clone()), operation, link_secret)
-        })
-        .await
     }
 
     async fn send_json_with_bearer<T: DeserializeOwned>(
@@ -2293,17 +2279,12 @@ impl TsfReadSession {
 }
 
 fn advance_read_options_for_batch(options: &mut ReadOptions, batch: &ReadBatch) -> bool {
-    let last = batch.last();
-    advance_read_options(options, last.seq_num, batch.record_count())
-}
-
-fn advance_read_options(options: &mut ReadOptions, last_seq_num: u64, record_count: usize) -> bool {
-    let Some(next_seq_num) = last_seq_num.checked_add(1) else {
+    let Some(next_seq_num) = batch.last().seq_num.checked_add(1) else {
         return true;
     };
     options.start = Some(ReadStart::SeqNum(next_seq_num));
     if let Some(remaining) = options.stop.as_mut().and_then(|stop| stop.count.as_mut()) {
-        *remaining = remaining.saturating_sub(record_count as u64);
+        *remaining = remaining.saturating_sub(batch.record_count() as u64);
     }
     options.stop.is_some_and(|stop| stop.count == Some(0))
 }
