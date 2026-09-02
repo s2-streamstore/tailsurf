@@ -911,11 +911,7 @@ impl TsfClient {
         operation: &'static str,
         link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
-        let response = self
-            .apply_rest_auth(request, link_secret)
-            .timeout(self.config.http_request_timeout)
-            .send()
-            .await?;
+        let response = self.send_request(request, link_secret).await?;
         json_response(response, operation).await
     }
 
@@ -925,16 +921,24 @@ impl TsfClient {
         operation: &'static str,
         link_secret: Option<&LinkSecret>,
     ) -> Result<(), TsfClientError> {
-        let response = self
-            .apply_rest_auth(request, link_secret)
-            .timeout(self.config.http_request_timeout)
-            .send()
-            .await?;
+        let response = self.send_request(request, link_secret).await?;
         let status = response.status();
         if status == StatusCode::NO_CONTENT {
             return Ok(());
         }
         Err(http_status_error(response, operation).await)
+    }
+
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        link_secret: Option<&LinkSecret>,
+    ) -> Result<reqwest::Response, TsfClientError> {
+        self.apply_rest_auth(request, link_secret)
+            .timeout(self.config.http_request_timeout)
+            .send()
+            .await
+            .map_err(Into::into)
     }
 
     async fn retry_transient<T, Fut>(&self, run: impl FnMut() -> Fut) -> Result<T, TsfClientError>
