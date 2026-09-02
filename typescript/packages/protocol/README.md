@@ -33,7 +33,7 @@ SDK durable writers use the shared `MAX_WRITER_IN_FLIGHT_RECORDS` and `MAX_WRITE
 
 ## Compatibility
 
-Protocol fixtures are shared with the Rust implementation in the `tailsurf` repository. CI rejects any byte-level drift between the two copies.
+Protocol fixtures have one canonical source in `rust/fixtures`. The package build copies them into the published `dist` tree.
 
 Additive fields in server responses are accepted where the public contract is forward-compatible. Client requests and binary frames remain strict.
 

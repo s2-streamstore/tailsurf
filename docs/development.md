@@ -6,7 +6,7 @@ The repository root is a virtual Cargo workspace. The CLI is the default workspa
 - `rust`: Rust SDK and common crate with API types, stream URL parsing, permissions, IDs, and binary frame encoding.
 - `typescript`: TypeScript workspace containing the high-level client and low-level protocol packages.
 
-Language-neutral TSF v1 frame vectors live in both protocol packages. Forward-compatible REST and SSE examples do too. `typescript/scripts/verify-fixtures.mjs` requires the Rust and TypeScript copies to remain byte-identical.
+Language-neutral TSF v1 frame vectors and REST examples live in `rust/fixtures`. Both implementations test against these files. The TypeScript package build copies them into its published `dist` tree.
 
 ## Local installation
 
