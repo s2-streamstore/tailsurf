@@ -214,6 +214,23 @@ export abstract class BaseTsfReadSession implements TsfReadSession {
     return record;
   }
 
+  protected recordCaughtUp(caughtUp: CaughtUpPosition): void {
+    this.options.lastCaughtUp = caughtUp;
+    this.options.start = { type: "seqNum", seqNum: caughtUp.nextSeqNum };
+    this.notify(this.options.onCaughtUp, caughtUp);
+  }
+
+  protected recordStreamMetadata(stream: StreamMetadata): void {
+    try {
+      validateReadStreamMetadata(this.options, stream);
+    } catch (error) {
+      this.close();
+      throw error;
+    }
+    this.options.streamMetadata = stream;
+    this.notify(this.options.onStreamMetadata, stream);
+  }
+
   protected notify<T>(observer: ((value: T) => void) | undefined, value: T): void {
     try {
       observer?.(value);
@@ -321,21 +338,11 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
           nextSeqNum: frame.nextSeqNum,
           lastTimestampMs: frame.lastTimestampMs,
         };
-        this.options.lastCaughtUp = caughtUp;
-        this.options.start = { type: "seqNum", seqNum: caughtUp.nextSeqNum };
-        this.notify(this.options.onCaughtUp, caughtUp);
+        this.recordCaughtUp(caughtUp);
         continue;
       }
       if (frame.type === "streamMetadata") {
-        const stream = streamMetadataFromWire(frame.stream);
-        try {
-          validateReadStreamMetadata(this.options, stream);
-        } catch (error) {
-          this.close();
-          throw error;
-        }
-        this.options.streamMetadata = stream;
-        this.notify(this.options.onStreamMetadata, stream);
+        this.recordStreamMetadata(streamMetadataFromWire(frame.stream));
         continue;
       }
       throw unexpectedFrame(frame);

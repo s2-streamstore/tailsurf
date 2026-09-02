@@ -176,18 +176,11 @@ class SseReadSession extends BaseTsfReadSession {
           this.finished = true;
           return undefined;
         }
-        try {
-          validateReadStreamMetadata(this.options, connection.stream);
-        } catch (error) {
-          connection.close();
-          throw error;
-        }
         this.#connection = connection;
+        this.recordStreamMetadata(connection.stream);
         if (connection.resumeEventId !== undefined) {
           this.#lastEventId = connection.resumeEventId;
         }
-        this.options.streamMetadata = this.#connection.stream;
-        this.notify(this.options.onStreamMetadata, this.#connection.stream);
         continue;
       }
       const event = result.value;
@@ -212,21 +205,13 @@ class SseReadSession extends BaseTsfReadSession {
         validateCaughtUp(caughtUp, cursor, this.#lastEventId, this.options);
         this.#noProgressReconnects = 0;
         this.#lastEventId = cursor.value;
-        this.options.lastCaughtUp = caughtUp;
-        this.options.start = { type: "seqNum", seqNum: caughtUp.nextSeqNum };
-        this.notify(this.options.onCaughtUp, caughtUp);
+        this.recordCaughtUp(caughtUp);
         continue;
       }
       if (event.event === "stream_metadata") {
-        const stream = streamMetadataFromWire(parseJsonEvent(event, streamMetadataSchema));
-        try {
-          validateReadStreamMetadata(this.options, stream);
-        } catch (error) {
-          this.close();
-          throw error;
-        }
-        this.options.streamMetadata = stream;
-        this.notify(this.options.onStreamMetadata, stream);
+        this.recordStreamMetadata(
+          streamMetadataFromWire(parseJsonEvent(event, streamMetadataSchema)),
+        );
         continue;
       }
       if (event.event === "error") {
