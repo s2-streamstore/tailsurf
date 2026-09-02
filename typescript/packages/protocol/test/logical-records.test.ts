@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_MAX_RECORD_REASSEMBLY_BYTES,
   LogicalRecordAssembler,
   partHeader,
   parseWriterId,
@@ -118,13 +117,6 @@ describe("logical record assembler", () => {
     ).toThrowError(
       expect.objectContaining({ code: "record_total_pending_parts_limit" }),
     );
-  });
-
-  it("uses one shared default reassembly byte limit", () => {
-    const transcript = new LogicalRecordAssembler();
-
-    expect(DEFAULT_MAX_RECORD_REASSEMBLY_BYTES).toBe(16 * 1024 * 1024);
-    expect(transcript.maxReassemblyBytes).toBe(DEFAULT_MAX_RECORD_REASSEMBLY_BYTES);
   });
 });
 

@@ -15,6 +15,7 @@ import {
   permissionsAllowRead,
   permissionsAllowWrite,
   ProtocolError,
+  streamIdFromBytes,
   WRITER_ID_BYTE_LENGTH,
 } from "../src/index.js";
 
@@ -42,6 +43,7 @@ describe("IDs", () => {
 
   it("rejects malformed IDs", () => {
     expect(() => parseStreamId("short")).toThrow(ProtocolError);
+    expect(() => streamIdFromBytes(new Uint8Array(19))).toThrow(ProtocolError);
     for (const id of ["", "Owner", "-owner", "owner-", "deploy_bot", "a".repeat(65)]) {
       expect(() => parseLinkId(id)).toThrow(ProtocolError);
     }

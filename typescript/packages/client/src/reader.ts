@@ -452,7 +452,7 @@ export function validateReadStreamMetadata(
   }
 }
 
-export function advanceReadOptions(
+function advanceReadOptions(
   options: NormalizedReadOptions,
   seqNum: bigint,
 ): boolean {
@@ -466,41 +466,43 @@ export function advanceReadOptions(
   return readExhausted(options);
 }
 
-function validateReadBatchForRequest(
+export function validateReadBatchForRequest(
   records: readonly ReadRecord[],
   options: NormalizedReadOptions,
+  invalid: (message: string) => TsfClientError = invalidServerRead,
 ): void {
   const first = records[0];
   if (first === undefined) {
-    throw invalidServerRead("ReadBatch is empty");
+    throw invalid("ReadBatch is empty");
   }
   const start = options.start;
   if (
     (start.type === "seqNum" && first.seqNum !== start.seqNum) ||
     (start.type === "timestampMs" && first.timestampMs < start.timestampMs)
   ) {
-    throw invalidServerRead("ReadBatch does not begin at the requested position");
+    throw invalid("ReadBatch does not begin at the requested position");
   }
   if (
     options.stop?.count !== undefined &&
     BigInt(records.length) > options.stop.count
   ) {
-    throw invalidServerRead("ReadBatch exceeds the remaining record count");
+    throw invalid("ReadBatch exceeds the remaining record count");
   }
   const untilTimestampMs = options.stop?.untilTimestampMs;
   if (untilTimestampMs !== undefined && records.some(
     (record) => record.timestampMs >= untilTimestampMs,
   )) {
-    throw invalidServerRead("ReadBatch reaches the exclusive until timestamp");
+    throw invalid("ReadBatch reaches the exclusive until timestamp");
   }
 }
 
-function validateCaughtUpForRequest(
+export function validateCaughtUpForRequest(
   nextSeqNum: bigint,
   options: NormalizedReadOptions,
+  invalid: (message: string) => TsfClientError = invalidServerRead,
 ): void {
   if (options.start.type === "seqNum" && nextSeqNum !== options.start.seqNum) {
-    throw invalidServerRead("CaughtUp does not match the next requested sequence");
+    throw invalid("CaughtUp does not match the next requested sequence");
   }
 }
 

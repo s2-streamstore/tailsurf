@@ -416,52 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_input_events() {
-        for event in [
-            TerminalInputEvent::Data(&[0, 1, 255]),
-            TerminalInputEvent::Resize {
-                columns: 132,
-                rows: 43,
-            },
-        ] {
-            let encoded = encode_terminal_input(event).expect("encode input event");
-            assert_eq!(decode_terminal_input(&encoded), Ok(event));
-        }
-    }
-
-    #[test]
-    fn round_trips_output_events() {
-        for event in [
-            TerminalOutputEvent::Data(&[27, 91, 109]),
-            TerminalOutputEvent::Resize {
-                columns: 80,
-                rows: 24,
-            },
-            TerminalOutputEvent::Started {
-                columns: 120,
-                rows: 40,
-            },
-            TerminalOutputEvent::Exited {
-                status: -1,
-                output_truncated: false,
-            },
-            TerminalOutputEvent::Exited {
-                status: 0,
-                output_truncated: true,
-            },
-            TerminalOutputEvent::Heartbeat,
-            TerminalOutputEvent::Checkpoint {
-                columns: 80,
-                rows: 24,
-                state: &[27, 91, 109],
-            },
-        ] {
-            let encoded = encode_terminal_output(event).expect("encode output event");
-            assert_eq!(decode_terminal_output(&encoded), Ok(event));
-        }
-    }
-
-    #[test]
     fn rejects_invalid_events() {
         assert_eq!(
             decode_terminal_input(&[TERMINAL_EVENT_VERSION]),

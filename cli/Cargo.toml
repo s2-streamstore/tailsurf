@@ -24,7 +24,6 @@ eyre.workspace = true
 humantime.workspace = true
 memchr.workspace = true
 portable-pty.workspace = true
-secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "process", "rt", "signal", "sync"] }

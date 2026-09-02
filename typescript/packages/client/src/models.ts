@@ -65,7 +65,7 @@ export function streamMetadataFromWire(
   };
 }
 
-export function streamLinkCredentialFromWire(
+function streamLinkCredentialFromWire(
   link: WireStreamLinkCredential,
 ): StreamLinkCredential {
   return {

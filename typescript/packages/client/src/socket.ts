@@ -57,13 +57,6 @@ export type WebSocketFactory = (
   protocol: string,
 ) => WebSocketLike;
 
-interface ReceiveQueueLimits {
-  /** Maximum queued physical records. A control frame consumes one unit. */
-  readonly maxUnits: number;
-  /** Maximum estimated encoded bytes across queued server frames. */
-  readonly maxBytes: number;
-}
-
 interface QueuedServerFrame {
   readonly frame: ServerFrame;
   readonly bytes: number;
@@ -94,7 +87,7 @@ export async function connectSocket(
       cause,
     });
   }
-  const socket = new FrameSocket(websocket, undefined, openingMessage);
+  const socket = new FrameSocket(websocket, openingMessage);
   try {
     await withTimeout(
       socket.opened,
@@ -119,7 +112,6 @@ export async function connectSocket(
 export class FrameSocket {
   public readonly opened: Promise<void>;
   readonly #queue: QueuedServerFrame[] = [];
-  readonly #limits: ReceiveQueueLimits;
   #queuedBytes = 0;
   #queuedUnits = 0;
   #waiting:
@@ -133,24 +125,8 @@ export class FrameSocket {
 
   public constructor(
     private readonly websocket: WebSocketLike,
-    limits: ReceiveQueueLimits = {
-      maxUnits: DEFAULT_MAX_RECEIVE_QUEUE_UNITS,
-      maxBytes: DEFAULT_MAX_RECEIVE_QUEUE_BYTES,
-    },
     openingMessage?: Uint8Array<ArrayBuffer>,
   ) {
-    if (
-      !Number.isSafeInteger(limits.maxUnits) ||
-      limits.maxUnits <= 0 ||
-      !Number.isSafeInteger(limits.maxBytes) ||
-      limits.maxBytes <= 0
-    ) {
-      throw new TsfClientError(
-        "invalid_client_option",
-        "WebSocket receive queue limits must be positive integers",
-      );
-    }
-    this.#limits = limits;
     websocket.binaryType = "arraybuffer";
     websocket.addEventListener("message", (event) => {
       this.#messagePipeline = this.#messagePipeline
@@ -235,8 +211,8 @@ export class FrameSocket {
       const bytes = serverFrameBytes(frame);
       const units = serverFrameQueueUnits(frame);
       if (
-        units > this.#limits.maxUnits - this.#queuedUnits ||
-        bytes > this.#limits.maxBytes - this.#queuedBytes
+        units > DEFAULT_MAX_RECEIVE_QUEUE_UNITS - this.#queuedUnits ||
+        bytes > DEFAULT_MAX_RECEIVE_QUEUE_BYTES - this.#queuedBytes
       ) {
         this.#finish(
           new TsfClientError(

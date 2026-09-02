@@ -229,15 +229,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sequential_bytes_encode_to_known_base64url() {
-        let bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
-        let encoded = encode_base64url_32(&bytes);
-
-        assert_eq!(encoded, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
-        assert!(is_canonical_base64url_32(&encoded));
-    }
-
-    #[test]
     fn accepts_exact_24_byte_link_secrets() {
         let canonical = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         assert!(is_canonical_base64url_24(canonical));

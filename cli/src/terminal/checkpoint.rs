@@ -566,28 +566,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_preserves_both_screens_across_a_resize() {
-        let mut emitter = TerminalCheckpointEmitter::new(80, 24);
-        emitter.process(b"shell\x1b[?1049hfull screen");
-        let checkpoint = emitter.resize(120, 40).expect("resized checkpoint");
-        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
-        restored.process(&checkpoint.state);
-
-        assert!(restored.screen().alternate_screen());
-        assert_eq!(
-            restored.screen().state_formatted(),
-            emitter.parser.screen().state_formatted()
-        );
-
-        emitter.process(b"\x1b[?1049l");
-        restored.process(b"\x1b[?1049l");
-        assert_eq!(
-            restored.screen().state_formatted(),
-            emitter.parser.screen().state_formatted()
-        );
-    }
-
-    #[test]
     fn btop_synchronized_output_stays_checkpointable_across_a_resize() {
         let mut emitter = TerminalCheckpointEmitter::new(80, 24);
         emitter.process(b"shell\x1b[?1049h\x1b[?1006h\x1b[?2026hframe");

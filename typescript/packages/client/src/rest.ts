@@ -5,8 +5,8 @@ import {
   createLinkResponseSchema,
   listLinksResponseSchema,
   parseStreamId,
-  parseLinkId,
   parseStreamTitle,
+  parseLinkId,
   streamKindSchema,
   streamMetadataSchema,
   updateStreamRequestSchema,
@@ -205,9 +205,7 @@ export class BaseTsfClient {
     options: IdempotencyOptions = {},
   ): Promise<CreateStreamResponse> {
     const normalized = prepareCreateStreamRequest(request);
-    const body = JSON.stringify(
-      createStreamRequestSchema.parse(createStreamRequestToWire(normalized)),
-    );
+    const body = JSON.stringify(createStreamRequestToWire(normalized));
     const idempotencyKey = parseIdempotencyKey(
       options.idempotencyKey ?? generateIdempotencyKey(),
     );
@@ -737,7 +735,9 @@ export function prepareCreateStreamRequest(
     : [{ linkId: parseLinkId("owner"), permissions: "o" as const }, ...requestedLinks];
   return parsePreparedCreateStreamRequest({
     kind: request.kind ?? "transcript",
-    ...(request.title === undefined ? {} : { title: request.title }),
+    ...(request.title === undefined
+      ? {}
+      : { title: parseStreamTitle(request.title) }),
     visibility: request.visibility ?? "private",
     ...(request.expiresInSeconds === undefined
       ? {}

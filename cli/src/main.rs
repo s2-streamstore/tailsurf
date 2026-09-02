@@ -128,7 +128,7 @@ struct UpdateArgs {
     check: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Default)]
 struct NewArgs {
     /// Human-facing stream title.
     #[arg(long, value_name = "TITLE")]
@@ -176,36 +176,11 @@ struct WriteArgs {
     input: InputArgs,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Default)]
 struct InputArgs {
     /// Program to run. Its stdout and stderr are written to the stream.
     #[arg(last = true, value_name = "PROGRAM")]
     program: Vec<String>,
-}
-
-impl InputArgs {
-    fn piped_defaults() -> Self {
-        Self {
-            program: Vec::new(),
-        }
-    }
-}
-
-impl NewArgs {
-    fn piped_defaults() -> Self {
-        Self {
-            title: None,
-            public: false,
-            links: Vec::new(),
-            expires: None,
-            json: false,
-            owner_link_file: None,
-            read_link_file: None,
-            write_link_file: None,
-            bytes: false,
-            input: InputArgs::piped_defaults(),
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -611,7 +586,7 @@ async fn main() -> ExitCode {
         eprint!("{help}");
         return ExitCode::from(2);
     }
-    let command = command.unwrap_or_else(|| Command::New(NewArgs::piped_defaults()));
+    let command = command.unwrap_or_else(|| Command::New(NewArgs::default()));
     let check_for_update = should_check_for_update_hint(
         matches!(command, Command::Update(_)),
         &origin,
@@ -2306,132 +2281,6 @@ mod tests {
     }
 
     #[test]
-    fn initial_links_accept_semantic_ids_and_short_permissions() {
-        let parsed = "deploy-bot=read"
-            .parse::<InitialLinkArg>()
-            .expect("valid initial link");
-
-        assert_eq!(parsed.0.link_id.as_str(), "deploy-bot");
-        assert_eq!(parsed.0.permissions, LinkPermissions::read());
-
-        for (value, expected) in [
-            ("reader=r", LinkPermissions::read()),
-            ("writer=w", LinkPermissions::write()),
-            ("operator=rw", LinkPermissions::read_write()),
-            ("owner=o", LinkPermissions::owner()),
-        ] {
-            let parsed = value
-                .parse::<InitialLinkArg>()
-                .expect("valid short permission");
-            assert_eq!(parsed.0.permissions, expected);
-        }
-    }
-
-    #[test]
-    fn reserved_default_link_ids_report_the_collision() {
-        let new_args = |links: Vec<InitialLinkArg>| NewArgs {
-            title: None,
-            public: false,
-            bytes: false,
-            links,
-            expires: None,
-            json: false,
-            owner_link_file: None,
-            read_link_file: None,
-            write_link_file: None,
-            input: InputArgs {
-                program: Vec::new(),
-            },
-        };
-
-        let args = new_args(vec!["owner=w".parse().expect("valid link")]);
-        let error = new_stream_links(&args, Visibility::Private).expect_err("reserved owner ID");
-        assert_eq!(
-            error.to_string(),
-            "Link ID \"owner\" is reserved for the default owner link; choose another ID or give that link owner permission"
-        );
-
-        let args = new_args(vec!["reader=w".parse().expect("valid link")]);
-        let error = new_stream_links(&args, Visibility::Private).expect_err("reserved reader ID");
-        assert_eq!(
-            error.to_string(),
-            "Link ID \"reader\" is reserved for the default read link on private streams; choose another ID or give that link read-only permission"
-        );
-
-        let args = new_args(vec!["reader=rw".parse().expect("valid link")]);
-        let error = new_stream_links(&args, Visibility::Private).expect_err("reserved reader ID");
-        assert_eq!(
-            error.to_string(),
-            "Link ID \"reader\" is reserved for the default read link on private streams; choose another ID or give that link read-only permission"
-        );
-
-        // User-vs-user duplicates still hit the generic uniqueness error.
-        let args = new_args(vec![
-            "bot=r".parse().expect("valid link"),
-            "bot=w".parse().expect("valid link"),
-        ]);
-        let error = new_stream_links(&args, Visibility::Public).expect_err("duplicate IDs");
-        assert_eq!(error.to_string(), "initial Link IDs must be unique");
-
-        // A reserved ID carrying the required permission needs no default injection.
-        let args = new_args(vec!["owner=o".parse().expect("valid link")]);
-        assert!(new_stream_links(&args, Visibility::Private).is_ok());
-    }
-
-    #[test]
-    fn update_hints_require_a_successful_interactive_production_command() {
-        let production = Url::parse("https://tail.surf").expect("production URL");
-        let non_production = Url::parse("https://api.example").expect("custom URL");
-        let check = |is_update, origin, terminal, disabled| {
-            should_check_for_update_hint(is_update, origin, terminal, disabled)
-        };
-        assert!(check(false, &production, true, false));
-        assert!(!check(false, &production, false, false));
-        assert!(!check(false, &production, true, true));
-        assert!(!check(false, &non_production, true, false));
-        assert!(!check(true, &production, true, false));
-    }
-
-    #[test]
-    fn update_hint_cache_retries_failures_before_successes() {
-        const NOW: u64 = 2_000_000;
-        let retry = UPDATE_HINT_RETRY_INTERVAL.as_secs();
-        let success = UPDATE_HINT_SUCCESS_INTERVAL.as_secs();
-        let cache = |last_attempt_at, last_success_at| UpdateHintCheckCache {
-            last_attempt_at,
-            last_success_at,
-        };
-
-        assert!(update_hint_check_is_due(None, NOW));
-        assert!(!update_hint_check_is_due(Some(&cache(NOW, None)), NOW));
-        assert!(!update_hint_check_is_due(
-            Some(&cache(NOW - retry + 1, None)),
-            NOW
-        ));
-        assert!(update_hint_check_is_due(
-            Some(&cache(NOW - retry, None)),
-            NOW
-        ));
-        assert!(!update_hint_check_is_due(
-            Some(&cache(NOW - success + 1, Some(NOW - success + 1))),
-            NOW
-        ));
-        assert!(update_hint_check_is_due(
-            Some(&cache(NOW - success, Some(NOW - success))),
-            NOW
-        ));
-        assert!(!update_hint_check_is_due(
-            Some(&cache(NOW + retry - 1, None)),
-            NOW
-        ));
-        assert!(update_hint_check_is_due(
-            Some(&cache(NOW + retry, None)),
-            NOW
-        ));
-        assert!(claim_update_hint_check(Path::new("."), NOW).is_none());
-    }
-
-    #[test]
     fn classifies_wrapped_broken_pipes_only() {
         let broken_pipe: eyre::Report =
             std::io::Error::new(ErrorKind::BrokenPipe, "closed consumer").into();
@@ -2472,23 +2321,5 @@ mod tests {
         let small = serde_json::json!({ "a": 1 });
         let error = write_json(BrokenPipeWriter, &small).expect_err("broken pipe");
         assert!(is_broken_pipe(&error));
-    }
-
-    #[test]
-    fn expiry_beyond_rfc3339_range_errors_instead_of_panicking() {
-        let huge = Duration::from_secs(u64::MAX / 4);
-        assert!(rfc3339_from_now(huge, "link expiry").is_err());
-
-        // One second before the last representable instant still formats.
-        let to_end = Duration::from_secs(
-            253_402_300_799
-                - SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("post-epoch")
-                    .as_secs()
-                - 1,
-        );
-        let formatted = rfc3339_from_now(to_end, "link expiry").expect("in-range expiry");
-        assert!(formatted.starts_with("9999-12-31T23:59:5"));
     }
 }

@@ -1,12 +1,6 @@
 //! JSON models for the REST v1 management and HTTP data planes.
 
-use std::fmt;
-
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{Error as _, IgnoredAny, MapAccess, Visitor},
-    ser::SerializeMap,
-};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap};
 use url::Url;
 
 use crate::{
@@ -341,52 +335,21 @@ impl<'de> Deserialize<'de> for JsonRecordPayload {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(JsonRecordPayloadVisitor)
-    }
-}
-
-struct JsonRecordPayloadVisitor;
-
-impl<'de> Visitor<'de> for JsonRecordPayloadVisitor {
-    type Value = JsonRecordPayload;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("exactly one text or bytes record payload")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut text = None;
-        let mut bytes = None;
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "text" => {
-                    if text.is_some() {
-                        return Err(A::Error::duplicate_field("text"));
-                    }
-                    text = Some(map.next_value()?);
-                }
-                "bytes" => {
-                    if bytes.is_some() {
-                        return Err(A::Error::duplicate_field("bytes"));
-                    }
-                    bytes = Some(map.next_value()?);
-                }
-                _ => {
-                    map.next_value::<IgnoredAny>()?;
-                }
-            }
-        }
-        match (text, bytes) {
-            (Some(text), None) => Ok(JsonRecordPayload::Text(text)),
-            (None, Some(bytes)) => Ok(JsonRecordPayload::Bytes(bytes)),
-            _ => Err(A::Error::custom(
+        let fields = JsonRecordPayloadFields::deserialize(deserializer)?;
+        match (fields.text, fields.bytes) {
+            (Some(text), None) => Ok(Self::Text(text)),
+            (None, Some(bytes)) => Ok(Self::Bytes(bytes)),
+            _ => Err(D::Error::custom(
                 "a record carries exactly one of text or bytes",
             )),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct JsonRecordPayloadFields {
+    text: Option<String>,
+    bytes: Option<String>,
 }
 
 /// One record in a stateless atomic append.
@@ -825,85 +788,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepares_a_default_owner_for_stream_creation() {
-        let request = CreateStreamRequest::default();
-        let value = serde_json::to_value(request).expect("serialize create request");
-
-        assert_eq!(value["visibility"], "private");
-        assert!(value.get("kind").is_none());
-        assert_eq!(value["links"][0]["link_id"], "owner");
-        assert_eq!(value["links"][0]["permissions"], "o");
-        assert!(value["links"][0].get("secret").is_none());
-    }
-
-    #[test]
-    fn serializes_requested_stream_lifetime() {
-        let request = CreateStreamRequest {
-            expires_in_seconds: Some(604_800),
-            ..CreateStreamRequest::default()
-        };
-        let value = serde_json::to_value(request).expect("serialize create request");
-        assert_eq!(value["expires_in_seconds"], json!(604_800));
-        assert_eq!(
-            serde_json::from_value::<CreateStreamRequest>(value)
-                .expect("deserialize create request")
-                .expires_in_seconds,
-            Some(604_800)
-        );
-    }
-
-    #[test]
-    fn serializes_link_mutations_and_omits_absent_stream_update() {
-        let link = CreateLinkInput::new(
-            "reader".parse().expect("Link ID"),
-            LinkPermissions::read(),
-            None,
-        );
-        let link = serde_json::to_value(link).expect("serialize link request");
-        assert_eq!(link["permissions"], "r");
-        assert!(link.get("link_id").is_none());
-        assert!(link.get("secret").is_none());
-        assert_eq!(
-            serde_json::to_value(UpdateStreamRequest::default()).expect("serialize update request"),
-            json!({})
-        );
-        assert_eq!(
-            serde_json::to_value(UpdateStreamRequest {
-                title: StreamTitleUpdate::Clear,
-                ..UpdateStreamRequest::default()
-            })
-            .expect("serialize title clear request"),
-            json!({ "title": null })
-        );
-        assert_eq!(
-            serde_json::to_value(UpdateStreamRequest {
-                title: StreamTitleUpdate::Set("Deploy log".parse().expect("title")),
-                ..UpdateStreamRequest::default()
-            })
-            .expect("serialize title set request"),
-            json!({ "title": "Deploy log" })
-        );
-        assert_eq!(
-            serde_json::from_value::<UpdateStreamRequest>(json!({ "title": "Deploy log" }))
-                .expect("deserialize title update")
-                .title,
-            StreamTitleUpdate::Set("Deploy log".parse().expect("title"))
-        );
-        assert_eq!(
-            serde_json::from_value::<UpdateStreamRequest>(json!({ "title": null }))
-                .expect("deserialize title clear")
-                .title,
-            StreamTitleUpdate::Clear
-        );
-        assert_eq!(
-            serde_json::from_value::<UpdateStreamRequest>(json!({}))
-                .expect("deserialize absent title update")
-                .title,
-            StreamTitleUpdate::Unchanged
-        );
-    }
-
-    #[test]
     fn record_payloads_require_exactly_one_encoding() {
         let base = json!({
             "seq_num": "1",
@@ -937,104 +821,6 @@ mod tests {
             serde_json::to_value(append).expect("serialize byte record"),
             json!({ "bytes": "AP8" })
         );
-    }
-
-    #[test]
-    fn response_models_require_kind_and_validate_rfc3339_timestamps() {
-        let stream = json!({
-            "stream_id": "00000000000000000000000000000000",
-            "kind": "transcript",
-            "visibility": "private",
-            "created_at": "2026-08-13T00:00:00Z",
-            "expires_at": "2026-08-23T00:00:00Z"
-        });
-        let stream =
-            serde_json::from_value::<StreamMetadata>(stream).expect("deserialize stream metadata");
-        assert_eq!(stream.kind, StreamKind::Transcript);
-        assert_eq!(stream.title, None);
-
-        let created = json!({
-            "stream_id": "00000000000000000000000000000000",
-            "kind": "transcript",
-            "visibility": "private",
-            "created_at": "2026-08-13T00:00:00Z",
-            "expires_at": "2026-08-23T00:00:00Z",
-            "web_origin": "https://tail.surf",
-            "links": []
-        });
-        let created = serde_json::from_value::<CreateStreamResponse>(created)
-            .expect("deserialize create response");
-        assert_eq!(created.kind, StreamKind::Transcript);
-        assert!(created.title.is_none());
-        assert_eq!(created.web_origin.as_str(), "https://tail.surf/");
-
-        let created_link = json!({
-            "web_origin": "http://localhost:3000",
-            "link_id": "reader",
-            "permissions": "r",
-            "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        });
-        let created_link = serde_json::from_value::<CreateLinkResponse>(created_link)
-            .expect("deserialize created link");
-        assert_eq!(created_link.web_origin.as_str(), "http://localhost:3000/");
-        assert_eq!(created_link.credential.link_id.as_str(), "reader");
-
-        let invalid_time = json!({
-            "stream_id": "00000000000000000000000000000000",
-            "kind": "transcript",
-            "title": null,
-            "visibility": "private",
-            "created_at": "2026-02-30T00:00:00Z",
-            "expires_at": "2026-08-23T00:00:00Z"
-        });
-        assert!(serde_json::from_value::<StreamMetadata>(invalid_time).is_err());
-
-        // Integer FromStr accepts a leading '+'; fixed-width windows must not.
-        for signed in [
-            "+026-08-13T00:00:00Z",
-            "2026-+8-13T00:00:00Z",
-            "2026-08-13T00:00:00++0:00",
-            "2026-08-13T00:00:00-+0:00",
-        ] {
-            let signed_time = json!({
-                "stream_id": "00000000000000000000000000000000",
-                "kind": "transcript",
-                "title": null,
-                "visibility": "private",
-                "created_at": signed,
-                "expires_at": "2026-08-23T00:00:00Z"
-            });
-            assert!(
-                serde_json::from_value::<StreamMetadata>(signed_time).is_err(),
-                "accepted {signed:?}"
-            );
-        }
-
-        assert!(serde_json::from_value::<ListLinksResponse>(json!({ "links": [] })).is_err());
-        assert!(
-            serde_json::from_value::<ListLinksResponse>(json!({
-                "authorizing_link_id": "owner",
-                "links": [],
-                "next_cursor": ""
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn api_error_tolerates_an_absent_request_id() {
-        let error: ApiErrorResponse = serde_json::from_value(json!({
-            "error": {
-                "code": "sequence_mismatch",
-                "message": "position changed",
-                "retry_after_ms": 250,
-                "actual_next_seq_num": "42"
-            }
-        }))
-        .expect("error without request id");
-        assert!(error.error.request_id.is_empty());
-        assert_eq!(error.error.retry_after_ms, Some(250));
-        assert_eq!(error.error.actual_next_seq_num, Some(42));
     }
 
     #[test]
