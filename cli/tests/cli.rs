@@ -95,15 +95,12 @@ async fn second_interrupt_aborts_a_stalled_stdin_write() {
     let server = HoldingWriteServer::start(1).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
-    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    let mut command = tsf_command(&server.origin);
     command
-        .arg("--origin")
-        .arg(server.origin.as_str())
         .args(["write", write_link.as_str()])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn tsf write");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
@@ -145,15 +142,12 @@ async fn first_interrupt_does_not_drain_an_unbounded_input_backlog() {
     let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
-    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    let mut command = tsf_command(&server.origin);
     command
-        .arg("--origin")
-        .arg(server.origin.as_str())
         .args(["write", write_link.as_str()])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn tsf write");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
@@ -197,15 +191,12 @@ async fn interrupted_command_unblocks_full_output_readers() {
     let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
     let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
     let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
-    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    let mut command = tsf_command(&server.origin);
     command
-        .arg("--origin")
-        .arg(server.origin.as_str())
         .args(["write", write_link.as_str(), "--", "yes", "123456789012345"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn tsf command capture");
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
 
@@ -946,14 +937,11 @@ async fn run_tsf_bytes(
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
 ) -> CommandOutputBytes {
-    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    let mut command = tsf_command(&origin);
     command
-        .arg("--origin")
-        .arg(origin.to_string())
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
@@ -984,10 +972,8 @@ async fn run_tsf_until_stdout_contains<const N: usize>(
     needle: &[u8],
     wait_for: Duration,
 ) -> CommandOutput {
-    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    let mut command = tsf_command(&origin);
     command
-        .arg("--origin")
-        .arg(origin.to_string())
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1056,6 +1042,15 @@ async fn run_tsf_until_stdout_contains<const N: usize>(
         stdout: String::from_utf8(stdout).expect("stdout utf8"),
         stderr: String::from_utf8(stderr).expect("stderr utf8"),
     }
+}
+
+fn tsf_command(origin: &Url) -> TokioCommand {
+    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_tsf"));
+    command
+        .arg("--origin")
+        .arg(origin.as_str())
+        .kill_on_drop(true);
+    command
 }
 
 async fn connect_default_writer(origin: &Url) -> tailsurf::TsfWriter {
