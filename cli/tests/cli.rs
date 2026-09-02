@@ -860,6 +860,23 @@ async fn start_server(router: Router) -> (Url, AbortOnDrop) {
     )
 }
 
+struct TestServer<S> {
+    origin: Url,
+    state: Arc<S>,
+    _task: AbortOnDrop,
+}
+
+impl<S> TestServer<S> {
+    async fn serve(state: Arc<S>, router: Router) -> Self {
+        let (origin, task) = start_server(router).await;
+        Self {
+            origin,
+            state,
+            _task: task,
+        }
+    }
+}
+
 struct CommandOutput {
     status: std::process::ExitStatus,
     stdout: String,
@@ -1068,13 +1085,9 @@ struct HoldingWriteAttempt {
     writer_seq_num: u64,
 }
 
-struct HoldingWriteServer {
-    origin: Url,
-    state: Arc<HoldingWriteState>,
-    _task: AbortOnDrop,
-}
+type HoldingWriteServer = TestServer<HoldingWriteState>;
 
-impl HoldingWriteServer {
+impl TestServer<HoldingWriteState> {
     async fn start(expected_before_ack: usize) -> Self {
         Self::start_with_mode(expected_before_ack, HoldingWriteMode::Hold).await
     }
@@ -1099,12 +1112,7 @@ impl HoldingWriteServer {
                 get(holding_write_socket),
             )
             .with_state(state.clone());
-        let (origin, task) = start_server(router).await;
-        Self {
-            origin,
-            state,
-            _task: task,
-        }
+        Self::serve(state, router).await
     }
 
     async fn wait_for_records(&self, expected: usize) {
@@ -1299,13 +1307,9 @@ struct StallingWriteState {
     connections: AtomicUsize,
 }
 
-struct StallingWriteServer {
-    origin: Url,
-    state: Arc<StallingWriteState>,
-    _task: AbortOnDrop,
-}
+type StallingWriteServer = TestServer<StallingWriteState>;
 
-impl StallingWriteServer {
+impl TestServer<StallingWriteState> {
     async fn start(stall: Duration, ack_delay: Duration) -> Self {
         let state = Arc::new(StallingWriteState {
             stall,
@@ -1318,12 +1322,7 @@ impl StallingWriteServer {
                 get(stalling_write_socket),
             )
             .with_state(state.clone());
-        let (origin, task) = start_server(router).await;
-        Self {
-            origin,
-            state,
-            _task: task,
-        }
+        Self::serve(state, router).await
     }
 
     fn connections(&self) -> usize {
@@ -1397,13 +1396,9 @@ struct FakeWriteState {
     terminal: bool,
 }
 
-struct FakeWriteServer {
-    origin: Url,
-    state: Arc<FakeWriteState>,
-    _task: AbortOnDrop,
-}
+type FakeWriteServer = TestServer<FakeWriteState>;
 
-impl FakeWriteServer {
+impl TestServer<FakeWriteState> {
     async fn start() -> Self {
         Self::start_with_mode(1, false).await
     }
@@ -1425,12 +1420,7 @@ impl FakeWriteServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/write", get(fake_write_socket))
             .with_state(state.clone());
-        let (origin, task) = start_server(router).await;
-        Self {
-            origin,
-            state,
-            _task: task,
-        }
+        Self::serve(state, router).await
     }
 
     fn append_attempts(&self) -> Vec<AppendAttempt> {
@@ -1546,13 +1536,9 @@ struct FakeSseState {
     mode: FakeSseMode,
 }
 
-struct FakeSseServer {
-    origin: Url,
-    state: Arc<FakeSseState>,
-    _task: AbortOnDrop,
-}
+type FakeSseServer = TestServer<FakeSseState>;
 
-impl FakeSseServer {
+impl TestServer<FakeSseState> {
     async fn start() -> Self {
         Self::start_with_mode(FakeSseMode::default()).await
     }
@@ -1565,12 +1551,7 @@ impl FakeSseServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/records", get(fake_sse_read))
             .with_state(state.clone());
-        let (origin, task) = start_server(router).await;
-        Self {
-            origin,
-            state,
-            _task: task,
-        }
+        Self::serve(state, router).await
     }
 
     fn attempts(&self) -> Vec<SseAttempt> {
@@ -1687,13 +1668,9 @@ enum FakeReadMode {
     ReplaySplitRecord,
 }
 
-struct FakeReadServer {
-    origin: Url,
-    state: Arc<FakeReadState>,
-    _task: AbortOnDrop,
-}
+type FakeReadServer = TestServer<FakeReadState>;
 
-impl FakeReadServer {
+impl TestServer<FakeReadState> {
     async fn start(mode: FakeReadMode) -> Self {
         let state = Arc::new(FakeReadState {
             read_attempts: Mutex::new(Vec::new()),
@@ -1702,12 +1679,7 @@ impl FakeReadServer {
         let router = Router::new()
             .route("/api/v1/streams/{stream_id}/read", get(fake_read_socket))
             .with_state(state.clone());
-        let (origin, task) = start_server(router).await;
-        Self {
-            origin,
-            state,
-            _task: task,
-        }
+        Self::serve(state, router).await
     }
 
     fn read_attempts(&self) -> Vec<ReadAttempt> {
