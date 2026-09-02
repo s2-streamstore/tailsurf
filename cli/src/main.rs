@@ -1186,12 +1186,7 @@ async fn stream_byte_chunks_to_writer(
                 }
             }
         } else {
-            let chunk = tokio::select! {
-                biased;
-                _ = session.interrupted() => break,
-                chunk = chunk_rx.recv() => chunk,
-            };
-            let Some(chunk) = chunk else {
+            let Some(chunk) = next_input_chunk(session, chunk_rx).await else {
                 break;
             };
             appender.push_bytes(session, &chunk?).await?;
@@ -1206,17 +1201,23 @@ async fn stream_line_chunks_to_writer(
 ) -> eyre::Result<()> {
     let mut line_appender = LineRecordAppender::new();
     loop {
-        let chunk = tokio::select! {
-            biased;
-            _ = session.interrupted() => break,
-            chunk = chunk_rx.recv() => chunk,
-        };
-        let Some(chunk) = chunk else {
+        let Some(chunk) = next_input_chunk(session, chunk_rx).await else {
             break;
         };
         line_appender.push_bytes(session, &chunk?).await?;
     }
     line_appender.finish(session).await
+}
+
+async fn next_input_chunk(
+    session: &WriterSession,
+    chunk_rx: &mut mpsc::Receiver<eyre::Result<Bytes>>,
+) -> Option<eyre::Result<Bytes>> {
+    tokio::select! {
+        biased;
+        _ = session.interrupted() => None,
+        chunk = chunk_rx.recv() => chunk,
+    }
 }
 
 /// Splits input into transcript records on `\n`. The delimiter is consumed, not stored;
