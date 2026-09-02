@@ -259,15 +259,9 @@ export class BaseTsfClient {
     streamId: StreamId,
     options: OwnerAuthOptions,
   ): Promise<void> {
-    return this.#request(
+    return this.#delete(
       "delete stream",
       `/streams/${parseStreamId(streamId)}`,
-      async (response) => {
-        if (response.status !== 204) {
-          throw await httpStatusError(response, "delete stream");
-        }
-      },
-      { method: "DELETE" },
       requiredLinkSecret(options, "delete stream", "owner"),
     );
   }
@@ -393,15 +387,9 @@ export class BaseTsfClient {
     linkId: LinkId,
     options: OwnerAuthOptions,
   ): Promise<void> {
-    return this.#request(
+    return this.#delete(
       "revoke link",
       `/streams/${parseStreamId(streamId)}/links/${parseLinkId(linkId)}`,
-      async (response) => {
-        if (response.status !== 204) {
-          throw await httpStatusError(response, "revoke link");
-        }
-      },
-      { method: "DELETE" },
       requiredLinkSecret(options, "revoke link", "owner"),
     );
   }
@@ -542,6 +530,18 @@ export class BaseTsfClient {
       init,
       linkSecret,
     );
+  }
+
+  async #delete(
+    operation: string,
+    path: string,
+    linkSecret: string,
+  ): Promise<void> {
+    return this.#request(operation, path, async (response) => {
+      if (response.status !== 204) {
+        throw await httpStatusError(response, operation);
+      }
+    }, { method: "DELETE" }, linkSecret);
   }
 
   async #request<T>(
