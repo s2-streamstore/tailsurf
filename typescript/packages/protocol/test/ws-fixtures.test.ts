@@ -46,7 +46,7 @@ interface Fixtures {
 }
 
 const fixtures = JSON.parse(
-  readFileSync(new URL("../fixtures/v1.json", import.meta.url), "utf8"),
+  readFileSync(new URL("../../../../rust/fixtures/v1.json", import.meta.url), "utf8"),
 ) as Fixtures;
 
 describe("TSF v1 wire fixtures", () => {

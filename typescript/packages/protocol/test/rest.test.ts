@@ -34,7 +34,7 @@ import {
 } from "../src/index.js";
 
 const fixtures = JSON.parse(readFileSync(
-  new URL("../fixtures/rest-v1.json", import.meta.url),
+  new URL("../../../../rust/fixtures/rest-v1.json", import.meta.url),
   "utf8",
 )) as Record<string, unknown>;
 

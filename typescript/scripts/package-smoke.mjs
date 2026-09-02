@@ -78,7 +78,8 @@ try {
   await Promise.all([
     access(join(installedProtocol, "LICENSE")),
     access(join(installedProtocol, "README.md")),
-    access(join(installedProtocol, "fixtures", "v1.json")),
+    access(join(installedProtocol, "dist", "fixtures", "rest-v1.json")),
+    access(join(installedProtocol, "dist", "fixtures", "v1.json")),
     access(join(installedClient, "LICENSE")),
     access(join(installedClient, "README.md")),
     access(join(installedAlias, "LICENSE")),
