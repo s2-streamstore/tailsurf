@@ -461,6 +461,8 @@ impl vte::Perform for CheckpointCompatibility {
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         if ignore || !intermediates.is_empty() || matches!(byte, b'7' | b'8') {
             self.reject();
+        } else if byte == b'c' {
+            self.passthrough_modes.clear();
         }
     }
 
@@ -477,6 +479,10 @@ impl vte::Perform for CheckpointCompatibility {
         }
         match (intermediates, action) {
             ([], 'r') => self.reject(),
+            ([b'!'], 'p') => {
+                self.passthrough_modes.clear();
+                self.reject();
+            }
             ([b'?'], 'h' | 'l') => {
                 let mut mode = None;
                 let mut count = 0;
@@ -607,6 +613,29 @@ mod tests {
         assert!(checkpoint.state.ends_with(
             b"\x1b[?1004h\x1b[?1016h\x1b[?2031l\x1b[?2048h\x1b[?5522l\x1b[?7727h\x1b[?9001h"
         ));
+    }
+
+    #[test]
+    fn terminal_resets_do_not_restore_stale_passthrough_modes() {
+        let mut hard_reset = TerminalCheckpointEmitter::new(80, 24);
+        hard_reset.process(b"screen\x1b[?1004;2026h\x1bcreset");
+        let checkpoint = hard_reset.flush().expect("hard-reset checkpoint");
+        assert!(
+            !checkpoint
+                .state
+                .windows(b"\x1b[?1004".len())
+                .any(|bytes| bytes == b"\x1b[?1004")
+        );
+        assert!(
+            !checkpoint
+                .state
+                .windows(b"\x1b[?2026".len())
+                .any(|bytes| bytes == b"\x1b[?2026")
+        );
+
+        let mut soft_reset = TerminalCheckpointEmitter::new(80, 24);
+        soft_reset.process(b"screen\x1b[?1004;2026h\x1b[!preset");
+        assert!(soft_reset.resize(120, 40).is_none());
     }
 
     #[test]
