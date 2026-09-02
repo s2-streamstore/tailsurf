@@ -102,9 +102,9 @@ enum Command {
     /// Write piped input or a program's output to an existing stream.
     Write(WriteArgs),
     /// Follow a stream, optionally starting from existing records.
-    Tail(TailArgs),
+    Tail(ReadStreamArgs),
     /// Print existing records and stop at the current tail.
-    Replay(ReplayArgs),
+    Replay(ReadStreamArgs),
     /// Show current stream metadata.
     Info(InfoArgs),
     /// Permanently delete a stream.
@@ -112,11 +112,13 @@ enum Command {
     /// Change stream visibility.
     Visibility(VisibilityArgs),
     /// Set or clear a stream title.
-    Title(TitleArgs),
+    #[command(subcommand)]
+    Title(TitleCommand),
     /// Extend a stream's expiration.
     Renew(RenewArgs),
     /// Manage links.
-    Link(LinkArgs),
+    #[command(subcommand)]
+    Link(LinkCommand),
     /// Update an installation managed by the tail.surf installer.
     Update(UpdateArgs),
 }
@@ -184,7 +186,7 @@ struct InputArgs {
 }
 
 #[derive(Debug, Args)]
-struct TailArgs {
+struct ReadStreamArgs {
     /// Read-capable link, public stream URL, or @path containing one.
     #[arg(value_name = "STREAM_LINK_OR_URL")]
     link: LinkInput,
@@ -220,15 +222,6 @@ struct ReadArgs {
 }
 
 #[derive(Debug, Args)]
-struct ReplayArgs {
-    /// Read-capable link, public stream URL, or @path containing one.
-    #[arg(value_name = "STREAM_LINK_OR_URL")]
-    link: LinkInput,
-    #[command(flatten)]
-    read: ReadArgs,
-}
-
-#[derive(Debug, Args)]
 struct InfoArgs {
     /// Read-capable link, public stream URL, or @path containing one.
     #[arg(value_name = "STREAM_LINK_OR_URL")]
@@ -261,12 +254,6 @@ struct VisibilityArgs {
     /// Print one JSON object instead of human-readable output.
     #[arg(long)]
     json: bool,
-}
-
-#[derive(Debug, Args)]
-struct TitleArgs {
-    #[command(subcommand)]
-    command: TitleCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -311,12 +298,6 @@ struct RenewArgs {
     /// Print one JSON object instead of human-readable output.
     #[arg(long)]
     json: bool,
-}
-
-#[derive(Debug, Args)]
-struct LinkArgs {
-    #[command(subcommand)]
-    command: LinkCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1456,7 +1437,7 @@ fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadSta
     options
 }
 
-async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
+async fn tail_stream(origin: Url, args: ReadStreamArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     require_record_stream(&locator, "tail")?;
     let request = read_options(&locator, &args.read, ReadStart::TailOffset(0));
@@ -1470,7 +1451,7 @@ async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
     .await
 }
 
-async fn replay_stream(origin: Url, args: ReplayArgs) -> eyre::Result<()> {
+async fn replay_stream(origin: Url, args: ReadStreamArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     require_record_stream(&locator, "replay")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
@@ -1553,8 +1534,8 @@ async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()
     .await
 }
 
-async fn update_title(origin: Url, args: TitleArgs) -> eyre::Result<()> {
-    let (owner_link, title, json) = match args.command {
+async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
+    let (owner_link, title, json) = match command {
         TitleCommand::Set(args) => (
             args.owner_link,
             StreamTitleUpdate::Set(args.title),
@@ -1591,8 +1572,8 @@ async fn renew_stream(origin: Url, args: RenewArgs) -> eyre::Result<()> {
     .await
 }
 
-async fn link_command(origin: Url, args: LinkArgs) -> eyre::Result<()> {
-    match args.command {
+async fn link_command(origin: Url, command: LinkCommand) -> eyre::Result<()> {
+    match command {
         LinkCommand::List(args) => list_links(origin, args).await,
         LinkCommand::Create(args) => create_link(origin, args).await,
         LinkCommand::Revoke(args) => revoke_link(origin, args).await,
