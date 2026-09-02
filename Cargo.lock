@@ -1963,7 +1963,6 @@ dependencies = [
  "humantime",
  "memchr",
  "portable-pty",
- "secrecy",
  "serde",
  "serde_json",
  "tailsurf",

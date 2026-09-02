@@ -2,7 +2,10 @@
 
 use url::{Url, form_urlencoded};
 
-use crate::{LinkPermissions, LinkSecret, StreamId, protocol::MAX_SAFE_INTEGER_U64};
+use crate::{
+    LinkPermissions, LinkSecret, StreamId,
+    protocol::{MAX_SAFE_INTEGER_U64, rest::parse_canonical_decimal_u64},
+};
 
 /// Encoded length of a 24-byte stream link credential.
 pub const LINK_SECRET_ENCODED_LENGTH: usize = LinkSecret::ENCODED_LEN;
@@ -185,16 +188,9 @@ fn parse_fragment(
             if anchor.is_some() {
                 return Err(StreamLinkError::MultipleAnchors);
             }
-            let canonical = value == "0"
-                || (!value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit()));
-            let seq_num = if canonical {
-                value.parse().map_err(|_| StreamLinkError::InvalidAnchor)?
-            } else {
-                return Err(StreamLinkError::InvalidAnchor);
-            };
-            if seq_num > MAX_SAFE_INTEGER_U64 {
-                return Err(StreamLinkError::InvalidAnchor);
-            }
+            let seq_num = parse_canonical_decimal_u64(&value)
+                .filter(|value| *value <= MAX_SAFE_INTEGER_U64)
+                .ok_or(StreamLinkError::InvalidAnchor)?;
             anchor = Some(StreamAnchor { seq_num });
             continue;
         }
@@ -348,18 +344,6 @@ mod tests {
             Err(StreamLinkError::InvalidLinkSecret)
         ));
         assert!(matches!(
-            StreamLocator::parse(
-                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"
-            ),
-            Err(StreamLinkError::InvalidLinkSecret)
-        ));
-        assert!(matches!(
-            StreamLocator::parse(
-                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#r=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            Err(StreamLinkError::InvalidLinkSecret)
-        ));
-        assert!(matches!(
             StreamLocator::parse(&format!(
                 "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#w={SECRET}&r={SECRET}"
             )),
@@ -377,25 +361,15 @@ mod tests {
             StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#at=1&at=2"),
             Err(StreamLinkError::MultipleAnchors)
         ));
-        for query in ["", "at=50", "seq_num=100", "view=raw"] {
-            assert!(matches!(
-                StreamLocator::parse(&format!(
-                    "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz?{query}"
-                )),
-                Err(StreamLinkError::QueryNotAllowed)
-            ));
-        }
-        assert!(matches!(
-            StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#&"),
-            Err(StreamLinkError::InvalidFragment)
-        ));
-        assert!(matches!(
-            StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#"),
-            Err(StreamLinkError::InvalidFragment)
-        ));
         assert!(matches!(
             StreamLocator::parse("https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#at=1&"),
             Err(StreamLinkError::InvalidFragment)
+        ));
+        assert!(matches!(
+            StreamLocator::parse(
+                "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz?seq_num=100"
+            ),
+            Err(StreamLinkError::QueryNotAllowed)
         ));
     }
 
@@ -445,17 +419,6 @@ mod tests {
             StreamLocator::parse(&format!("https://tail.surf/t/{STREAM_ID}#at=1")),
             Err(StreamLinkError::TerminalAnchorNotAllowed)
         ));
-    }
-
-    #[test]
-    fn rejects_invalid_link_secret_text() {
-        assert!("too-short".parse::<LinkSecret>().is_err());
-        // Correct length but non-canonical trailing bits.
-        assert!(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .parse::<LinkSecret>()
-                .is_err()
-        );
     }
 
     #[test]

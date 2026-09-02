@@ -159,38 +159,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_every_permission_canonically() {
-        let cases = [
-            (LinkPermissions::owner(), "o"),
-            (LinkPermissions::read(), "r"),
-            (LinkPermissions::write(), "w"),
-            (LinkPermissions::read_write(), "rw"),
-        ];
-
-        for (permissions, canonical) in cases {
-            assert_eq!(permissions.as_str(), canonical);
+    fn parses_serializes_and_applies_permissions() {
+        for (input, canonical, allows) in [
+            ("o", "o", [true, true, true]),
+            ("r", "r", [false, true, false]),
+            ("w", "w", [false, false, true]),
+            ("wr", "rw", [false, true, true]),
+        ] {
+            let permissions: LinkPermissions = input.parse().expect("valid permissions");
             assert_eq!(permissions.to_string(), canonical);
+            assert_eq!(
+                [
+                    permissions.allows_owner(),
+                    permissions.allows_read(),
+                    permissions.allows_write(),
+                ],
+                allows
+            );
+            assert_eq!(
+                serde_json::to_string(&permissions).expect("serialize permissions"),
+                format!("\"{canonical}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<LinkPermissions>(&format!("\"{input}\""))
+                    .expect("deserialize permissions"),
+                permissions
+            );
         }
-    }
-
-    #[test]
-    fn parses_data_permissions_in_any_order_and_formats_canonically() {
-        let permissions: LinkPermissions = "wr".parse().expect("valid permissions");
-
-        assert!(!permissions.allows_owner());
-        assert!(permissions.allows_read());
-        assert!(permissions.allows_write());
-        assert_eq!(permissions.to_string(), "rw");
-    }
-
-    #[test]
-    fn owner_implies_all_effective_permissions() {
-        let permissions: LinkPermissions = "o".parse().expect("valid permissions");
-
-        assert!(permissions.allows_owner());
-        assert!(permissions.allows_read());
-        assert!(permissions.allows_write());
-        assert_eq!(permissions.to_string(), "o");
     }
 
     #[test]
@@ -215,18 +210,6 @@ mod tests {
         assert_eq!(
             "orw".parse::<LinkPermissions>(),
             Err(PermissionsError::OwnerCannotBeCombined)
-        );
-    }
-
-    #[test]
-    fn serde_uses_canonical_string_form() {
-        let permissions: LinkPermissions =
-            serde_json::from_str("\"wr\"").expect("valid permission JSON");
-
-        assert_eq!(permissions.to_string(), "rw");
-        assert_eq!(
-            serde_json::to_string(&permissions).expect("serialize permissions"),
-            "\"rw\""
         );
     }
 }

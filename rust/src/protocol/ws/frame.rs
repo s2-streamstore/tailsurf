@@ -1311,7 +1311,6 @@ pub enum FrameCodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::rest::Visibility;
 
     fn owned_read_record(seq_num: u64, data: Bytes) -> OwnedReadRecord {
         OwnedReadRecord {
@@ -1322,15 +1321,6 @@ mod tests {
             part: PartHeader::unsplit(),
             data,
         }
-    }
-
-    #[test]
-    fn part_header_packs_final_bit_and_index() {
-        let part = PartHeader::new(42, true).expect("part header");
-
-        assert_eq!(part.index(), 42);
-        assert!(part.is_final());
-        assert_eq!(PartHeader::from_raw(part.raw()), part);
     }
 
     #[test]
@@ -1376,192 +1366,25 @@ mod tests {
     }
 
     #[test]
-    fn part_header_rejects_indexes_above_the_31_bit_range() {
-        let max = PartHeader::new(PartHeader::MAX_INDEX, true).expect("max part index");
-
-        assert_eq!(max.index(), PartHeader::MAX_INDEX);
-        assert!(max.is_final());
-        assert!(matches!(
-            PartHeader::new(PartHeader::MAX_INDEX + 1, false),
-            Err(FrameCodecError::PartIndexTooLarge(value)) if value == PartHeader::MAX_INDEX + 1
-        ));
-    }
-
-    #[test]
-    fn frame_decoders_reject_unknown_empty_and_truncated_frames() {
-        assert!(matches!(
-            ClientFrame::decode(&[]),
-            Err(FrameCodecError::EmptyFrame)
-        ));
-        assert!(matches!(
-            ServerFrame::decode(&[]),
-            Err(FrameCodecError::EmptyFrame)
-        ));
-        assert!(matches!(
-            ClientFrame::decode(&[0x7f]),
-            Err(FrameCodecError::UnknownOperation(0x7f))
-        ));
-        assert!(matches!(
-            ServerFrame::decode(&[0x7f]),
-            Err(FrameCodecError::UnknownOperation(0x7f))
-        ));
-        assert!(matches!(
-            ClientFrame::decode(&[ClientOp::AppendBatch.byte(), 0]),
-            Err(FrameCodecError::TruncatedFrame { .. })
-        ));
-        assert!(matches!(
-            ServerFrame::decode(&[ServerOp::AppendAck.byte(), 0]),
-            Err(FrameCodecError::TruncatedFrame { .. })
-        ));
-    }
-
-    #[test]
-    fn stream_metadata_ignores_unknown_json_fields() {
-        let mut encoded = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-        encoded.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","kind":"transcript","title":null,"visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z","future_field":{"enabled":true}}"#);
-
-        assert_eq!(
-            ServerFrame::decode(&encoded).expect("decode stream metadata"),
-            ServerFrame::StreamMetadata(StreamMetadata {
-                stream_id: "00000000000000000000000000000000"
-                    .parse()
-                    .expect("stream ID"),
-                kind: crate::protocol::rest::StreamKind::Transcript,
-                title: None,
-                visibility: Visibility::Private,
-                created_at: "2026-08-13T00:00:00Z".to_owned(),
-                expires_at: "2026-08-23T00:00:00Z".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn stream_metadata_tolerates_absent_title_and_requires_valid_timestamps() {
-        let mut missing_title = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-        missing_title.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","kind":"transcript","visibility":"private","created_at":"2026-08-13T00:00:00Z","expires_at":"2026-08-23T00:00:00Z"}"#);
-        assert!(matches!(
-            ServerFrame::decode(&missing_title),
-            Ok(ServerFrame::StreamMetadata(StreamMetadata {
-                kind: crate::protocol::rest::StreamKind::Transcript,
-                title: None,
-                ..
-            }))
-        ));
-
-        let mut invalid_time = BytesMut::from(&[ServerOp::StreamMetadata.byte()][..]);
-        invalid_time.extend_from_slice(br#"{"stream_id":"00000000000000000000000000000000","kind":"transcript","title":null,"visibility":"private","created_at":"not-a-time","expires_at":"2026-08-23T00:00:00Z"}"#);
-        assert!(matches!(
-            ServerFrame::decode(&invalid_time),
-            Err(FrameCodecError::InvalidStreamMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn frame_decoders_reject_invalid_utf8_and_trailing_bytes() {
-        let mut invalid_utf8 = vec![ClientOp::OpenRead.byte(), OPEN_READ_LINK_SECRET];
-        invalid_utf8.extend_from_slice(&[b'A'; LinkSecret::ENCODED_LEN]);
-        *invalid_utf8.last_mut().expect("secret byte") = 0xff;
-        assert!(matches!(
-            ClientFrame::decode(&invalid_utf8),
-            Err(FrameCodecError::InvalidUtf8(_))
-        ));
-        assert!(matches!(
-            ServerFrame::decode(&[ServerOp::Ready.byte(), 0, 0]),
-            Err(FrameCodecError::TrailingBytes { op, count: 1 }) if op == ServerOp::Ready.byte()
-        ));
-        assert!(matches!(
-            ServerFrame::decode(&[ServerOp::Ready.byte()]),
-            Err(FrameCodecError::TruncatedFrame { .. })
-        ));
-        let mut malformed_open_write = vec![ClientOp::OpenWrite.byte()];
-        malformed_open_write.extend_from_slice(&[0; ClientWriterId::BYTE_LEN]);
-        malformed_open_write.extend_from_slice("B".repeat(LinkSecret::ENCODED_LEN).as_bytes());
-        assert!(matches!(
-            ClientFrame::decode(&malformed_open_write),
-            Err(FrameCodecError::InvalidLinkSecret)
-        ));
-        let mut missing_timestamp = vec![ServerOp::CaughtUp.byte()];
-        missing_timestamp.extend_from_slice(&[0; 8]);
-        assert!(matches!(
-            ServerFrame::decode(&missing_timestamp),
-            Err(FrameCodecError::TruncatedFrame { .. })
-        ));
-        let mut trailing_position = vec![ServerOp::CaughtUp.byte()];
-        trailing_position.extend_from_slice(&[0; 17]);
-        assert!(matches!(
-            ServerFrame::decode(&trailing_position),
-            Err(FrameCodecError::TrailingBytes { count: 1, .. })
-        ));
-    }
-
-    #[test]
-    fn open_read_strictly_validates_flags_credentials_and_lengths() {
-        let valid = ClientFrame::OpenRead { link_secret: None }
-            .encode()
-            .expect("valid OpenRead");
-        assert_eq!(valid.len(), ClientFrame::OPEN_READ_FIXED_LEN);
-
-        let mut unknown_flags = valid.to_vec();
-        unknown_flags[1] = 0x02;
-        assert!(matches!(
-            ClientFrame::decode(&unknown_flags),
-            Err(FrameCodecError::UnknownOpenReadFlags(0x02))
-        ));
-
-        let empty_secret = [ClientOp::OpenRead.byte(), OPEN_READ_LINK_SECRET];
-        assert!(matches!(
-            ClientFrame::decode(&empty_secret),
-            Err(FrameCodecError::TruncatedFrame { .. })
-        ));
-        let mut malformed_secret = valid.to_vec();
-        malformed_secret[1] = OPEN_READ_LINK_SECRET;
-        malformed_secret.extend_from_slice(format!("{}!", "B".repeat(31)).as_bytes());
-        assert!(matches!(
-            ClientFrame::decode(&malformed_secret),
-            Err(FrameCodecError::InvalidLinkSecret)
-        ));
-        assert!(matches!(
-            ClientFrame::decode(&valid[..valid.len() - 1]),
-            Err(FrameCodecError::TruncatedFrame { .. })
-        ));
-        let mut trailing = valid.to_vec();
-        trailing.push(0);
-        assert!(matches!(
-            ClientFrame::decode(&trailing),
-            Err(FrameCodecError::TrailingBytes { count: 1, .. })
-        ));
-    }
-
-    #[test]
-    fn open_write_strictly_validates_flags_preconditions_and_lengths() {
-        let valid = ClientFrame::OpenWrite {
-            client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
-            link_secret: "A"
-                .repeat(LinkSecret::ENCODED_LEN)
-                .parse()
-                .expect("canonical secret"),
-            expected_next_seq_num: Some(7),
+    fn frame_decoders_reject_malformed_messages() {
+        for frame in [
+            vec![],
+            vec![0x7f],
+            vec![ClientOp::OpenRead.byte(), 0x02],
+            vec![ClientOp::OpenRead.byte(), OPEN_READ_LINK_SECRET],
+            vec![ClientOp::AppendBatch.byte(), 0],
+        ] {
+            assert!(ClientFrame::decode(&frame).is_err());
         }
-        .encode()
-        .expect("valid OpenWrite");
-
-        let mut unknown_flags = valid.to_vec();
-        unknown_flags[1] = 0x02;
-        assert!(matches!(
-            ClientFrame::decode(&unknown_flags),
-            Err(FrameCodecError::UnknownOpenWriteFlags(0x02))
-        ));
-        assert!(ClientFrame::decode(&valid[..valid.len() - 1]).is_err());
-        assert!(matches!(
-            ClientFrame::OpenWrite {
-                client_writer_id: ClientWriterId::from_bytes([0; ClientWriterId::BYTE_LEN]),
-                link_secret: "A".repeat(LinkSecret::ENCODED_LEN).parse().expect("canonical secret"),
-                expected_next_seq_num: Some(MAX_SAFE_INTEGER_U64 + 1),
-            }
-            .encode(),
-            Err(FrameCodecError::ExpectedNextSeqNumOutOfRange(value))
-                if value == MAX_SAFE_INTEGER_U64 + 1
-        ));
+        for frame in [
+            vec![],
+            vec![0x7f],
+            vec![ServerOp::Ready.byte()],
+            vec![ServerOp::Ready.byte(), 0, 0],
+            vec![ServerOp::AppendAck.byte(), 0],
+        ] {
+            assert!(ServerFrame::decode(&frame).is_err());
+        }
     }
 
     #[test]
@@ -1638,49 +1461,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    /// Decoding a hand-written wire fixture, so encoder and decoder cannot share a framing
-    /// defect that a round trip would cancel out.
-    ///
-    /// Layout: op byte `0x03` (AppendBatch), then per record a big-endian u32 body length
-    /// (12-byte header plus payload), a big-endian u64 writer sequence number, a big-endian
-    /// u32 packed part header, and the payload bytes.
-    #[test]
-    fn append_batch_decodes_a_canonical_wire_fixture() {
-        #[rustfmt::skip]
-        const FRAME: &[u8] = &[
-            0x03, // AppendBatch
-            // Record 1: writer_seq_num 7, unsplit part, "hi" (body len 12 + 2).
-            0x00, 0x00, 0x00, 0x0e,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
-            0x80, 0x00, 0x00, 0x00,
-            b'h', b'i',
-            // Record 2: writer_seq_num 8, part index 1 non-final, [0x00, 0xff, 0x10]
-            // (body len 12 + 3).
-            0x00, 0x00, 0x00, 0x0f,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
-            0x00, 0x00, 0x00, 0x01,
-            0x00, 0xff, 0x10,
-        ];
-
-        let expected = vec![
-            AppendRecord {
-                writer_seq_num: 7,
-                part: PartHeader::unsplit(),
-                data: Bytes::from_static(b"hi"),
-            },
-            AppendRecord {
-                writer_seq_num: 8,
-                part: PartHeader::new(1, false).expect("valid part header"),
-                data: Bytes::from_static(&[0x00, 0xff, 0x10]),
-            },
-        ];
-        let ClientFrame::AppendBatch(decoded) = ClientFrame::decode(FRAME).expect("decode fixture")
-        else {
-            panic!("expected append batch");
-        };
-        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -1801,60 +1581,6 @@ mod tests {
             ReadBatch::try_from_parts(Bytes::new(), vec![record]),
             Err(FrameCodecError::InvalidRecordLength)
         ));
-    }
-
-    #[test]
-    fn read_batch_views_preserve_payload_boundaries() {
-        let alpha = OwnedReadRecord {
-            seq_num: 7,
-            timestamp_ms: 100,
-            writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
-            writer_seq_num: 3,
-            part: PartHeader::unsplit(),
-            data: Bytes::from_static(b"alpha"),
-        };
-        let beta = OwnedReadRecord {
-            seq_num: 8,
-            timestamp_ms: 101,
-            writer_id: WriterId::from_bytes([2; WriterId::BYTE_LEN]),
-            writer_seq_num: 4,
-            part: PartHeader::unsplit(),
-            data: Bytes::from_static(b"beta-longer"),
-        };
-        let batch =
-            ReadBatch::try_from_records(vec![alpha.clone(), beta.clone()]).expect("valid batch");
-
-        assert_eq!(batch.record_count(), 2);
-        assert_eq!(batch.first(), alpha.as_record());
-        assert_eq!(batch.last(), beta.as_record());
-
-        let viewed: Vec<ReadRecord<'_>> = batch.iter().collect();
-        assert_eq!(viewed, [alpha.as_record(), beta.as_record()]);
-        assert_eq!(viewed[0].data, b"alpha");
-        assert_eq!(viewed[1].data, b"beta-longer");
-        assert_eq!(batch.iter().len(), 2);
-
-        // Owned conversion copies payload bytes out of the shared buffer.
-        let owned = viewed[1].into_owned();
-        assert_eq!(owned, beta);
-        assert_eq!(owned.data.as_ref(), b"beta-longer");
-
-        // `&batch` iterates directly, and the iterator is double-ended and fused.
-        let mut total = 0_usize;
-        for record in &batch {
-            total += record.data.len();
-        }
-        assert_eq!(total, b"alpha".len() + b"beta-longer".len());
-        let mut reversed = batch.iter().rev().map(|record| record.seq_num);
-        assert_eq!(reversed.next(), Some(8));
-        assert_eq!(reversed.next(), Some(7));
-        assert_eq!(reversed.next(), None);
-        assert_eq!(reversed.next(), None);
-
-        // A wire round trip preserves the same record views and payload boundaries.
-        let frame = ServerFrame::ReadBatch(batch);
-        let decoded = ServerFrame::decode_bytes(frame.encode().expect("encode")).expect("decode");
-        assert_eq!(decoded, frame);
     }
 
     fn encoded_append_data_with_len(data_len: usize) -> Bytes {

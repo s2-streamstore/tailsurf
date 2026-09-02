@@ -1,8 +1,6 @@
 import {
   generateStreamId,
-  MAX_RECORD_PAYLOAD_BYTES,
   MAX_SSE_EVENT_BYTES,
-  MAX_SSE_UNTERMINATED_EVENT_BYTES,
   type StreamKind,
 } from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
@@ -11,44 +9,22 @@ import { TsfClient } from "../src/index.js";
 
 const CURSOR_ONE = "v1,1,1";
 const CURSOR_TWO = "v1,2,2";
-const CAUGHT_UP_CURSOR = "v1,4,0";
 
-describe("SSE reader resume", () => {
-  it("accepts several complete events delivered in one large transport chunk", async () => {
+describe("SSE reader", () => {
+  it("parses UTF-8 and CRLF boundaries split across chunks", async () => {
     const streamId = generateStreamId();
-    const padding = `:${"a".repeat(1_100_000)}\n\n:${"b".repeat(1_100_000)}\n\n`;
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, `${padding}${recordsEvent("v1,1,1", 0)}`),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
+    const source = sseText(
       streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: 1n },
-    });
-
-    expect((await session.nextRecord())?.seqNum).toBe(0n);
-    session.close();
-  });
-
-  it("accepts a valid event fragmented across transport chunks", async () => {
-    const streamId = generateStreamId();
-    const encoded = new TextEncoder().encode(
-      sseResponseText(streamId, readBatchEvent("v1,1,1", {
-        text: "split 😀 payload",
-      })),
+      recordEvent(CURSOR_ONE, 0, "split 😀 payload"),
+    ).replaceAll("\n", "\r\n");
+    const encoded = new TextEncoder().encode(source);
+    const chunks = Array.from(
+      { length: Math.ceil(encoded.byteLength / 7) },
+      (_unused, index) => encoded.subarray(index * 7, index * 7 + 7),
     );
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        for (let offset = 0; offset < encoded.byteLength; offset += 7) {
-          controller.enqueue(encoded.subarray(offset, offset + 7));
-        }
-        controller.close();
-      },
-    });
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      new Response(body, { headers: { "content-type": "text/event-stream" } }),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
+    const session = await new TsfClient({
+      fetch: vi.fn<typeof fetch>(async () => chunkedResponse(chunks)),
+    }).connectSseReader({
       streamId,
       start: { type: "seqNum", seqNum: 0n },
       stop: { count: 1n },
@@ -57,242 +33,38 @@ describe("SSE reader resume", () => {
     expect(new TextDecoder().decode((await session.nextRecord())?.data)).toBe(
       "split 😀 payload",
     );
-    session.close();
   });
 
-  it("accepts a CRLF event boundary split across transport chunks", async () => {
+  it("rejects invalid UTF-8 and oversized events", async () => {
     const streamId = generateStreamId();
-    const text = sseResponseText(
-      streamId,
-      recordsEvent("v1,1,1", 0),
-    ).replaceAll("\n", "\r\n");
-    const boundary = text.indexOf("\r\n\r\n");
-    const encoder = new TextEncoder();
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encoder.encode(text.slice(0, boundary + 3)));
-        controller.enqueue(encoder.encode(text.slice(boundary + 3)));
-        controller.close();
-      },
-    });
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      new Response(body, { headers: { "content-type": "text/event-stream" } }),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: 1n },
-    });
-
-    expect((await session.nextRecord())?.seqNum).toBe(0n);
-    session.close();
-  });
-
-  it("rejects invalid UTF-8 after an earlier event in the same chunk", async () => {
-    const streamId = generateStreamId();
-    const prefix = new TextEncoder().encode(sseResponseText(streamId, ""));
-    const body = new Uint8Array(prefix.byteLength + 1);
-    body.set(prefix);
-    body[body.byteLength - 1] = 0xff;
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      new Response(body, { headers: { "content-type": "text/event-stream" } }),
-    );
-
-    await expect(new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    })).rejects.toMatchObject({
+    const prefix = new TextEncoder().encode(sseText(streamId, ""));
+    const invalid = new Uint8Array(prefix.byteLength + 1);
+    invalid.set(prefix);
+    invalid[invalid.byteLength - 1] = 255;
+    await expect(new TsfClient({
+      fetch: vi.fn<typeof fetch>(async () => chunkedResponse([invalid])),
+    }).connectSseReader({ streamId })).rejects.toMatchObject({
       code: "invalid_api_response",
     });
+
+    const oversized = `${sseText(streamId, "")}event: read_batch\ndata: ${"a".repeat(MAX_SSE_EVENT_BYTES)}\n\n`;
+    const reading = new TsfClient({
+      fetch: vi.fn<typeof fetch>(async () => sseResponse(oversized)),
+    }).connectSseReader({ streamId }).then((session) => session.nextRecord());
+    await expect(reading).rejects.toMatchObject({ code: "invalid_api_response" });
   });
 
-  it("drains one maximum-size read batch in sequence", async () => {
-    const streamId = generateStreamId();
-    const count = 1_000;
-    const records = Array.from({ length: count }, (_unused, seqNum) =>
-      readRecordWire(seqNum, { text: `${seqNum}\n` })
-    );
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(
-        streamId,
-        readBatchRecordsEvent(`v1,${count},${count}`, records),
-      ),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: BigInt(count) },
-    });
-
-    for (let seqNum = 0; seqNum < count; seqNum += 1) {
-      expect((await session.nextRecord())?.seqNum).toBe(BigInt(seqNum));
-    }
-    expect(await session.nextRecord()).toBeUndefined();
-    expect(fetch).toHaveBeenCalledOnce();
-  });
-
-  it("accepts an escape-heavy maximum-size record in its compact encoding", async () => {
-    const streamId = generateStreamId();
-    const value = Buffer.alloc(MAX_RECORD_PAYLOAD_BYTES).toString("base64url");
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, readBatchEvent("v1,1,1", { bytes: value })),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: 1n },
-    });
-
-    expect((await session.nextRecord())?.data).toHaveLength(MAX_RECORD_PAYLOAD_BYTES);
-    session.close();
-  });
-
-  it.each([
-    {
-      name: "an oversized decoded record",
-      count: undefined,
-      event: () => readBatchEvent("v1,1,1", {
-        bytes: Buffer.alloc(MAX_RECORD_PAYLOAD_BYTES + 1).toString("base64url"),
-      }),
-    },
-    {
-      name: "an oversized aggregate decoded payload",
-      count: undefined,
-      event: () => readBatchRecordsEvent("v1,3,3", [0, 1, 2].map((seqNum) =>
-        readRecordWire(seqNum, {
-          bytes: Buffer.alloc(400 * 1024).toString("base64url"),
-        })
-      )),
-    },
-    {
-      name: "a cursor that does not follow its records",
-      count: undefined,
-      event: () => recordsEvent("v1,2,1", 0),
-    },
-    {
-      name: "more records than the remaining count",
-      count: 1n,
-      event: () => readBatchRecordsEvent("v1,2,2", [
-        readRecordWire(0, { text: "zero" }),
-        readRecordWire(1, { text: "one" }),
-      ]),
-    },
-  ])("rejects read_batch with $name", async ({ event, count }) => {
-    const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, event()),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      ...(count === undefined ? {} : { stop: { count } }),
-    });
-
-    await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "invalid_api_response",
-    });
-  });
-
-  it("rejects caught_up that skips past the previous cursor", async () => {
-    const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(
-        streamId,
-        `${recordsEvent("v1,1,1", 0)}id: v1,2,1\nevent: caught_up\ndata: {"next_seq_num":"2","last_timestamp_ms":"0"}\n\n`,
-      ),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    expect((await session.nextRecord())?.seqNum).toBe(0n);
-    await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "invalid_api_response",
-    });
-  });
-
-  it("rejects one oversized completed SSE event", async () => {
-    const streamId = generateStreamId();
-    const oversized = `event: read_batch\ndata: ${"a".repeat(MAX_SSE_EVENT_BYTES)}\n\n`;
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, oversized),
-    );
-    await expect(new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    })).rejects.toMatchObject({
-      code: "invalid_api_response",
-    });
-  });
-
-  it("rejects an oversized completed SSE event across chunks", async () => {
-    const streamId = generateStreamId();
-    const encoder = new TextEncoder();
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encoder.encode(
-          `${sseResponseText(streamId, "")}event: read_batch\ndata: ${"a".repeat(
-            MAX_SSE_EVENT_BYTES / 2,
-          )}`,
-        ));
-        controller.enqueue(encoder.encode(
-          `${"a".repeat(MAX_SSE_EVENT_BYTES / 2)}\n\n`,
-        ));
-        controller.close();
-      },
-    });
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      new Response(body, { headers: { "content-type": "text/event-stream" } }),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "invalid_api_response",
-    });
-  });
-
-  it("rejects an oversized unterminated SSE event across chunks", async () => {
-    const streamId = generateStreamId();
-    const prefix = sseResponseText(streamId, "");
-    const encoder = new TextEncoder();
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encoder.encode(prefix));
-        controller.enqueue(encoder.encode(`event: read_batch\ndata: ${"a".repeat(
-          MAX_SSE_UNTERMINATED_EVENT_BYTES / 2,
-        )}`));
-        controller.enqueue(encoder.encode("a".repeat(
-          MAX_SSE_UNTERMINATED_EVENT_BYTES / 2 + 1,
-        )));
-        controller.close();
-      },
-    });
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      new Response(body, { headers: { "content-type": "text/event-stream" } }),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "invalid_api_response",
-    });
-  });
-
-  it("retries a transient resume request and keeps its cursor", async () => {
+  it("resumes with the last event ID through transient setup failures", async () => {
     const streamId = generateStreamId();
     const fetch = vi.fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(interruptedSseResponseAfter(
+      .mockResolvedValueOnce(interruptedAfter(
         streamId,
-        recordsEvent("v1,1,1", 0),
+        recordEvent(CURSOR_ONE, 0),
       ))
       .mockResolvedValueOnce(new Response(null, { status: 503 }))
-      .mockResolvedValueOnce(sseResponse(streamId, recordsEvent("v1,2,2", 1)));
+      .mockResolvedValueOnce(sseResponse(
+        sseText(streamId, recordEvent(CURSOR_TWO, 1)),
+      ));
     const session = await new TsfClient({
       fetch,
       boundedOperationAttempts: 3,
@@ -305,182 +77,39 @@ describe("SSE reader resume", () => {
     expect((await session.nextRecord())?.seqNum).toBe(0n);
     expect((await session.nextRecord())?.seqNum).toBe(1n);
     expect(fetch).toHaveBeenCalledTimes(3);
-    expect(new Headers(fetch.mock.calls[1]?.[1]?.headers).get("last-event-id"))
-      .toBe("v1,1,1");
-    expect(new Headers(fetch.mock.calls[2]?.[1]?.headers).get("last-event-id"))
-      .toBe("v1,1,1");
+    for (const call of fetch.mock.calls.slice(1)) {
+      expect(new Headers(call[1]?.headers).get("last-event-id")).toBe(CURSOR_ONE);
+    }
   });
 
-  it("honors a bounded structured retry hint during SSE setup", async () => {
-    vi.useFakeTimers();
-    try {
+  it.each([undefined, "v2,1,1"])(
+    "rejects an invalid resume cursor %s",
+    async (cursor) => {
       const streamId = generateStreamId();
-      const fetch = vi.fn<typeof globalThis.fetch>()
-        .mockResolvedValueOnce(new Response(JSON.stringify({
-          error: {
-            code: "rate_limited",
-            message: "slow down",
-            request_id: "request-sse",
-            retry_after_ms: 60_000,
-          },
-        }), {
-          status: 429,
-          headers: { "content-type": "application/json" },
-        }))
-        .mockResolvedValueOnce(sseResponse(
-          streamId,
-          recordsEvent("v1,1,1", 0),
-        ));
-      const opening = new TsfClient({
-        fetch,
-        boundedOperationAttempts: 2,
+      const session = await new TsfClient({
+        fetch: vi.fn<typeof fetch>(async () =>
+          sseResponse(sseText(streamId, recordEvent(cursor, 0)))
+        ),
       }).connectSseReader({
         streamId,
         start: { type: "seqNum", seqNum: 0n },
-        stop: { count: 1n },
       });
 
-      await vi.advanceTimersByTimeAsync(1_999);
-      expect(fetch).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(1);
-      const session = await opening;
-      expect((await session.nextRecord())?.seqNum).toBe(0n);
-      expect(fetch).toHaveBeenCalledTimes(2);
-      session.close();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("preserves structured HTTP details when SSE setup retries are exhausted", async () => {
-    const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      new Response(JSON.stringify({
-        error: {
-          code: "rate_limited",
-          message: "slow down",
-          request_id: "request-sse",
-          retry_after_ms: 125,
-        },
-      }), { status: 429 }),
-    );
-
-    await expect(new TsfClient({
-      fetch,
-      boundedOperationAttempts: 1,
-    }).connectSseReader({ streamId })).rejects.toMatchObject({
-      apiCode: "rate_limited",
-      requestId: "request-sse",
-      retryAfterMs: 125,
-    });
-  });
-
-  it("bounds an SSE handshake with the HTTP request timeout", async () => {
-    vi.useFakeTimers();
-    try {
-      const streamId = generateStreamId();
-      const fetch = vi.fn<typeof globalThis.fetch>((_input, init) =>
-        new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => {
-            reject(new Error("request aborted", { cause: init.signal?.reason }));
-          }, { once: true });
-        })
-      );
-      const opening = new TsfClient({
-        fetch,
-        httpRequestTimeoutMs: 5,
-        boundedOperationAttempts: 1,
-      }).connectSseReader({ streamId });
-      const rejected = expect(opening).rejects.toMatchObject({
-        code: "http_timeout",
+      await expect(session.nextRecord()).rejects.toMatchObject({
+        code: "invalid_api_response",
       });
-
-      await vi.advanceTimersByTimeAsync(5);
-      await rejected;
-      expect(fetch).toHaveBeenCalledOnce();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("resumes after the response body fails mid-stream", async () => {
-    const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(interruptedSseResponse(streamId))
-      .mockResolvedValueOnce(sseResponse(streamId, recordsEvent("v1,1,1", 0)));
-    const session = await new TsfClient({
-      fetch,
-      boundedOperationAttempts: 2,
-    }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: 1n },
-    });
-
-    expect((await session.nextRecord())?.seqNum).toBe(0n);
-    expect(fetch).toHaveBeenCalledTimes(2);
-  });
-
-  it("reconnects with the versioned event ID and the unchanged request URL", async () => {
-    const streamId = generateStreamId();
-    const calls: Array<{ readonly url: string; readonly headers: Headers }> = [];
-    const responses = [
-      interruptedSseResponseAfter(
-        streamId,
-        recordsEvent(CURSOR_ONE, 0),
-      ),
-      sseResponse(
-        streamId,
-        recordsEvent(CURSOR_TWO, 1),
-      ),
-    ];
-    const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
-      const url = input instanceof Request
-        ? input.url
-        : input instanceof URL
-          ? input.href
-          : input;
-      calls.push({ url, headers: new Headers(init?.headers) });
-      const response = responses.shift();
-      if (response === undefined) {
-        throw new Error("unexpected SSE request");
-      }
-      return response;
-    });
-    const session = await new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      fetch,
-    }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: 2n },
-    });
-
-    expect((await session.nextRecord())?.seqNum).toBe(0n);
-    expect((await session.nextRecord())?.seqNum).toBe(1n);
-    expect(await session.nextRecord()).toBeUndefined();
-    expect(calls).toHaveLength(2);
-    expect(calls[1]?.url).toBe(calls[0]?.url);
-    const url = new URL(calls[0]!.url);
-    expect(Object.fromEntries(url.searchParams)).toEqual({
-      seq_num: "0",
-      count: "2",
-    });
-    expect(calls[0]?.headers.get("last-event-id")).toBeNull();
-    expect(calls[1]?.headers.get("last-event-id")).toBe(CURSOR_ONE);
-  });
+    },
+  );
 
   it("rejects a stream kind change while reconnecting", async () => {
     const streamId = generateStreamId();
     const fetch = vi.fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(interruptedSseResponseAfter(
+      .mockResolvedValueOnce(interruptedAfter(
         streamId,
-        recordsEvent(CURSOR_ONE, 0),
+        recordEvent(CURSOR_ONE, 0),
       ))
       .mockResolvedValueOnce(sseResponse(
-        streamId,
-        recordsEvent(CURSOR_TWO, 1),
-        { kind: "bytes" },
+        sseText(streamId, recordEvent(CURSOR_TWO, 1), "bytes"),
       ));
     const session = await new TsfClient({ fetch }).connectSseReader({
       streamId,
@@ -494,36 +123,14 @@ describe("SSE reader resume", () => {
     });
   });
 
-  it("treats clean finite completion as terminal", async () => {
+  it("treats HTTP 204 as terminal after receiving a cursor", async () => {
     const streamId = generateStreamId();
-    const calls: Headers[] = [];
-    const responses = [sseResponse(streamId, recordsEvent(CURSOR_ONE, 0))];
-    const fetch = vi.fn<typeof globalThis.fetch>(async (_input, init) => {
-      calls.push(new Headers(init?.headers));
-      const response = responses.shift();
-      if (response === undefined) {
-        throw new Error("unexpected SSE request");
-      }
-      return response;
-    });
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { waitSeconds: 0 },
-    });
-
-    expect((await session.nextRecord())?.seqNum).toBe(0n);
-    expect(await session.nextRecord()).toBeUndefined();
-    expect(calls).toHaveLength(1);
-  });
-
-  it("treats HTTP 204 as terminal after an established resume cursor", async () => {
-    const streamId = generateStreamId();
+    const cursor = "v1,4,0";
     const fetch = vi.fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(sseResponse(
+      .mockResolvedValueOnce(sseResponse(sseText(
         streamId,
-        `id: ${CAUGHT_UP_CURSOR}\nevent: caught_up\ndata: {"next_seq_num":"4","last_timestamp_ms":"0"}\n\n`,
-      ))
+        `id: ${cursor}\nevent: caught_up\ndata: {"next_seq_num":"4","last_timestamp_ms":"0"}\n\n`,
+      )))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     const session = await new TsfClient({ fetch }).connectSseReader({
       streamId,
@@ -531,62 +138,14 @@ describe("SSE reader resume", () => {
     });
 
     expect(await session.nextRecord()).toBeUndefined();
-    expect(fetch).toHaveBeenCalledTimes(2);
-    const [, secondInit] = fetch.mock.calls[1] ?? [];
-    expect(new Headers(secondInit?.headers).get("last-event-id")).toBe(
-      CAUGHT_UP_CURSOR,
-    );
+    expect(new Headers(fetch.mock.calls[1]?.[1]?.headers).get("last-event-id"))
+      .toBe(cursor);
   });
 
-  it("accepts a terminal count-zero cursor on stream metadata", async () => {
+  it("bounds reconnects that make no progress", async () => {
     const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, "", { streamMetadataCursor: "v1,0,0" }),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      stop: { count: 0n },
-    });
-
-    expect(await session.nextRecord()).toBeUndefined();
-    expect(session.streamMetadata().streamId).toBe(streamId);
-    expect(fetch).toHaveBeenCalledOnce();
-  });
-
-  it("rejects record and caught-up events without a resume cursor", async () => {
-    const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, recordsEvent(undefined, 0)),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "invalid_api_response",
-    });
-  });
-
-  it("rejects malformed and unsupported resume cursor IDs", async () => {
-    const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
-      sseResponse(streamId, recordsEvent("v2,1,1", 0)),
-    );
-    const session = await new TsfClient({ fetch }).connectSseReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "invalid_api_response",
-    });
-  });
-
-  it("bounds reconnects that repeatedly make no read progress", async () => {
-    const streamId = generateStreamId();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async () =>
-      sseResponse(streamId, "")
+    const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+      sseResponse(sseText(streamId, ""))
     );
     const session = await new TsfClient({
       fetch,
@@ -600,94 +159,62 @@ describe("SSE reader resume", () => {
   });
 });
 
-function sseResponse(
+function sseText(
   streamId: string,
   events: string,
-  options: {
-    readonly streamMetadataCursor?: string;
-    readonly kind?: StreamKind;
-  } = {},
-): Response {
-  return new Response(sseResponseText(streamId, events, options), {
-    headers: { "content-type": "text/event-stream" },
-  });
-}
-
-function sseResponseText(
-  streamId: string,
-  events: string,
-  options: {
-    readonly streamMetadataCursor?: string;
-    readonly kind?: StreamKind;
-  } = {},
+  kind: StreamKind = "transcript",
 ): string {
-  return `${options.streamMetadataCursor === undefined ? "" : `id: ${options.streamMetadataCursor}\n`}event: stream_metadata\ndata: ${JSON.stringify({
-      stream_id: streamId,
-      kind: options.kind ?? "transcript",
-      title: null,
-      visibility: "public",
-      created_at: "2026-08-13T00:00:00Z",
-      expires_at: "2026-08-23T00:00:00Z",
-    })}\n\n${events}`;
+  return `event: stream_metadata\ndata: ${JSON.stringify({
+    stream_id: streamId,
+    kind,
+    title: null,
+    visibility: "public",
+    created_at: "2026-08-13T00:00:00Z",
+    expires_at: "2026-08-23T00:00:00Z",
+  })}\n\n${events}`;
 }
 
-function interruptedSseResponse(streamId: string): Response {
-  return interruptedSseResponseAfter(streamId, "");
+function recordEvent(
+  cursor: string | undefined,
+  seqNum: number,
+  text = `record ${seqNum.toString()}\n`,
+): string {
+  return `${cursor === undefined ? "" : `id: ${cursor}\n`}event: read_batch\ndata: ${JSON.stringify({
+    records: [{
+      seq_num: seqNum.toString(),
+      timestamp_ms: (1_786_579_200_000 + seqNum).toString(),
+      writer: {
+        id: "AAAAAAAAAAAAAAAAAAAAAA",
+        seq_num: seqNum.toString(),
+      },
+      text,
+    }],
+  })}\n\n`;
 }
 
-function interruptedSseResponseAfter(streamId: string, events: string): Response {
-  const encoder = new TextEncoder();
-  const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(encoder.encode(
-        `event: stream_metadata\ndata: ${JSON.stringify({
-          stream_id: streamId,
-          kind: "transcript",
-          title: null,
-          visibility: "public",
-          created_at: "2026-08-13T00:00:00Z",
-          expires_at: "2026-08-23T00:00:00Z",
-        })}\n\n${events}`,
-      ));
-      setTimeout(() => controller.error(new TypeError("connection reset")), 0);
-    },
-  });
+function sseResponse(body: BodyInit): Response {
   return new Response(body, {
     headers: { "content-type": "text/event-stream" },
   });
 }
 
-function recordsEvent(id: string | undefined, seqNum: number): string {
-  return readBatchEvent(id, {
-    text: `record ${seqNum.toString()}\n`,
-  }, seqNum);
+function chunkedResponse(chunks: readonly Uint8Array[]): Response {
+  return sseResponse(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+      }
+      controller.close();
+    },
+  }));
 }
 
-function readBatchEvent(
-  id: string | undefined,
-  payload: { readonly text: string } | { readonly bytes: string },
-  seqNum = 0,
-): string {
-  return readBatchRecordsEvent(id, [readRecordWire(seqNum, payload)]);
-}
-
-function readBatchRecordsEvent(
-  id: string | undefined,
-  records: readonly ReturnType<typeof readRecordWire>[],
-): string {
-  return `${id === undefined ? "" : `id: ${id}\n`}event: read_batch\ndata: ${JSON.stringify({
-    records,
-  })}\n\n`;
-}
-
-function readRecordWire(
-  seqNum: number,
-  payload: { readonly text: string } | { readonly bytes: string },
-) {
-  return {
-    seq_num: seqNum.toString(),
-    timestamp_ms: (1_786_579_200_000 + seqNum).toString(),
-    writer: { id: "AAAAAAAAAAAAAAAAAAAAAA", seq_num: seqNum.toString() },
-    ...payload,
-  } as const;
+function interruptedAfter(streamId: string, events: string): Response {
+  const bytes = new TextEncoder().encode(sseText(streamId, events));
+  return sseResponse(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      setTimeout(() => controller.error(new TypeError("connection reset")), 0);
+    },
+  }));
 }

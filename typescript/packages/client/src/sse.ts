@@ -26,6 +26,8 @@ import {
   BaseTsfReadSession,
   normalizeReadOptions,
   readExhausted,
+  validateCaughtUpForRequest,
+  validateReadBatchForRequest,
   validateReadStreamMetadata,
   type NormalizedReadOptions,
   type ReadOptions,
@@ -643,16 +645,9 @@ function validateReadBatch(
     if (previousSeqNum !== undefined && record.seqNum !== previousSeqNum + 1n) {
       throw invalidSseContract("read_batch sequence numbers are not contiguous");
     }
-    if (options.stop?.untilTimestampMs !== undefined &&
-      record.timestampMs >= options.stop.untilTimestampMs) {
-      throw invalidSseContract("read_batch reaches the exclusive until timestamp");
-    }
     previousSeqNum = record.seqNum;
   }
-  if (options.stop?.count !== undefined &&
-    BigInt(records.length) > options.stop.count) {
-    throw invalidSseContract("read_batch exceeds the remaining record count");
-  }
+  validateReadBatchForRequest(records, options, invalidSseContract);
   const first = records[0];
   const last = records.at(-1);
   if (first === undefined || last === undefined || cursor.nextSeqNum !== last.seqNum + 1n) {
@@ -663,20 +658,6 @@ function validateReadBatch(
     : parseResumeCursor(previousId, "previous");
   if (previous !== undefined && first.seqNum !== previous.nextSeqNum) {
     throw invalidSseContract("read_batch does not resume at the previous cursor");
-  }
-  if (
-    previous === undefined &&
-    options.start.type === "seqNum" &&
-    first.seqNum !== options.start.seqNum
-  ) {
-    throw invalidSseContract("read_batch does not begin at the requested sequence");
-  }
-  if (
-    previous === undefined &&
-    options.start.type === "timestampMs" &&
-    first.timestampMs < options.start.timestampMs
-  ) {
-    throw invalidSseContract("read_batch begins before the requested timestamp");
   }
   const consumedBefore = previous?.consumedRecords ?? 0n;
   if (cursor.consumedRecords !== consumedBefore + BigInt(records.length)) {
@@ -706,12 +687,8 @@ function validateCaughtUp(
   if (previous === undefined && cursor.consumedRecords !== 0n) {
     throw invalidSseContract("initial caught_up cursor has a consumed count");
   }
-  if (
-    previous === undefined &&
-    options.start.type === "seqNum" &&
-    cursor.nextSeqNum !== options.start.seqNum
-  ) {
-    throw invalidSseContract("initial caught_up does not match the requested sequence");
+  if (previous === undefined) {
+    validateCaughtUpForRequest(cursor.nextSeqNum, options, invalidSseContract);
   }
 }
 

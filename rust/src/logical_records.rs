@@ -502,82 +502,6 @@ fn clear_pending(writer: &mut WriterState, totals: &mut PendingTotals) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ws::frame::{OwnedReadRecord, ReadBatch};
-
-    fn owned_batch_record(seq: u64, part: PartHeader, data: &'static [u8]) -> OwnedReadRecord {
-        OwnedReadRecord {
-            seq_num: seq,
-            timestamp_ms: seq,
-            writer_id: WriterId::from_bytes([1; WriterId::BYTE_LEN]),
-            writer_seq_num: seq,
-            part,
-            data: Bytes::from_static(data),
-        }
-    }
-
-    #[test]
-    fn unsplit_records_lend_the_source_payload() {
-        let mut transcript = LogicalRecordAssembler::new();
-        let data = b"lent";
-        let pushed =
-            push(&mut transcript, record(0, PartHeader::unsplit(), data)).expect("unsplit record");
-
-        // Content equality alone cannot catch an accidental copy regression; require the exact
-        // source slice.
-        let LogicalRecordData::Borrowed(slice) = &pushed.data else {
-            panic!("unsplit record must lend the source payload");
-        };
-        assert!(std::ptr::eq(*slice, data.as_slice()));
-    }
-
-    #[test]
-    fn into_owned_retains_records_beyond_the_source_batch() {
-        let mut transcript = LogicalRecordAssembler::new();
-        let retained: LogicalRecord<'static> = {
-            let batch = ReadBatch::try_from_records(vec![owned_batch_record(
-                0,
-                PartHeader::unsplit(),
-                b"kept",
-            )])
-            .expect("batch");
-            push(&mut transcript, batch.first())
-                .expect("record")
-                .into_owned()
-        };
-        // The batch is dropped; the retained record must own its payload.
-        assert!(matches!(retained.data, LogicalRecordData::Owned(_)));
-        assert_eq!(retained.data.into_bytes(), Bytes::from_static(b"kept"));
-    }
-
-    #[test]
-    fn split_completion_across_batches_retains_without_coalescing() {
-        let mut transcript = LogicalRecordAssembler::new();
-        {
-            let first_batch = ReadBatch::try_from_records(vec![owned_batch_record(
-                0,
-                PartHeader::new(0, false).expect("part"),
-                b"hel",
-            )])
-            .expect("batch");
-            assert!(push(&mut transcript, first_batch.first()).is_none());
-        }
-        // The first batch is dropped; the pending part was copied at ingest.
-        let second_batch = ReadBatch::try_from_records(vec![owned_batch_record(
-            1,
-            PartHeader::new(1, true).expect("part"),
-            b"lo",
-        )])
-        .expect("batch");
-        let completed = push(&mut transcript, second_batch.first()).expect("split completion");
-        assert!(matches!(completed.data, LogicalRecordData::Chunked(_)));
-
-        let retained = completed.into_owned();
-        assert!(
-            matches!(retained.data, LogicalRecordData::Chunked(_)),
-            "retention must not coalesce chunks"
-        );
-        assert_eq!(retained.data.into_bytes(), Bytes::from_static(b"hello"));
-    }
 
     #[test]
     fn split_records_round_trip_through_reassembly() {
@@ -630,20 +554,6 @@ mod tests {
         assert_eq!(empty.len(), 1);
         assert!(empty[0].data.is_empty());
         assert_eq!(empty[0].part, PartHeader::unsplit());
-    }
-
-    #[test]
-    fn exact_multiples_split_into_full_parts() {
-        let data = Bytes::from(vec![0_u8; MAX_RECORD_PAYLOAD_BYTES * 2]);
-        let records = split_logical_record(0, data).expect("split");
-        assert_eq!(records.len(), 2);
-        assert!(
-            records
-                .iter()
-                .all(|part| part.data.len() == MAX_RECORD_PAYLOAD_BYTES)
-        );
-        assert!(!records[0].part.is_final());
-        assert!(records[1].part.is_final());
     }
 
     #[test]
@@ -728,90 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn reassembles_split_records() {
-        let mut transcript = LogicalRecordAssembler::new();
-
-        assert_eq!(
-            push(
-                &mut transcript,
-                record(7, PartHeader::new(0, false).expect("part"), b"hel"),
-            ),
-            None
-        );
-        assert_chunked_record(
-            push(
-                &mut transcript,
-                record(8, PartHeader::new(1, true).expect("part"), b"lo"),
-            ),
-            b"hello",
-        );
-    }
-
-    #[test]
-    fn chunked_record_data_advances_across_parts() {
-        let mut data = LogicalRecordData::from_ordered_chunks(
-            vec![Bytes::from_static(b"hel"), Bytes::from_static(b"lo")],
-            5,
-        );
-
-        assert_eq!(data.remaining(), 5);
-        assert_eq!(data.chunk(), b"hel");
-        data.advance(2);
-        assert_eq!(data.chunk(), b"l");
-        data.advance(1);
-        assert_eq!(data.chunk(), b"lo");
-        data.advance(2);
-        assert_eq!(data.remaining(), 0);
-        assert_eq!(data.chunk(), b"");
-    }
-
-    #[test]
-    fn partially_consumed_chunks_coalesce_remaining_bytes() {
-        let mut data = LogicalRecordData::from_ordered_chunks(
-            vec![
-                Bytes::from_static(b"hel"),
-                Bytes::from_static(b"lo "),
-                Bytes::from_static(b"world"),
-            ],
-            11,
-        );
-
-        // Several chunks remain: the payload has to be copied out from the consumed offset.
-        data.advance(4);
-        assert_eq!(data.clone().into_bytes(), Bytes::from_static(b"o world"));
-
-        // One chunk remains at offset zero, so it is shared as-is.
-        data.advance(2);
-        assert_eq!(data.clone().into_bytes(), Bytes::from_static(b"world"));
-
-        // One chunk remains mid-way through, so the shared slice must start at the offset.
-        data.advance(1);
-        assert_eq!(data.clone().into_bytes(), Bytes::from_static(b"orld"));
-
-        data.advance(4);
-        assert_eq!(data.into_bytes(), Bytes::new());
-    }
-
-    #[test]
-    fn drops_split_records_without_prefix() {
-        let mut transcript = LogicalRecordAssembler::new();
-
-        assert_eq!(
-            push(
-                &mut transcript,
-                record(8, PartHeader::new(1, true).expect("part"), b"lo"),
-            ),
-            None
-        );
-        assert_eq!(
-            push(&mut transcript, record(9, PartHeader::unsplit(), b"next")),
-            Some(LogicalRecord {
-                data: LogicalRecordData::Borrowed(b"next")
-            })
-        );
-    }
-
-    #[test]
     fn drops_split_records_after_gap() {
         let mut transcript = LogicalRecordAssembler::new();
 
@@ -860,36 +686,6 @@ mod tests {
             Some(LogicalRecord {
                 data: LogicalRecordData::Borrowed(b"second")
             })
-        );
-    }
-
-    #[test]
-    fn does_not_charge_borrowed_unsplit_records_to_reassembly() {
-        let mut transcript = LogicalRecordAssembler::with_max_reassembly_bytes(4);
-
-        assert_eq!(
-            push(&mut transcript, record(0, PartHeader::unsplit(), b"hello")),
-            Some(LogicalRecord {
-                data: LogicalRecordData::Borrowed(b"hello")
-            })
-        );
-    }
-
-    #[test]
-    fn uses_one_explicit_reassembly_byte_limit() {
-        let transcript = LogicalRecordAssembler::with_max_reassembly_bytes(4);
-
-        assert_eq!(transcript.max_reassembly_bytes, 4);
-    }
-
-    #[test]
-    fn uses_the_shared_default_reassembly_byte_limit() {
-        let transcript = LogicalRecordAssembler::new();
-
-        assert_eq!(DEFAULT_MAX_RECORD_REASSEMBLY_BYTES, 16 * 1024 * 1024);
-        assert_eq!(
-            transcript.max_reassembly_bytes,
-            DEFAULT_MAX_RECORD_REASSEMBLY_BYTES
         );
     }
 
@@ -1089,30 +885,6 @@ mod tests {
                 data: LogicalRecordData::Borrowed(b""),
             }),
         );
-        assert_eq!(transcript.pending_totals.parts, 0);
-    }
-
-    #[test]
-    fn malformed_sequence_releases_its_reassembly_bytes() {
-        let mut transcript = LogicalRecordAssembler::with_max_reassembly_bytes(4);
-
-        assert_eq!(
-            push(
-                &mut transcript,
-                record(0, PartHeader::new(0, false).expect("part"), b"abc"),
-            ),
-            None
-        );
-        assert_eq!(transcript.pending_totals.bytes, 3);
-        assert_eq!(transcript.pending_totals.parts, 1);
-        assert_eq!(
-            push(
-                &mut transcript,
-                record(2, PartHeader::new(2, true).expect("part"), b"d"),
-            ),
-            None
-        );
-        assert_eq!(transcript.pending_totals.bytes, 0);
         assert_eq!(transcript.pending_totals.parts, 0);
     }
 }

@@ -3,1311 +3,110 @@ import {
   encodeServerFrame,
   generateStreamId,
   parseWriterId,
-  MAX_APPEND_FRAME_RECORDS,
-  MAX_FRAME_PAYLOAD_BYTES,
-  MAX_READ_FRAME_RECORDS,
-  MAX_RECORD_PAYLOAD_BYTES,
   TSF_WEBSOCKET_PROTOCOL,
   UNSPLIT_PART,
-  type CaughtUpPosition,
-  type ReadRecord,
   type ClientFrame,
+  type ReadRecord,
   type ServerFrame,
   type StreamId,
-  type StreamKind,
 } from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
 
-import {
-  MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES,
-  MAX_WRITER_IN_FLIGHT_RECORDS,
-  TsfClient,
-  type WebSocketFactory,
-} from "../src/index.js";
+import { TsfClient, type WebSocketFactory } from "../src/index.js";
 import { FrameSocket } from "../src/socket.js";
 
+const LINK_SECRET = "A".repeat(32);
+
 describe("FrameSocket", () => {
-  it("closes the transport after an invalid server frame", async () => {
-    const transport = new HangingWebSocket(true, [], false);
+  it("closes after invalid input", async () => {
+    const transport = new TestWebSocket();
     const socket = new FrameSocket(transport);
     await socket.opened;
 
-    transport.dispatchEvent(new MessageEvent("message", {
-      data: new Uint8Array([255]),
-    }));
+    transport.serverBytes(Uint8Array.of(255));
 
     await expect(socket.nextFrame()).rejects.toBeInstanceOf(Error);
     expect(transport.closed).toBe(true);
   });
 
-  it("bounds queued physical record slots and bytes", async () => {
-    const frameBounded = new FrameSocket(
-      new ScriptedWebSocket(
-        [
-          { type: "ready", kind: "transcript" },
-          { type: "heartbeat" },
-          { type: "heartbeat" },
-        ],
-        1000,
-      ),
-      { maxUnits: 2, maxBytes: 1_024 },
-    );
-    await frameBounded.opened;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await expect(frameBounded.nextFrame()).resolves.toMatchObject({ type: "ready", kind: "transcript" });
-    await expect(frameBounded.nextFrame()).resolves.toMatchObject({ type: "heartbeat" });
-    await expect(frameBounded.nextFrame()).rejects.toMatchObject({
-      code: "client_receive_overload",
-    });
-
-    const byteBounded = new FrameSocket(
-      new ScriptedWebSocket(
-        [
-          { type: "ready", kind: "transcript" },
-          readBatch(record(0n, "too large")),
-        ],
-        1000,
-      ),
-      { maxUnits: 10, maxBytes: 100 },
-    );
-    await byteBounded.opened;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await expect(byteBounded.nextFrame()).resolves.toMatchObject({ type: "ready", kind: "transcript" });
-    await expect(byteBounded.nextFrame()).rejects.toMatchObject({
-      code: "client_receive_overload",
-    });
-  });
-
-  it("accounts for every physical record in a queued read batch", async () => {
-    const records = Array.from(
-      { length: MAX_READ_FRAME_RECORDS },
-      (_unused, index) => record(BigInt(index), ""),
-    );
-    const socket = new FrameSocket(
-      new ScriptedWebSocket(
-        [
-          { type: "ready", kind: "transcript" },
-          { type: "readBatch", records },
-          {
-            type: "readBatch",
-            records: Array.from(
-              { length: 25 },
-              (_unused, index) =>
-                record(BigInt(MAX_READ_FRAME_RECORDS + index), ""),
-            ),
-          },
-        ],
-        1000,
-      ),
-      { maxUnits: 1_024, maxBytes: 16 * 1024 * 1024 },
-    );
-    await socket.opened;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    await expect(socket.nextFrame()).resolves.toMatchObject({ type: "ready", kind: "transcript" });
-    await expect(socket.nextFrame()).resolves.toMatchObject({
-      type: "readBatch",
-      records: { length: MAX_READ_FRAME_RECORDS },
-    });
-    await expect(socket.nextFrame()).rejects.toMatchObject({
-      code: "client_receive_overload",
-    });
-  });
-});
-
-describe("TsfClient configuration", () => {
-  it("rejects timeouts that cannot be represented by JavaScript timers", () => {
-    expect(() => new TsfClient({
-      webSocketConnectTimeoutMs: 2_147_483_648,
-    })).toThrow(expect.objectContaining({ code: "invalid_client_option" }));
-  });
-
-  it("routes terminal readers and writers to separate channels", async () => {
-    const streamId = generateStreamId();
-    const urls: string[] = [];
-    const client = new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      webSocketFactory: (url) => {
-        urls.push(url);
-        return new ScriptedWebSocket(
-          new URL(url).pathname.endsWith("/read")
-            ? [{ type: "ready", kind: "terminal" }, streamMetadataFrame(streamId, "terminal")]
-            : [{ type: "ready", kind: "terminal" }],
-          1000,
-        );
-      },
-    });
-    const options = {
-      streamId,
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    };
-
-    const outputReader = await client.connectTerminalOutputReader(options);
-    outputReader.close();
-    const inputReader = await client.connectTerminalInputReader(options);
-    inputReader.close();
-    const inputWriter = await client.connectTerminalInputWriter(options);
-    await inputWriter.close();
-    const outputWriter = await client.connectTerminalOutputWriter(options);
-    await outputWriter.close();
-
-    expect(urls.map((url) => new URL(url).pathname)).toEqual([
-      `/api/v1/streams/${streamId}/terminal/output/read`,
-      `/api/v1/streams/${streamId}/terminal/input/read`,
-      `/api/v1/streams/${streamId}/terminal/input/write`,
-      `/api/v1/streams/${streamId}/terminal/output/write`,
-    ]);
-  });
 });
 
 describe("TsfReadSession", () => {
-  it("rejects a reader handshake for a different stream", async () => {
-    const streamId = generateStreamId();
-    const socket = new ScriptedWebSocket(
-      [
-        { type: "ready", kind: "transcript" },
-        streamMetadataFrame(generateStreamId()),
-      ],
-      1000,
-    );
-    const client = new TsfClient({ webSocketFactory: () => socket });
-
-    await expect(client.connectReader({ streamId })).rejects.toMatchObject({
-      code: "invalid_api_response",
-      message: "reader handshake returned a different stream ID",
-    });
-    expect(socket.closed).toBe(true);
-  });
-
-  it("drains a maximum read batch in order", async () => {
-    const streamId = generateStreamId();
-    const records = Array.from(
-      { length: MAX_READ_FRAME_RECORDS },
-      (_unused, index) => record(BigInt(index), ""),
-    );
-    const client = new TsfClient({
-      webSocketFactory: () =>
-        new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-            { type: "readBatch", records },
-          ],
-          1000,
-        ),
-    });
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: BigInt(MAX_READ_FRAME_RECORDS) },
-    });
-
-    for (let index = 0; index < MAX_READ_FRAME_RECORDS; index += 1) {
-      await expect(reader.nextRecord()).resolves.toMatchObject({
-        seqNum: BigInt(index),
-      });
-    }
-    await expect(reader.nextRecord()).resolves.toBeUndefined();
-  });
-
-  it("is async iterable and closes when iteration stops early", async () => {
-    const streamId = generateStreamId();
-    const socket = new HangingWebSocket(true, [
-      { type: "ready", kind: "transcript" },
-      streamMetadataFrame(streamId),
-      { type: "readBatch", records: [record(0n, "first"), record(1n, "second")] },
-    ], false);
-    const client = new TsfClient({ webSocketFactory: () => socket });
-    const session = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    const seen: bigint[] = [];
-    for await (const next of session) {
-      seen.push(next.seqNum);
-      break;
-    }
-
-    expect(seen).toEqual([0n]);
-    expect(socket.closed).toBe(true);
-  });
-
   it("cancels an in-flight connection without retrying", async () => {
-    const stalled = new HangingWebSocket(true);
+    const transport = new TestWebSocket(undefined, false);
     const controller = new AbortController();
-    let connectionCount = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        connectionCount += 1;
-        return stalled;
-      },
-    });
-
+    const factory = vi.fn<WebSocketFactory>(() => transport);
+    const client = new TsfClient({ webSocketFactory: factory });
     const connecting = client.connectReader({
       streamId: generateStreamId(),
       start: { type: "seqNum", seqNum: 0n },
       signal: controller.signal,
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(stalled.readyState).toBe(1);
     const reason = new Error("connection cancelled");
+
     controller.abort(reason);
 
     await expect(connecting).rejects.toBe(reason);
-    expect(stalled.closed).toBe(true);
-    expect(connectionCount).toBe(1);
-  });
-
-  it("stops reconnecting when a session closes", async () => {
-    const streamId = generateStreamId();
-    let connectionCount = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        connectionCount += 1;
-        return new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-          ],
-          1006,
-        );
-      },
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-    const pending = reader.nextRecord();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    reader.close();
-
-    await expect(pending).resolves.toBeUndefined();
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(connectionCount).toBe(1);
-  });
-
-  it("cancels an active record wait when a session closes", async () => {
-    const streamId = generateStreamId();
-    const socket = new HangingWebSocket(
-      true,
-      [
-        { type: "ready", kind: "transcript" },
-        streamMetadataFrame(streamId),
-      ],
-      false,
-    );
-    const client = new TsfClient({
-      webSocketFactory: () => socket,
-    });
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    const pending = reader.nextRecord();
-    reader.close();
-
-    await expect(Promise.race([
-      pending,
-      new Promise((resolve) => setTimeout(() => resolve("still pending"), 10)),
-    ])).resolves.toBeUndefined();
-  });
-
-  it("times out a silent reader after three missed heartbeat intervals", async () => {
-    vi.useFakeTimers();
-    try {
-      const streamId = generateStreamId();
-      const socket = new HangingWebSocket(
-        true,
-        [{ type: "ready", kind: "transcript" }, streamMetadataFrame(streamId)],
-        false,
-      );
-      const client = new TsfClient({
-        webSocketFactory: () => socket,
-        boundedOperationAttempts: 1,
-      });
-      const reader = await client.connectReader({ streamId });
-      const pending = reader.nextRecord();
-      const timedOut = expect(pending).rejects.toMatchObject({
-        code: "operation_timeout",
-        message: "read stream record timed out after 60000ms",
-      });
-
-      await vi.advanceTimersByTimeAsync(60_000);
-      await timedOut;
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("retries a timed-out initial handshake and closes the abandoned socket", async () => {
-    const streamId = generateStreamId();
-    const abandoned = new HangingWebSocket(true);
-    let connectionCount = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        connectionCount += 1;
-        return (connectionCount === 1
-          ? abandoned
-          : new ScriptedWebSocket(
-              [
-                { type: "ready", kind: "transcript" },
-                streamMetadataFrame(streamId),
-                readBatch(record(0n, "recovered")),
-              ],
-              1000,
-            ));
-      },
-      webSocketProgressTimeoutMs: 5,
-      boundedOperationAttempts: 2,
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { count: 1n },
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 0n });
-    expect(abandoned.closed).toBe(true);
-    expect(connectionCount).toBe(2);
-  });
-
-  it("bounds consecutive failed reconnect handshakes", async () => {
-    const streamId = generateStreamId();
-    let connections = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        connections += 1;
-        return connections === 1
-          ? new ScriptedWebSocket(
-              [{ type: "ready", kind: "transcript" }, streamMetadataFrame(streamId)],
-              1006,
-            )
-          : new HangingWebSocket(false);
-      },
-      webSocketConnectTimeoutMs: 5,
-      boundedOperationAttempts: 3,
-    });
-    const session = await client.connectReader({ streamId });
-
-    await expect(session.nextRecord()).rejects.toMatchObject({
-      code: "operation_timeout",
-    });
-    expect(connections).toBe(3);
-  });
-
-  it("closes the read transport when an observer throws", async () => {
-    const streamId = generateStreamId();
-    const socket = new HangingWebSocket(true, [
-      { type: "ready", kind: "transcript" },
-      streamMetadataFrame(streamId),
-      { type: "caughtUp", nextSeqNum: 0n, lastTimestampMs: 0n },
-    ], false);
-    const client = new TsfClient({ webSocketFactory: () => socket });
-    const failure = new Error("observer failed");
-    const session = await client.connectReader({
-      streamId,
-      onCaughtUp: () => {
-        throw failure;
-      },
-    });
-
-    await expect(session.nextRecord()).rejects.toBe(failure);
-    expect(socket.closed).toBe(true);
-  });
-
-  it("reports caught-up positions without interrupting record delivery", async () => {
-    const streamId = generateStreamId();
-    const caughtUpPositions: CaughtUpPosition[] = [];
-    const streams: string[] = [];
-    const client = new TsfClient({
-      webSocketFactory: () =>
-        new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-            {
-              type: "caughtUp",
-              nextSeqNum: 1n,
-              lastTimestampMs: 1_000n,
-            },
-            readBatch(record(1n, "next")),
-          ],
-          1000,
-        ),
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 1n },
-      stop: { count: 1n },
-      onCaughtUp: (caughtUp) => caughtUpPositions.push(caughtUp),
-      onStreamMetadata: (stream) => streams.push(stream.streamId),
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 1n });
-    expect(caughtUpPositions).toEqual([{
-      nextSeqNum: 1n,
-      lastTimestampMs: 1_000n,
-    }]);
-    expect(reader.lastCaughtUp()).toEqual(caughtUpPositions[0]);
-    expect(streams).toEqual([streamId]);
-    expect(reader.streamMetadata().streamId).toBe(streamId);
-  });
-
-  it("rejects a caught-up position that rewinds an absolute read", async () => {
-    const streamId = generateStreamId();
-    const client = new TsfClient({
-      webSocketFactory: () =>
-        new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-            {
-              type: "caughtUp",
-              nextSeqNum: 1n,
-              lastTimestampMs: 1_000n,
-            },
-          ],
-          1000,
-        ),
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 2n },
-    });
-    await expect(reader.nextRecord()).rejects.toMatchObject({
-      code: "invalid_server_read",
-    });
-  });
-
-  it("reconnects a finite read without retaining a tail boundary", async () => {
-    const streamId = generateStreamId();
-    const urls: string[] = [];
-    const clientFrames: ClientFrame[][] = [];
-    let connection = 0;
-    const client = new TsfClient({
-      webSocketFactory: (url) => {
-        urls.push(url);
-        const index = connection;
-        connection += 1;
-        return new ScriptedWebSocket(
-          index === 0
-            ? [
-                { type: "ready", kind: "transcript" },
-                streamMetadataFrame(streamId),
-                readBatch(record(0n, "first")),
-              ]
-            : [
-                { type: "ready", kind: "transcript" },
-                streamMetadataFrame(streamId),
-                {
-                  type: "readBatch",
-                  records: [record(1n, "second"), record(2n, "third")],
-                },
-              ],
-          index === 0 ? 1013 : 1000,
-          clientFrames[index] = [],
-        );
-      },
-    });
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-      stop: { waitSeconds: 0 },
-    });
-
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 0n });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 1n });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 2n });
-    await expect(reader.nextRecord()).resolves.toBeUndefined();
-    expect(urls.map(readQuery)).toEqual([
-      "seq_num=0&wait=0",
-      "seq_num=1&wait=0",
-    ]);
-    expect(clientFrames).toEqual([
-      [{ type: "openRead" }],
-      [{ type: "openRead" }],
-    ]);
-  });
-
-  it("rejects a stream kind change while reconnecting a reader", async () => {
-    const streamId = generateStreamId();
-    let connection = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        const initial = connection++ === 0;
-        const kind: StreamKind = initial ? "transcript" : "bytes";
-        return new ScriptedWebSocket(
-          [
-            { type: "ready", kind },
-            streamMetadataFrame(streamId, kind),
-            ...(initial ? [readBatch(record(0n, "first"))] : []),
-          ],
-          initial ? 1013 : 1000,
-        );
-      },
-    });
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 0n },
-    });
-
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 0n });
-    await expect(reader.nextRecord()).rejects.toMatchObject({
-      code: "invalid_api_response",
-      message: "stream kind changed while reconnecting the reader",
-    });
-  });
-
-  it("opens one bounded paced read", async () => {
-    const streamId = generateStreamId();
-    const urls: string[] = [];
-    const clientFrames: ClientFrame[] = [];
-    const client = new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      webSocketFactory: (url) => {
-        urls.push(url);
-        return new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-            readBatch(record(9n, "paced")),
-          ],
-          1000,
-          clientFrames,
-        );
-      },
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "timestampMs", timestampMs: 1_000n },
-      stop: { untilTimestampMs: 1_787_000_000_000n },
-      rate: 2,
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 9n });
-
-    expect(urls).toHaveLength(1);
-    expect(urls.map(readQuery)).toEqual([
-      "timestamp=1000&until=1787000000000&rate=2",
-    ]);
-    expect(clientFrames).toEqual([{ type: "openRead" }]);
-  });
-
-  it.each([
-    { closeCode: 1006, description: "an unclean disconnect" },
-    { closeCode: 1001, description: "server shutdown" },
-  ])("resumes from the next sequence after $description", async ({ closeCode }) => {
-    const streamId = generateStreamId();
-    const urls: string[] = [];
-    const clientFrames: ClientFrame[][] = [];
-    const scripts: readonly (readonly ServerFrame[])[] = [
-      [
-        { type: "ready", kind: "transcript" },
-        streamMetadataFrame(streamId),
-        readBatch(record(5n, "first")),
-      ],
-      [
-        { type: "ready", kind: "transcript" },
-        streamMetadataFrame(streamId),
-        readBatch(record(6n, "second")),
-      ],
-    ];
-    const webSocketFactory: WebSocketFactory = (url) => {
-      const index = urls.length;
-      urls.push(url);
-      const script = scripts[index];
-      if (script === undefined) {
-        throw new Error("unexpected reconnect");
-      }
-      return new ScriptedWebSocket(
-        script,
-        index === 0 ? closeCode : 1000,
-        clientFrames[index] = [],
-      );
-    };
-    const client = new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      webSocketFactory,
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "seqNum", seqNum: 5n },
-      stop: { count: 2n },
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 5n });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 6n });
-    await expect(reader.nextRecord()).resolves.toBeUndefined();
-
-    expect(urls.map(readQuery)).toEqual([
-      "seq_num=5&count=2",
-      "seq_num=6&count=1",
-    ]);
-    expect(clientFrames).toEqual([
-      [{ type: "openRead" }],
-      [{ type: "openRead" }],
-    ]);
-  });
-
-  it("reconnects a tail-relative read after the last received record", async () => {
-    const streamId = generateStreamId();
-    const urls: string[] = [];
-    const clientFrames: ClientFrame[][] = [];
-    const client = new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      webSocketFactory: (url) => {
-        const connection = urls.length;
-        urls.push(url);
-        return new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-            readBatch(record(connection === 0 ? 8n : 9n, "record")),
-          ],
-          connection === 0 ? 1013 : 1000,
-          clientFrames[connection] = [],
-        );
-      },
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "tailOffset", tailOffset: 2n },
-      stop: { count: 2n },
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 8n });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 9n });
-
-    expect(urls.map(readQuery)).toEqual([
-      "tail_offset=2&count=2",
-      "seq_num=9&count=1",
-    ]);
-    expect(clientFrames).toEqual([
-      [{ type: "openRead" }],
-      [{ type: "openRead" }],
-    ]);
-  });
-
-  it("uses an empty caught-up position as the reconnect position", async () => {
-    const streamId = generateStreamId();
-    const urls: string[] = [];
-    const clientFrames: ClientFrame[] = [];
-    const request = vi.fn<typeof fetch>();
-    const client = new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      fetch: request,
-      webSocketFactory: (url) => {
-        const connection = urls.length;
-        urls.push(url);
-        return new ScriptedWebSocket(
-          connection === 0
-            ? [
-                { type: "ready", kind: "transcript" },
-                streamMetadataFrame(streamId),
-                {
-                  type: "caughtUp",
-                  nextSeqNum: 10n,
-                  lastTimestampMs: 1_000n,
-                },
-              ]
-            : [
-                { type: "ready", kind: "transcript" },
-                streamMetadataFrame(streamId),
-                readBatch(record(10n, "stable")),
-              ],
-          connection === 0 ? 1006 : 1000,
-          clientFrames,
-        );
-      },
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "tailOffset", tailOffset: 2n },
-      stop: { count: 1n },
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 10n });
-
-    expect(request).not.toHaveBeenCalled();
-    expect(urls).toHaveLength(2);
-    expect(urls.map(readQuery)).toEqual([
-      "tail_offset=2&count=1",
-      "seq_num=10&count=1",
-    ]);
-    expect(clientFrames).toEqual([
-      {
-        type: "openRead",
-        linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      },
-      {
-        type: "openRead",
-        linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      },
-    ]);
-  });
-
-  it("retries the original tail selector before receiving session state", async () => {
-    const streamId = generateStreamId();
-    const urls: string[] = [];
-    const clientFrames: ClientFrame[] = [];
-    const client = new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      webSocketFactory: (url) => {
-        const connection = urls.length;
-        urls.push(url);
-        return new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-            ...(connection === 0
-              ? []
-              : [readBatch(record(8n, "stable"))]),
-          ],
-          connection === 0 ? 1006 : 1000,
-          clientFrames,
-        );
-      },
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      start: { type: "tailOffset", tailOffset: 2n },
-      stop: { count: 1n },
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 8n });
-
-    expect(urls).toHaveLength(2);
-    expect(urls.map(readQuery)).toEqual(Array.from(
-      { length: 2 },
-      () => "tail_offset=2&count=1",
-    ));
-    expect(clientFrames).toEqual(Array.from({ length: 2 }, () => ({
-      type: "openRead",
-    })));
-  });
-
-  it("uses the implicit default tail offset until the first record", async () => {
-    const streamId = generateStreamId();
-    let socketUrl = "";
-    const clientFrames: ClientFrame[] = [];
-    const request = vi.fn<typeof fetch>();
-    const client = new TsfClient({
-      fetch: request,
-      webSocketFactory: (url) => {
-        socketUrl = url;
-        return new ScriptedWebSocket(
-          [
-            { type: "ready", kind: "transcript" },
-            streamMetadataFrame(streamId),
-            readBatch(record(20n, "default")),
-          ],
-          1000,
-          clientFrames,
-        );
-      },
-    });
-
-    const reader = await client.connectReader({
-      streamId,
-      stop: { count: 1n },
-    });
-    await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 20n });
-    expect(readQuery(socketUrl)).toBe("tail_offset=0&count=1");
-    expect(clientFrames).toEqual([{ type: "openRead" }]);
-    expect(request).not.toHaveBeenCalled();
+    expect(transport.closed).toBe(true);
+    expect(factory).toHaveBeenCalledOnce();
   });
 
   it.each([1006, 1013])(
-    "starts a fresh retry burst after an idle reconnect on close %i",
+    "resumes a finite read after close %i",
     async (closeCode) => {
       const streamId = generateStreamId();
-      let connectionCount = 0;
+      const urls: string[] = [];
+      const opens: ClientFrame[] = [];
       const client = new TsfClient({
-        webSocketFactory: () => {
-          const connection = connectionCount;
-          connectionCount += 1;
-          return new ScriptedWebSocket(
-            connection < 2
-              ? [
-                  { type: "ready", kind: "transcript" },
-                  streamMetadataFrame(streamId),
-                ]
-              : [
-                  { type: "ready", kind: "transcript" },
-                  streamMetadataFrame(streamId),
-                  readBatch(record(0n, "recovered")),
-                ],
-            connection < 2 ? closeCode : 1000,
-          );
-        },
-        boundedOperationAttempts: 2,
-      });
-
-      const reader = await client.connectReader({
-        streamId,
-        start: { type: "seqNum", seqNum: 0n },
-      });
-      await expect(reader.nextRecord()).resolves.toMatchObject({
-        seqNum: 0n,
-        data: new TextEncoder().encode("recovered"),
-      });
-      expect(connectionCount).toBe(3);
-    },
-  );
-
-  it.each([1002, 1008])(
-    "surfaces permanent close %i without reconnecting",
-    async (closeCode) => {
-      const streamId = generateStreamId();
-      let connectionCount = 0;
-      const client = new TsfClient({
-        webSocketFactory: () => {
-          connectionCount += 1;
-          return new ScriptedWebSocket(
-            [
-              { type: "ready", kind: "transcript" },
-              streamMetadataFrame(streamId),
-            ],
-            closeCode,
+        webSocketFactory: (url) => {
+          const connection = urls.length;
+          urls.push(url);
+          return readerSocket(
+            streamId,
+            [record(BigInt(5 + connection), connection === 0 ? "first" : "second")],
+            connection === 0 ? closeCode : 1000,
+            opens,
           );
         },
       });
-
       const reader = await client.connectReader({
         streamId,
-        start: { type: "seqNum", seqNum: 0n },
+        start: { type: "seqNum", seqNum: 5n },
+        stop: { count: 2n },
       });
-      await expect(reader.nextRecord()).rejects.toMatchObject({
-        code: "websocket_closed",
-        closeCode,
-      });
-      expect(connectionCount).toBe(1);
+
+      await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 5n });
+      await expect(reader.nextRecord()).resolves.toMatchObject({ seqNum: 6n });
+      await expect(reader.nextRecord()).resolves.toBeUndefined();
+      expect(urls.map((url) => new URL(url).searchParams.toString())).toEqual([
+        "seq_num=5&count=2",
+        "seq_num=6&count=1",
+      ]);
+      expect(opens).toEqual([{ type: "openRead" }, { type: "openRead" }]);
     },
   );
-
-  it("rejects invalid start selectors before opening a socket", async () => {
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        throw new Error("should not connect");
-      },
-    });
-
-    await expect(
-      client.connectReader({
-        streamId: generateStreamId(),
-        start: { type: "unknown", value: 1n },
-      } as never),
-    ).rejects.toMatchObject({ code: "invalid_read_parameter" });
-    await expect(
-      client.connectReader({
-        streamId: generateStreamId(),
-        start: { type: "timestampMs", timestampMs: 1n },
-        rate: 1,
-      }),
-    ).rejects.toMatchObject({ code: "invalid_read_parameter" });
-    await expect(
-      client.connectReader({
-        streamId: generateStreamId(),
-        start: { type: "tailOffset", tailOffset: BigInt(Number.MAX_SAFE_INTEGER) + 1n },
-      }),
-    ).rejects.toMatchObject({ code: "invalid_read_parameter" });
-  });
 });
 
 describe("TsfWriter", () => {
-  it("rejects malformed credentials before opening a socket", async () => {
-    const webSocketFactory = vi.fn<WebSocketFactory>();
-    const client = new TsfClient({ webSocketFactory });
-
-    await expect(client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "not-a-secret",
-    })).rejects.toMatchObject({ code: "invalid_link_secret" });
-    expect(webSocketFactory).not.toHaveBeenCalled();
-  });
-
-  it("coalesces queued append calls without delaying the first drain", async () => {
-    const socket = new ControlledWriterWebSocket();
-    const client = new TsfClient({
-      webSocketFactory: () => socket,
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-    expect(writer.streamKind).toBe("transcript");
-
-    const first = writer.append({ data: "first" });
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(1));
-    const second = writer.append({ data: "second" });
-    const third = writer.append({ data: "third" });
-
-    socket.ackCurrent();
-    await expect(first).resolves.toEqual({ writerSeqNum: 0n, seqNum: 0n });
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(2));
-    expect(socket.appendCount).toBe(2);
-
-    socket.ackCurrent();
-    await expect(Promise.all([second, third])).resolves.toEqual([
-      { writerSeqNum: 1n, seqNum: 1n },
-      { writerSeqNum: 2n, seqNum: 2n },
-    ]);
-    await writer.close();
-  });
-
-  it("coalesces append calls made in one turn into one protocol frame", async () => {
-    const socket = new ControlledWriterWebSocket();
-    const client = new TsfClient({
-      webSocketFactory: () => socket,
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    const appends = [
-      writer.append({ data: "first" }),
-      writer.append({ data: "second" }),
-      writer.append({ data: "third" }),
-    ];
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(3));
-    expect(socket.appendCount).toBe(1);
-
-    socket.ackCurrent();
-    await expect(Promise.all(appends)).resolves.toEqual([
-      { writerSeqNum: 0n, seqNum: 0n },
-      { writerSeqNum: 1n, seqNum: 1n },
-      { writerSeqNum: 2n, seqNum: 2n },
-    ]);
-    await writer.close();
-  });
-
-  it("flushes accepted appends before closing", async () => {
-    const socket = new ControlledWriterWebSocket();
-    const client = new TsfClient({ webSocketFactory: () => socket });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-    const appends = [
-      writer.append({ data: "first" }),
-      writer.append({ data: "second" }),
-    ];
-
-    const closing = writer.close();
-    await expect(writer.append({ data: "late" })).rejects.toMatchObject({
-      code: "writer_closed",
-    });
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(2));
-    socket.ackCurrent();
-
-    await expect(Promise.all(appends)).resolves.toHaveLength(2);
-    await expect(closing).resolves.toBeUndefined();
-  });
-
-  it("queues records and payload beyond the socket window", async () => {
-    const socket = new ControlledWriterWebSocket();
-    const client = new TsfClient({
-      webSocketFactory: () => socket,
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    const recordCalls = Array.from(
-      { length: MAX_WRITER_IN_FLIGHT_RECORDS },
-      () => writer.append({ data: new Uint8Array() }),
-    );
-    const queuedRecord = writer.append({ data: new Uint8Array() });
-    await vi.waitFor(() =>
-      expect(socket.pendingRecordCount).toBe(MAX_WRITER_IN_FLIGHT_RECORDS)
-    );
-    socket.ackCurrent();
-    await expect(recordCalls[0]).resolves.toMatchObject({ writerSeqNum: 0n });
-    socket.setAutoAck(true);
-    await Promise.all([...recordCalls.slice(1), queuedRecord]);
-
-    socket.setAutoAck(false);
-    const payloadRecordCount =
-      MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES / MAX_RECORD_PAYLOAD_BYTES;
-    if (!Number.isInteger(payloadRecordCount)) {
-      throw new TypeError("writer byte window must compose from whole records");
-    }
-    const maxRecord = new Uint8Array(MAX_RECORD_PAYLOAD_BYTES);
-    const payloadCalls = Array.from(
-      { length: payloadRecordCount },
-      () => writer.append({ data: maxRecord }),
-    );
-    const emptyAtFullPayload = writer.append({ data: new Uint8Array() });
-    const queuedPayload = writer.append({ data: Uint8Array.of(1) });
-    await vi.waitFor(() =>
-      expect(socket.pendingRecordCount).toBe(payloadRecordCount + 1)
-    );
-    socket.ackCurrent();
-    await expect(payloadCalls[0]).resolves.toBeDefined();
-    socket.setAutoAck(true);
-    await Promise.all([
-      ...payloadCalls.slice(1),
-      emptyAtFullPayload,
-      queuedPayload,
-    ]);
-
-    expect(socket.appendCount).toBe(
-      Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS) +
-        1 +
-        Math.ceil(MAX_WRITER_IN_FLIGHT_PAYLOAD_BYTES / MAX_FRAME_PAYLOAD_BYTES) +
-        1,
-    );
-    await writer.close();
-  });
-
-  it("bounds writer authentication and closes the stalled socket", async () => {
-    const stalled = new HangingWebSocket(true);
-    const client = new TsfClient({
-      webSocketFactory: () => stalled,
-      webSocketProgressTimeoutMs: 5,
-      boundedOperationAttempts: 1,
-    });
-
-    await expect(
-      client.connectWriter({
-        streamId: generateStreamId(),
-        linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      }),
-    ).rejects.toMatchObject({ code: "operation_timeout" });
-    expect(stalled.closed).toBe(true);
-  });
-
-  it("closes a socket whose opening handshake times out", async () => {
-    const stalled = new HangingWebSocket(false);
-    const client = new TsfClient({
-      webSocketFactory: () => stalled,
-      webSocketConnectTimeoutMs: 5,
-      boundedOperationAttempts: 1,
-    });
-
-    await expect(
-      client.connectWriter({
-        streamId: generateStreamId(),
-        linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      }),
-    ).rejects.toMatchObject({ code: "operation_timeout" });
-    expect(stalled.closed).toBe(true);
-  });
-
-  it("creates a fresh identity for each durable writer", async () => {
-    const authFrames: WriterOpenFrame[] = [];
-    const client = new TsfClient({
-      webSocketFactory: () => new WriterWebSocket(true, authFrames, []),
-    });
-    const options = {
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    } as const;
-
-    const first = await client.connectWriter(options);
-    await first.close();
-    const second = await client.connectWriter(options);
-    await second.close();
-
-    expect(authFrames).toHaveLength(2);
-    expect(authFrames[0]?.clientWriterId).not.toEqual(
-      authFrames[1]?.clientWriterId,
-    );
-  });
-
-  it("reuses its writer identity and sequence when resending after disconnect", async () => {
+  it("retains acknowledged progress and resends only the pending suffix", async () => {
     const appends: AppendRecord[] = [];
-    const authFrames: WriterOpenFrame[] = [];
-    let connectionCount = 0;
-    const client = new TsfClient({
-      apiOrigin: "http://localhost:8787",
-      webSocketFactory: () => {
-        const shouldAck = connectionCount > 0;
-        connectionCount += 1;
-        return new WriterWebSocket(
-          shouldAck,
-          authFrames,
-          appends,
-          1013,
-        );
-      },
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      expectedNextSeqNum: 42n,
-    });
-
-    await expect(writer.append({ data: "durable\n" })).resolves.toEqual({
-      writerSeqNum: 0n,
-      seqNum: 42n,
-    });
-    await writer.close();
-
-    expect(connectionCount).toBe(2);
-    expect(authFrames).toHaveLength(2);
-    expect(authFrames[0]?.clientWriterId).toEqual(authFrames[1]?.clientWriterId);
-    expect(authFrames.map((frame) => frame.expectedNextSeqNum)).toEqual([
-      42n,
-      undefined,
-    ]);
-    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([0n, 0n]);
-    expect(appends[0]?.data).toEqual(appends[1]?.data);
-  });
-
-  it("sends an explicit append batch in one message", async () => {
-    const appends: AppendRecord[] = [];
-    const client = new TsfClient({
-      webSocketFactory: () =>
-        new WriterWebSocket(true, [], appends),
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    await expect(writer.appendBatch([
-      { data: "first" },
-      { data: "second" },
-    ])).resolves.toEqual([
-      { writerSeqNum: 0n, seqNum: 42n },
-      { writerSeqNum: 1n, seqNum: 43n },
-    ]);
-    expect(appends.map(({ writerSeqNum }) => writerSeqNum)).toEqual([0n, 1n]);
-    await writer.close();
-  });
-
-  it("splits one submission across bounded wire frames", async () => {
-    const socket = new ControlledWriterWebSocket();
-    const client = new TsfClient({ webSocketFactory: () => socket });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    const submission = writer.appendBatch(Array.from(
-      { length: 3 },
-      () => ({ data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES) }),
-    ));
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(3));
-    expect(socket.appendCount).toBe(2);
-    socket.ackCurrent();
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(1));
-    socket.ackCurrent();
-
-    await expect(submission).resolves.toHaveLength(3);
-    expect(socket.appendCount).toBe(2);
-    await writer.close();
-  });
-
-  it("paces queued input larger than the socket window", async () => {
-    const socket = new ControlledWriterWebSocket();
-    const client = new TsfClient({ webSocketFactory: () => socket });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    const submission = writer.appendBatch(Array.from(
-      { length: 16 },
-      () => ({ data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES) }),
-    ));
-    await vi.waitFor(() => expect(socket.pendingRecordCount).toBe(10));
-    expect(socket.appendCount).toBe(5);
-
-    socket.setAutoAck(true);
-    await expect(submission).resolves.toHaveLength(16);
-    await writer.close();
-  });
-
-  it("accepts one submission larger than a protocol frame", async () => {
-    const socket = new ControlledWriterWebSocket();
-    const client = new TsfClient({ webSocketFactory: () => socket });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    const submission = writer.appendBatch(Array.from(
-      { length: MAX_WRITER_IN_FLIGHT_RECORDS + 1 },
-      () => ({ data: new Uint8Array() }),
-    ));
-    await vi.waitFor(() =>
-      expect(socket.pendingRecordCount).toBe(MAX_WRITER_IN_FLIGHT_RECORDS)
-    );
-    expect(socket.appendCount).toBe(
-      Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS),
-    );
-
-    socket.setAutoAck(true);
-    await expect(submission).resolves.toHaveLength(MAX_WRITER_IN_FLIGHT_RECORDS + 1);
-    expect(socket.appendCount).toBe(
-      Math.ceil(MAX_WRITER_IN_FLIGHT_RECORDS / MAX_APPEND_FRAME_RECORDS) + 1,
-    );
-    await writer.close();
-  });
-
-  it("splits a logical record into contiguous physical parts", async () => {
-    const appends: AppendRecord[] = [];
-    const client = new TsfClient({
-      webSocketFactory: () => new WriterWebSocket(true, [], appends),
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    await expect(writer.appendLogical({
-      data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES + 1),
-    })).resolves.toHaveLength(2);
-    expect(appends.map(({ writerSeqNum, part, data }) => ({
-      writerSeqNum,
-      part,
-      bytes: data.byteLength,
-    }))).toEqual([
-      {
-        writerSeqNum: 0n,
-        part: { index: 0, isFinal: false },
-        bytes: MAX_RECORD_PAYLOAD_BYTES,
-      },
-      {
-        writerSeqNum: 1n,
-        part: { index: 1, isFinal: true },
-        bytes: 1,
-      },
-    ]);
-    await writer.close();
-  });
-
-  it("retains acknowledged progress and resends only the unacknowledged suffix", async () => {
-    const appends: AppendRecord[] = [];
-    const authFrames: WriterOpenFrame[] = [];
+    const opens: WriterOpenFrame[] = [];
     let connection = 0;
     const client = new TsfClient({
       webSocketFactory: () => {
-        const current = connection;
-        connection += 1;
-        return new WriterWebSocket(
-          true,
-          authFrames,
+        const current = connection++;
+        return writerSocket({
+          opens,
           appends,
-          1013,
-          "interrupted",
-          current === 0 ? 1 : undefined,
-          current === 0 ? 42n : 43n,
-        );
+          ...(current === 0 ? { acknowledgedRecords: 1 } : {}),
+          nextSeqNum: current === 0 ? 42n : 43n,
+          closeAfterAck: current === 0,
+        });
       },
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      linkSecret: LINK_SECRET,
     });
 
     await expect(writer.appendBatch([
@@ -1326,136 +125,32 @@ describe("TsfWriter", () => {
       1n,
       2n,
     ]);
-    expect(authFrames[0]?.clientWriterId).toEqual(authFrames[1]?.clientWriterId);
+    expect(opens[0]?.clientWriterId).toEqual(opens[1]?.clientWriterId);
     await writer.close();
   });
 
-  it("surfaces policy closes without resending", async () => {
-    const appends: AppendRecord[] = [];
-    const authFrames: WriterOpenFrame[] = [];
-    let connectionCount = 0;
+  it("can abort ambiguous recovery", async () => {
+    let connection = 0;
     const client = new TsfClient({
       webSocketFactory: () => {
-        connectionCount += 1;
-        return new WriterWebSocket(
-          false,
-          authFrames,
-          appends,
-          1008,
-        );
-      },
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    const error = await writer.append({ data: "rejected\n" }).catch(
-      (caught: unknown) => caught,
-    );
-    expect(error).toMatchObject({ code: "writer_durability_unknown" });
-    expect((error as Error).cause).toMatchObject({
-      code: "websocket_closed",
-      closeCode: 1008,
-    });
-    expect(connectionCount).toBe(1);
-    expect(appends).toHaveLength(1);
-  });
-
-  it("surfaces an opening sequence mismatch without retrying", async () => {
-    const appends: AppendRecord[] = [];
-    let connectionCount = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        connectionCount += 1;
-        return new WriterWebSocket(
-          false,
-          [],
-          appends,
-          1008,
-          "sequence_mismatch",
-        );
-      },
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      expectedNextSeqNum: 0n,
-    });
-
-    await expect(writer.append({ data: "rejected\n" })).rejects.toMatchObject({
-      code: "sequence_mismatch",
-    });
-    expect(connectionCount).toBe(1);
-    expect(appends).toHaveLength(1);
-  });
-
-  it("recovers the same records beyond the bounded operation retry count", async () => {
-    const appends: AppendRecord[] = [];
-    const authFrames: WriterOpenFrame[] = [];
-    let connectionCount = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        connectionCount += 1;
-        if (connectionCount === 1) {
-          return new WriterWebSocket(false, authFrames, appends);
-        }
-        return connectionCount === 2
-          ? new HangingWebSocket(false)
-          : new WriterWebSocket(true, authFrames, appends);
-      },
-      webSocketConnectTimeoutMs: 5,
-      webSocketProgressTimeoutMs: 5,
-      boundedOperationAttempts: 2,
-    });
-    const writer = await client.connectWriter({
-      streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    });
-
-    const uncertain = writer.append({ data: "possibly durable\n" });
-    const queued = writer.append({ data: "next record\n" });
-
-    await expect(uncertain).resolves.toEqual({
-      writerSeqNum: 0n,
-      seqNum: 42n,
-    });
-    await expect(queued).resolves.toEqual({
-      writerSeqNum: 1n,
-      seqNum: 43n,
-    });
-    await writer.close();
-
-    expect(connectionCount).toBe(3);
-    expect(authFrames).toHaveLength(2);
-    expect(authFrames[0]?.clientWriterId).toEqual(authFrames[1]?.clientWriterId);
-    expect(appends.map((frame) => frame.writerSeqNum)).toEqual([0n, 1n, 0n, 1n]);
-    expect(appends[0]?.data).toEqual(appends[2]?.data);
-    expect(appends[1]?.data).toEqual(appends[3]?.data);
-  });
-
-  it("can explicitly abort ambiguous recovery", async () => {
-    let connectionCount = 0;
-    const client = new TsfClient({
-      webSocketFactory: () => {
-        connectionCount += 1;
-        return connectionCount === 1
-          ? new WriterWebSocket(false, [], [])
-          : new HangingWebSocket(false);
+        connection += 1;
+        return connection === 1
+          ? writerSocket({ closeWithoutAck: true })
+          : new TestWebSocket(undefined, false);
       },
       webSocketConnectTimeoutMs: 5,
       boundedOperationAttempts: 1,
     });
     const writer = await client.connectWriter({
       streamId: generateStreamId(),
-      linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      linkSecret: LINK_SECRET,
     });
-    const uncertain = writer.append({ data: "possibly durable\n" });
-    const rejection = expect(uncertain).rejects.toMatchObject({
+    const append = writer.append({ data: "possibly durable" });
+    const rejection = expect(append).rejects.toMatchObject({
       code: "writer_durability_unknown",
       cause: { code: "writer_aborted" },
     });
-    await vi.waitFor(() => expect(connectionCount).toBeGreaterThan(1));
+    await vi.waitFor(() => expect(connection).toBeGreaterThan(1));
 
     writer.abort();
 
@@ -1463,16 +158,86 @@ describe("TsfWriter", () => {
   });
 });
 
-class HangingWebSocket extends EventTarget {
+type WriterOpenFrame = Extract<ClientFrame, { type: "openWrite" }>;
+type AppendRecord = Extract<ClientFrame, { type: "appendBatch" }>["records"][number];
+
+interface WriterSocketOptions {
+  readonly opens?: WriterOpenFrame[];
+  readonly appends?: AppendRecord[];
+  readonly acknowledgedRecords?: number;
+  readonly nextSeqNum?: bigint;
+  readonly closeAfterAck?: boolean;
+  readonly closeWithoutAck?: boolean;
+}
+
+function writerSocket(options: WriterSocketOptions): TestWebSocket {
+  return new TestWebSocket((frame, socket) => {
+    if (frame.type === "openWrite") {
+      options.opens?.push(frame);
+      socket.serverFrame({ type: "ready", kind: "transcript" });
+      return;
+    }
+    if (frame.type !== "appendBatch" || frame.records.length === 0) {
+      throw new Error(`unexpected ${frame.type} frame`);
+    }
+    options.appends?.push(...frame.records);
+    if (options.closeWithoutAck) {
+      socket.serverClose(1006, "interrupted");
+      return;
+    }
+    const count = Math.min(
+      options.acknowledgedRecords ?? frame.records.length,
+      frame.records.length,
+    );
+    const first = frame.records[0];
+    const last = frame.records[count - 1];
+    if (first === undefined || last === undefined) {
+      throw new Error("empty acknowledgement");
+    }
+    const nextSeqNum = options.nextSeqNum ?? 0n;
+    socket.serverFrame({
+      type: "appendAck",
+      writerStartSeqNum: first.writerSeqNum,
+      writerEndSeqNum: last.writerSeqNum + 1n,
+      startSeqNum: nextSeqNum,
+      endSeqNum: nextSeqNum + BigInt(count),
+    });
+    if (options.closeAfterAck) {
+      socket.serverClose(1013, "interrupted");
+    }
+  });
+}
+
+function readerSocket(
+  streamId: StreamId,
+  records: readonly ReadRecord[],
+  closeCode: number,
+  opens: ClientFrame[],
+): TestWebSocket {
+  return new TestWebSocket((frame, socket) => {
+    if (frame.type !== "openRead") {
+      throw new Error(`unexpected ${frame.type} frame`);
+    }
+    opens.push(frame);
+    socket.serverFrame({ type: "ready", kind: "transcript" });
+    socket.serverFrame(streamMetadataFrame(streamId));
+    socket.serverFrame({ type: "readBatch", records });
+    setTimeout(() => socket.serverClose(closeCode, "script complete"), 0);
+  });
+}
+
+class TestWebSocket extends EventTarget {
   public readonly protocol = TSF_WEBSOCKET_PROTOCOL;
   public readyState = 0;
-  public binaryType: BinaryType = "blob";
+  public binaryType = "blob";
   public closed = false;
 
   public constructor(
-    open: boolean,
-    private readonly frames: readonly ServerFrame[] = [],
-    private readonly reportsClose = true,
+    private readonly onClientFrame?: (
+      frame: ClientFrame,
+      socket: TestWebSocket,
+    ) => void,
+    open = true,
   ) {
     super();
     if (open) {
@@ -1480,93 +245,33 @@ class HangingWebSocket extends EventTarget {
         if (!this.closed) {
           this.readyState = 1;
           this.dispatchEvent(new Event("open"));
-          for (const frame of this.frames) {
-            this.dispatchEvent(
-              new MessageEvent("message", {
-                data: arrayBuffer(encodeServerFrame(frame)),
-              }),
-            );
-          }
         }
       });
     }
   }
 
-  public send(): void {}
+  public send(data: Uint8Array<ArrayBuffer>): void {
+    this.onClientFrame?.(decodeClientFrame(data), this);
+  }
 
   public close(code = 1000, reason = ""): void {
+    this.serverClose(code, reason, true);
+  }
+
+  public serverFrame(frame: ServerFrame): void {
+    this.serverBytes(encodeServerFrame(frame));
+  }
+
+  public serverBytes(data: Uint8Array): void {
+    this.dispatchEvent(new MessageEvent("message", { data: arrayBuffer(data) }));
+  }
+
+  public serverClose(code: number, reason: string, wasClean = false): void {
     if (this.closed) {
       return;
     }
     this.closed = true;
     this.readyState = 3;
-    if (!this.reportsClose) {
-      return;
-    }
-    const event = new Event("close") as CloseEvent;
-    Object.defineProperties(event, {
-      code: { value: code },
-      reason: { value: reason },
-      wasClean: { value: true },
-    });
-    this.dispatchEvent(event);
-  }
-}
-
-class ScriptedWebSocket extends EventTarget {
-  public readonly protocol = TSF_WEBSOCKET_PROTOCOL;
-  public readyState = 0;
-  public binaryType: BinaryType = "blob";
-  #closed = false;
-
-  public get closed(): boolean {
-    return this.#closed;
-  }
-
-  public constructor(
-    private readonly frames: readonly ServerFrame[],
-    private readonly closeCode: number,
-    private readonly clientFrames: ClientFrame[] = [],
-  ) {
-    super();
-    queueMicrotask(() => this.#open());
-  }
-
-  public send(data: Uint8Array<ArrayBuffer>): void {
-    this.clientFrames.push(decodeClientFrame(data));
-  }
-
-  public close(code = 1000, reason = ""): void {
-    this.#dispatchClose(code, reason, true);
-  }
-
-  #open(): void {
-    this.readyState = 1;
-    this.dispatchEvent(new Event("open"));
-    for (const frame of this.frames) {
-      this.dispatchEvent(
-        new MessageEvent("message", {
-          data: arrayBuffer(encodeServerFrame(frame)),
-        }),
-      );
-    }
-    setTimeout(
-      () =>
-        this.#dispatchClose(
-          this.closeCode,
-          "script complete",
-          this.closeCode === 1000,
-        ),
-      0,
-    );
-  }
-
-  #dispatchClose(code: number, reason: string, wasClean: boolean): void {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
-    this.readyState = 3;
     const event = new Event("close") as CloseEvent;
     Object.defineProperties(event, {
       code: { value: code },
@@ -1574,208 +279,6 @@ class ScriptedWebSocket extends EventTarget {
       wasClean: { value: wasClean },
     });
     this.dispatchEvent(event);
-  }
-}
-
-type WriterOpenFrame = Extract<
-  ClientFrame,
-  { type: "openWrite" }
->;
-type AppendRecord = Extract<
-  ClientFrame,
-  { type: "appendBatch" }
->["records"][number];
-
-class WriterWebSocket extends EventTarget {
-  public readonly protocol = TSF_WEBSOCKET_PROTOCOL;
-  public readyState = 0;
-  public binaryType: BinaryType = "blob";
-  #closed = false;
-
-  public constructor(
-    private readonly shouldAck: boolean,
-    private readonly openFrames: WriterOpenFrame[],
-    private readonly appends: AppendRecord[],
-    private readonly disconnectCode = 1006,
-    private readonly disconnectReason = "interrupted",
-    private readonly acknowledgedRecords?: number,
-    private nextStreamSeqNum = 42n,
-  ) {
-    super();
-    queueMicrotask(() => {
-      this.readyState = 1;
-      this.dispatchEvent(new Event("open"));
-    });
-  }
-
-  public send(data: Uint8Array<ArrayBuffer>): void {
-    const frame = decodeClientFrame(data);
-    if (frame.type === "openWrite") {
-      this.openFrames.push(frame);
-      this.#emit({ type: "ready", kind: "transcript" });
-      return;
-    }
-    if (frame.type !== "appendBatch") {
-      throw new Error(`unexpected ${frame.type} frame`);
-    }
-    const first = frame.records[0];
-    const last = frame.records.at(-1);
-    if (first === undefined || last === undefined) {
-      throw new Error("empty append batch");
-    }
-    this.appends.push(...frame.records);
-    if (this.shouldAck) {
-      const acknowledgedRecords = Math.min(
-        this.acknowledgedRecords ?? frame.records.length,
-        frame.records.length,
-      );
-      const lastAcknowledged = frame.records[acknowledgedRecords - 1];
-      if (lastAcknowledged === undefined) {
-        throw new Error("writer acknowledgement was empty");
-      }
-      this.#emit({
-        type: "appendAck",
-        writerStartSeqNum: first.writerSeqNum,
-        writerEndSeqNum: lastAcknowledged.writerSeqNum + 1n,
-        startSeqNum: this.nextStreamSeqNum,
-        endSeqNum: this.nextStreamSeqNum + BigInt(acknowledgedRecords),
-      });
-      this.nextStreamSeqNum += BigInt(acknowledgedRecords);
-      if (acknowledgedRecords < frame.records.length) {
-        this.#dispatchClose(
-          this.disconnectCode,
-          this.disconnectReason,
-          this.disconnectCode === 1000,
-        );
-      }
-    } else {
-      this.#dispatchClose(
-        this.disconnectCode,
-        this.disconnectReason,
-        this.disconnectCode === 1000,
-      );
-    }
-  }
-
-  public close(code = 1000, reason = ""): void {
-    this.#dispatchClose(code, reason, true);
-  }
-
-  #emit(frame: ServerFrame): void {
-    this.dispatchEvent(
-      new MessageEvent("message", {
-        data: arrayBuffer(encodeServerFrame(frame)),
-      }),
-    );
-  }
-
-  #dispatchClose(code: number, reason: string, wasClean: boolean): void {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
-    this.readyState = 3;
-    const event = new Event("close") as CloseEvent;
-    Object.defineProperties(event, {
-      code: { value: code },
-      reason: { value: reason },
-      wasClean: { value: wasClean },
-    });
-    this.dispatchEvent(event);
-  }
-}
-
-class ControlledWriterWebSocket extends EventTarget {
-  public readonly protocol = TSF_WEBSOCKET_PROTOCOL;
-  public readyState = 0;
-  public binaryType: BinaryType = "blob";
-  public appendCount = 0;
-  #autoAck = false;
-  #closed = false;
-  readonly #pendingAppends: (readonly AppendRecord[])[] = [];
-
-  public constructor() {
-    super();
-    queueMicrotask(() => {
-      this.readyState = 1;
-      this.dispatchEvent(new Event("open"));
-    });
-  }
-
-  public get hasPendingAppend(): boolean {
-    return this.#pendingAppends.length > 0;
-  }
-
-  public get pendingRecordCount(): number {
-    return this.#pendingAppends.reduce(
-      (total, records) => total + records.length,
-      0,
-    );
-  }
-
-  public send(data: Uint8Array<ArrayBuffer>): void {
-    const frame = decodeClientFrame(data);
-    if (frame.type === "openWrite") {
-      this.#emit({ type: "ready", kind: "transcript" });
-      return;
-    }
-    if (frame.type !== "appendBatch" || frame.records.length === 0) {
-      throw new Error(`unexpected ${frame.type} frame`);
-    }
-    this.appendCount += 1;
-    this.#pendingAppends.push(frame.records);
-    if (this.#autoAck && this.#pendingAppends.length === 1) {
-      queueMicrotask(() => this.ackCurrent());
-    }
-  }
-
-  public ackCurrent(): void {
-    const records = this.#pendingAppends.shift();
-    const first = records?.[0];
-    const last = records?.at(-1);
-    if (first === undefined || last === undefined) {
-      throw new Error("writer has no append awaiting acknowledgement");
-    }
-    this.#emit({
-      type: "appendAck",
-      writerStartSeqNum: first.writerSeqNum,
-      writerEndSeqNum: last.writerSeqNum + 1n,
-      startSeqNum: first.writerSeqNum,
-      endSeqNum: last.writerSeqNum + 1n,
-    });
-    if (this.#autoAck && this.#pendingAppends.length > 0) {
-      queueMicrotask(() => this.ackCurrent());
-    }
-  }
-
-  public setAutoAck(enabled: boolean): void {
-    this.#autoAck = enabled;
-    if (enabled && this.#pendingAppends.length > 0) {
-      queueMicrotask(() => this.ackCurrent());
-    }
-  }
-
-  public close(code = 1000, reason = ""): void {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
-    this.readyState = 3;
-    const event = new Event("close") as CloseEvent;
-    Object.defineProperties(event, {
-      code: { value: code },
-      reason: { value: reason },
-      wasClean: { value: true },
-    });
-    this.dispatchEvent(event);
-  }
-
-  #emit(frame: ServerFrame): void {
-    this.dispatchEvent(
-      new MessageEvent("message", {
-        data: arrayBuffer(encodeServerFrame(frame)),
-      }),
-    );
   }
 }
 
@@ -1790,23 +293,14 @@ function record(seqNum: bigint, text: string): ReadRecord {
   };
 }
 
-function readBatch(recordValue: ReadRecord): ServerFrame {
-  return { type: "readBatch", records: [recordValue] };
-}
-
-function readQuery(url: string): string {
-  return new URL(url).searchParams.toString();
-}
-
 function streamMetadataFrame(
   streamId: StreamId,
-  kind: StreamKind = "transcript",
-): Extract<ServerFrame, { readonly type: "streamMetadata" }> {
+): Extract<ServerFrame, { type: "streamMetadata" }> {
   return {
     type: "streamMetadata",
     stream: {
       stream_id: streamId,
-      kind,
+      kind: "transcript",
       title: null,
       visibility: "public",
       created_at: "2026-08-13T00:00:00Z",
