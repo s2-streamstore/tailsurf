@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use tailsurf::{
     TERMINAL_CHECKPOINT_EVENT_HEADER_BYTES, TERMINAL_CHECKPOINT_RECORD_INTERVAL,
     protocol::ws::frame::MAX_RECORD_PAYLOAD_BYTES,
@@ -212,7 +214,7 @@ impl TerminalCheckpointEmitter {
         }
 
         let (rows, columns) = self.parser.screen().size();
-        let state = if self.parser.screen().alternate_screen() {
+        let mut state = if self.parser.screen().alternate_screen() {
             let restore = self.alternate_restore.as_ref()?;
             let active_state = self.parser.screen().state_formatted();
             let mut state = Vec::with_capacity(
@@ -227,6 +229,7 @@ impl TerminalCheckpointEmitter {
         } else {
             self.parser.screen().state_formatted()
         };
+        self.compatibility.append_passthrough_modes(&mut state);
 
         (state.len() <= MAX_CHECKPOINT_STATE_BYTES).then_some((columns, rows, state))
     }
@@ -334,12 +337,23 @@ impl vt100::Callbacks for CheckpointCallbacks {
     fn unhandled_csi(
         &mut self,
         _: &mut vt100::Screen,
-        _: Option<u8>,
-        _: Option<u8>,
-        _: &[&[u16]],
-        _: char,
+        first_intermediate: Option<u8>,
+        second_intermediate: Option<u8>,
+        params: &[&[u16]],
+        action: char,
     ) {
-        self.reject();
+        let serializable_dec_modes = first_intermediate == Some(b'?')
+            && second_intermediate.is_none()
+            && matches!(action, 'h' | 'l')
+            && params.iter().all(|param| {
+                let [mode] = **param else {
+                    return false;
+                };
+                vt100_handles_dec_mode(mode) || mode == 1047 || is_passthrough_dec_mode(mode)
+            });
+        if !serializable_dec_modes {
+            self.reject();
+        }
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, _: &[&[u8]]) {
@@ -350,6 +364,7 @@ impl vt100::Callbacks for CheckpointCallbacks {
 struct CheckpointCompatibility {
     compatible: bool,
     transition: Option<AlternateTransition>,
+    passthrough_modes: BTreeMap<u16, bool>,
 }
 
 impl Default for CheckpointCompatibility {
@@ -357,6 +372,7 @@ impl Default for CheckpointCompatibility {
         Self {
             compatible: true,
             transition: None,
+            passthrough_modes: BTreeMap::new(),
         }
     }
 }
@@ -366,6 +382,69 @@ impl CheckpointCompatibility {
         self.compatible = false;
         self.transition = None;
     }
+
+    fn append_passthrough_modes(&self, state: &mut Vec<u8>) {
+        for (mode, enabled) in &self.passthrough_modes {
+            state.extend_from_slice(b"\x1b[?");
+            state.extend_from_slice(mode.to_string().as_bytes());
+            state.push(if *enabled { b'h' } else { b'l' });
+        }
+    }
+}
+
+fn vt100_handles_dec_mode(mode: u16) -> bool {
+    matches!(
+        mode,
+        1 | 6 | 9 | 25 | 47 | 1000 | 1002 | 1003 | 1005 | 1006 | 1049 | 2004
+    )
+}
+
+// These modes affect presentation or terminal-to-application input. They do not change how
+// output bytes update the grid, so their latest value can follow the serialized screen state.
+fn is_passthrough_dec_mode(mode: u16) -> bool {
+    matches!(
+        mode,
+        4 | 5
+            | 8
+            | 12
+            | 66
+            | 67
+            | 1001
+            | 1004
+            | 1007
+            | 1010
+            | 1011
+            | 1014
+            | 1015
+            | 1016
+            | 1034
+            | 1035
+            | 1036
+            | 1037
+            | 1039
+            | 1040
+            | 1041
+            | 1042
+            | 1043
+            | 1044
+            | 1050
+            | 1051
+            | 1052
+            | 1053
+            | 1060
+            | 1061
+            | 2001
+            | 2002
+            | 2003
+            | 2005
+            | 2006
+            | 2026
+            | 2031
+            | 2048
+            | 5522
+            | 7727
+            | 9001
+    )
 }
 
 impl vte::Perform for CheckpointCompatibility {
@@ -408,7 +487,11 @@ impl vte::Perform for CheckpointCompatibility {
                         [47] => mode = Some(AlternateScreenMode::Switch47),
                         [1047] => mode = Some(AlternateScreenMode::Switch1047),
                         [1049] => mode = Some(AlternateScreenMode::SaveCursor),
-                        _ => {}
+                        [value] if is_passthrough_dec_mode(*value) => {
+                            self.passthrough_modes.insert(*value, action == 'h');
+                        }
+                        [value] if vt100_handles_dec_mode(*value) => {}
+                        _ => self.reject(),
                     }
                 }
                 if let Some(mode) = mode {
@@ -496,6 +579,34 @@ mod tests {
             restored.screen().state_formatted(),
             emitter.parser.screen().state_formatted()
         );
+    }
+
+    #[test]
+    fn btop_synchronized_output_stays_checkpointable_across_a_resize() {
+        let mut emitter = TerminalCheckpointEmitter::new(80, 24);
+        emitter.process(b"shell\x1b[?1049h\x1b[?1006h\x1b[?2026hframe");
+        emitter.process(b" updated\x1b[?2026l");
+        let checkpoint = emitter.resize(120, 40).expect("resized checkpoint");
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
+
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+    }
+
+    #[test]
+    fn checkpoint_preserves_modern_input_and_reporting_modes() {
+        let mut emitter = TerminalCheckpointEmitter::new(80, 24);
+        emitter.process(b"screen\x1b[?1004;1016;2031;2048;5522;7727;9001h");
+        emitter.process(b"\x1b[?2031;5522l");
+        let checkpoint = emitter.flush().expect("checkpoint");
+
+        assert!(checkpoint.state.ends_with(
+            b"\x1b[?1004h\x1b[?1016h\x1b[?2031l\x1b[?2048h\x1b[?5522l\x1b[?7727h\x1b[?9001h"
+        ));
     }
 
     #[test]
