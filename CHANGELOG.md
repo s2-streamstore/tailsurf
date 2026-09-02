@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.14.7](https://github.com/s2-streamstore/tailsurf/compare/v0.14.6...v0.14.7) - 2026-09-02
+
+### Other
+
+- simplify SDK and CLI internals ([#95](https://github.com/s2-streamstore/tailsurf/pull/95))
+
 ## [0.14.6](https://github.com/s2-streamstore/tailsurf/compare/v0.14.5...v0.14.6) - 2026-09-02
 
 ### Fixed
