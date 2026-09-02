@@ -19,10 +19,6 @@ const EXITED = 0x04;
 const HEARTBEAT = 0x05;
 const CHECKPOINT = 0x06;
 
-export type TerminalInputEvent =
-  | { readonly type: "data"; readonly data: Uint8Array }
-  | { readonly type: "resize"; readonly columns: number; readonly rows: number };
-
 export type TerminalOutputEvent =
   | { readonly type: "data"; readonly data: Uint8Array }
   | { readonly type: "resize"; readonly columns: number; readonly rows: number }
@@ -40,13 +36,13 @@ export type TerminalOutputEvent =
     readonly state: Uint8Array;
   };
 
+export type TerminalInputEvent = Extract<
+  TerminalOutputEvent,
+  { readonly type: "data" | "resize" }
+>;
+
 export function encodeTerminalInputEvent(event: TerminalInputEvent): Uint8Array {
-  switch (event.type) {
-    case "data":
-      return encodeData(DATA, event.data);
-    case "resize":
-      return encodeSize(RESIZE, event.columns, event.rows);
-  }
+  return encodeTerminalOutputEvent(event);
 }
 
 export function decodeTerminalInputEvent(payload: Uint8Array): TerminalInputEvent {

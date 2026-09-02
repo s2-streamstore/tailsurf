@@ -12,6 +12,8 @@ import {
   MAX_TERMINAL_ROWS,
   MAX_RECORD_PAYLOAD_BYTES,
   ProtocolError,
+  type TerminalInputEvent,
+  type TerminalOutputEvent,
 } from "../src/index.js";
 
 describe("terminal event protocol", () => {
@@ -21,41 +23,17 @@ describe("terminal event protocol", () => {
       "utf8",
     )) as readonly { readonly name: string; readonly bytes: readonly number[] }[];
     for (const vector of vectors) {
-      const encoded = encodeVector(vector.name);
+      const event = vectorEvent(vector.name);
+      const encoded = "input" in event
+        ? encodeTerminalInputEvent(event.input)
+        : encodeTerminalOutputEvent(event.output);
       expect(Array.from(encoded), vector.name).toEqual(vector.bytes);
-    }
-  });
-
-  it("round trips input events", () => {
-    expect(decodeTerminalInputEvent(encodeTerminalInputEvent({
-      type: "data",
-      data: Uint8Array.of(0, 1, 255),
-    }))).toEqual({ type: "data", data: Uint8Array.of(0, 1, 255) });
-    expect(decodeTerminalInputEvent(encodeTerminalInputEvent({
-      type: "resize",
-      columns: 132,
-      rows: 43,
-    }))).toEqual({ type: "resize", columns: 132, rows: 43 });
-  });
-
-  it("round trips output events", () => {
-    const events = [
-      { type: "data", data: Uint8Array.of(27, 91, 109) },
-      { type: "resize", columns: 80, rows: 24 },
-      { type: "started", columns: 120, rows: 40 },
-      { type: "exited", status: -1, outputTruncated: false },
-      { type: "exited", status: 0, outputTruncated: true },
-      { type: "heartbeat" },
-      {
-        type: "checkpoint",
-        columns: 80,
-        rows: 24,
-        state: Uint8Array.of(27, 91, 109),
-      },
-    ] as const;
-    for (const event of events) {
-      expect(decodeTerminalOutputEvent(encodeTerminalOutputEvent(event)))
-        .toEqual(event);
+      expect(
+        "input" in event
+          ? decodeTerminalInputEvent(encoded)
+          : decodeTerminalOutputEvent(encoded),
+        vector.name,
+      ).toEqual("input" in event ? event.input : event.output);
     }
   });
 
@@ -107,46 +85,47 @@ describe("terminal event protocol", () => {
   });
 });
 
-function encodeVector(name: string): Uint8Array {
-  switch (name) {
-    case "input-data":
-      return encodeTerminalInputEvent({
-        type: "data",
-        data: Uint8Array.of(0, 1, 255),
-      });
-    case "input-resize":
-      return encodeTerminalInputEvent({ type: "resize", columns: 132, rows: 43 });
-    case "output-data":
-      return encodeTerminalOutputEvent({
-        type: "data",
-        data: Uint8Array.of(27, 91, 109),
-      });
-    case "output-resize":
-      return encodeTerminalOutputEvent({ type: "resize", columns: 80, rows: 24 });
-    case "output-started":
-      return encodeTerminalOutputEvent({ type: "started", columns: 120, rows: 40 });
-    case "output-exited":
-      return encodeTerminalOutputEvent({
-        type: "exited",
-        status: -1,
-        outputTruncated: false,
-      });
-    case "output-exited-truncated":
-      return encodeTerminalOutputEvent({
-        type: "exited",
-        status: 0,
-        outputTruncated: true,
-      });
-    case "output-heartbeat":
-      return encodeTerminalOutputEvent({ type: "heartbeat" });
-    case "output-checkpoint":
-      return encodeTerminalOutputEvent({
-        type: "checkpoint",
-        columns: 80,
-        rows: 24,
-        state: Uint8Array.of(27, 91, 109),
-      });
-    default:
-      throw new Error(`unknown terminal test vector ${name}`);
+type TerminalEventVector =
+  | { readonly input: TerminalInputEvent }
+  | { readonly output: TerminalOutputEvent };
+
+const VECTOR_EVENTS: Readonly<Record<string, TerminalEventVector>> = {
+  "input-data": {
+    input: { type: "data", data: Uint8Array.of(0, 1, 255) },
+  },
+  "input-resize": {
+    input: { type: "resize", columns: 132, rows: 43 },
+  },
+  "output-data": {
+    output: { type: "data", data: Uint8Array.of(27, 91, 109) },
+  },
+  "output-resize": {
+    output: { type: "resize", columns: 80, rows: 24 },
+  },
+  "output-started": {
+    output: { type: "started", columns: 120, rows: 40 },
+  },
+  "output-exited": {
+    output: { type: "exited", status: -1, outputTruncated: false },
+  },
+  "output-exited-truncated": {
+    output: { type: "exited", status: 0, outputTruncated: true },
+  },
+  "output-heartbeat": { output: { type: "heartbeat" } },
+  "output-checkpoint": {
+    output: {
+      type: "checkpoint",
+      columns: 80,
+      rows: 24,
+      state: Uint8Array.of(27, 91, 109),
+    },
+  },
+};
+
+function vectorEvent(name: string): TerminalEventVector {
+  const event = VECTOR_EVENTS[name];
+  if (event === undefined) {
+    throw new Error(`unknown terminal test vector ${name}`);
   }
+  return event;
 }
