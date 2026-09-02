@@ -81,13 +81,7 @@ export const clientWriterIdBase64urlSchema = z.string().check(
     "writer id must be 16 bytes encoded as unpadded base64url",
   ),
 );
-export const writerIdBase64urlSchema = z.string().check(
-  z.regex(WRITER_ID_BASE64URL_PATTERN),
-  z.refine(
-    (value) => canonicalBase64url(value, 16),
-    "writer_id must be 16 bytes encoded as unpadded base64url",
-  ),
-);
+export const writerIdBase64urlSchema = clientWriterIdBase64urlSchema;
 export const bytesBase64urlSchema = z.string().check(
   z.regex(BASE64URL_PATTERN),
   z.refine(

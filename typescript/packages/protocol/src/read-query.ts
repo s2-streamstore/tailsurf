@@ -190,11 +190,11 @@ function requiredU64(
 }
 
 function validateReadRequest(request: ReadRequest): void {
-  const selector = readSelectorValue(request.start);
+  const [startParameter, selector] = readStartValue(request.start);
   const stop = request.stop;
   if (selector < 0n || selector > MAX_SAFE_INTEGER_U64) {
     throw invalidParameter(
-      readStartParameter(request.start),
+      startParameter,
       `must not exceed ${MAX_SAFE_INTEGER_U64}`,
     );
   }
@@ -238,25 +238,14 @@ function validateReadRequest(request: ReadRequest): void {
   }
 }
 
-function readSelectorValue(start: ReadStart): bigint {
+function readStartValue(start: ReadStart): readonly [string, bigint] {
   switch (start.type) {
     case "seqNum":
-      return start.seqNum;
+      return ["seq_num", start.seqNum];
     case "timestampMs":
-      return start.timestampMs;
+      return ["timestamp", start.timestampMs];
     case "tailOffset":
-      return start.tailOffset;
-  }
-}
-
-function readStartParameter(start: ReadStart): string {
-  switch (start.type) {
-    case "seqNum":
-      return "seq_num";
-    case "timestampMs":
-      return "timestamp";
-    case "tailOffset":
-      return "tail_offset";
+      return ["tail_offset", start.tailOffset];
   }
 }
 
