@@ -43,11 +43,20 @@ use tokio::{
 use url::Url;
 
 const TEST_STREAM_LINK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TEST_STREAM_ID: &str = "0123456789abcdefghjkmnpqrstvwxyz";
 
 fn canonical_test_link_secret() -> LinkSecret {
     TEST_STREAM_LINK
         .parse()
         .expect("canonical test link secret")
+}
+
+fn canonical_test_stream_id() -> StreamId {
+    TEST_STREAM_ID.parse().expect("canonical test stream ID")
+}
+
+fn test_stream_link(permissions: &str) -> String {
+    format!("http://localhost:3000/s/{TEST_STREAM_ID}#{permissions}={TEST_STREAM_LINK}")
 }
 
 #[cfg(unix)]
@@ -58,6 +67,24 @@ async fn interrupt_process(pid: u32) {
         .await
         .expect("send SIGINT");
     assert!(signal.success());
+}
+
+#[cfg(unix)]
+async fn read_interrupt_notice(stderr: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> String {
+    let mut notice = String::new();
+    timeout(Duration::from_secs(5), stderr.read_line(&mut notice))
+        .await
+        .expect("timed out waiting for interrupt notice")
+        .expect("read interrupt notice");
+    notice
+}
+
+#[cfg(unix)]
+async fn wait_for_tsf(child: &mut tokio::process::Child) -> std::process::ExitStatus {
+    timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("timed out waiting for tsf")
+        .expect("wait for tsf")
 }
 
 #[test]
@@ -75,11 +102,10 @@ fn update_refuses_an_unmanaged_executable() {
 
 #[test]
 fn renew_rejects_an_overflowing_expiry() {
-    const OWNER_LINK: &str =
-        "https://tail.surf/s/0123456789abcdefghjkmnpqrstvwxyz#o=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let owner_link = test_stream_link("o");
 
     let renewed = Command::new(env!("CARGO_BIN_EXE_tsf"))
-        .args(["renew", OWNER_LINK, "18446744073709551615s"])
+        .args(["renew", owner_link.as_str(), "18446744073709551615s"])
         .output()
         .expect("tsf renew with overflowing expiry");
 
@@ -93,8 +119,7 @@ fn renew_rejects_an_overflowing_expiry() {
 #[tokio::test]
 async fn second_interrupt_aborts_a_stalled_stdin_write() {
     let server = HoldingWriteServer::start(1).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
-    let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
+    let write_link = test_stream_link("w");
     let mut command = tsf_command(&server.origin);
     command
         .args(["write", write_link.as_str()])
@@ -113,11 +138,7 @@ async fn second_interrupt_aborts_a_stalled_stdin_write() {
 
     let pid = child.id().expect("tsf process ID");
     interrupt_process(pid).await;
-    let mut notice = String::new();
-    timeout(Duration::from_secs(5), stderr.read_line(&mut notice))
-        .await
-        .expect("timed out waiting for interrupt notice")
-        .expect("read interrupt notice");
+    let notice = read_interrupt_notice(&mut stderr).await;
     assert!(
         notice.contains("press Ctrl-C again to stop immediately"),
         "stderr={notice}"
@@ -128,10 +149,7 @@ async fn second_interrupt_aborts_a_stalled_stdin_write() {
     );
 
     interrupt_process(pid).await;
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .expect("timed out waiting for forced interrupt")
-        .expect("wait for tsf");
+    let status = wait_for_tsf(&mut child).await;
     drop(stdin);
     assert_eq!(status.code(), Some(130));
 }
@@ -140,8 +158,7 @@ async fn second_interrupt_aborts_a_stalled_stdin_write() {
 #[tokio::test]
 async fn first_interrupt_does_not_drain_an_unbounded_input_backlog() {
     let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
-    let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
+    let write_link = test_stream_link("w");
     let mut command = tsf_command(&server.origin);
     command
         .args(["write", write_link.as_str()])
@@ -162,18 +179,11 @@ async fn first_interrupt_does_not_drain_an_unbounded_input_backlog() {
 
     let pid = child.id().expect("tsf process ID");
     interrupt_process(pid).await;
-    let mut notice = String::new();
-    timeout(Duration::from_secs(5), stderr.read_line(&mut notice))
-        .await
-        .expect("timed out waiting for interrupt notice")
-        .expect("read interrupt notice");
+    let notice = read_interrupt_notice(&mut stderr).await;
     assert!(notice.contains("Input stopped"), "stderr={notice}");
 
     server.release_acknowledgements();
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .expect("timed out waiting for interrupted tsf")
-        .expect("wait for tsf");
+    let status = wait_for_tsf(&mut child).await;
     drop(stdin);
     assert_eq!(status.code(), Some(130));
 
@@ -189,8 +199,7 @@ async fn first_interrupt_does_not_drain_an_unbounded_input_backlog() {
 #[tokio::test]
 async fn interrupted_command_unblocks_full_output_readers() {
     let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
-    let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
+    let write_link = test_stream_link("w");
     let mut command = tsf_command(&server.origin);
     command
         .args(["write", write_link.as_str(), "--", "yes", "123456789012345"])
@@ -205,28 +214,18 @@ async fn interrupted_command_unblocks_full_output_readers() {
 
     let pid = child.id().expect("tsf process ID");
     interrupt_process(pid).await;
-    let mut notice = String::new();
-    timeout(Duration::from_secs(5), stderr.read_line(&mut notice))
-        .await
-        .expect("timed out waiting for interrupt notice")
-        .expect("read interrupt notice");
+    let notice = read_interrupt_notice(&mut stderr).await;
     assert!(notice.contains("Input stopped"), "stderr={notice}");
 
     server.release_acknowledgements();
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .expect("timed out waiting for interrupted tsf")
-        .expect("wait for tsf");
+    let status = wait_for_tsf(&mut child).await;
     assert_eq!(status.code(), Some(130));
 }
 
 #[tokio::test]
 async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret() {
     let server = FakeWriteServer::start().await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let write_link = format!("http://localhost:3000/s/{stream_id}#w={TEST_STREAM_LINK}");
+    let write_link = test_stream_link("w");
 
     let output = run_tsf_with_origin(
         server.origin.clone(),
@@ -259,9 +258,7 @@ async fn write_reconnect_reuses_client_writer_identity_sequence_and_link_secret(
 #[tokio::test]
 async fn durable_writer_recovery_outlives_the_bounded_operation_retry_count() {
     let server = FakeWriteServer::start_after_failures(3).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.bounded_operation_attempts = 1;
     let writer = TsfClient::with_config(config)
@@ -408,9 +405,7 @@ async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
     // One 6 MiB batch (12 x 512 KiB) exceeds the server's 5 MiB sent-but-unacknowledged socket
     // window, so the writer must stop after ten records until acknowledgements arrive.
     let server = HoldingWriteServer::start(10).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let writer = TsfClient::with_api_origin(server.origin.clone())
         .expect("valid API origin")
         .connect_writer(tailsurf::DurableWriterOptions::new(
@@ -465,9 +460,7 @@ async fn continuous_submissions_cannot_starve_the_acknowledgement_deadline() {
     // keeps submission commands flowing to the actor; that traffic must not postpone the
     // deadline, so a silent server still triggers a reconnect.
     let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.websocket_progress_timeout = Duration::from_millis(100);
     let writer = TsfClient::with_config(config)
@@ -513,9 +506,7 @@ async fn writer_reconnect_arms_a_fresh_acknowledgement_deadline() {
     // fresh deadline instead of being finished off by the dead socket's remainder.
     let server =
         StallingWriteServer::start(Duration::from_millis(180), Duration::from_millis(100)).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.websocket_progress_timeout = Duration::from_millis(200);
     let writer = TsfClient::with_config(config)
@@ -547,10 +538,7 @@ async fn writer_reconnect_arms_a_fresh_acknowledgement_deadline() {
 #[tokio::test]
 async fn tail_reconnect_after_multi_record_batch_advances_start_and_count() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectAfterBatch).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+    let read_link = test_stream_link("r");
 
     let output = run_tsf_until_stdout_contains(
         server.origin.clone(),
@@ -575,8 +563,7 @@ async fn tail_reconnect_after_multi_record_batch_advances_start_and_count() {
 #[tokio::test]
 async fn bounded_sse_tail_finishes_after_a_multi_record_batch() {
     let server = FakeSseServer::start_with_mode(FakeSseMode::BatchThenClose).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz";
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+    let read_link = test_stream_link("r");
 
     let output = run_tsf_with_origin(
         server.origin.clone(),
@@ -604,9 +591,7 @@ async fn bounded_sse_tail_finishes_after_a_multi_record_batch() {
 #[tokio::test]
 async fn sse_wait_zero_finishes_at_the_current_tail() {
     let server = FakeSseServer::start().await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let mut options = ReadOptions::new(stream_id);
     options.start = Some(ReadStart::SeqNum(0));
     options.stop = Some(ReadStop {
@@ -641,10 +626,7 @@ async fn sse_wait_zero_finishes_at_the_current_tail() {
 #[tokio::test]
 async fn tail_since_is_sent_as_a_timestamp_selector() {
     let server = FakeReadServer::start(FakeReadMode::OneRecord).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+    let read_link = test_stream_link("r");
 
     let output = run_tsf_until_stdout_contains(
         server.origin.clone(),
@@ -669,9 +651,7 @@ async fn tail_since_is_sent_as_a_timestamp_selector() {
 #[tokio::test]
 async fn default_read_start_reconnect_before_first_record_retries_the_default() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectBeforeFirstDefault).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     let mut reader = client.connect_reader(request).await.expect("reader");
@@ -694,9 +674,7 @@ async fn default_read_start_reconnect_before_first_record_retries_the_default() 
 #[tokio::test]
 async fn reader_restarts_retries_after_established_idle_connections() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectTwiceThenRecord).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.bounded_operation_attempts = 2;
     let client = TsfClient::with_config(config).expect("valid client config");
@@ -719,9 +697,7 @@ async fn reader_restarts_retries_after_established_idle_connections() {
 #[tokio::test]
 async fn explicit_read_timeout_covers_reconnect_cycles() {
     let server = FakeReadServer::start(FakeReadMode::SlowReconnectForever).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let mut config = TsfClientConfig::new(server.origin.clone()).expect("valid API origin");
     config.bounded_operation_attempts = 100;
     let client = TsfClient::with_config(config).expect("valid client config");
@@ -749,9 +725,7 @@ async fn explicit_read_timeout_covers_reconnect_cycles() {
 #[tokio::test]
 async fn reader_resumes_pending_reconnect_after_caller_timeout() {
     let server = FakeReadServer::start(FakeReadMode::ReconnectAfterEmptyCaughtUp).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     let client = TsfClient::with_api_origin(server.origin.clone()).expect("valid API origin");
     let mut request = ReadOptions::new(stream_id).with_link_secret(canonical_test_link_secret());
     request.start = Some(ReadStart::TailOffset(2));
@@ -785,10 +759,7 @@ async fn reader_resumes_pending_reconnect_after_caller_timeout() {
 #[tokio::test]
 async fn count_zero_reads_complete_without_opening_a_socket() {
     let server = FakeReadServer::start(FakeReadMode::OneRecord).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+    let read_link = test_stream_link("r");
 
     let replay = run_tsf_with_origin(
         server.origin.clone(),
@@ -804,10 +775,7 @@ async fn count_zero_reads_complete_without_opening_a_socket() {
 #[tokio::test]
 async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
     let server = FakeReadServer::start(FakeReadMode::OneRecord).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+    let read_link = test_stream_link("r");
 
     let output = run_tsf_with_origin(
         server.origin.clone(),
@@ -828,10 +796,7 @@ async fn tail_rejects_ambiguous_start_selectors_before_connecting() {
 #[tokio::test]
 async fn replay_rejects_split_records_above_the_reassembly_limit() {
     let server = FakeReadServer::start(FakeReadMode::ReplaySplitRecord).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+    let read_link = test_stream_link("r");
 
     let output = run_tsf_with_origin(
         server.origin.clone(),
@@ -858,10 +823,7 @@ async fn replay_rejects_split_records_above_the_reassembly_limit() {
 #[tokio::test]
 async fn replay_preserves_non_utf8_stdout_bytes() {
     let server = FakeReadServer::start(FakeReadMode::ReplayBinary).await;
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
-    let read_link = format!("http://localhost:3000/s/{stream_id}#r={TEST_STREAM_LINK}");
+    let read_link = test_stream_link("r");
 
     let output =
         run_tsf_bytes_with_origin(server.origin.clone(), ["replay", read_link.as_str()]).await;
@@ -1054,9 +1016,7 @@ fn tsf_command(origin: &Url) -> TokioCommand {
 }
 
 async fn connect_default_writer(origin: &Url) -> tailsurf::TsfWriter {
-    let stream_id = "0123456789abcdefghjkmnpqrstvwxyz"
-        .parse::<StreamId>()
-        .expect("stream id");
+    let stream_id = canonical_test_stream_id();
     TsfClient::with_api_origin(origin.clone())
         .expect("valid API origin")
         .connect_writer(tailsurf::DurableWriterOptions::new(
