@@ -77,17 +77,17 @@ interface Schema<T> {
 }
 
 export interface HttpClientOptions {
-  readonly apiOrigin?: string | URL;
-  readonly fetch?: typeof globalThis.fetch;
+  readonly apiOrigin?: string | URL | undefined;
+  readonly fetch?: typeof globalThis.fetch | undefined;
   /** Bounds REST requests and SSE opening handshakes. It does not time out an established SSE body. */
-  readonly httpRequestTimeoutMs?: number;
+  readonly httpRequestTimeoutMs?: number | undefined;
   /** Total attempts for bounded operations, including the initial attempt. */
-  readonly boundedOperationAttempts?: number;
+  readonly boundedOperationAttempts?: number | undefined;
 }
 
 export interface IdempotencyOptions {
   /** Sensitive recovery key retained across every attempt of one logical mutation. */
-  readonly idempotencyKey?: string;
+  readonly idempotencyKey?: string | undefined;
 }
 
 export interface InitialStreamLinkOptions {
@@ -96,24 +96,24 @@ export interface InitialStreamLinkOptions {
 }
 
 export interface CreateStreamInput {
-  readonly kind?: StreamKind;
-  readonly title?: string;
-  readonly visibility?: Visibility;
-  readonly expiresInSeconds?: number;
-  readonly links?: readonly InitialStreamLinkOptions[];
+  readonly kind?: StreamKind | undefined;
+  readonly title?: string | undefined;
+  readonly visibility?: Visibility | undefined;
+  readonly expiresInSeconds?: number | undefined;
+  readonly links?: readonly InitialStreamLinkOptions[] | undefined;
 }
 
 export interface PreparedCreateStreamRequest {
   readonly kind: StreamKind;
-  readonly title?: string;
+  readonly title?: string | undefined;
   readonly visibility: Visibility;
-  readonly expiresInSeconds?: number;
+  readonly expiresInSeconds?: number | undefined;
   readonly links: readonly InitialStreamLinkOptions[];
 }
 
 /** Authorization for metadata reads. Public streams may omit the link secret. */
 export interface ReadAuthOptions {
-  readonly linkSecret?: string;
+  readonly linkSecret?: string | undefined;
 }
 
 /** Owner authorization for one stream-management request. */
@@ -127,22 +127,22 @@ export interface WriteAuthOptions {
 }
 
 export interface ListLinksOptions extends OwnerAuthOptions {
-  readonly limit?: number;
-  readonly cursor?: string;
+  readonly limit?: number | undefined;
+  readonly cursor?: string | undefined;
 }
 
 export interface CreateLinkInput {
   readonly linkId: string;
   readonly permissions: LinkPermissions;
-  readonly expiresAt?: string;
+  readonly expiresAt?: string | undefined;
 }
 
 export interface CreateLinkOptions extends OwnerAuthOptions, IdempotencyOptions {}
 
 export interface UpdateStreamInput {
-  readonly title?: string | null;
-  readonly visibility?: Visibility;
-  readonly expiresAt?: string;
+  readonly title?: string | null | undefined;
+  readonly visibility?: Visibility | undefined;
+  readonly expiresAt?: string | undefined;
 }
 
 export interface AppendRange {
@@ -151,7 +151,7 @@ export interface AppendRange {
 }
 
 export interface StatelessAppendRecord {
-  readonly part?: PartHeader;
+  readonly part?: PartHeader | undefined;
   readonly data: Uint8Array | string;
 }
 
@@ -159,7 +159,7 @@ export interface StatelessAppendRequest {
   readonly clientWriterId: ClientWriterId;
   readonly writerStartSeqNum: bigint;
   readonly records: readonly StatelessAppendRecord[];
-  readonly expectedNextSeqNum?: bigint;
+  readonly expectedNextSeqNum?: bigint | undefined;
 }
 
 export class BaseTsfClient {
@@ -246,9 +246,9 @@ export class BaseTsfClient {
       {
         method: "PATCH",
         body: JSON.stringify(updateStreamRequestSchema.parse({
-          ...(request.title === undefined ? {} : { title: request.title }),
-          ...(request.visibility === undefined ? {} : { visibility: request.visibility }),
-          ...(request.expiresAt === undefined ? {} : { expires_at: request.expiresAt }),
+          title: request.title,
+          visibility: request.visibility,
+          expires_at: request.expiresAt,
         })),
       },
       requiredLinkSecret(options, "update stream", "owner"),
@@ -283,7 +283,7 @@ export class BaseTsfClient {
     );
     const createRequest: WireCreateLinkRequestInput = {
       permissions: request.permissions,
-      ...(request.expiresAt === undefined ? {} : { expires_at: request.expiresAt }),
+      expires_at: request.expiresAt,
     };
     return this.#json(
       "create link",
@@ -348,7 +348,7 @@ export class BaseTsfClient {
       const page = await this.listLinks(streamId, {
         ...options,
         limit: MAX_LINK_PAGE_ITEMS,
-        ...(cursor === undefined ? {} : { cursor }),
+        cursor,
       });
       if (
         authorizingLinkId !== undefined &&
@@ -429,9 +429,9 @@ export class BaseTsfClient {
       payloadBytes += bytes.byteLength;
       return {
         ...compactRecordPayload(bytes),
-        ...(part === undefined
-          ? {}
-          : { part: { index: part.index, is_final: part.isFinal } }),
+        part: part === undefined
+          ? undefined
+          : { index: part.index, is_final: part.isFinal },
       };
     });
     if (payloadBytes > MAX_STATELESS_APPEND_PAYLOAD_BYTES) {
@@ -463,9 +463,7 @@ export class BaseTsfClient {
         seq_num: request.writerStartSeqNum.toString(),
       },
       records,
-      ...(request.expectedNextSeqNum === undefined
-        ? {}
-        : { expected_next_seq_num: request.expectedNextSeqNum.toString() }),
+      expected_next_seq_num: request.expectedNextSeqNum?.toString(),
     });
     const encodedBody = JSON.stringify(body);
     if (textEncoder.encode(encodedBody).byteLength > MAX_STATELESS_APPEND_JSON_BYTES) {
@@ -735,13 +733,9 @@ export function prepareCreateStreamRequest(
     : [{ linkId: parseLinkId("owner"), permissions: "o" as const }, ...requestedLinks];
   return parsePreparedCreateStreamRequest({
     kind: request.kind ?? "transcript",
-    ...(request.title === undefined
-      ? {}
-      : { title: parseStreamTitle(request.title) }),
+    title: request.title === undefined ? undefined : parseStreamTitle(request.title),
     visibility: request.visibility ?? "private",
-    ...(request.expiresInSeconds === undefined
-      ? {}
-      : { expiresInSeconds: request.expiresInSeconds }),
+    expiresInSeconds: request.expiresInSeconds,
     links,
   });
 }
@@ -762,11 +756,9 @@ export function parsePreparedCreateStreamRequest(
   const kind = streamKindSchema.parse(input.kind);
   const wire = createStreamRequestSchema.parse({
     kind,
-    ...(input.title === undefined ? {} : { title: input.title }),
-    ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
-    ...(input.expiresInSeconds === undefined
-      ? {}
-      : { expires_in_seconds: input.expiresInSeconds }),
+    title: input.title,
+    visibility: input.visibility,
+    expires_in_seconds: input.expiresInSeconds,
     links: input.links.map((link) => {
       if (!isRecord(link)) {
         throw new TsfClientError(
@@ -799,13 +791,9 @@ function createStreamRequestToWire(
 ): WireCreateStreamRequest {
   return {
     ...(request.kind === "transcript" ? {} : { kind: request.kind }),
-    ...(request.title === undefined
-      ? {}
-      : { title: parseStreamTitle(request.title) }),
+    title: request.title === undefined ? undefined : parseStreamTitle(request.title),
     visibility: request.visibility,
-    ...(request.expiresInSeconds === undefined
-      ? {}
-      : { expires_in_seconds: request.expiresInSeconds }),
+    expires_in_seconds: request.expiresInSeconds,
     links: request.links.map((link) => ({
       link_id: parseLinkId(link.linkId),
       permissions: link.permissions,

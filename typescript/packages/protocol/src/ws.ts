@@ -100,7 +100,7 @@ export interface AppendRecord {
 export type ClientFrame =
   | {
       readonly type: "openRead";
-      readonly linkSecret?: string;
+      readonly linkSecret?: string | undefined;
     }
   | {
       readonly type: "openWrite";

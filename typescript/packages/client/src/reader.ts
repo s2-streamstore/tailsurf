@@ -42,13 +42,13 @@ import { INITIAL_RETRY_BACKOFF_MS } from "./retry.js";
 export interface ReadOptions {
   readonly streamId: StreamId;
   /** Cancels connection establishment. Close the returned session to stop reading. */
-  readonly signal?: AbortSignal;
-  readonly start?: ReadStart;
-  readonly stop?: ReadStop;
-  readonly rate?: number;
-  readonly linkSecret?: string;
-  readonly onCaughtUp?: (caughtUp: CaughtUpPosition) => void;
-  readonly onStreamMetadata?: (stream: StreamMetadata) => void;
+  readonly signal?: AbortSignal | undefined;
+  readonly start?: ReadStart | undefined;
+  readonly stop?: ReadStop | undefined;
+  readonly rate?: number | undefined;
+  readonly linkSecret?: string | undefined;
+  readonly onCaughtUp?: ((caughtUp: CaughtUpPosition) => void) | undefined;
+  readonly onStreamMetadata?: ((stream: StreamMetadata) => void) | undefined;
 }
 
 export interface TsfReadSession extends AsyncIterable<ReadRecord> {
@@ -65,19 +65,19 @@ export interface TsfReadSession extends AsyncIterable<ReadRecord> {
 export interface NormalizedReadOptions {
   readonly streamId: StreamId;
   start: ReadStart;
-  stop?: NormalizedReadStop;
-  readonly rate?: number;
-  readonly linkSecret?: string;
-  readonly onCaughtUp?: (caughtUp: CaughtUpPosition) => void;
-  readonly onStreamMetadata?: (stream: StreamMetadata) => void;
-  streamMetadata?: StreamMetadata;
-  lastCaughtUp?: CaughtUpPosition;
+  stop?: NormalizedReadStop | undefined;
+  readonly rate?: number | undefined;
+  readonly linkSecret?: string | undefined;
+  readonly onCaughtUp?: ((caughtUp: CaughtUpPosition) => void) | undefined;
+  readonly onStreamMetadata?: ((stream: StreamMetadata) => void) | undefined;
+  streamMetadata?: StreamMetadata | undefined;
+  lastCaughtUp?: CaughtUpPosition | undefined;
 }
 
 interface NormalizedReadStop {
-  count?: bigint;
-  readonly untilTimestampMs?: bigint;
-  readonly waitSeconds?: number;
+  count?: bigint | undefined;
+  readonly untilTimestampMs?: bigint | undefined;
+  readonly waitSeconds?: number | undefined;
 }
 
 export function normalizeReadOptions(
@@ -112,15 +112,13 @@ export function normalizeReadOptions(
   return {
     streamId: parseStreamId(options.streamId),
     start,
-    ...(stop === undefined ? {} : { stop }),
-    ...(rate === undefined ? {} : { rate }),
-    ...(options.linkSecret === undefined
-      ? {}
-      : { linkSecret: requireLinkSecret(options.linkSecret) }),
-    ...(options.onCaughtUp === undefined ? {} : { onCaughtUp: options.onCaughtUp }),
-    ...(options.onStreamMetadata === undefined
-      ? {}
-      : { onStreamMetadata: options.onStreamMetadata }),
+    stop,
+    rate,
+    linkSecret: options.linkSecret === undefined
+      ? undefined
+      : requireLinkSecret(options.linkSecret),
+    onCaughtUp: options.onCaughtUp,
+    onStreamMetadata: options.onStreamMetadata,
   };
 }
 
@@ -129,9 +127,7 @@ export function openReadFrame(
 ): Extract<ClientFrame, { readonly type: "openRead" }> {
   return {
     type: "openRead",
-    ...(linkSecret === undefined
-      ? {}
-      : { linkSecret }),
+    linkSecret,
   };
 }
 
@@ -387,9 +383,9 @@ function normalizeReadStop(stop: ReadStop | undefined): NormalizedReadStop | und
       waitSeconds === undefined
     ? undefined
     : {
-        ...(count === undefined ? {} : { count }),
-        ...(untilTimestampMs === undefined ? {} : { untilTimestampMs }),
-        ...(waitSeconds === undefined ? {} : { waitSeconds }),
+        count,
+        untilTimestampMs,
+        waitSeconds,
       };
 }
 
@@ -426,8 +422,8 @@ export function readRequestForConnection(
 ): ReadRequest {
   return {
     start: options.start,
-    ...(options.stop === undefined ? {} : { stop: options.stop }),
-    ...(options.rate === undefined ? {} : { rate: options.rate }),
+    stop: options.stop,
+    rate: options.rate,
   };
 }
 

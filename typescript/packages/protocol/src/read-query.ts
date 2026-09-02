@@ -17,17 +17,17 @@ export type ReadStart =
 /** Conditions that make a stream read finite. */
 export interface ReadStop {
   /** Maximum number of physical records to deliver. */
-  readonly count?: bigint;
+  readonly count?: bigint | undefined;
   /** Exclusive ending timestamp in Unix epoch milliseconds. */
-  readonly untilTimestampMs?: bigint;
+  readonly untilTimestampMs?: bigint | undefined;
   /** Seconds to wait at the tail before ending this connection. */
-  readonly waitSeconds?: number;
+  readonly waitSeconds?: number | undefined;
 }
 
 export interface ReadRequest {
   readonly start: ReadStart;
-  readonly stop?: ReadStop;
-  readonly rate?: number;
+  readonly stop?: ReadStop | undefined;
+  readonly rate?: number | undefined;
 }
 
 const READ_START_PARAMETERS = [
