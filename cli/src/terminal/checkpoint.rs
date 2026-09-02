@@ -531,14 +531,8 @@ mod tests {
         );
         assert!(emitter.process(b"\x1b[?1h\x1b[?2004h").is_none());
         let checkpoint = emitter.flush().expect("checkpoint");
-        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
-        restored.process(&checkpoint.state);
-
+        let restored = restore_and_assert_checkpoint(&checkpoint, &emitter);
         assert_eq!(restored.screen().size(), emitter.parser.screen().size());
-        assert_eq!(
-            restored.screen().state_formatted(),
-            emitter.parser.screen().state_formatted()
-        );
     }
 
     #[test]
@@ -546,14 +540,9 @@ mod tests {
         let mut emitter = TerminalCheckpointEmitter::new(80, 24);
         emitter.process(b"shell\x1b[7m\x1b7\x1b[?1049hfull screen");
         let checkpoint = emitter.flush().expect("fallback checkpoint");
-        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
-        restored.process(&checkpoint.state);
+        let mut restored = restore_and_assert_checkpoint(&checkpoint, &emitter);
 
         assert!(restored.screen().alternate_screen());
-        assert_eq!(
-            restored.screen().state_formatted(),
-            emitter.parser.screen().state_formatted()
-        );
 
         emitter.process(b"\x1b[?1049l\x1b8restored");
         restored.process(b"\x1b[?1049l\x1b8restored");
@@ -571,14 +560,9 @@ mod tests {
         emitter.process(b"shell\x1b[?1049h\x1b[?1006h\x1b[?2026hframe");
         emitter.process(b" updated\x1b[?2026l");
         let checkpoint = emitter.resize(120, 40).expect("resized checkpoint");
-        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
-        restored.process(&checkpoint.state);
+        let restored = restore_and_assert_checkpoint(&checkpoint, &emitter);
 
         assert!(restored.screen().alternate_screen());
-        assert_eq!(
-            restored.screen().state_formatted(),
-            emitter.parser.screen().state_formatted()
-        );
     }
 
     #[test]
@@ -632,14 +616,9 @@ mod tests {
         assert_eq!(checkpoints.len(), 3);
         let checkpoint = checkpoints.pop().expect("checkpoint");
         assert!(checkpoint.state.len() < MAX_CHECKPOINT_STATE_BYTES);
-        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
-        restored.process(&checkpoint.state);
+        let mut restored = restore_and_assert_checkpoint(&checkpoint, &emitter);
 
         assert!(restored.screen().alternate_screen());
-        assert_eq!(
-            restored.screen().state_formatted(),
-            emitter.parser.screen().state_formatted()
-        );
 
         emitter.process(b"\x1b[?104");
         emitter.process(b"9l");
@@ -655,14 +634,9 @@ mod tests {
         let mut emitter = TerminalCheckpointEmitter::new(80, 24);
         emitter.process(b"shell\x1b[?1047hfull screen");
         let checkpoint = emitter.flush().expect("checkpoint");
-        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
-        restored.process(&checkpoint.state);
+        let mut restored = restore_and_assert_checkpoint(&checkpoint, &emitter);
 
         assert!(restored.screen().alternate_screen());
-        assert_eq!(
-            restored.screen().state_formatted(),
-            emitter.parser.screen().state_formatted()
-        );
 
         emitter.process(b"\x1b[?1047l");
         restored.process(b"\x1b[?47l");
@@ -680,5 +654,18 @@ mod tests {
         }
 
         assert!(emitter.heartbeat().is_some());
+    }
+
+    fn restore_and_assert_checkpoint(
+        checkpoint: &TerminalStateCheckpoint,
+        emitter: &TerminalCheckpointEmitter,
+    ) -> vt100::Parser {
+        let mut restored = vt100::Parser::new(checkpoint.rows, checkpoint.columns, 0);
+        restored.process(&checkpoint.state);
+        assert_eq!(
+            restored.screen().state_formatted(),
+            emitter.parser.screen().state_formatted()
+        );
+        restored
     }
 }
