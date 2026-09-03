@@ -287,19 +287,17 @@ export function unexpectedFrame(frame: ServerFrame): TsfClientError {
   );
 }
 
+export type DataPlaneRoute = "records" | "terminal/input" | "terminal/output";
+
 export function dataPlaneUrl(
   apiOrigin: string,
   streamId: StreamId,
-  operation:
-    | "read"
-    | "write"
-    | "terminal/input/read"
-    | "terminal/input/write"
-    | "terminal/output/read"
-    | "terminal/output/write",
+  route: DataPlaneRoute,
+  operation: "read" | "write",
 ): string {
+  const resource = route === "records" ? operation : `${route}/${operation}`;
   const url = new URL(
-    `/api/v1/streams/${streamId}/${operation}`,
+    `/api/v1/streams/${streamId}/${resource}`,
     apiOrigin,
   );
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
