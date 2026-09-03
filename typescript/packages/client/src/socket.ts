@@ -131,15 +131,14 @@ export class FrameSocket {
     websocket.addEventListener("message", (event) => {
       this.#messagePipeline = this.#messagePipeline
         .then(async () => this.#push(decodeServerFrame(
-          await messageBytes(messageEventData(event)),
+          await messageBytes(
+            typeof event === "object" && event !== null && "data" in event
+              ? event.data
+              : undefined,
+          ),
         )))
         .catch((error: unknown) => {
-          this.#finish(error);
-          try {
-            websocket.close(1002, "invalid server frame");
-          } catch {
-            // The decode error remains the useful terminal error.
-          }
+          this.#fail(error, 1002, "invalid server frame");
         });
     });
     websocket.addEventListener("close", (event) => {
@@ -214,17 +213,14 @@ export class FrameSocket {
         units > DEFAULT_MAX_RECEIVE_QUEUE_UNITS - this.#queuedUnits ||
         bytes > DEFAULT_MAX_RECEIVE_QUEUE_BYTES - this.#queuedBytes
       ) {
-        this.#finish(
+        this.#fail(
           new TsfClientError(
             "client_receive_overload",
             "WebSocket receive buffer reached its bounded limit",
           ),
+          1013,
+          "client receive buffer full",
         );
-        try {
-          this.websocket.close(1013, "client receive buffer full");
-        } catch {
-          // The bounded client error remains the actionable failure.
-        }
         return;
       }
       this.#queue.push({ frame, bytes, units });
@@ -243,6 +239,15 @@ export class FrameSocket {
       const waiting = this.#waiting;
       this.#waiting = undefined;
       waiting.reject(terminalError);
+    }
+  }
+
+  #fail(error: unknown, closeCode: number, closeReason: string): void {
+    this.#finish(error);
+    try {
+      this.websocket.close(closeCode, closeReason);
+    } catch {
+      // The original terminal error remains actionable.
     }
   }
 }
@@ -517,12 +522,6 @@ function closeError(event: unknown): TsfWebSocketClosedError {
     return new TsfWebSocketClosedError(event.code, event.reason, event.wasClean);
   }
   return new TsfWebSocketClosedError(1006, "invalid WebSocket close event", false);
-}
-
-function messageEventData(event: unknown): unknown {
-  return typeof event === "object" && event !== null && "data" in event
-    ? event.data
-    : undefined;
 }
 
 async function messageBytes(data: unknown): Promise<Uint8Array> {
