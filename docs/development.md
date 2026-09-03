@@ -13,7 +13,7 @@ Language-neutral TSF v1 frame vectors and REST examples live in `rust/fixtures`.
 Install the CLI from the checkout:
 
 ```sh
-cargo install --path cli
+cargo install --locked --path cli
 ```
 
 ## Local service

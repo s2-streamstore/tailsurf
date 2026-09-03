@@ -58,5 +58,5 @@ tailsurf = { path = "$sdk_name" }
 EOF
 
 verify_target="$work_dir/verify-target"
-CARGO_TARGET_DIR="$verify_target" "$cargo_bin" generate-lockfile --manifest-path "$verify_root/Cargo.toml"
+cp "$repo_root/Cargo.lock" "$verify_root/Cargo.lock"
 CARGO_TARGET_DIR="$verify_target" "$cargo_bin" check --manifest-path "$verify_root/Cargo.toml" --workspace --all-targets --locked
