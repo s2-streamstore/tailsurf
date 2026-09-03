@@ -109,7 +109,7 @@ macro_rules! impl_writer_id {
     ($type:ident) => {
         impl $type {
             /// Encoded writer ID length.
-            pub const BYTE_LEN: usize = 16;
+            pub const BYTE_LEN: usize = WRITER_ID_BYTE_LEN;
 
             /// Creates a writer ID from its exact binary representation.
             pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
@@ -133,9 +133,11 @@ macro_rules! impl_writer_id {
     };
 }
 
+const WRITER_ID_BYTE_LEN: usize = 16;
+
 /// Stable 128-bit client-chosen writer identity reused across reconnects.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ClientWriterId([u8; 16]);
+pub struct ClientWriterId([u8; WRITER_ID_BYTE_LEN]);
 
 impl_writer_id!(ClientWriterId);
 
@@ -154,7 +156,7 @@ fn fill_random(bytes: &mut [u8]) {
 
 /// Stable 128-bit server-derived writer identity attached to delivered records.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct WriterId([u8; 16]);
+pub struct WriterId([u8; WRITER_ID_BYTE_LEN]);
 
 impl_writer_id!(WriterId);
 
