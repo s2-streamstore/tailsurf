@@ -775,7 +775,7 @@ impl TsfClient {
         sse_request: &SseReadRequest,
         last_event: Option<&SseResumeEvent>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
-        let mut request = self.apply_rest_auth(
+        let mut request = Self::apply_rest_auth(
             self.http
                 .get(sse_request.url.clone())
                 .header("Accept", "text/event-stream"),
@@ -870,7 +870,6 @@ impl TsfClient {
     }
 
     fn apply_rest_auth(
-        &self,
         request: reqwest::RequestBuilder,
         link_secret: Option<&LinkSecret>,
     ) -> reqwest::RequestBuilder {
@@ -921,7 +920,7 @@ impl TsfClient {
         request: reqwest::RequestBuilder,
         link_secret: Option<&LinkSecret>,
     ) -> Result<reqwest::Response, TsfClientError> {
-        self.apply_rest_auth(request, link_secret)
+        Self::apply_rest_auth(request, link_secret)
             .timeout(self.config.http_request_timeout)
             .send()
             .await
@@ -949,10 +948,10 @@ impl TsfClient {
             match run().await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < attempts && should_retry(&error) => {
-                    let delay = error
-                        .retry_after()
-                        .map(|delay| delay.min(MAX_RETRY_BACKOFF))
-                        .unwrap_or_else(|| reconnect_delay(attempt - 1));
+                    let delay = error.retry_after().map_or_else(
+                        || reconnect_delay(attempt - 1),
+                        |delay| delay.min(MAX_RETRY_BACKOFF),
+                    );
                     if !delay.is_zero() {
                         sleep(delay).await;
                     }
