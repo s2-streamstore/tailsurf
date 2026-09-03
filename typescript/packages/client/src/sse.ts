@@ -486,11 +486,7 @@ class SseParser {
     try {
       return this.#decoder.decode(bytes);
     } catch (cause) {
-      throw new TsfClientError(
-        "invalid_api_response",
-        "SSE response is not valid UTF-8",
-        { cause },
-      );
+      throw invalidSseUtf8(cause);
     }
   }
 
@@ -498,11 +494,7 @@ class SseParser {
     try {
       this.#validator.decode(bytes, { stream: true });
     } catch (cause) {
-      throw new TsfClientError(
-        "invalid_api_response",
-        "SSE response is not valid UTF-8",
-        { cause },
-      );
+      throw invalidSseUtf8(cause);
     }
   }
 
@@ -510,13 +502,17 @@ class SseParser {
     try {
       this.#validator.decode();
     } catch (cause) {
-      throw new TsfClientError(
-        "invalid_api_response",
-        "SSE response is not valid UTF-8",
-        { cause },
-      );
+      throw invalidSseUtf8(cause);
     }
   }
+}
+
+function invalidSseUtf8(cause: unknown): TsfClientError {
+  return new TsfClientError(
+    "invalid_api_response",
+    "SSE response is not valid UTF-8",
+    { cause },
+  );
 }
 
 function parseEventBlock(block: string): ParsedSseEvent | undefined {
