@@ -545,7 +545,7 @@ export class BaseTsfClient {
     }, { method: "DELETE" }, linkSecret);
   }
 
-  async #request<T>(
+  #request<T>(
     operation: string,
     path: string,
     consume: (response: Response) => Promise<T>,
