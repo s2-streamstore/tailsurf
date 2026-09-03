@@ -862,17 +862,17 @@ impl<S> TestServer<S> {
     }
 }
 
-struct CommandOutput {
+struct CommandOutput<T> {
     status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
+    stdout: T,
+    stderr: T,
 }
 
 async fn run_tsf_with_origin<const N: usize>(
     origin: Url,
     args: [&str; N],
     stdin: Option<&str>,
-) -> CommandOutput {
+) -> CommandOutput<String> {
     let output = run_tsf_bytes_with_origin(origin, args, stdin.map(str::as_bytes)).await;
     CommandOutput {
         status: output.status,
@@ -881,17 +881,11 @@ async fn run_tsf_with_origin<const N: usize>(
     }
 }
 
-struct CommandOutputBytes {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
 async fn run_tsf_bytes_with_origin<const N: usize>(
     origin: Url,
     args: [&str; N],
     stdin: Option<&[u8]>,
-) -> CommandOutputBytes {
+) -> CommandOutput<Vec<u8>> {
     let mut command = tsf_command(&origin);
     command
         .args(args)
@@ -911,7 +905,7 @@ async fn run_tsf_bytes_with_origin<const N: usize>(
         .await
         .expect("timed out waiting for tsf")
         .expect("tsf output");
-    CommandOutputBytes {
+    CommandOutput {
         status: output.status,
         stdout: output.stdout,
         stderr: output.stderr,
@@ -923,7 +917,7 @@ async fn run_tsf_until_stdout_contains<const N: usize>(
     args: [&str; N],
     needle: &[u8],
     wait_for: Duration,
-) -> CommandOutput {
+) -> CommandOutput<String> {
     let mut command = tsf_command(&origin);
     command
         .args(args)
