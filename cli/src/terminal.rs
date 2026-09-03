@@ -800,7 +800,7 @@ async fn host(
                 output_drain_deadline = Some(now + PTY_EXIT_DRAIN_IDLE_TIMEOUT);
                 output_drain_max_deadline = Some(now + PTY_EXIT_DRAIN_MAX_TIMEOUT);
             }
-            _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() && pty_output_is_idle(&pending_output, &output_rx) => {
+            _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() && pending_output.is_empty() && output_rx.is_empty() => {
                 close_and_queue_pty_output(
                     &mut output_rx,
                     &output_handoff_state,
@@ -1013,13 +1013,6 @@ async fn close_and_queue_pty_output(
         pending.push_pty_data(result.context("failed to read PTY output")?);
     }
     Ok(())
-}
-
-fn pty_output_is_idle(
-    pending: &PendingTerminalOutput,
-    output: &mpsc::Receiver<std::io::Result<Vec<u8>>>,
-) -> bool {
-    pending.is_empty() && output.is_empty()
 }
 
 #[cfg(test)]
