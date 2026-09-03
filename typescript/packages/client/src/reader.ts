@@ -1,10 +1,7 @@
 import {
   DEFAULT_READ_TAIL_OFFSET,
-  MAX_SAFE_INTEGER_U64,
   MAX_U64,
-  MAX_PLAYBACK_RATE,
-  MAX_READ_WAIT_SECONDS,
-  MIN_PLAYBACK_RATE,
+  encodeReadQuery,
   parseStreamId,
   type ReadStart as ProtocolReadStart,
   type ReadStop as ProtocolReadStop,
@@ -30,7 +27,6 @@ import {
   reconnectSocket,
   requireLinkSecret,
   type SocketPolicy,
-  u64,
   unexpectedFrame,
   WEBSOCKET_READ_IDLE_TIMEOUT_MS,
 } from "./socket.js";
@@ -80,30 +76,25 @@ interface NormalizedReadStop {
 export function normalizeReadOptions(
   options: ReadOptions,
 ): NormalizedReadOptions {
-  const start = normalizeReadStart(options.start ?? {
+  const start = options.start ?? {
     type: "tailOffset",
     tailOffset: DEFAULT_READ_TAIL_OFFSET,
-  });
+  };
+  const requestedStop = options.stop;
+  const stop = requestedStop === undefined ||
+      (requestedStop.count === undefined &&
+        requestedStop.untilTimestampMs === undefined &&
+        requestedStop.waitSeconds === undefined)
+    ? undefined
+    : { ...requestedStop };
   const rate = options.rate;
-  const stop = normalizeReadStop(options.stop);
-  if (
-    rate !== undefined &&
-    (!Number.isFinite(rate) || rate < MIN_PLAYBACK_RATE || rate > MAX_PLAYBACK_RATE)
-  ) {
+  try {
+    encodeReadQuery({ start, stop, rate });
+  } catch (cause) {
     throw new TsfClientError(
       "invalid_read_parameter",
-      `rate must be between ${MIN_PLAYBACK_RATE} and ${MAX_PLAYBACK_RATE}`,
-    );
-  }
-  if (
-    rate !== undefined &&
-    stop?.count === undefined &&
-    stop?.untilTimestampMs === undefined &&
-    stop?.waitSeconds !== 0
-  ) {
-    throw new TsfClientError(
-      "invalid_read_parameter",
-      "rate requires stop.count, stop.untilTimestampMs, or stop.waitSeconds=0",
+      cause instanceof Error ? cause.message : "invalid read parameters",
+      { cause },
     );
   }
   return {
@@ -346,68 +337,6 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
     this.finished = true;
     this.#socket.close();
     return undefined;
-  }
-}
-
-function readSelector(value: bigint, name: string): bigint {
-  const parsed = u64(value, name);
-  if (parsed > MAX_SAFE_INTEGER_U64) {
-    throw new TsfClientError(
-      "invalid_read_parameter",
-      `${name} cannot exceed ${MAX_SAFE_INTEGER_U64}`,
-    );
-  }
-  return parsed;
-}
-
-function readWaitSeconds(value: number): number {
-  if (!Number.isInteger(value) || value < 0 || value > MAX_READ_WAIT_SECONDS) {
-    throw new TsfClientError(
-      "invalid_read_parameter",
-      `waitSeconds must be an integer from 0 through ${MAX_READ_WAIT_SECONDS}`,
-    );
-  }
-  return value;
-}
-
-function normalizeReadStop(stop: ReadStop | undefined): NormalizedReadStop | undefined {
-  if (stop === undefined) {
-    return undefined;
-  }
-  const count = stop.count === undefined ? undefined : u64(stop.count, "stop.count");
-  const untilTimestampMs = stop.untilTimestampMs === undefined
-    ? undefined
-    : readSelector(stop.untilTimestampMs, "stop.untilTimestampMs");
-  const waitSeconds = stop.waitSeconds === undefined
-    ? undefined
-    : readWaitSeconds(stop.waitSeconds);
-  return count === undefined &&
-      untilTimestampMs === undefined &&
-      waitSeconds === undefined
-    ? undefined
-    : {
-        count,
-        untilTimestampMs,
-        waitSeconds,
-      };
-}
-
-function normalizeReadStart(start: ReadStart): ReadStart {
-  switch (start.type) {
-    case "seqNum":
-      return { type: "seqNum", seqNum: readSelector(start.seqNum, "start.seqNum") };
-    case "timestampMs":
-      return {
-        type: "timestampMs",
-        timestampMs: readSelector(start.timestampMs, "start.timestampMs"),
-      };
-    case "tailOffset":
-      return {
-        type: "tailOffset",
-        tailOffset: readSelector(start.tailOffset, "start.tailOffset"),
-      };
-    default:
-      throw new TsfClientError("invalid_read_parameter", "start has an unknown selector type");
   }
 }
 
