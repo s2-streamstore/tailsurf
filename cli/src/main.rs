@@ -1463,10 +1463,10 @@ async fn delete_stream(origin: Url, args: DeleteArgs) -> eyre::Result<()> {
         .await
         .context("failed to delete stream")?;
     if args.owner.json {
-        print_json(&DeleteOutput {
-            stream_id: owner.locator.stream_id.to_string(),
-            status: "deleted",
-        })?;
+        print_json(&serde_json::json!({
+            "stream_id": owner.locator.stream_id.to_string(),
+            "status": "deleted",
+        }))?;
     } else {
         println!("Deleted stream {}", owner.locator.stream_id);
     }
@@ -1612,10 +1612,10 @@ async fn revoke_link(origin: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
         .await
         .context("failed to revoke link")?;
     if args.owner.json {
-        print_json(&LinkMutationOutput {
-            link_id: args.link_id.to_string(),
-            status: "revoked",
-        })?;
+        print_json(&serde_json::json!({
+            "link_id": args.link_id.to_string(),
+            "status": "revoked",
+        }))?;
     } else {
         println!("Revoked link {}", args.link_id);
     }
@@ -2121,18 +2121,6 @@ struct CreatedLinkOutput {
     link_id: String,
     permissions: &'static str,
     url: String,
-}
-
-#[derive(Serialize)]
-struct DeleteOutput {
-    stream_id: String,
-    status: &'static str,
-}
-
-#[derive(Serialize)]
-struct LinkMutationOutput {
-    link_id: String,
-    status: &'static str,
 }
 
 #[cfg(test)]
