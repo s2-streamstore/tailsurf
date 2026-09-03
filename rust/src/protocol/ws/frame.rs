@@ -670,14 +670,17 @@ impl ClientFrame {
     fn append_batch_encoded_len<R: Borrow<AppendRecord>>(
         records: &[R],
     ) -> Result<usize, FrameCodecError> {
+        let mut payload_bytes = 0;
         for record in records {
-            validate_writer_seq_num(record.borrow().writer_seq_num)?;
+            let record = record.borrow();
+            validate_writer_seq_num(record.writer_seq_num)?;
+            validate_record_len(record.data.len())?;
+            payload_bytes += record.data.len();
         }
-        batch_encoded_len(
-            records.iter().map(|record| record.borrow().data.len()),
-            APPEND_RECORD_HEADER_LEN,
-            MAX_APPEND_FRAME_RECORDS,
-        )
+        validate_batch(records.len(), payload_bytes, MAX_APPEND_FRAME_RECORDS)?;
+        Ok(FRAME_OPERATION_LEN
+            + records.len() * (RECORD_LENGTH_LEN + APPEND_RECORD_HEADER_LEN)
+            + payload_bytes)
     }
 
     fn put_append_batch<R: Borrow<AppendRecord>>(output: &mut BytesMut, records: &[R]) {
@@ -1000,27 +1003,19 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
             ensure_empty(op_byte, body)?;
             Ok(ServerFrame::Heartbeat)
         }
-        ServerOp::CaughtUp => decode_position(op_byte, body, |next_seq_num, last_timestamp_ms| {
-            ServerFrame::CaughtUp(CaughtUpPosition {
+        ServerOp::CaughtUp => {
+            let (next_seq_num, body) = read_u64(body)?;
+            let (last_timestamp_ms, body) = read_u64(body)?;
+            ensure_empty(op_byte, body)?;
+            Ok(ServerFrame::CaughtUp(CaughtUpPosition {
                 next_seq_num,
                 last_timestamp_ms,
-            })
-        }),
+            }))
+        }
         ServerOp::StreamMetadata => serde_json::from_slice(body)
             .map(ServerFrame::StreamMetadata)
             .map_err(FrameCodecError::InvalidStreamMetadata),
     }
-}
-
-fn decode_position(
-    op: u8,
-    body: &[u8],
-    frame: impl FnOnce(u64, u64) -> ServerFrame,
-) -> Result<ServerFrame, FrameCodecError> {
-    let (seq_num, body) = read_u64(body)?;
-    let (last_timestamp_ms, body) = read_u64(body)?;
-    ensure_empty(op, body)?;
-    Ok(frame(seq_num, last_timestamp_ms))
 }
 
 fn parse_link_secret(text: &str) -> Result<LinkSecret, FrameCodecError> {
@@ -1051,21 +1046,6 @@ fn validate_expected_next_seq_num(value: u64) -> Result<(), FrameCodecError> {
     } else {
         Ok(())
     }
-}
-
-fn batch_encoded_len(
-    record_lens: impl ExactSizeIterator<Item = usize>,
-    record_header_len: usize,
-    maximum_records: usize,
-) -> Result<usize, FrameCodecError> {
-    let record_count = record_lens.len();
-    let mut payload_bytes = 0;
-    for len in record_lens {
-        validate_record_len(len)?;
-        payload_bytes += len;
-    }
-    validate_batch(record_count, payload_bytes, maximum_records)?;
-    Ok(1 + record_count * (4 + record_header_len) + payload_bytes)
 }
 
 fn validate_batch_count(
