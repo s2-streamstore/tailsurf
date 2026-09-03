@@ -284,7 +284,7 @@ enum TitleCommand {
     /// Set the stream title.
     Set(SetTitleArgs),
     /// Remove the stream title.
-    Clear(ClearTitleArgs),
+    Clear(OwnerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -294,12 +294,6 @@ struct SetTitleArgs {
     /// New stream title.
     #[arg(value_name = "TITLE")]
     title: StreamTitle,
-}
-
-#[derive(Debug, Args)]
-struct ClearTitleArgs {
-    #[command(flatten)]
-    owner: OwnerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -314,17 +308,11 @@ struct RenewArgs {
 #[derive(Debug, Subcommand)]
 enum LinkCommand {
     /// List link metadata without secrets.
-    List(ListLinkArgs),
+    List(OwnerArgs),
     /// Create a link and print it once.
     Create(CreateLinkArgs),
     /// Revoke a link by its ID.
     Revoke(RevokeLinkArgs),
-}
-
-#[derive(Debug, Args)]
-struct ListLinkArgs {
-    #[command(flatten)]
-    owner: OwnerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -1516,7 +1504,7 @@ async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()
 async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
     let (owner, title) = match command {
         TitleCommand::Set(args) => (args.owner, StreamTitleUpdate::Set(args.title)),
-        TitleCommand::Clear(args) => (args.owner, StreamTitleUpdate::Clear),
+        TitleCommand::Clear(owner) => (owner, StreamTitleUpdate::Clear),
     };
     update_and_print(
         origin,
@@ -1551,14 +1539,14 @@ async fn link_command(origin: Url, command: LinkCommand) -> eyre::Result<()> {
     }
 }
 
-async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
-    let owner = args.owner.resolve(origin)?;
+async fn list_links(origin: Url, args: OwnerArgs) -> eyre::Result<()> {
+    let owner = args.resolve(origin)?;
     let inventory = owner
         .client
         .list_all_links(&owner.locator.stream_id, &owner.link_secret)
         .await
         .context("failed to list links")?;
-    if args.owner.json {
+    if args.json {
         print_json(&inventory)?;
     } else {
         for link in &inventory.links {
