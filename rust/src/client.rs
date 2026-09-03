@@ -1596,7 +1596,7 @@ async fn run_writer(
         if let Err(error) =
             send_pending(&mut session, &mut pending, &mut in_flight, &mut frame).await
         {
-            match recover_pending_appends(
+            if let Err(error) = recover_pending_appends(
                 &mut session,
                 &connection,
                 &mut pending,
@@ -1606,13 +1606,11 @@ async fn run_writer(
             )
             .await
             {
-                // Resend the unacknowledged queue on the fresh session at the loop top.
-                Ok(()) => continue,
-                Err(error) => {
-                    finish_writer_error(&mut pending, &mut close_tx, &shared.terminal_error, error);
-                    return;
-                }
+                finish_writer_error(&mut pending, &mut close_tx, &shared.terminal_error, error);
+                return;
             }
+            // Resend the unacknowledged queue on the fresh session at the loop top.
+            continue;
         }
 
         if pending.is_empty()
