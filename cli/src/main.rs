@@ -871,16 +871,11 @@ async fn write_input(
     }
 }
 
-fn print_write_summary(records: u64) {
-    let noun = if records == 1 { "record" } else { "records" };
-    eprintln!("{records} {noun} durable");
-}
-
-async fn finish_and_close_writer(
+async fn finish_write(
     session: WriterSession,
     writer: TsfWriter,
     interrupted: bool,
-) -> eyre::Result<u64> {
+) -> eyre::Result<()> {
     if interrupted {
         eprintln!(
             "Interrupted. Input stopped. Waiting for accepted records to become durable; press Ctrl-C again to stop immediately."
@@ -903,7 +898,12 @@ async fn finish_and_close_writer(
             exit_interrupted();
         }
     }
-    Ok(records)
+    let noun = if records == 1 { "record" } else { "records" };
+    eprintln!("{records} {noun} durable");
+    if interrupted {
+        exit_interrupted();
+    }
+    Ok(())
 }
 
 async fn connect_session_writer(
@@ -954,12 +954,7 @@ async fn stream_stdin_to_writer(
         WriteBuffering::Lines => stream_line_chunks_to_writer(&mut session, &mut chunk_rx).await?,
     }
     let interrupted = stdin_task.await.context("stdin reader task panicked")??;
-    let records = finish_and_close_writer(session, writer, interrupted).await?;
-    print_write_summary(records);
-    if interrupted {
-        exit_interrupted();
-    }
-    Ok(())
+    finish_write(session, writer, interrupted).await
 }
 
 async fn stream_command_to_writer(
@@ -974,11 +969,7 @@ async fn stream_command_to_writer(
     let interrupt = Arc::new(WriteInterrupt::default());
     let mut session = WriterSession::new(&writer, Arc::clone(&interrupt));
     let outcome = stream_child_command_output(&mut session, interrupt, buffering, command).await?;
-    let records = finish_and_close_writer(session, writer, outcome.interrupted).await?;
-    print_write_summary(records);
-    if outcome.interrupted {
-        exit_interrupted();
-    }
+    finish_write(session, writer, outcome.interrupted).await?;
     if outcome.status.success() {
         Ok(())
     } else {
