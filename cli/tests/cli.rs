@@ -826,7 +826,8 @@ async fn replay_preserves_non_utf8_stdout_bytes() {
     let read_link = test_stream_link("r");
 
     let output =
-        run_tsf_bytes_with_origin(server.origin.clone(), ["replay", read_link.as_str()]).await;
+        run_tsf_bytes_with_origin(server.origin.clone(), ["replay", read_link.as_str()], None)
+            .await;
 
     assert!(output.status.success(), "stderr={:?}", output.stderr);
     assert_eq!(
@@ -848,18 +849,6 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn start_server(router: Router) -> (Url, AbortOnDrop) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let address = listener.local_addr().expect("address");
-    let task = AbortOnDrop(tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("test server");
-    }));
-    (
-        Url::parse(&format!("http://{address}")).expect("API URL"),
-        task,
-    )
-}
-
 struct TestServer<S> {
     origin: Url,
     state: Arc<S>,
@@ -868,9 +857,13 @@ struct TestServer<S> {
 
 impl<S> TestServer<S> {
     async fn serve(state: Arc<S>, router: Router) -> Self {
-        let (origin, task) = start_server(router).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let task = AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("test server");
+        }));
         Self {
-            origin,
+            origin: Url::parse(&format!("http://{address}")).expect("API URL"),
             state,
             _task: task,
         }
@@ -888,8 +881,7 @@ async fn run_tsf_with_origin<const N: usize>(
     args: [&str; N],
     stdin: Option<&str>,
 ) -> CommandOutput {
-    let args = args.map(str::to_owned).to_vec();
-    let output = run_tsf_bytes(origin, args, stdin.map(|value| value.as_bytes().to_vec())).await;
+    let output = run_tsf_bytes_with_origin(origin, args, stdin.map(str::as_bytes)).await;
     CommandOutput {
         status: output.status,
         stdout: String::from_utf8(output.stdout).expect("stdout utf8"),
@@ -906,15 +898,7 @@ struct CommandOutputBytes {
 async fn run_tsf_bytes_with_origin<const N: usize>(
     origin: Url,
     args: [&str; N],
-) -> CommandOutputBytes {
-    let args = args.map(str::to_owned).to_vec();
-    run_tsf_bytes(origin, args, None).await
-}
-
-async fn run_tsf_bytes(
-    origin: Url,
-    args: Vec<String>,
-    stdin: Option<Vec<u8>>,
+    stdin: Option<&[u8]>,
 ) -> CommandOutputBytes {
     let mut command = tsf_command(&origin);
     command
@@ -928,10 +912,7 @@ async fn run_tsf_bytes(
     let mut child = command.spawn().expect("spawn tsf");
     if let Some(input) = stdin {
         let mut child_stdin = child.stdin.take().expect("tsf stdin");
-        child_stdin
-            .write_all(&input)
-            .await
-            .expect("write tsf stdin");
+        child_stdin.write_all(input).await.expect("write tsf stdin");
         child_stdin.shutdown().await.expect("close tsf stdin");
     }
     let output = timeout(Duration::from_secs(15), child.wait_with_output())
