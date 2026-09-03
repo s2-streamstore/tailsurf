@@ -34,11 +34,8 @@ import {
   type TsfReadSession,
 } from "./reader.js";
 import {
-  INITIAL_RETRY_BACKOFF_MS,
   isRetryableHttpStatus,
-  nextRetryBackoffMs,
-  retryWaitMs,
-  sleep,
+  retryOperation,
   withTimeout,
 } from "./retry.js";
 
@@ -316,32 +313,17 @@ async function openConnectionWithRetry(
   lastEventId?: string,
   delayBeforeFirst = false,
 ): Promise<SseConnection | undefined> {
-  const maximumAttempts = connectionOptions.boundedOperationAttempts;
-  let reconnectDelay = INITIAL_RETRY_BACKOFF_MS;
-  let retryAfterMs: number | undefined;
-  for (let attempt = 0; ; attempt += 1) {
-    if (delayBeforeFirst || attempt > 0) {
-      await sleep(
-        retryWaitMs(reconnectDelay, retryAfterMs),
-        signal,
-      );
-      retryAfterMs = undefined;
-      reconnectDelay = nextRetryBackoffMs(reconnectDelay);
-    }
-    try {
-      return await openConnection(request, connectionOptions, signal, lastEventId);
-    } catch (error) {
-      if (signal?.aborted === true || !isRetryableSseError(error)) {
-        throw error;
-      }
-      if (error instanceof TsfHttpError && error.retryAfterMs !== undefined) {
-        retryAfterMs = error.retryAfterMs;
-      }
-      if (attempt + 1 >= maximumAttempts) {
-        throw error;
-      }
-    }
-  }
+  return retryOperation(
+    () => openConnection(request, connectionOptions, signal, lastEventId),
+    {
+      attempts: connectionOptions.boundedOperationAttempts,
+      shouldRetry: isRetryableSseError,
+      retryAfterMs: (error) =>
+        error instanceof TsfHttpError ? error.retryAfterMs : undefined,
+      signal,
+      delayBeforeFirst,
+    },
+  );
 }
 
 function isRetryableSseError(error: unknown): boolean {

@@ -19,6 +19,41 @@ export function integerOption(
   return value;
 }
 
+interface RetryOptions {
+  readonly attempts: number;
+  readonly shouldRetry: (error: unknown) => boolean;
+  readonly retryAfterMs?: (error: unknown) => number | undefined;
+  readonly signal?: AbortSignal | undefined;
+  readonly delayBeforeFirst?: boolean;
+}
+
+export async function retryOperation<T>(
+  operation: () => Promise<T>,
+  options: RetryOptions,
+): Promise<T> {
+  let delayMs = INITIAL_RETRY_BACKOFF_MS;
+  let retryAfterMs: number | undefined;
+  for (let attempt = 0; ; attempt += 1) {
+    if (options.delayBeforeFirst === true || attempt > 0) {
+      await sleep(retryWaitMs(delayMs, retryAfterMs), options.signal);
+      retryAfterMs = undefined;
+      delayMs = nextRetryBackoffMs(delayMs);
+    }
+    try {
+      return await operation();
+    } catch (error) {
+      if (
+        options.signal?.aborted === true ||
+        !options.shouldRetry(error) ||
+        attempt + 1 >= options.attempts
+      ) {
+        throw error;
+      }
+      retryAfterMs = options.retryAfterMs?.(error);
+    }
+  }
+}
+
 export async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,

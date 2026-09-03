@@ -57,13 +57,10 @@ import {
 import { connectSseReader as openSseReader } from "./sse.js";
 import type { ReadOptions, TsfReadSession } from "./reader.js";
 import {
-  INITIAL_RETRY_BACKOFF_MS,
   integerOption,
   isRetryableHttpStatus,
   MAX_TIMER_DELAY_MS,
-  nextRetryBackoffMs,
-  retryWaitMs,
-  sleep,
+  retryOperation,
   withTimeout,
 } from "./retry.js";
 
@@ -554,29 +551,15 @@ export class BaseTsfClient {
     init: RequestInit = {},
     linkSecret?: string,
   ): Promise<T> {
-    let retryDelayMs = INITIAL_RETRY_BACKOFF_MS;
-    for (
-      let attempt = 0;
-      attempt < this.boundedOperationAttempts;
-      attempt += 1
-    ) {
-      try {
-        return await this.#requestOnce(operation, path, consume, init, linkSecret);
-      } catch (error) {
-        if (
-          attempt + 1 === this.boundedOperationAttempts ||
-          !isRetryableRestError(error)
-        ) {
-          throw error;
-        }
-        await sleep(retryWaitMs(
-          retryDelayMs,
+    return retryOperation(
+      () => this.#requestOnce(operation, path, consume, init, linkSecret),
+      {
+        attempts: this.boundedOperationAttempts,
+        shouldRetry: isRetryableRestError,
+        retryAfterMs: (error) =>
           error instanceof TsfHttpError ? error.retryAfterMs : undefined,
-        ));
-        retryDelayMs = nextRetryBackoffMs(retryDelayMs);
-      }
-    }
-    throw new Error("REST retry loop exhausted without returning");
+      },
+    );
   }
 
   async #requestOnce<T>(
