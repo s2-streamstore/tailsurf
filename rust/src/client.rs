@@ -725,6 +725,7 @@ impl TsfClient {
                     "initial read completed without stream_metadata",
                 ))?;
         validate_read_stream_metadata(&options.stream_id, None, &connection.stream_metadata)?;
+        let reconnects = BoundedReadReconnects::new(self.config.bounded_operation_attempts);
         Ok(TsfSseReadSession {
             client: self.clone(),
             options,
@@ -733,7 +734,7 @@ impl TsfClient {
             parser: connection.parser,
             stream_metadata: connection.stream_metadata,
             last_caught_up: None,
-            reconnect_attempts: 0,
+            reconnects,
             last_event: connection.resume_event,
             finished: false,
         })
@@ -2011,7 +2012,7 @@ pub struct TsfSseReadSession {
     parser: SseParser,
     stream_metadata: StreamMetadata,
     last_caught_up: Option<CaughtUpPosition>,
-    reconnect_attempts: usize,
+    reconnects: BoundedReadReconnects,
     last_event: Option<SseResumeEvent>,
     finished: bool,
 }
@@ -2057,17 +2058,10 @@ impl TsfSseReadSession {
                 Err(error) => return Err(error),
             };
             let Some(event) = event else {
-                let attempts = self.client.config.bounded_operation_attempts;
-                if self.reconnect_attempts + 1 >= attempts {
-                    return Err(TsfClientError::ReadReconnectLimitExceeded {
-                        max_connection_attempts: attempts,
-                    });
-                }
-                let delay = reconnect_delay(self.reconnect_attempts);
+                let delay = self.reconnects.next_delay()?;
                 if !delay.is_zero() {
                     sleep(delay).await;
                 }
-                self.reconnect_attempts += 1;
                 let Some(connection) = self
                     .client
                     .open_sse_connection(&self.request, self.last_event.as_ref())
@@ -2100,7 +2094,7 @@ impl TsfSseReadSession {
                     let (cursor, previous) = self.resume_cursors(&event)?;
                     validate_sse_read_batch_cursor(&batch, cursor, previous, &self.options)?;
                     self.last_event = event.id.map(|id| (id, cursor));
-                    self.reconnect_attempts = 0;
+                    self.reconnects.reset();
                     self.finished = advance_read_options_for_batch(&mut self.options, &batch);
                     return Ok(Some(batch));
                 }
@@ -2116,7 +2110,7 @@ impl TsfSseReadSession {
                     self.last_event = event.id.map(|id| (id, cursor));
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
-                    self.reconnect_attempts = 0;
+                    self.reconnects.reset();
                 }
                 "error" => return Err(TsfClientError::SseTerminal(event.data)),
                 "stream_metadata" => {
@@ -2148,8 +2142,8 @@ pub struct TsfReadSession {
     stream_metadata: StreamMetadata,
     finished: bool,
     last_caught_up: Option<CaughtUpPosition>,
-    no_progress_reconnects: usize,
-    reconnect_needed: bool,
+    reconnects: BoundedReadReconnects,
+    reconnect_delay: Option<Duration>,
 }
 
 impl TsfReadSession {
@@ -2160,6 +2154,7 @@ impl TsfReadSession {
         socket: ReadSocket,
         stream_metadata: StreamMetadata,
     ) -> Self {
+        let reconnects = BoundedReadReconnects::new(client.config.bounded_operation_attempts);
         Self {
             client,
             options,
@@ -2168,8 +2163,8 @@ impl TsfReadSession {
             stream_metadata,
             finished: false,
             last_caught_up: None,
-            no_progress_reconnects: 0,
-            reconnect_needed: false,
+            reconnects,
+            reconnect_delay: None,
         }
     }
 
@@ -2194,7 +2189,7 @@ impl TsfReadSession {
                 self.finished = true;
                 return Ok(None);
             }
-            if self.reconnect_needed {
+            if self.reconnect_delay.is_some() {
                 self.reconnect().await?;
             }
 
@@ -2231,8 +2226,9 @@ impl TsfReadSession {
     }
 
     async fn reconnect(&mut self) -> Result<(), TsfClientError> {
-        debug_assert!(self.reconnect_needed);
-        let delay = reconnect_delay(self.no_progress_reconnects.saturating_sub(1));
+        let delay = self
+            .reconnect_delay
+            .expect("reconnect is called only when one is pending");
         if !delay.is_zero() {
             sleep(delay).await;
         }
@@ -2250,31 +2246,51 @@ impl TsfReadSession {
         )?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
-        self.no_progress_reconnects = 0;
-        self.reconnect_needed = false;
+        self.reconnects.reset();
+        self.reconnect_delay = None;
         Ok(())
     }
 
     fn require_reconnect(&mut self) -> Result<(), TsfClientError> {
-        if self.reconnect_needed {
-            return Ok(());
+        if self.reconnect_delay.is_none() {
+            self.reconnect_delay = Some(self.reconnects.next_delay()?);
         }
-        let attempts = self.client.config.bounded_operation_attempts;
-        let max_reconnects = attempts.saturating_sub(1);
-        if self.no_progress_reconnects >= max_reconnects {
-            return Err(TsfClientError::ReadReconnectLimitExceeded {
-                max_connection_attempts: attempts,
-            });
-        }
-        self.no_progress_reconnects += 1;
-        self.reconnect_needed = true;
         Ok(())
     }
 
     fn batch_delivered(&mut self, batch: &ReadBatch) {
-        self.no_progress_reconnects = 0;
-        self.reconnect_needed = false;
+        self.reconnects.reset();
+        self.reconnect_delay = None;
         self.finished = advance_read_options_for_batch(&mut self.options, batch);
+    }
+}
+
+struct BoundedReadReconnects {
+    retries: usize,
+    max_connection_attempts: usize,
+}
+
+impl BoundedReadReconnects {
+    fn new(max_connection_attempts: usize) -> Self {
+        Self {
+            retries: 0,
+            max_connection_attempts,
+        }
+    }
+
+    fn next_delay(&mut self) -> Result<Duration, TsfClientError> {
+        if self.retries >= self.max_connection_attempts.saturating_sub(1) {
+            return Err(TsfClientError::ReadReconnectLimitExceeded {
+                max_connection_attempts: self.max_connection_attempts,
+            });
+        }
+        let delay = reconnect_delay(self.retries);
+        self.retries += 1;
+        Ok(delay)
+    }
+
+    fn reset(&mut self) {
+        self.retries = 0;
     }
 }
 
