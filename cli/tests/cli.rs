@@ -87,6 +87,26 @@ async fn wait_for_tsf(child: &mut tokio::process::Child) -> std::process::ExitSt
         .expect("wait for tsf")
 }
 
+#[cfg(unix)]
+fn spawn_piped_writer(
+    origin: &Url,
+) -> (
+    tokio::process::Child,
+    tokio::process::ChildStdin,
+    BufReader<tokio::process::ChildStderr>,
+) {
+    let mut command = tsf_command(origin);
+    command
+        .args(["write", &test_stream_link("w")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn tsf write");
+    let stdin = child.stdin.take().expect("stdin");
+    let stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    (child, stdin, stderr)
+}
+
 #[test]
 fn update_refuses_an_unmanaged_executable() {
     let update = Command::new(env!("CARGO_BIN_EXE_tsf"))
@@ -119,16 +139,7 @@ fn renew_rejects_an_overflowing_expiry() {
 #[tokio::test]
 async fn second_interrupt_aborts_a_stalled_stdin_write() {
     let server = HoldingWriteServer::start(1).await;
-    let write_link = test_stream_link("w");
-    let mut command = tsf_command(&server.origin);
-    command
-        .args(["write", write_link.as_str()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn tsf write");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let (mut child, mut stdin, mut stderr) = spawn_piped_writer(&server.origin);
 
     stdin
         .write_all(b"pending acknowledgement\n")
@@ -158,16 +169,7 @@ async fn second_interrupt_aborts_a_stalled_stdin_write() {
 #[tokio::test]
 async fn first_interrupt_does_not_drain_an_unbounded_input_backlog() {
     let server = HoldingWriteServer::start(MAX_WRITER_IN_FLIGHT_RECORDS).await;
-    let write_link = test_stream_link("w");
-    let mut command = tsf_command(&server.origin);
-    command
-        .args(["write", write_link.as_str()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn tsf write");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let (mut child, mut stdin, mut stderr) = spawn_piped_writer(&server.origin);
 
     let input_records = MAX_WRITER_IN_FLIGHT_RECORDS * 10;
     let input = "123456789012345\n".repeat(input_records);
