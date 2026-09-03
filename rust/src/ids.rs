@@ -14,7 +14,8 @@ pub type StreamId = ubid::Ubid160;
 pub const MAX_LINK_ID_LEN: usize = 64;
 
 /// Client-chosen immutable identifier for a stream link.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct LinkId(String);
 
 impl LinkId {
@@ -45,15 +46,6 @@ impl FromStr for LinkId {
             return Err(LinkIdError);
         }
         Ok(Self(value.to_owned()))
-    }
-}
-
-impl Serialize for LinkId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
     }
 }
 
