@@ -152,18 +152,14 @@ export function buildPublicStreamUrl(
   baseUrl: string | URL,
   streamId: StreamId,
 ): URL {
-  const url = normalizedStreamUrl(baseUrl, "s", streamId);
-  url.hash = "";
-  return url;
+  return normalizedStreamUrl(baseUrl, "s", streamId);
 }
 
 export function buildPublicTerminalUrl(
   baseUrl: string | URL,
   streamId: StreamId,
 ): URL {
-  const url = normalizedStreamUrl(baseUrl, "t", streamId);
-  url.hash = "";
-  return url;
+  return normalizedStreamUrl(baseUrl, "t", streamId);
 }
 
 function buildLink(
