@@ -30,68 +30,50 @@ pub const MAX_ENCODED_FRAME_BYTES: usize = FRAME_OPERATION_LEN
     + MAX_READ_FRAME_RECORDS * (RECORD_LENGTH_LEN + READ_RECORD_HEADER_LEN)
     + MAX_FRAME_PAYLOAD_BYTES;
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClientOp {
+macro_rules! wire_operations {
+    ($name:ident { $($variant:ident = $byte:literal),+ $(,)? }) => {
+        #[repr(u8)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum $name {
+            $($variant = $byte),+
+        }
+
+        impl $name {
+            const fn byte(self) -> u8 {
+                self as u8
+            }
+        }
+
+        impl TryFrom<u8> for $name {
+            type Error = FrameCodecError;
+
+            fn try_from(value: u8) -> Result<Self, Self::Error> {
+                match value {
+                    $($byte => Ok(Self::$variant),)+
+                    other => Err(FrameCodecError::UnknownOperation(other)),
+                }
+            }
+        }
+    };
+}
+
+wire_operations!(ClientOp {
     OpenRead = 0x01,
     OpenWrite = 0x02,
     AppendBatch = 0x03,
-}
-
-impl ClientOp {
-    const fn byte(self) -> u8 {
-        self as u8
-    }
-}
-
-impl TryFrom<u8> for ClientOp {
-    type Error = FrameCodecError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            value if value == Self::OpenRead.byte() => Ok(Self::OpenRead),
-            value if value == Self::OpenWrite.byte() => Ok(Self::OpenWrite),
-            value if value == Self::AppendBatch.byte() => Ok(Self::AppendBatch),
-            other => Err(FrameCodecError::UnknownOperation(other)),
-        }
-    }
-}
+});
 
 const OPEN_READ_LINK_SECRET: u8 = 0x01;
 const OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM: u8 = 0x01;
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ServerOp {
+wire_operations!(ServerOp {
     Ready = 0x80,
     AppendAck = 0x81,
     ReadBatch = 0x82,
     Heartbeat = 0x83,
     CaughtUp = 0x84,
     StreamMetadata = 0x85,
-}
-
-impl ServerOp {
-    const fn byte(self) -> u8 {
-        self as u8
-    }
-}
-
-impl TryFrom<u8> for ServerOp {
-    type Error = FrameCodecError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            value if value == Self::Ready.byte() => Ok(Self::Ready),
-            value if value == Self::AppendAck.byte() => Ok(Self::AppendAck),
-            value if value == Self::ReadBatch.byte() => Ok(Self::ReadBatch),
-            value if value == Self::Heartbeat.byte() => Ok(Self::Heartbeat),
-            value if value == Self::CaughtUp.byte() => Ok(Self::CaughtUp),
-            value if value == Self::StreamMetadata.byte() => Ok(Self::StreamMetadata),
-            other => Err(FrameCodecError::UnknownOperation(other)),
-        }
-    }
-}
+});
 
 /// Packed split-record part index and final-part marker.
 ///
