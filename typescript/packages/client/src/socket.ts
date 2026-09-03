@@ -211,7 +211,7 @@ export class FrameSocket {
       waiting.resolve(frame);
     } else {
       const bytes = serverFrameBytes(frame);
-      const units = serverFrameQueueUnits(frame);
+      const units = frame.type === "readBatch" ? frame.records.length : 1;
       if (
         units > DEFAULT_MAX_RECEIVE_QUEUE_UNITS - this.#queuedUnits ||
         bytes > DEFAULT_MAX_RECEIVE_QUEUE_BYTES - this.#queuedBytes
@@ -524,8 +524,4 @@ function serverFrameBytes(frame: ServerFrame): number {
     return JSON.stringify(frame.stream).length + 64;
   }
   return 64;
-}
-
-function serverFrameQueueUnits(frame: ServerFrame): number {
-  return frame.type === "readBatch" ? frame.records.length : 1;
 }
