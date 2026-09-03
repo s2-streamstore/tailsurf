@@ -7,6 +7,7 @@ import {
   MAX_STATELESS_APPEND_JSON_BYTES,
   parseClientWriterId,
   parseLinkId,
+  WRITER_ID_BYTE_LENGTH,
 } from "@tailsurf/protocol";
 import { describe, expect, it, vi } from "vitest";
 
@@ -61,7 +62,7 @@ describe("TsfClient REST API", () => {
     const request = vi.fn<typeof fetch>();
     const client = new TsfClient({ fetch: request });
     const writer = {
-      clientWriterId: parseClientWriterId(new Uint8Array(16)),
+      clientWriterId: parseClientWriterId(new Uint8Array(WRITER_ID_BYTE_LENGTH)),
       writerStartSeqNum: 0n,
     };
 
@@ -100,7 +101,7 @@ describe("TsfClient REST API", () => {
     const client = new TsfClient({ fetch: request });
 
     await client.appendRecords(generateStreamId(), {
-      clientWriterId: parseClientWriterId(new Uint8Array(16)),
+      clientWriterId: parseClientWriterId(new Uint8Array(WRITER_ID_BYTE_LENGTH)),
       writerStartSeqNum: 0n,
       records: [{ data: new Uint8Array(MAX_RECORD_PAYLOAD_BYTES) }],
     }, { linkSecret: LINK_SECRET });

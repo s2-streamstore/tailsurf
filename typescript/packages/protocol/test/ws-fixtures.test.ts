@@ -21,6 +21,7 @@ import {
   streamMetadataSchema,
   TSF_WEBSOCKET_PROTOCOL,
   WEBSOCKET_HEARTBEAT_INTERVAL_MS,
+  WRITER_ID_BYTE_LENGTH,
   type ClientFrame,
   type ServerFrame,
 } from "../src/index.js";
@@ -206,7 +207,7 @@ describe("TSF v1 wire fixtures", () => {
     expect(() =>
       encodeClientFrame({
         type: "openWrite",
-        clientWriterId: parseClientWriterId(new Uint8Array(16)),
+        clientWriterId: parseClientWriterId(new Uint8Array(WRITER_ID_BYTE_LENGTH)),
         linkSecret: "B".repeat(33),
       })
     ).toThrow(ProtocolError);
@@ -238,7 +239,7 @@ describe("TSF v1 wire fixtures", () => {
   it("strictly validates OpenWrite flags, preconditions, and lengths", () => {
     const valid = encodeClientFrame({
       type: "openWrite",
-      clientWriterId: parseClientWriterId(new Uint8Array(16)),
+      clientWriterId: parseClientWriterId(new Uint8Array(WRITER_ID_BYTE_LENGTH)),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       expectedNextSeqNum: 7n,
     });
@@ -249,7 +250,7 @@ describe("TSF v1 wire fixtures", () => {
       .toThrow(ProtocolError);
     expect(() => encodeClientFrame({
       type: "openWrite",
-      clientWriterId: parseClientWriterId(new Uint8Array(16)),
+      clientWriterId: parseClientWriterId(new Uint8Array(WRITER_ID_BYTE_LENGTH)),
       linkSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       expectedNextSeqNum: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
     })).toThrow(ProtocolError);
