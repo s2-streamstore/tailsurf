@@ -856,23 +856,21 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
     match ClientOp::try_from(op_byte)? {
         ClientOp::OpenRead => decode_open_read(op_byte, body),
         ClientOp::OpenWrite => {
-            let (&flags, body) = body.split_first().ok_or(FrameCodecError::TruncatedFrame {
-                op: op_byte,
-                needed: 1,
-            })?;
+            let mut decoder = FrameDecoder::new(op_byte, body);
+            let flags = decoder.byte()?;
             if flags & !OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM != 0 {
                 return Err(FrameCodecError::UnknownOpenWriteFlags(
                     flags & !OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM,
                 ));
             }
-            let (client_writer_id, body) = take::<{ ClientWriterId::BYTE_LEN }>(body)?;
+            let client_writer_id = decoder.take::<{ ClientWriterId::BYTE_LEN }>()?;
             let (expected_next_seq_num, secret_bytes) =
                 if flags & OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM == 0 {
-                    (None, body)
+                    (None, decoder.rest())
                 } else {
-                    let (value, body) = read_u64(body)?;
+                    let value = decoder.u64()?;
                     validate_expected_next_seq_num(value)?;
-                    (Some(value), body)
+                    (Some(value), decoder.rest())
                 };
             if secret_bytes.len() != LinkSecret::ENCODED_LEN {
                 return Err(FrameCodecError::InvalidLinkSecret);
@@ -889,11 +887,11 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
             let mut payload_bytes = 0;
             for range in record_body_ranges(bytes, MAX_APPEND_FRAME_RECORDS) {
                 let (start, end) = range?;
-                let record_body = &bytes[start..end];
-                let (writer_seq_num, body) = read_u64(record_body)?;
+                let mut decoder = FrameDecoder::new(op_byte, &bytes[start..end]);
+                let writer_seq_num = decoder.u64()?;
                 validate_writer_seq_num(writer_seq_num)?;
-                let (part_raw, body) = read_u32(body)?;
-                let data = body;
+                let part_raw = decoder.u32()?;
+                let data = decoder.rest();
                 validate_record_len(data.len())?;
                 payload_bytes += data.len();
                 let data_start = end - data.len();
@@ -910,26 +908,20 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
 }
 
 fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError> {
-    let (&flags, body) = body
-        .split_first()
-        .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
+    let mut decoder = FrameDecoder::new(op, body);
+    let flags = decoder.byte()?;
     if flags & !OPEN_READ_LINK_SECRET != 0 {
         return Err(FrameCodecError::UnknownOpenReadFlags(
             flags & !OPEN_READ_LINK_SECRET,
         ));
     }
     let link_secret = if flags & OPEN_READ_LINK_SECRET == 0 {
-        ensure_empty(op, body)?;
+        decoder.finish()?;
         None
     } else {
-        let Some((secret, trailing)) = body.split_at_checked(LinkSecret::ENCODED_LEN) else {
-            return Err(FrameCodecError::TruncatedFrame {
-                op,
-                needed: LinkSecret::ENCODED_LEN.saturating_sub(body.len()),
-            });
-        };
-        ensure_empty(op, trailing)?;
-        Some(parse_link_secret(utf8_tail(secret)?)?)
+        let secret = decoder.take::<{ LinkSecret::ENCODED_LEN }>()?;
+        decoder.finish()?;
+        Some(parse_link_secret(utf8_tail(&secret)?)?)
     };
     Ok(ClientFrame::OpenRead { link_secret })
 }
@@ -942,19 +934,18 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
 
     match ServerOp::try_from(op_byte)? {
         ServerOp::Ready => {
-            let (&kind, trailing) = body.split_first().ok_or(FrameCodecError::TruncatedFrame {
-                op: op_byte,
-                needed: 1,
-            })?;
-            ensure_empty(op_byte, trailing)?;
+            let mut decoder = FrameDecoder::new(op_byte, body);
+            let kind = decoder.byte()?;
+            decoder.finish()?;
             Ok(ServerFrame::Ready(stream_kind_from_byte(kind)?))
         }
         ServerOp::AppendAck => {
-            let (writer_start_seq_num, body) = read_u64(body)?;
-            let (writer_end_seq_num, body) = read_u64(body)?;
-            let (start_seq_num, body) = read_u64(body)?;
-            let (end_seq_num, body) = read_u64(body)?;
-            ensure_empty(op_byte, body)?;
+            let mut decoder = FrameDecoder::new(op_byte, body);
+            let writer_start_seq_num = decoder.u64()?;
+            let writer_end_seq_num = decoder.u64()?;
+            let start_seq_num = decoder.u64()?;
+            let end_seq_num = decoder.u64()?;
+            decoder.finish()?;
             Ok(ServerFrame::AppendAck {
                 writer_start_seq_num,
                 writer_end_seq_num,
@@ -971,13 +962,13 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
             let mut payload_bytes = 0;
             for range in record_body_ranges(bytes, MAX_READ_FRAME_RECORDS) {
                 let (start, end) = range?;
-                let record_body = &bytes[start..end];
-                let (seq_num, body) = read_u64(record_body)?;
-                let (timestamp_ms, body) = read_u64(body)?;
-                let (writer_id, body) = take::<{ WriterId::BYTE_LEN }>(body)?;
-                let (writer_seq_num, body) = read_u64(body)?;
-                let (part_raw, body) = read_u32(body)?;
-                let data = body;
+                let mut decoder = FrameDecoder::new(op_byte, &bytes[start..end]);
+                let seq_num = decoder.u64()?;
+                let timestamp_ms = decoder.u64()?;
+                let writer_id = decoder.take::<{ WriterId::BYTE_LEN }>()?;
+                let writer_seq_num = decoder.u64()?;
+                let part_raw = decoder.u32()?;
+                let data = decoder.rest();
                 validate_record_len(data.len())?;
                 payload_bytes += data.len();
                 records.push(RecordMeta {
@@ -997,13 +988,14 @@ fn decode_server_frame(input: Bytes) -> Result<ServerFrame, FrameCodecError> {
             )))
         }
         ServerOp::Heartbeat => {
-            ensure_empty(op_byte, body)?;
+            FrameDecoder::new(op_byte, body).finish()?;
             Ok(ServerFrame::Heartbeat)
         }
         ServerOp::CaughtUp => {
-            let (next_seq_num, body) = read_u64(body)?;
-            let (last_timestamp_ms, body) = read_u64(body)?;
-            ensure_empty(op_byte, body)?;
+            let mut decoder = FrameDecoder::new(op_byte, body);
+            let next_seq_num = decoder.u64()?;
+            let last_timestamp_ms = decoder.u64()?;
+            decoder.finish()?;
             Ok(ServerFrame::CaughtUp(CaughtUpPosition {
                 next_seq_num,
                 last_timestamp_ms,
@@ -1127,7 +1119,8 @@ impl RecordBodyRanges<'_> {
                 max: self.maximum_records,
             });
         }
-        let (length, _) = read_u32(&self.input[self.offset..])?;
+        let mut decoder = FrameDecoder::new(self.input[0], &self.input[self.offset..]);
+        let length = decoder.u32()?;
         self.offset += 4;
         let length = length as usize;
         let Some(end) = self
@@ -1147,24 +1140,56 @@ impl RecordBodyRanges<'_> {
     }
 }
 
-fn take<const N: usize>(input: &[u8]) -> Result<([u8; N], &[u8]), FrameCodecError> {
-    let Some((head, tail)) = input.split_at_checked(N) else {
-        return Err(FrameCodecError::TruncatedFrame { op: 0, needed: N });
-    };
-
-    let mut bytes = [0_u8; N];
-    bytes.copy_from_slice(head);
-    Ok((bytes, tail))
+struct FrameDecoder<'a> {
+    op: u8,
+    remaining: &'a [u8],
 }
 
-fn read_u32(input: &[u8]) -> Result<(u32, &[u8]), FrameCodecError> {
-    let (bytes, tail) = take::<4>(input)?;
-    Ok((u32::from_be_bytes(bytes), tail))
-}
+impl<'a> FrameDecoder<'a> {
+    fn new(op: u8, body: &'a [u8]) -> Self {
+        Self {
+            op,
+            remaining: body,
+        }
+    }
 
-fn read_u64(input: &[u8]) -> Result<(u64, &[u8]), FrameCodecError> {
-    let (bytes, tail) = take::<8>(input)?;
-    Ok((u64::from_be_bytes(bytes), tail))
+    fn byte(&mut self) -> Result<u8, FrameCodecError> {
+        Ok(self.take::<1>()?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, FrameCodecError> {
+        Ok(u32::from_be_bytes(self.take()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, FrameCodecError> {
+        Ok(u64::from_be_bytes(self.take()?))
+    }
+
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], FrameCodecError> {
+        let Some((head, tail)) = self.remaining.split_at_checked(N) else {
+            return Err(FrameCodecError::TruncatedFrame {
+                op: self.op,
+                needed: N.saturating_sub(self.remaining.len()),
+            });
+        };
+        self.remaining = tail;
+        Ok(head.try_into().expect("fixed-size frame field"))
+    }
+
+    fn rest(self) -> &'a [u8] {
+        self.remaining
+    }
+
+    fn finish(self) -> Result<(), FrameCodecError> {
+        if self.remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(FrameCodecError::TrailingBytes {
+                op: self.op,
+                count: self.remaining.len(),
+            })
+        }
+    }
 }
 
 fn stream_kind_byte(kind: StreamKind) -> u8 {
@@ -1186,17 +1211,6 @@ fn stream_kind_from_byte(value: u8) -> Result<StreamKind, FrameCodecError> {
 
 fn utf8_tail(input: &[u8]) -> Result<&str, FrameCodecError> {
     std::str::from_utf8(input).map_err(FrameCodecError::InvalidUtf8)
-}
-
-fn ensure_empty(op: u8, body: &[u8]) -> Result<(), FrameCodecError> {
-    if body.is_empty() {
-        Ok(())
-    } else {
-        Err(FrameCodecError::TrailingBytes {
-            op,
-            count: body.len(),
-        })
-    }
 }
 
 /// Error returned when encoding or decoding a TSF v1 binary frame.
@@ -1254,7 +1268,7 @@ pub enum FrameCodecError {
     /// A fixed-width frame ended before all required bytes were present.
     #[error("frame 0x{op:02x} is truncated; needed {needed} more bytes")]
     TruncatedFrame {
-        /// Operation byte, or zero when truncation occurred in a shared field decoder.
+        /// Operation byte for the decoded frame.
         op: u8,
         /// Minimum number of additional bytes required.
         needed: usize,
