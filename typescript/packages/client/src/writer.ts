@@ -8,6 +8,7 @@ import {
   partHeader,
   UNSPLIT_PART,
   type PartHeader,
+  type ServerFrame,
   type StreamKind,
 } from "@tailsurf/protocol";
 
@@ -411,21 +412,14 @@ export class DefaultTsfWriter implements TsfWriter {
   }
 
   #submissionError(): TsfClientError | undefined {
-    const unavailable = this.#terminalOrClosedError();
-    if (unavailable !== undefined) {
-      return unavailable;
-    }
-    return this.#closing
-      ? new TsfClientError("writer_closed", "TSF writer is closing")
-      : undefined;
-  }
-
-  #terminalOrClosedError(): TsfClientError | undefined {
     if (this.#terminalError !== undefined) {
       return this.#terminalError;
     }
-    return this.#closed
-      ? new TsfClientError("writer_closed", "TSF writer is closed")
+    if (this.#closed) {
+      return new TsfClientError("writer_closed", "TSF writer is closed");
+    }
+    return this.#closing
+      ? new TsfClientError("writer_closed", "TSF writer is closing")
       : undefined;
   }
 
@@ -488,12 +482,7 @@ interface SelectedAppend {
   readonly record: PendingAppend;
 }
 
-interface AppendAckFrame {
-  readonly writerStartSeqNum: bigint;
-  readonly writerEndSeqNum: bigint;
-  readonly startSeqNum: bigint;
-  readonly endSeqNum: bigint;
-}
+type AppendAckFrame = Extract<ServerFrame, { readonly type: "appendAck" }>;
 
 function prepareAppend(input: AppendInput): PendingAppend {
   if (
