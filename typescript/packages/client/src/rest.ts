@@ -484,7 +484,7 @@ export class BaseTsfClient {
     });
   }
 
-  async #json<T>(
+  #json<T>(
     operation: string,
     path: string,
     schema: Schema<T>,
@@ -533,7 +533,7 @@ export class BaseTsfClient {
     );
   }
 
-  async #delete(
+  #delete(
     operation: string,
     path: string,
     linkSecret: string,

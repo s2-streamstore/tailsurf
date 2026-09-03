@@ -83,21 +83,21 @@ export class TsfClient extends BaseTsfClient {
     };
   }
 
-  public async connectReader(
+  public connectReader(
     options: ReadOptions,
   ): Promise<TsfReadSession> {
     return this.#connectReader(options, "read");
   }
 
   /** Reads the browser-visible output of a terminal session. */
-  public async connectTerminalOutputReader(
+  public connectTerminalOutputReader(
     options: ReadOptions,
   ): Promise<TsfReadSession> {
     return this.#connectReader(options, "terminal/output/read");
   }
 
   /** Reads controller input for a terminal host. Requires an owner link. */
-  public async connectTerminalInputReader(
+  public connectTerminalInputReader(
     options: ReadOptions,
   ): Promise<TsfReadSession> {
     return this.#connectReader(options, "terminal/input/read");
@@ -122,21 +122,21 @@ export class TsfClient extends BaseTsfClient {
     );
   }
 
-  public async connectWriter(
+  public connectWriter(
     options: DurableWriterOptions,
   ): Promise<TsfWriter> {
     return this.#connectWriter(options, "write");
   }
 
   /** Sends input and resize events from a terminal controller. */
-  public async connectTerminalInputWriter(
+  public connectTerminalInputWriter(
     options: DurableWriterOptions,
   ): Promise<TsfWriter> {
     return this.#connectWriter(options, "terminal/input/write");
   }
 
   /** Publishes PTY output from a terminal host. Requires an owner link. */
-  public async connectTerminalOutputWriter(
+  public connectTerminalOutputWriter(
     options: DurableWriterOptions,
   ): Promise<TsfWriter> {
     return this.#connectWriter(options, "terminal/output/write");

@@ -306,7 +306,7 @@ async function openConnection(
   }
 }
 
-async function openConnectionWithRetry(
+function openConnectionWithRetry(
   request: SseRequest,
   connectionOptions: SseConnectOptions,
   signal?: AbortSignal,
