@@ -1347,7 +1347,7 @@ async fn send_server_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result
         .await
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 struct AppendAttempt {
     client_writer_id: ClientWriterId,
     link_secret: String,
@@ -1481,7 +1481,7 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
     .expect("send ack");
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 struct SseAttempt {
     query: Option<String>,
     last_event_id: Option<String>,
@@ -1579,13 +1579,11 @@ async fn fake_sse_read(
         .into_response()
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 struct ReadAttempt {
-    link_secret: String,
     start: ReadStart,
     count: Option<u64>,
     until_timestamp_ms: Option<u64>,
-    rate: Option<f64>,
     wait_seconds: Option<u32>,
 }
 
@@ -1596,7 +1594,6 @@ struct TestReadQuery {
     tail_offset: Option<u64>,
     count: Option<u64>,
     until: Option<u64>,
-    rate: Option<f64>,
     wait: Option<u32>,
 }
 
@@ -1683,7 +1680,7 @@ async fn fake_read_flow(
         return;
     };
     let ClientFrame::OpenRead {
-        link_secret: Some(link_secret),
+        link_secret: Some(_),
     } = ClientFrame::decode_bytes(opening).expect("open read")
     else {
         return;
@@ -1691,16 +1688,13 @@ async fn fake_read_flow(
     let start = query.start();
     let count = query.count;
     let until_timestamp_ms = query.until;
-    let rate = query.rate;
     let wait_seconds = query.wait;
     let attempt_count = {
         let mut attempts = state.read_attempts.lock().expect("read attempts lock");
         attempts.push(ReadAttempt {
-            link_secret: link_secret.expose_secret().to_owned(),
             start,
             count,
             until_timestamp_ms,
-            rate,
             wait_seconds,
         });
         attempts.len()
