@@ -1879,7 +1879,7 @@ fn print_created_stream(
             created
                 .title
                 .as_ref()
-                .map_or_else(|| format!("Untitled {resource}"), |title| title.to_string())
+                .map_or_else(|| format!("Untitled {resource}"), ToString::to_string)
         );
         println!("Expires: {}", created.expires_at);
         let mut links = created
@@ -2015,9 +2015,9 @@ fn print_created_link(
 
 fn write_link_files(created: &CreateStreamResponse, args: &NewArgs) -> eyre::Result<()> {
     for (path, permissions) in [
-        (&args.owner_link_file, LinkPermissions::owner()),
-        (&args.read_link_file, LinkPermissions::read()),
-        (&args.write_link_file, LinkPermissions::write()),
+        (args.owner_link_file.as_deref(), LinkPermissions::owner()),
+        (args.read_link_file.as_deref(), LinkPermissions::read()),
+        (args.write_link_file.as_deref(), LinkPermissions::write()),
     ] {
         write_link_file(path, created, permissions)?;
     }
@@ -2025,7 +2025,7 @@ fn write_link_files(created: &CreateStreamResponse, args: &NewArgs) -> eyre::Res
 }
 
 fn write_link_file(
-    path: &Option<PathBuf>,
+    path: Option<&Path>,
     created: &CreateStreamResponse,
     permissions: LinkPermissions,
 ) -> eyre::Result<()> {
@@ -2107,7 +2107,7 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
-            status.signal().map(|signal| 128 + signal).unwrap_or(1)
+            status.signal().map_or(1, |signal| 128 + signal)
         }
         #[cfg(not(unix))]
         {
