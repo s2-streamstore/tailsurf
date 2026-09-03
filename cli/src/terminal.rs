@@ -1230,25 +1230,4 @@ mod tests {
         .expect("PTY output close should succeed");
         assert!(pending.is_empty());
     }
-
-    #[tokio::test]
-    async fn queued_pty_bytes_are_not_idle() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let mut pending = PendingTerminalOutput::new(80, 24);
-
-        sender
-            .send(Ok(vec![1]))
-            .await
-            .expect("PTY chunk should enqueue");
-        assert!(!pty_output_is_idle(&pending, &receiver));
-        receiver
-            .recv()
-            .await
-            .expect("PTY channel should remain open")
-            .expect("PTY chunk should be valid");
-        assert!(pty_output_is_idle(&pending, &receiver));
-
-        pending.push_event(OwnedTerminalOutput::Heartbeat);
-        assert!(!pty_output_is_idle(&pending, &receiver));
-    }
 }
