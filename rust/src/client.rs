@@ -1615,40 +1615,36 @@ async fn run_writer(
             }
         }
 
-        if close_tx.is_some() && pending.is_empty() {
-            if let Some(close_tx) = close_tx.take() {
-                let _ = close_tx.send(Ok(()));
-            }
+        if pending.is_empty()
+            && let Some(close_tx) = close_tx.take()
+        {
+            let _ = close_tx.send(Ok(()));
             return;
         }
 
         tokio::select! {
             cmd = cmd_rx.recv(), if close_tx.is_none() => {
-                match cmd {
-                    Some(command) => {
-                        if let Err(error) = drain_queued_commands(
-                            &mut pending,
-                            &mut close_tx,
-                            &mut cursor,
-                            &mut cmd_rx,
-                            command,
-                        ) {
-                            finish_writer_error(
-                                &mut pending,
-                                &mut close_tx,
-                                &shared.terminal_error,
-                                error,
-                            );
-                            return;
-                        }
-                    }
-                    None => {
-                        fail_pending(
-                            &mut pending,
-                            &Arc::new(TsfClientError::AppendWriterDropped),
-                        );
-                        return;
-                    }
+                let Some(command) = cmd else {
+                    fail_pending(
+                        &mut pending,
+                        &Arc::new(TsfClientError::AppendWriterDropped),
+                    );
+                    return;
+                };
+                if let Err(error) = drain_queued_commands(
+                    &mut pending,
+                    &mut close_tx,
+                    &mut cursor,
+                    &mut cmd_rx,
+                    command,
+                ) {
+                    finish_writer_error(
+                        &mut pending,
+                        &mut close_tx,
+                        &shared.terminal_error,
+                        error,
+                    );
+                    return;
                 }
             }
 
