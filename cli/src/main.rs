@@ -1621,10 +1621,12 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
         )
         .await
         .context("failed to create link")?;
-    let url = resource_link_for_route(
+    let url = match owner.locator.route {
+        StreamRoute::Stream => stream_link,
+        StreamRoute::Terminal => terminal_link,
+    }(
         &created.web_origin,
         &owner.locator.stream_id,
-        owner.locator.route,
         created.credential.permissions,
         &created.credential.secret,
     )?;
@@ -1643,7 +1645,15 @@ async fn revoke_link(origin: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
         .revoke_link(&owner.locator.stream_id, &args.link_id, &owner.link_secret)
         .await
         .context("failed to revoke link")?;
-    print_link_revoked(&args.link_id, args.owner.json)
+    if args.owner.json {
+        print_json(&LinkMutationOutput {
+            link_id: args.link_id.to_string(),
+            status: "revoked",
+        })?;
+    } else {
+        println!("Revoked link {}", args.link_id);
+    }
+    Ok(())
 }
 
 async fn read_transcript(
@@ -1830,18 +1840,6 @@ fn confirm_delete(stream_id: &StreamId, yes: bool) -> eyre::Result<bool> {
     ))
 }
 
-fn print_link_revoked(link_id: &LinkId, json: bool) -> eyre::Result<()> {
-    if json {
-        print_json(&LinkMutationOutput {
-            link_id: link_id.to_string(),
-            status: "revoked",
-        })?;
-    } else {
-        println!("Revoked link {link_id}");
-    }
-    Ok(())
-}
-
 fn print_json(value: &impl Serialize) -> eyre::Result<()> {
     write_json(std::io::stdout().lock(), value)
 }
@@ -1868,19 +1866,6 @@ fn resource_link(
             stream_link(web_origin, stream_id, permissions, secret)
         }
         StreamKind::Terminal => terminal_link(web_origin, stream_id, permissions, secret),
-    }
-}
-
-fn resource_link_for_route(
-    web_origin: &Url,
-    stream_id: &StreamId,
-    route: StreamRoute,
-    permissions: LinkPermissions,
-    secret: &LinkSecret,
-) -> Result<Url, tailsurf::stream_url::StreamLinkError> {
-    match route {
-        StreamRoute::Stream => stream_link(web_origin, stream_id, permissions, secret),
-        StreamRoute::Terminal => terminal_link(web_origin, stream_id, permissions, secret),
     }
 }
 
