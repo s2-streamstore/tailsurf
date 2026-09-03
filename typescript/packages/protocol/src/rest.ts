@@ -15,9 +15,6 @@ import {
 import { parseLinkSecret } from "./stream-url.js";
 import { parseStreamTitle } from "./stream-title.js";
 
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
-const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
-const WRITER_ID_BASE64URL_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 const TEXT_PAYLOAD_JSON_OVERHEAD = '"text":""'.length;
 const BYTES_PAYLOAD_JSON_OVERHEAD = '"bytes":""'.length;
 const partIndexSchema = z.number().check(
@@ -81,7 +78,6 @@ export const decimalSafeU64Schema = decimalU64Schema.check(z.refine(
   `value must not exceed ${MAX_SAFE_INTEGER_U64}`,
 ));
 export const clientWriterIdBase64urlSchema = z.string().check(
-  z.regex(WRITER_ID_BASE64URL_PATTERN),
   z.refine(
     (value) => canonicalBase64url(value, 16),
     "writer id must be 16 bytes encoded as unpadded base64url",
@@ -89,7 +85,6 @@ export const clientWriterIdBase64urlSchema = z.string().check(
 );
 export const writerIdBase64urlSchema = clientWriterIdBase64urlSchema;
 export const bytesBase64urlSchema = z.string().check(
-  z.regex(BASE64URL_PATTERN),
   z.refine(
     (value) => canonicalBase64url(value),
     "value must be canonical unpadded base64url",
@@ -354,6 +349,5 @@ function jsonEscapedUtf8ByteLength(bytes: Uint8Array): number {
 }
 
 export function isCanonicalIdempotencyKey(value: string): boolean {
-  return IDEMPOTENCY_KEY_PATTERN.test(value) &&
-    canonicalBase64url(value, IDEMPOTENCY_KEY_BYTES);
+  return canonicalBase64url(value, IDEMPOTENCY_KEY_BYTES);
 }

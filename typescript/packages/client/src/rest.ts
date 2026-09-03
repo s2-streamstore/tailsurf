@@ -21,6 +21,7 @@ import {
   MAX_STATELESS_APPEND_JSON_BYTES,
   MAX_STATELESS_APPEND_PAYLOAD_BYTES,
   MAX_STATELESS_APPEND_RECORDS,
+  MAX_U64,
   parseLinkSecret,
   parseClientWriterId,
   partHeader,
@@ -429,7 +430,7 @@ export class BaseTsfClient {
       );
     }
     const finalWriterSeqNum = request.writerStartSeqNum + BigInt(request.records.length - 1);
-    if (request.writerStartSeqNum < 0n || finalWriterSeqNum >= 0xffff_ffff_ffff_ffffn) {
+    if (request.writerStartSeqNum < 0n || finalWriterSeqNum >= MAX_U64) {
       throw new TsfClientError(
         "invalid_client_option",
         "writer sequence range must end before u64::MAX",
