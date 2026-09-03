@@ -333,7 +333,7 @@ struct CreateLinkArgs {
     owner: OwnerArgs,
     /// Immutable Link ID and permission, as LINK_ID=PERMISSION.
     #[arg(value_name = "LINK_ID=PERMISSION")]
-    link: InitialLinkArg,
+    new_link: InitialLinkArg,
     /// Expiry such as 1h, 7d, or never.
     #[arg(long, value_name = "EXPIRY", default_value = "never")]
     expires: ExpiresArg,
@@ -1584,7 +1584,7 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
     let InitialStreamLink {
         link_id,
         permissions,
-    } = args.link.0;
+    } = args.new_link.0;
     let expires_at = args.expires.rfc3339()?;
     let created = owner
         .client
