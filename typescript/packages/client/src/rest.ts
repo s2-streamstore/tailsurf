@@ -60,9 +60,9 @@ import {
   INITIAL_RETRY_BACKOFF_MS,
   integerOption,
   isRetryableHttpStatus,
-  jitteredBackoffMs,
-  MAX_RETRY_BACKOFF_MS,
   MAX_TIMER_DELAY_MS,
+  nextRetryBackoffMs,
+  retryWaitMs,
   sleep,
   withTimeout,
 } from "./retry.js";
@@ -700,11 +700,11 @@ async function retryRest<T>(
       ) {
         throw error;
       }
-      const delayMs = error instanceof TsfHttpError && error.retryAfterMs !== undefined
-        ? Math.min(error.retryAfterMs, MAX_RETRY_BACKOFF_MS)
-        : jitteredBackoffMs(retryDelayMs);
-      await sleep(delayMs);
-      retryDelayMs = Math.min(MAX_RETRY_BACKOFF_MS, retryDelayMs * 2);
+      await sleep(retryWaitMs(
+        retryDelayMs,
+        error instanceof TsfHttpError ? error.retryAfterMs : undefined,
+      ));
+      retryDelayMs = nextRetryBackoffMs(retryDelayMs);
     }
   }
   throw new Error("REST retry loop exhausted without returning");

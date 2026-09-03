@@ -19,8 +19,8 @@ import {
 import {
   asError,
   INITIAL_RETRY_BACKOFF_MS,
-  jitteredBackoffMs,
-  MAX_RETRY_BACKOFF_MS,
+  nextRetryBackoffMs,
+  retryWaitMs,
   sleep,
   withTimeout,
 } from "./retry.js";
@@ -338,8 +338,8 @@ export async function reconnectSocket(
   signal?.throwIfAborted();
   while (attempts + 1 < attemptLimit) {
     attempts += 1;
-    await sleep(jitteredBackoffMs(nextDelayMs), signal);
-    nextDelayMs = Math.min(nextDelayMs * 2, MAX_RETRY_BACKOFF_MS);
+    await sleep(retryWaitMs(nextDelayMs), signal);
+    nextDelayMs = nextRetryBackoffMs(nextDelayMs);
     try {
       const socket = await connect();
       if (signal?.aborted) {

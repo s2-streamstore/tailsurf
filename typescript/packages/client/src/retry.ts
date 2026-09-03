@@ -2,7 +2,7 @@ import { TsfClientError } from "./errors.js";
 
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 export const INITIAL_RETRY_BACKOFF_MS = 200;
-export const MAX_RETRY_BACKOFF_MS = 2_000;
+const MAX_RETRY_BACKOFF_MS = 2_000;
 
 export function integerOption(
   value: number,
@@ -60,7 +60,7 @@ export async function withTimeout<T>(
   }
 }
 
-export function jitteredBackoffMs(backoffMs: number): number {
+function jitteredBackoffMs(backoffMs: number): number {
   if (backoffMs === 0) {
     return 0;
   }
@@ -68,6 +68,19 @@ export function jitteredBackoffMs(backoffMs: number): number {
     MAX_RETRY_BACKOFF_MS,
     Math.floor(backoffMs * (0.5 + Math.random())),
   );
+}
+
+export function retryWaitMs(
+  backoffMs: number,
+  retryAfterMs?: number,
+): number {
+  return retryAfterMs === undefined
+    ? jitteredBackoffMs(backoffMs)
+    : Math.min(retryAfterMs, MAX_RETRY_BACKOFF_MS);
+}
+
+export function nextRetryBackoffMs(backoffMs: number): number {
+  return Math.min(backoffMs * 2, MAX_RETRY_BACKOFF_MS);
 }
 
 export function isRetryableHttpStatus(status: number): boolean {

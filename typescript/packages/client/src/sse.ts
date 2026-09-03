@@ -36,8 +36,8 @@ import {
 import {
   INITIAL_RETRY_BACKOFF_MS,
   isRetryableHttpStatus,
-  jitteredBackoffMs,
-  MAX_RETRY_BACKOFF_MS,
+  nextRetryBackoffMs,
+  retryWaitMs,
   sleep,
   withTimeout,
 } from "./retry.js";
@@ -338,11 +338,11 @@ async function openConnectionWithRetry(
   for (let attempt = 0; ; attempt += 1) {
     if (delayBeforeFirst || attempt > 0) {
       await sleep(
-        retryAfterMs ?? jitteredBackoffMs(reconnectDelay),
+        retryWaitMs(reconnectDelay, retryAfterMs),
         signal,
       );
       retryAfterMs = undefined;
-      reconnectDelay = Math.min(MAX_RETRY_BACKOFF_MS, reconnectDelay * 2);
+      reconnectDelay = nextRetryBackoffMs(reconnectDelay);
     }
     try {
       return await openConnection(request, connectionOptions, signal, lastEventId);
@@ -351,7 +351,7 @@ async function openConnectionWithRetry(
         throw error;
       }
       if (error instanceof TsfHttpError && error.retryAfterMs !== undefined) {
-        retryAfterMs = Math.min(error.retryAfterMs, MAX_RETRY_BACKOFF_MS);
+        retryAfterMs = error.retryAfterMs;
       }
       if (attempt + 1 >= maximumAttempts) {
         throw error;
