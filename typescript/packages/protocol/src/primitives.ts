@@ -27,12 +27,9 @@ export function tryParseDecimalU64(value: string): bigint | undefined {
 
 export function canonicalBase64url(value: string, expectedBytes?: number): boolean {
   try {
-    const standard = value.replaceAll("-", "+").replaceAll("_", "/");
-    const decoded = atob(standard + "=".repeat((4 - standard.length % 4) % 4));
-    const encoded = btoa(decoded).replaceAll("+", "-").replaceAll("/", "_")
-      .replace(/=+$/, "");
-    return (expectedBytes === undefined || decoded.length === expectedBytes) &&
-      encoded === value;
+    const decoded = decodeBase64url(value);
+    return (expectedBytes === undefined || decoded.byteLength === expectedBytes) &&
+      encodeBase64url(decoded) === value;
   } catch {
     return false;
   }
