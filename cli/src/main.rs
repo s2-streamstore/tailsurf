@@ -1953,22 +1953,22 @@ fn print_created_stream(
 }
 
 fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()> {
-    if !json {
-        println!("Stream {}", stream.stream_id);
-        println!("Kind: {}", stream.kind);
-        println!(
-            "Title: {}",
-            stream
-                .title
-                .as_ref()
-                .map_or("Untitled stream", StreamTitle::as_str)
-        );
-        println!("Visibility: {}", stream.visibility);
-        println!("Created: {}", stream.created_at);
-        println!("Expires: {}", stream.expires_at);
-    } else {
-        print_json(stream)?;
+    if json {
+        return print_json(stream);
     }
+
+    println!("Stream {}", stream.stream_id);
+    println!("Kind: {}", stream.kind);
+    println!(
+        "Title: {}",
+        stream
+            .title
+            .as_ref()
+            .map_or("Untitled stream", StreamTitle::as_str)
+    );
+    println!("Visibility: {}", stream.visibility);
+    println!("Created: {}", stream.created_at);
+    println!("Expires: {}", stream.expires_at);
     Ok(())
 }
 
@@ -1977,23 +1977,23 @@ fn print_created_link(
     credential: &StreamLinkCredential,
     json: bool,
 ) -> eyre::Result<()> {
-    if !json {
-        println!(
-            "Created {} ({})",
-            credential.link_id,
-            permission_label(credential.permissions)
-        );
-        println!("  Link     {url}");
-        println!("  Link ID  {}", credential.link_id);
-        println!("Link is shown once. Revoke it with the id above.");
-    } else {
+    if json {
         let output = CreatedLinkOutput {
             link_id: credential.link_id.to_string(),
             permissions: permission_label(credential.permissions),
             url: url.to_string(),
         };
-        print_json(&output)?;
+        return print_json(&output);
     }
+
+    println!(
+        "Created {} ({})",
+        credential.link_id,
+        permission_label(credential.permissions)
+    );
+    println!("  Link     {url}");
+    println!("  Link ID  {}", credential.link_id);
+    println!("Link is shown once. Revoke it with the id above.");
     Ok(())
 }
 
