@@ -1,6 +1,7 @@
 export const U64_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
 export const MAX_U64 = 0xffff_ffff_ffff_ffffn;
 export const MAX_SAFE_INTEGER_U64 = BigInt(Number.MAX_SAFE_INTEGER);
+export const MAX_PART_INDEX = 0x7fff_ffff;
 
 export function encodeBase64url(bytes: Uint8Array): string {
   let binary = "";

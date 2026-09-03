@@ -7,6 +7,7 @@ import {
   canonicalBase64url,
   decodeBase64url,
   encodeBase64url,
+  MAX_PART_INDEX,
   MAX_SAFE_INTEGER_U64,
   MAX_U64,
   U64_PATTERN,
@@ -19,6 +20,11 @@ const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const WRITER_ID_BASE64URL_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 const TEXT_PAYLOAD_JSON_OVERHEAD = '"text":""'.length;
 const BYTES_PAYLOAD_JSON_OVERHEAD = '"bytes":""'.length;
+const partIndexSchema = z.number().check(
+  z.int(),
+  z.nonnegative(),
+  z.maximum(MAX_PART_INDEX),
+);
 
 export const MAX_STATELESS_APPEND_RECORDS = 128;
 export const MAX_STATELESS_APPEND_PAYLOAD_BYTES = 900 * 1024;
@@ -99,11 +105,7 @@ export const createStreamRequestSchema = z.strictObject({
   kind: z.optional(streamKindSchema),
   title: z.optional(streamTitleSchema),
   visibility: z._default(visibilitySchema, "private"),
-  expires_in_seconds: z.optional(z.number().check(
-    z.int(),
-    z.positive(),
-    z.maximum(Number.MAX_SAFE_INTEGER),
-  )),
+  expires_in_seconds: z.optional(jsonU64Schema.check(z.positive())),
   links: z.array(initialStreamLinkSchema).check(
     z.minLength(1),
     z.maxLength(MAX_INITIAL_STREAM_LINKS),
@@ -183,7 +185,7 @@ export const updateStreamRequestSchema = z.strictObject({
 }));
 
 export const appendPartSchema = z.strictObject({
-  index: z.number().check(z.int(), z.nonnegative(), z.maximum(0x7fff_ffff)),
+  index: partIndexSchema,
   is_final: z.boolean(),
 });
 
@@ -198,7 +200,7 @@ const bytesRecordPayloadShape = {
 } as const;
 
 const ssePartSchema = z.object({
-  index: z.number().check(z.int(), z.nonnegative(), z.maximum(0x7fff_ffff)),
+  index: partIndexSchema,
   is_final: z.boolean(),
 });
 

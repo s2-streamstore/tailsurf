@@ -8,6 +8,7 @@ import {
 } from "./ids.js";
 import {
   MAX_SAFE_INTEGER_U64,
+  MAX_PART_INDEX,
   MAX_U64,
 } from "./primitives.js";
 import {
@@ -52,7 +53,6 @@ export const MAX_ENCODED_FRAME_BYTES =
   MAX_READ_FRAME_RECORDS * (RECORD_LENGTH_BYTES + READ_RECORD_HEADER_BYTES) +
   MAX_FRAME_PAYLOAD_BYTES;
 export const PART_FINAL_BIT = 0x8000_0000;
-export const MAX_PART_INDEX = 0x7fff_ffff;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
