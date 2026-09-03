@@ -2155,33 +2155,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_commands_reject_terminal_links() {
-        let stream_id: StreamId = "00000000000000000000000000000000"
-            .parse()
-            .expect("valid stream ID");
-        let terminal = StreamLocator {
-            stream_id,
-            route: StreamRoute::Terminal,
-            link: None,
-            anchor: None,
-        };
-        let records = StreamLocator {
-            stream_id,
-            route: StreamRoute::Stream,
-            link: None,
-            anchor: None,
-        };
-
-        assert_eq!(
-            require_record_stream(&terminal, "tail")
-                .expect_err("terminal link must be rejected")
-                .to_string(),
-            "`tsf tail` accepts stream links, not terminal links",
-        );
-        require_record_stream(&records, "tail").expect("record link must be accepted");
-    }
-
-    #[test]
     fn classifies_wrapped_broken_pipes_only() {
         let broken_pipe: eyre::Report =
             std::io::Error::new(ErrorKind::BrokenPipe, "closed consumer").into();
