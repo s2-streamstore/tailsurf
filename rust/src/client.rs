@@ -3020,9 +3020,8 @@ async fn next_server_frame(
                 ));
             }
             Message::Close(None) => return Ok(None),
-            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Text(_) => return Err(TsfClientError::UnexpectedTextMessage),
-            Message::Frame(_) => {}
         }
     }
 }
@@ -3435,9 +3434,8 @@ impl TsfClientError {
 
     fn is_resumable_read_interruption(&self) -> bool {
         match self {
-            Self::Timeout { .. } => true,
+            Self::Timeout { .. } | Self::WebSocketClosed => true,
             Self::WebSocket(error) => is_retryable_websocket_error(error),
-            Self::WebSocketClosed => true,
             Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),
             _ => false,
         }
@@ -3470,8 +3468,8 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
         WebSocketError::ConnectionClosed
         | WebSocketError::Io(_)
         | WebSocketError::Tls(_)
-        | WebSocketError::WriteBufferFull(_) => true,
-        WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        | WebSocketError::WriteBufferFull(_)
+        | WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
         WebSocketError::Http(response) => is_retryable_http_status(response.status().as_u16()),
         _ => false,
     }

@@ -268,7 +268,7 @@ impl From<Bytes> for LogicalRecordData<'_> {
 }
 
 /// Storage shape does not change payload identity: compare contents, not variants.
-impl<'a, 'b> PartialEq<LogicalRecordData<'b>> for LogicalRecordData<'a> {
+impl<'b> PartialEq<LogicalRecordData<'b>> for LogicalRecordData<'_> {
     fn eq(&self, other: &LogicalRecordData<'b>) -> bool {
         let mut this = self.clone();
         let mut other = other.clone();
@@ -293,7 +293,7 @@ impl<'a, 'b> PartialEq<LogicalRecordData<'b>> for LogicalRecordData<'a> {
 
 impl Eq for LogicalRecordData<'_> {}
 
-impl<'a, 'b> PartialEq<LogicalRecord<'b>> for LogicalRecord<'a> {
+impl<'b> PartialEq<LogicalRecord<'b>> for LogicalRecord<'_> {
     fn eq(&self, other: &LogicalRecord<'b>) -> bool {
         self.data == other.data
     }
