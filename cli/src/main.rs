@@ -2036,24 +2036,13 @@ fn print_created_link(
 }
 
 fn write_link_files(created: &CreateStreamResponse, args: &NewArgs) -> eyre::Result<()> {
-    write_link_file(
-        &args.owner_link_file,
-        created,
-        LinkPermissions::owner(),
-        "owner",
-    )?;
-    write_link_file(
-        &args.read_link_file,
-        created,
-        LinkPermissions::read(),
-        "read",
-    )?;
-    write_link_file(
-        &args.write_link_file,
-        created,
-        LinkPermissions::write(),
-        "write",
-    )?;
+    for (path, permissions) in [
+        (&args.owner_link_file, LinkPermissions::owner()),
+        (&args.read_link_file, LinkPermissions::read()),
+        (&args.write_link_file, LinkPermissions::write()),
+    ] {
+        write_link_file(path, created, permissions)?;
+    }
     Ok(())
 }
 
@@ -2061,11 +2050,11 @@ fn write_link_file(
     path: &Option<PathBuf>,
     created: &CreateStreamResponse,
     permissions: LinkPermissions,
-    kind: &str,
 ) -> eyre::Result<()> {
     let Some(path) = path else {
         return Ok(());
     };
+    let kind = permission_label(permissions);
     let link = created
         .links
         .iter()
