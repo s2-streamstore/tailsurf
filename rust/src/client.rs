@@ -401,7 +401,7 @@ impl TsfClient {
     ) -> Result<ListLinksResponse, TsfClientError> {
         let mut links = Vec::new();
         let mut cursor: Option<String> = None;
-        let mut authorizing_link_id = None;
+        let mut expected_authorizing_link_id = None;
         let mut seen_cursors = HashSet::new();
         let mut seen_link_ids = HashSet::new();
         loop {
@@ -415,7 +415,7 @@ impl TsfClient {
                     owner_link_secret,
                 )
                 .await?;
-            if authorizing_link_id
+            if expected_authorizing_link_id
                 .as_ref()
                 .is_some_and(|expected| expected != &page.authorizing_link_id)
             {
@@ -423,7 +423,6 @@ impl TsfClient {
                     "authorizing link changed across pages",
                 ));
             }
-            authorizing_link_id.get_or_insert(page.authorizing_link_id);
             // validate_link_page rejects duplicates within a page. Keep that invariant across
             // pages.
             for link in &page.links {
@@ -434,22 +433,21 @@ impl TsfClient {
                 }
             }
             links.extend(page.links);
-            match page.next_cursor {
-                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
-                Some(_) => {
-                    return Err(TsfClientError::InvalidLinkPage(
-                        "link pagination cursor repeated",
-                    ));
-                }
-                None => break,
+            let Some(next) = page.next_cursor else {
+                return Ok(ListLinksResponse {
+                    authorizing_link_id: page.authorizing_link_id,
+                    links,
+                    next_cursor: None,
+                });
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(TsfClientError::InvalidLinkPage(
+                    "link pagination cursor repeated",
+                ));
             }
+            cursor = Some(next);
+            expected_authorizing_link_id = Some(page.authorizing_link_id);
         }
-        Ok(ListLinksResponse {
-            authorizing_link_id: authorizing_link_id
-                .expect("link inventory always contains an authorizing link ID"),
-            links,
-            next_cursor: None,
-        })
     }
 
     /// Revokes a stream link by its non-secret identifier.
