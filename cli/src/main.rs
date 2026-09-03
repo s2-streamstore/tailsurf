@@ -567,12 +567,10 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let command = command.unwrap_or_else(|| Command::New(NewArgs::default()));
-    let check_for_update = should_check_for_update_hint(
-        matches!(command, Command::Update(_)),
-        &origin,
-        std::io::stderr().is_terminal(),
-        automatic_update_checks_disabled(),
-    );
+    let check_for_update = !matches!(command, Command::Update(_))
+        && origin == default_api_origin()
+        && std::io::stderr().is_terminal()
+        && !automatic_update_checks_disabled();
     let result = run(origin, command).await;
     match result {
         Ok(()) => {
@@ -644,15 +642,6 @@ fn managed_updater() -> eyre::Result<AxoUpdater> {
         bail!(OWNERSHIP_ERROR);
     }
     Ok(updater)
-}
-
-fn should_check_for_update_hint(
-    is_update_command: bool,
-    origin: &Url,
-    stderr_is_terminal: bool,
-    disabled: bool,
-) -> bool {
-    stderr_is_terminal && !disabled && !is_update_command && *origin == default_api_origin()
 }
 
 fn automatic_update_checks_disabled() -> bool {
