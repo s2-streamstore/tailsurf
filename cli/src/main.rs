@@ -1505,9 +1505,8 @@ async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()
         origin,
         &args.owner,
         &UpdateStreamRequest {
-            title: StreamTitleUpdate::Unchanged,
             visibility: Some(args.visibility.into()),
-            expires_at: None,
+            ..UpdateStreamRequest::default()
         },
         "failed to update stream visibility",
     )
@@ -1524,8 +1523,7 @@ async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
         &owner,
         &UpdateStreamRequest {
             title,
-            visibility: None,
-            expires_at: None,
+            ..UpdateStreamRequest::default()
         },
         "failed to update stream title",
     )
@@ -1537,9 +1535,8 @@ async fn renew_stream(origin: Url, args: RenewArgs) -> eyre::Result<()> {
         origin,
         &args.owner,
         &UpdateStreamRequest {
-            title: StreamTitleUpdate::Unchanged,
-            visibility: None,
             expires_at: Some(args.expires.rfc3339()?),
+            ..UpdateStreamRequest::default()
         },
         "failed to renew stream",
     )
