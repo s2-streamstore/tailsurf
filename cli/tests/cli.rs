@@ -405,15 +405,7 @@ async fn writer_paces_an_oversized_batch_under_the_in_flight_window() {
     // One 6 MiB batch (12 x 512 KiB) exceeds the server's 5 MiB sent-but-unacknowledged socket
     // window, so the writer must stop after ten records until acknowledgements arrive.
     let server = HoldingWriteServer::start(10).await;
-    let stream_id = canonical_test_stream_id();
-    let writer = TsfClient::with_api_origin(server.origin.clone())
-        .expect("valid API origin")
-        .connect_writer(tailsurf::DurableWriterOptions::new(
-            stream_id,
-            canonical_test_link_secret(),
-        ))
-        .await
-        .expect("writer");
+    let writer = connect_default_writer(&server.origin).await;
     let payload = Bytes::from(vec![7_u8; MAX_RECORD_PAYLOAD_BYTES]);
     let batch = AppendBatch::from_records(
         (0..12)
