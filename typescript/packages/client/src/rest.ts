@@ -5,9 +5,7 @@ import {
   createLinkResponseSchema,
   listLinksResponseSchema,
   parseStreamId,
-  parseStreamTitle,
   parseLinkId,
-  streamKindSchema,
   streamMetadataSchema,
   updateStreamRequestSchema,
   appendRecordsRequestSchema,
@@ -734,10 +732,10 @@ export function prepareCreateStreamRequest(
   const requestedLinks = request.links ?? [];
   const links = requestedLinks.some((link) => link.permissions === "o")
     ? requestedLinks
-    : [{ linkId: parseLinkId("owner"), permissions: "o" as const }, ...requestedLinks];
+    : [{ linkId: "owner", permissions: "o" as const }, ...requestedLinks];
   return parsePreparedCreateStreamRequest({
     kind: request.kind ?? "transcript",
-    title: request.title === undefined ? undefined : parseStreamTitle(request.title),
+    title: request.title,
     visibility: request.visibility ?? "private",
     expiresInSeconds: request.expiresInSeconds,
     links,
@@ -757,9 +755,8 @@ export function parsePreparedCreateStreamRequest(
       "normalized stream request is invalid",
     );
   }
-  const kind = streamKindSchema.parse(input.kind);
   const wire = createStreamRequestSchema.parse({
-    kind,
+    kind: input.kind,
     title: input.title,
     visibility: input.visibility,
     expires_in_seconds: input.expiresInSeconds,
@@ -777,7 +774,7 @@ export function parsePreparedCreateStreamRequest(
     }),
   });
   return {
-    kind,
+    kind: wire.kind ?? "transcript",
     ...(wire.title === undefined ? {} : { title: wire.title }),
     visibility: wire.visibility,
     ...(wire.expires_in_seconds === undefined
