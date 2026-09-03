@@ -1421,12 +1421,13 @@ impl WriterSession {
 
 fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadStart) -> ReadOptions {
     let mut options = ReadOptions::new(locator.stream_id);
-    options.start = Some(selected_read_start(
-        read.last,
-        read.seq,
-        read.since,
-        default_start,
-    ));
+    options.start = Some(
+        read.last
+            .map(ReadStart::TailOffset)
+            .or_else(|| read.seq.map(ReadStart::SeqNum))
+            .or_else(|| read.since.map(|since| ReadStart::TimestampMs(since.0)))
+            .unwrap_or(default_start),
+    );
     options.stop = read.count.map(|count| ReadStop {
         count: Some(count),
         ..ReadStop::default()
@@ -2118,18 +2119,6 @@ fn permission_rank(permissions: LinkPermissions) -> usize {
         p if p == LinkPermissions::read_write() => 2,
         _ => 3,
     }
-}
-
-fn selected_read_start(
-    last: Option<u64>,
-    seq: Option<u64>,
-    since: Option<SinceArg>,
-    default: ReadStart,
-) -> ReadStart {
-    last.map(ReadStart::TailOffset)
-        .or_else(|| seq.map(ReadStart::SeqNum))
-        .or_else(|| since.map(|since| ReadStart::TimestampMs(since.0)))
-        .unwrap_or(default)
 }
 
 fn exit_interrupted() -> ! {
