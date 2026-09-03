@@ -151,17 +151,9 @@ fn reconnect_delay(retry: usize) -> Duration {
         .checked_mul(multiplier)
         .unwrap_or(MAX_RETRY_BACKOFF)
         .min(MAX_RETRY_BACKOFF);
-    jittered_backoff(backoff)
-}
-
-fn jittered_backoff(backoff: Duration) -> Duration {
-    if backoff.is_zero() {
-        Duration::ZERO
-    } else {
-        backoff
-            .mul_f64(rand::rng().random_range(0.5_f64..=1.5_f64))
-            .min(MAX_RETRY_BACKOFF)
-    }
+    backoff
+        .mul_f64(rand::rng().random_range(0.5_f64..=1.5_f64))
+        .min(MAX_RETRY_BACKOFF)
 }
 
 /// Cloneable TSF REST, SSE, and v1 WebSocket client.
