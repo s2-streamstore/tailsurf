@@ -10,8 +10,6 @@ export const LINK_SECRET_ENCODED_LENGTH = Math.ceil(
   LINK_SECRET_BYTES * 8 / 6,
 );
 
-const LINK_SECRET_PATTERN = /^[A-Za-z0-9_-]{32}$/;
-
 export interface StreamLinkParam {
   readonly declaredPermissions: LinkPermissions;
   readonly secret: string;
@@ -203,11 +201,7 @@ function normalizedStreamUrl(
 }
 
 export function parseLinkSecret(input: string): string {
-  if (
-    input.length !== LINK_SECRET_ENCODED_LENGTH ||
-    !LINK_SECRET_PATTERN.test(input) ||
-    !canonicalBase64url(input, LINK_SECRET_BYTES)
-  ) {
+  if (!canonicalBase64url(input, LINK_SECRET_BYTES)) {
     throw new ProtocolError(
       "invalid_link_secret",
       `link secret must be ${LINK_SECRET_ENCODED_LENGTH} base64url characters`,
