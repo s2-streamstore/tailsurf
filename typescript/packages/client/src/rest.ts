@@ -414,7 +414,12 @@ export class BaseTsfClient {
       const bytes = typeof record.data === "string"
         ? textEncoder.encode(record.data)
         : record.data;
-      validateStatelessRecordBytes(bytes.byteLength);
+      if (bytes.byteLength > MAX_RECORD_PAYLOAD_BYTES) {
+        throw new TsfClientError(
+          "invalid_client_option",
+          `each append record must not exceed ${MAX_RECORD_PAYLOAD_BYTES} bytes`,
+        );
+      }
       payloadBytes += bytes.byteLength;
       return {
         ...compactRecordPayload(bytes),
@@ -631,15 +636,6 @@ function optionalLinkSecret(value: string | undefined): string | undefined {
       "invalid_client_option",
       "linkSecret must be a canonical 24-byte unpadded base64url secret",
       { cause },
-    );
-  }
-}
-
-function validateStatelessRecordBytes(bytes: number): void {
-  if (bytes > MAX_RECORD_PAYLOAD_BYTES) {
-    throw new TsfClientError(
-      "invalid_client_option",
-      `each append record must not exceed ${MAX_RECORD_PAYLOAD_BYTES} bytes`,
     );
   }
 }
