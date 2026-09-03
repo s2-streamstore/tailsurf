@@ -1044,21 +1044,9 @@ mod tests {
         });
         resume_pty_output(&handoff);
 
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![1]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![2]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Resize {
-                columns: 120,
-                rows: 40,
-            })
-        ));
+        assert_next_data(&mut pending, &[1]);
+        assert_next_data(&mut pending, &[2]);
+        assert_next_resize(&mut pending, 120, 40);
     }
 
     #[tokio::test]
@@ -1138,21 +1126,9 @@ mod tests {
             vec![3],
         );
         assert!(paused_send.join().expect("paused send should finish"));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![1]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![2]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Resize {
-                columns: 120,
-                rows: 40,
-            })
-        ));
+        assert_next_data(&mut pending, &[1]);
+        assert_next_data(&mut pending, &[2]);
+        assert_next_resize(&mut pending, 120, 40);
     }
 
     #[tokio::test]
@@ -1191,18 +1167,9 @@ mod tests {
             .await
             .expect("queued and in-flight PTY output should drain");
 
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == [1]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == [2]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == [3]
-        ));
+        assert_next_data(&mut pending, &[1]);
+        assert_next_data(&mut pending, &[2]);
+        assert_next_data(&mut pending, &[3]);
         assert!(pending.is_empty());
         assert!(!blocked_send.join().expect("send thread should finish"));
     }
@@ -1222,5 +1189,22 @@ mod tests {
         .expect("PTY output close should not wait for a blocked read")
         .expect("PTY output close should succeed");
         assert!(pending.is_empty());
+    }
+
+    fn assert_next_data(pending: &mut PendingTerminalOutput, expected: &[u8]) {
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == expected
+        ));
+    }
+
+    fn assert_next_resize(pending: &mut PendingTerminalOutput, columns: u16, rows: u16) {
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Resize {
+                columns: actual_columns,
+                rows: actual_rows,
+            }) if actual_columns == columns && actual_rows == rows
+        ));
     }
 }
