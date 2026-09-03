@@ -1040,7 +1040,7 @@ struct HoldingWriteState {
     mode: HoldingWriteMode,
     expected_before_ack: usize,
     attempts: Mutex<Vec<HoldingWriteAttempt>>,
-    connections: Mutex<usize>,
+    connections: AtomicUsize,
     /// Sticky release signal: a connection that starts after release must still observe it.
     release: watch::Sender<bool>,
     /// Set when a record arrives past the unacknowledged cap before acknowledgements flow.
@@ -1071,7 +1071,7 @@ impl TestServer<HoldingWriteState> {
             mode,
             expected_before_ack,
             attempts: Mutex::new(Vec::new()),
-            connections: Mutex::new(0),
+            connections: AtomicUsize::new(0),
             release,
             overrun: AtomicBool::new(false),
         });
@@ -1100,7 +1100,7 @@ impl TestServer<HoldingWriteState> {
     async fn wait_for_connections(&self, expected: usize, within: Duration) {
         timeout(within, async {
             loop {
-                if *self.state.connections.lock().expect("connections lock") >= expected {
+                if self.state.connections.load(Ordering::SeqCst) >= expected {
                     return;
                 }
                 sleep(Duration::from_millis(5)).await;
@@ -1143,12 +1143,7 @@ async fn holding_write_flow(state: Arc<HoldingWriteState>, mut socket: WebSocket
     };
     // Subscribe before the connection becomes visible so a release can never be missed.
     let mut release = state.release.subscribe();
-    let connection_index = {
-        let mut connections = state.connections.lock().expect("connections lock");
-        let connection_index = *connections;
-        *connections += 1;
-        connection_index
-    };
+    let connection_index = state.connections.fetch_add(1, Ordering::SeqCst);
     if send_server_frame(&mut socket, ServerFrame::Ready(StreamKind::Transcript))
         .await
         .is_err()
