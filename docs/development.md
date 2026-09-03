@@ -30,15 +30,7 @@ Stream links use the `web_origin` the service returns when it mints credentials.
 
 ## Checks
 
-Run the workspace checks:
-
-```sh
-cargo +nightly fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
-scripts/verify-packages.sh
-```
+Run the [contributor checks](../CONTRIBUTING.md#checks) before submitting a change.
 
 The package verifier builds the exact SDK and CLI archives that would be published. It extracts both archives, patches the CLI registry dependency to the packaged SDK, and checks every packaged target.
 
