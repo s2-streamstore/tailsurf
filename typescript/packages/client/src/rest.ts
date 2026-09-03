@@ -63,8 +63,9 @@ import {
   jitteredBackoffMs,
   MAX_RETRY_BACKOFF_MS,
   MAX_TIMER_DELAY_MS,
+  sleep,
+  withTimeout,
 } from "./retry.js";
-import { sleep, withTimeout } from "./socket.js";
 
 export const DEFAULT_API_ORIGIN = "https://tail.surf";
 const API_PREFIX = "/api/v1";

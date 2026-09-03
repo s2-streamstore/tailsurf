@@ -27,7 +27,6 @@ import {
   requireLinkSecret,
   type SocketPolicy,
   u64,
-  withTimeout,
   type WebSocketFactory,
   type WebSocketLike,
 } from "./socket.js";
@@ -36,7 +35,7 @@ import {
   type TsfWriter,
 } from "./writer.js";
 import { streamMetadataFromWire } from "./models.js";
-import { integerOption, MAX_TIMER_DELAY_MS } from "./retry.js";
+import { integerOption, MAX_TIMER_DELAY_MS, withTimeout } from "./retry.js";
 
 export interface TsfClientOptions extends HttpClientOptions {
   readonly webSocketFactory?: WebSocketFactory;

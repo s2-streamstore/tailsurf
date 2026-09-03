@@ -33,9 +33,8 @@ import {
   u64,
   unexpectedFrame,
   WEBSOCKET_READ_IDLE_TIMEOUT_MS,
-  withTimeout,
 } from "./socket.js";
-import { INITIAL_RETRY_BACKOFF_MS } from "./retry.js";
+import { INITIAL_RETRY_BACKOFF_MS, withTimeout } from "./retry.js";
 
 export interface ReadOptions {
   readonly streamId: StreamId;

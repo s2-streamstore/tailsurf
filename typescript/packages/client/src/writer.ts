@@ -13,14 +13,13 @@ import {
 } from "@tailsurf/protocol";
 
 import { TsfClientError, TsfWebSocketClosedError } from "./errors.js";
-import { INITIAL_RETRY_BACKOFF_MS } from "./retry.js";
+import { INITIAL_RETRY_BACKOFF_MS, withTimeout } from "./retry.js";
 import {
   type FrameSocket,
   isRetryableSocketError,
   reconnectSocket,
   type SocketPolicy,
   unexpectedFrame,
-  withTimeout,
 } from "./socket.js";
 
 const textEncoder = new TextEncoder();

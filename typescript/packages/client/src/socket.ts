@@ -17,9 +17,12 @@ import {
   TsfWebSocketClosedError,
 } from "./errors.js";
 import {
+  asError,
   INITIAL_RETRY_BACKOFF_MS,
   jitteredBackoffMs,
   MAX_RETRY_BACKOFF_MS,
+  sleep,
+  withTimeout,
 } from "./retry.js";
 
 export const NORMAL_CLOSE_CODE = 1000;
@@ -386,47 +389,6 @@ export async function connectInitialSocket(
   }
 }
 
-export async function withTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  operation: string,
-  signal?: AbortSignal,
-  options?: {
-    readonly error?: Error;
-    readonly onTimeout?: () => void;
-  },
-): Promise<T> {
-  signal?.throwIfAborted();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let abort: (() => void) | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      options?.onTimeout?.();
-      reject(
-        options?.error ??
-          new TsfClientError(
-            "operation_timeout",
-            `${operation} timed out after ${timeoutMs}ms`,
-          ),
-      );
-    }, timeoutMs);
-    if (signal !== undefined) {
-      abort = () => reject(asError(signal.reason));
-      signal.addEventListener("abort", abort, { once: true });
-    }
-  });
-  try {
-    return await Promise.race([promise, deadline]);
-  } finally {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    if (abort !== undefined) {
-      signal?.removeEventListener("abort", abort);
-    }
-  }
-}
-
 export function requireLinkSecret(secret: string): string {
   try {
     return parseLinkSecret(secret);
@@ -568,30 +530,4 @@ function serverFrameBytes(frame: ServerFrame): number {
 
 function serverFrameQueueUnits(frame: ServerFrame): number {
   return frame.type === "readBatch" ? frame.records.length : 1;
-}
-
-export function sleep(durationMs: number, signal?: AbortSignal): Promise<void> {
-  if (signal === undefined) {
-    return new Promise((resolve) => setTimeout(resolve, durationMs));
-  }
-  signal.throwIfAborted();
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", aborted);
-      resolve();
-    }, durationMs);
-    const aborted = () => {
-      clearTimeout(timer);
-      reject(asError(signal.reason));
-    };
-    signal.addEventListener("abort", aborted, { once: true });
-  });
-}
-
-function asError(error: unknown): Error {
-  return error instanceof Error
-    ? error
-    : new TsfClientError("websocket_error", "WebSocket failed", {
-        cause: error,
-      });
 }

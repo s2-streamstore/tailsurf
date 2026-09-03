@@ -38,8 +38,9 @@ import {
   isRetryableHttpStatus,
   jitteredBackoffMs,
   MAX_RETRY_BACKOFF_MS,
+  sleep,
+  withTimeout,
 } from "./retry.js";
-import { sleep, withTimeout } from "./socket.js";
 
 const API_PREFIX = "/api/v1";
 const CARRIAGE_RETURN = 0x0d;
