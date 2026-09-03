@@ -1,7 +1,7 @@
 // zod/mini keeps the tree-shaken server bundle ~400KB smaller than classic zod.
 import * as z from "zod/mini";
 
-import { parseLinkId, parseStreamId } from "./ids.js";
+import { parseLinkId, parseStreamId, WRITER_ID_BYTE_LENGTH } from "./ids.js";
 import { parseLinkPermissions } from "./permissions.js";
 import {
   canonicalBase64url,
@@ -79,8 +79,8 @@ export const decimalSafeU64Schema = decimalU64Schema.check(z.refine(
 ));
 export const clientWriterIdBase64urlSchema = z.string().check(
   z.refine(
-    (value) => canonicalBase64url(value, 16),
-    "writer id must be 16 bytes encoded as unpadded base64url",
+    (value) => canonicalBase64url(value, WRITER_ID_BYTE_LENGTH),
+    `writer id must be ${WRITER_ID_BYTE_LENGTH} bytes encoded as unpadded base64url`,
   ),
 );
 export const writerIdBase64urlSchema = clientWriterIdBase64urlSchema;
