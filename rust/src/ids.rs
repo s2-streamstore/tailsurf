@@ -113,29 +113,46 @@ impl FromStr for LinkSecret {
 #[error("link secret must be canonical 32-character unpadded base64url")]
 pub struct LinkSecretError;
 
+macro_rules! impl_writer_id {
+    ($type:ident) => {
+        impl $type {
+            /// Encoded writer ID length.
+            pub const BYTE_LEN: usize = 16;
+
+            /// Creates a writer ID from its exact binary representation.
+            pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
+                Self(bytes)
+            }
+
+            /// Returns the exact binary representation.
+            pub const fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
+                &self.0
+            }
+        }
+
+        impl Serialize for $type {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_bytes(self.as_bytes())
+            }
+        }
+    };
+}
+
 /// Stable 128-bit client-chosen writer identity reused across reconnects.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ClientWriterId([u8; 16]);
 
-impl ClientWriterId {
-    /// Encoded client writer ID length.
-    pub const BYTE_LEN: usize = 16;
+impl_writer_id!(ClientWriterId);
 
+impl ClientWriterId {
     /// Generates a cryptographically random client writer ID.
     pub fn new_random() -> Self {
         let mut bytes = [0_u8; Self::BYTE_LEN];
         fill_random(&mut bytes);
         Self(bytes)
-    }
-
-    /// Creates a client writer ID from its exact binary representation.
-    pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the exact binary representation.
-    pub const fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
-        &self.0
     }
 }
 
@@ -143,42 +160,11 @@ fn fill_random(bytes: &mut [u8]) {
     rand::rng().fill_bytes(bytes);
 }
 
-impl Serialize for ClientWriterId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(self.as_bytes())
-    }
-}
-
 /// Stable 128-bit server-derived writer identity attached to delivered records.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WriterId([u8; 16]);
 
-impl WriterId {
-    /// Encoded writer ID length.
-    pub const BYTE_LEN: usize = 16;
-
-    /// Creates a writer ID from its exact binary representation.
-    pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the exact binary representation.
-    pub const fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
-        &self.0
-    }
-}
-
-impl Serialize for WriterId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(self.as_bytes())
-    }
-}
+impl_writer_id!(WriterId);
 
 pub(crate) fn serialize_link_secret<S>(
     secret: &LinkSecret,
