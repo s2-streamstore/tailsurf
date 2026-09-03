@@ -554,10 +554,29 @@ export class BaseTsfClient {
     init: RequestInit = {},
     linkSecret?: string,
   ): Promise<T> {
-    return retryRest(
-      () => this.#requestOnce(operation, path, consume, init, linkSecret),
-      this.boundedOperationAttempts,
-    );
+    let retryDelayMs = INITIAL_RETRY_BACKOFF_MS;
+    for (
+      let attempt = 0;
+      attempt < this.boundedOperationAttempts;
+      attempt += 1
+    ) {
+      try {
+        return await this.#requestOnce(operation, path, consume, init, linkSecret);
+      } catch (error) {
+        if (
+          attempt + 1 === this.boundedOperationAttempts ||
+          !isRetryableRestError(error)
+        ) {
+          throw error;
+        }
+        await sleep(retryWaitMs(
+          retryDelayMs,
+          error instanceof TsfHttpError ? error.retryAfterMs : undefined,
+        ));
+        retryDelayMs = nextRetryBackoffMs(retryDelayMs);
+      }
+    }
+    throw new Error("REST retry loop exhausted without returning");
   }
 
   async #requestOnce<T>(
@@ -679,35 +698,6 @@ export function parseApiOrigin(input: string | URL): string {
     );
   }
   return url.origin;
-}
-
-async function retryRest<T>(
-  attempt: () => Promise<T>,
-  boundedOperationAttempts: number,
-): Promise<T> {
-  let retryDelayMs = INITIAL_RETRY_BACKOFF_MS;
-  for (
-    let attemptIndex = 0;
-    attemptIndex < boundedOperationAttempts;
-    attemptIndex += 1
-  ) {
-    try {
-      return await attempt();
-    } catch (error) {
-      if (
-        attemptIndex + 1 === boundedOperationAttempts ||
-        !isRetryableRestError(error)
-      ) {
-        throw error;
-      }
-      await sleep(retryWaitMs(
-        retryDelayMs,
-        error instanceof TsfHttpError ? error.retryAfterMs : undefined,
-      ));
-      retryDelayMs = nextRetryBackoffMs(retryDelayMs);
-    }
-  }
-  throw new Error("REST retry loop exhausted without returning");
 }
 
 function isRetryableRestError(error: unknown): boolean {
