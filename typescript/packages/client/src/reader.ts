@@ -6,8 +6,6 @@ import {
   MAX_READ_WAIT_SECONDS,
   MIN_PLAYBACK_RATE,
   parseStreamId,
-  type ClientFrame,
-  type ReadRequest,
   type ReadStart as ProtocolReadStart,
   type ReadStop as ProtocolReadStop,
   type ReadRecord,
@@ -122,15 +120,6 @@ export function normalizeReadOptions(
   };
 }
 
-export function openReadFrame(
-  linkSecret: string | undefined,
-): Extract<ClientFrame, { readonly type: "openRead" }> {
-  return {
-    type: "openRead",
-    linkSecret,
-  };
-}
-
 export abstract class BaseTsfReadSession implements TsfReadSession {
   protected pendingRecords: readonly ReadRecord[] = [];
   protected pendingRecordIndex = 0;
@@ -210,7 +199,15 @@ export abstract class BaseTsfReadSession implements TsfReadSession {
       this.pendingRecords = [];
       this.pendingRecordIndex = 0;
     }
-    this.finished = advanceReadOptions(this.options, record.seqNum);
+    if (record.seqNum === MAX_U64) {
+      this.finished = true;
+    } else {
+      this.options.start = { type: "seqNum", seqNum: record.seqNum + 1n };
+      if (this.options.stop?.count !== undefined) {
+        this.options.stop.count -= 1n;
+      }
+      this.finished = readExhausted(this.options);
+    }
     return record;
   }
 
@@ -424,16 +421,6 @@ export function readExhausted(options: NormalizedReadOptions): boolean {
   );
 }
 
-export function readRequestForConnection(
-  options: NormalizedReadOptions,
-): ReadRequest {
-  return {
-    start: options.start,
-    stop: options.stop,
-    rate: options.rate,
-  };
-}
-
 export function validateReadStreamMetadata(
   options: NormalizedReadOptions,
   stream: StreamMetadata,
@@ -453,20 +440,6 @@ export function validateReadStreamMetadata(
       "stream kind changed while reconnecting the reader",
     );
   }
-}
-
-function advanceReadOptions(
-  options: NormalizedReadOptions,
-  seqNum: bigint,
-): boolean {
-  if (seqNum === MAX_U64) {
-    return true;
-  }
-  options.start = { type: "seqNum", seqNum: seqNum + 1n };
-  if (options.stop?.count !== undefined) {
-    options.stop.count -= 1n;
-  }
-  return readExhausted(options);
 }
 
 export function validateReadBatchForRequest(

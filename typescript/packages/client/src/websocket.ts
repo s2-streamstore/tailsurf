@@ -11,8 +11,6 @@ import { TsfClientError } from "./errors.js";
 import {
   DefaultTsfReadSession,
   normalizeReadOptions,
-  openReadFrame,
-  readRequestForConnection,
   validateReadStreamMetadata,
   type NormalizedReadOptions,
   type ReadOptions,
@@ -183,13 +181,16 @@ export class TsfClient extends BaseTsfClient {
     signal?: AbortSignal,
   ): Promise<FrameSocket> {
     const url = new URL(dataPlaneUrl(this.apiOrigin, options.streamId, operation));
-    const request = readRequestForConnection(options);
-    url.search = encodeReadQuery(request).toString();
+    url.search = encodeReadQuery({
+      start: options.start,
+      stop: options.stop,
+      rate: options.rate,
+    }).toString();
     const socket = await connectSocket(
       url.href,
       this.#socketPolicy,
       signal,
-      openReadFrame(options.linkSecret),
+      { type: "openRead", linkSecret: options.linkSecret },
     );
     try {
       const metadata = await withTimeout(
