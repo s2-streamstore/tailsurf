@@ -58,10 +58,7 @@ impl TryFrom<u8> for ClientOp {
 }
 
 const OPEN_READ_LINK_SECRET: u8 = 0x01;
-const OPEN_READ_FLAGS: u8 = OPEN_READ_LINK_SECRET;
-
 const OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM: u8 = 0x01;
-const OPEN_WRITE_FLAGS: u8 = OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -863,9 +860,9 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
                 op: op_byte,
                 needed: 1,
             })?;
-            if flags & !OPEN_WRITE_FLAGS != 0 {
+            if flags & !OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM != 0 {
                 return Err(FrameCodecError::UnknownOpenWriteFlags(
-                    flags & !OPEN_WRITE_FLAGS,
+                    flags & !OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM,
                 ));
             }
             let (client_writer_id, body) = take::<{ ClientWriterId::BYTE_LEN }>(body)?;
@@ -916,9 +913,9 @@ fn decode_open_read(op: u8, body: &[u8]) -> Result<ClientFrame, FrameCodecError>
     let (&flags, body) = body
         .split_first()
         .ok_or(FrameCodecError::TruncatedFrame { op, needed: 1 })?;
-    if flags & !OPEN_READ_FLAGS != 0 {
+    if flags & !OPEN_READ_LINK_SECRET != 0 {
         return Err(FrameCodecError::UnknownOpenReadFlags(
-            flags & !OPEN_READ_FLAGS,
+            flags & !OPEN_READ_LINK_SECRET,
         ));
     }
     let link_secret = if flags & OPEN_READ_LINK_SECRET == 0 {
