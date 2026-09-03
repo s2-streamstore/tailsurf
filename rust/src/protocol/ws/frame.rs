@@ -753,25 +753,26 @@ impl ServerFrame {
     /// Largest encoded size among the fixed-width frames, set by [`ServerFrame::AppendAck`].
     const MAX_FIXED_FRAME_LEN: usize = 1 + 4 * 8;
 
-    /// Returns the exact wire length of this frame, validating the payload size for records.
+    /// Returns the exact wire length of this frame.
     ///
     /// Covers only fixed-size and batch frames; [`ServerFrame::StreamMetadata`] carries
     /// variable-length JSON and is serialized directly by [`ServerFrame::encode`]. ReadBatch
     /// validity is a construction invariant ([`ReadBatch::try_from_records`], decode), so only
     /// the length is computed here.
-    fn encoded_len(&self) -> Result<usize, FrameCodecError> {
+    fn encoded_len(&self) -> usize {
         match self {
-            Self::ReadBatch(batch) => Ok(1
-                + batch.records.len() * (RECORD_LENGTH_LEN + READ_RECORD_HEADER_LEN)
-                + batch
-                    .records
-                    .iter()
-                    .map(|record| record.data_len as usize)
-                    .sum::<usize>()),
+            Self::ReadBatch(batch) => {
+                1 + batch.records.len() * (RECORD_LENGTH_LEN + READ_RECORD_HEADER_LEN)
+                    + batch
+                        .records
+                        .iter()
+                        .map(|record| record.data_len as usize)
+                        .sum::<usize>()
+            }
             Self::StreamMetadata(_) => {
                 unreachable!("StreamMetadata is serialized directly by encode()")
             }
-            _ => Ok(Self::MAX_FIXED_FRAME_LEN),
+            _ => Self::MAX_FIXED_FRAME_LEN,
         }
     }
 
@@ -830,7 +831,7 @@ impl ServerFrame {
                 .map_err(FrameCodecError::InvalidStreamMetadata)?;
             return Ok(output.freeze());
         }
-        let mut output = BytesMut::with_capacity(self.encoded_len()?);
+        let mut output = BytesMut::with_capacity(self.encoded_len());
         self.encode_into(&mut output);
         Ok(output.freeze())
     }
