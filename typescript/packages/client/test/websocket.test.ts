@@ -5,6 +5,7 @@ import {
   parseWriterId,
   TSF_WEBSOCKET_PROTOCOL,
   UNSPLIT_PART,
+  WRITER_ID_BYTE_LENGTH,
   type ClientFrame,
   type ReadRecord,
   type ServerFrame,
@@ -286,7 +287,7 @@ function record(seqNum: bigint, text: string): ReadRecord {
   return {
     seqNum,
     timestampMs: 1_786_000_000_000n + seqNum,
-    writerId: parseWriterId(new Uint8Array(16)),
+    writerId: parseWriterId(new Uint8Array(WRITER_ID_BYTE_LENGTH)),
     writerSeqNum: seqNum,
     part: UNSPLIT_PART,
     data: new TextEncoder().encode(text),

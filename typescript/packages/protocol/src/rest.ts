@@ -1,24 +1,26 @@
 // zod/mini keeps the tree-shaken server bundle ~400KB smaller than classic zod.
 import * as z from "zod/mini";
 
-import { parseLinkId, parseStreamId } from "./ids.js";
+import { parseLinkId, parseStreamId, WRITER_ID_BYTE_LENGTH } from "./ids.js";
 import { parseLinkPermissions } from "./permissions.js";
 import {
   canonicalBase64url,
   decodeBase64url,
   encodeBase64url,
+  MAX_PART_INDEX,
   MAX_SAFE_INTEGER_U64,
-  MAX_U64,
-  U64_PATTERN,
+  tryParseDecimalU64,
 } from "./primitives.js";
 import { parseLinkSecret } from "./stream-url.js";
 import { parseStreamTitle } from "./stream-title.js";
 
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
-const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
-const WRITER_ID_BASE64URL_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 const TEXT_PAYLOAD_JSON_OVERHEAD = '"text":""'.length;
 const BYTES_PAYLOAD_JSON_OVERHEAD = '"bytes":""'.length;
+const partIndexSchema = z.number().check(
+  z.int(),
+  z.nonnegative(),
+  z.maximum(MAX_PART_INDEX),
+);
 
 export const MAX_STATELESS_APPEND_RECORDS = 128;
 export const MAX_STATELESS_APPEND_PAYLOAD_BYTES = 900 * 1024;
@@ -64,32 +66,23 @@ export const jsonU64Schema = z.number().check(
 );
 export const streamTimestampSchema = z.iso.datetime({ offset: true });
 export const decimalU64Schema = z.string().check(
-  z.regex(U64_PATTERN),
   z.refine(
-    (value) => BigInt(value) <= MAX_U64,
+    (value) => tryParseDecimalU64(value) !== undefined,
     "value must fit in an unsigned 64-bit integer",
   ),
 );
 export const decimalSafeU64Schema = decimalU64Schema.check(z.refine(
-  (value) => BigInt(value) <= MAX_SAFE_INTEGER_U64,
+  (value) => tryParseDecimalU64(value, MAX_SAFE_INTEGER_U64) !== undefined,
   `value must not exceed ${MAX_SAFE_INTEGER_U64}`,
 ));
 export const clientWriterIdBase64urlSchema = z.string().check(
-  z.regex(WRITER_ID_BASE64URL_PATTERN),
   z.refine(
-    (value) => canonicalBase64url(value, 16),
-    "writer id must be 16 bytes encoded as unpadded base64url",
+    (value) => canonicalBase64url(value, WRITER_ID_BYTE_LENGTH),
+    `writer id must be ${WRITER_ID_BYTE_LENGTH} bytes encoded as unpadded base64url`,
   ),
 );
-export const writerIdBase64urlSchema = z.string().check(
-  z.regex(WRITER_ID_BASE64URL_PATTERN),
-  z.refine(
-    (value) => canonicalBase64url(value, 16),
-    "writer_id must be 16 bytes encoded as unpadded base64url",
-  ),
-);
+export const writerIdBase64urlSchema = clientWriterIdBase64urlSchema;
 export const bytesBase64urlSchema = z.string().check(
-  z.regex(BASE64URL_PATTERN),
   z.refine(
     (value) => canonicalBase64url(value),
     "value must be canonical unpadded base64url",
@@ -105,11 +98,7 @@ export const createStreamRequestSchema = z.strictObject({
   kind: z.optional(streamKindSchema),
   title: z.optional(streamTitleSchema),
   visibility: z._default(visibilitySchema, "private"),
-  expires_in_seconds: z.optional(z.number().check(
-    z.int(),
-    z.positive(),
-    z.maximum(Number.MAX_SAFE_INTEGER),
-  )),
+  expires_in_seconds: z.optional(jsonU64Schema.check(z.positive())),
   links: z.array(initialStreamLinkSchema).check(
     z.minLength(1),
     z.maxLength(MAX_INITIAL_STREAM_LINKS),
@@ -189,7 +178,7 @@ export const updateStreamRequestSchema = z.strictObject({
 }));
 
 export const appendPartSchema = z.strictObject({
-  index: z.number().check(z.int(), z.nonnegative(), z.maximum(0x7fff_ffff)),
+  index: partIndexSchema,
   is_final: z.boolean(),
 });
 
@@ -204,7 +193,7 @@ const bytesRecordPayloadShape = {
 } as const;
 
 const ssePartSchema = z.object({
-  index: z.number().check(z.int(), z.nonnegative(), z.maximum(0x7fff_ffff)),
+  index: partIndexSchema,
   is_final: z.boolean(),
 });
 
@@ -358,6 +347,5 @@ function jsonEscapedUtf8ByteLength(bytes: Uint8Array): number {
 }
 
 export function isCanonicalIdempotencyKey(value: string): boolean {
-  return IDEMPOTENCY_KEY_PATTERN.test(value) &&
-    canonicalBase64url(value, IDEMPOTENCY_KEY_BYTES);
+  return canonicalBase64url(value, IDEMPOTENCY_KEY_BYTES);
 }

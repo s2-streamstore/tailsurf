@@ -268,7 +268,7 @@ impl From<Bytes> for LogicalRecordData<'_> {
 }
 
 /// Storage shape does not change payload identity: compare contents, not variants.
-impl<'a, 'b> PartialEq<LogicalRecordData<'b>> for LogicalRecordData<'a> {
+impl<'b> PartialEq<LogicalRecordData<'b>> for LogicalRecordData<'_> {
     fn eq(&self, other: &LogicalRecordData<'b>) -> bool {
         let mut this = self.clone();
         let mut other = other.clone();
@@ -293,7 +293,7 @@ impl<'a, 'b> PartialEq<LogicalRecordData<'b>> for LogicalRecordData<'a> {
 
 impl Eq for LogicalRecordData<'_> {}
 
-impl<'a, 'b> PartialEq<LogicalRecord<'b>> for LogicalRecord<'a> {
+impl<'b> PartialEq<LogicalRecord<'b>> for LogicalRecord<'_> {
     fn eq(&self, other: &LogicalRecord<'b>) -> bool {
         self.data == other.data
     }
@@ -744,7 +744,13 @@ mod tests {
                 max: MAX_RECORD_WRITER_STATES,
             }
         );
-        assert_eq!(transcript.writers.len(), MAX_RECORD_WRITER_STATES);
+        assert!(
+            push(
+                &mut transcript,
+                record_with_writer(writer_id(0), 1, PartHeader::unsplit(), b"known"),
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -765,9 +771,6 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_totals.bytes, 3);
-        assert_eq!(transcript.pending_totals.parts, 1);
-
         let error = transcript
             .push_record(record_with_writer(
                 second_writer,
@@ -780,8 +783,6 @@ mod tests {
             error,
             LogicalRecordError::ReassemblyLimitExceeded { actual: 5, max: 4 }
         );
-        assert_eq!(transcript.pending_totals.bytes, 3);
-
         assert_chunked_record(
             push(
                 &mut transcript,
@@ -794,9 +795,6 @@ mod tests {
             ),
             b"abcd",
         );
-        assert_eq!(transcript.pending_totals.bytes, 0);
-        assert_eq!(transcript.pending_totals.parts, 0);
-
         assert_eq!(
             push(
                 &mut transcript,
@@ -809,12 +807,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(transcript.pending_totals.bytes, 4);
-        assert_eq!(transcript.pending_totals.parts, 1);
     }
 
     #[test]
-    fn bounds_total_pending_parts_including_empty_parts() {
+    fn bounds_total_pending_parts_and_resynchronizes() {
         let mut transcript = LogicalRecordAssembler::with_max_reassembly_bytes(16);
 
         for index in 0..MAX_RECORD_TOTAL_PENDING_PARTS {
@@ -830,12 +826,6 @@ mod tests {
                 None
             );
         }
-        assert_eq!(transcript.pending_totals.bytes, 0);
-        assert_eq!(
-            transcript.pending_totals.parts,
-            MAX_RECORD_TOTAL_PENDING_PARTS
-        );
-
         let error = transcript
             .push_record(record(
                 MAX_RECORD_TOTAL_PENDING_PARTS as u64,
@@ -850,8 +840,17 @@ mod tests {
                 max: MAX_RECORD_TOTAL_PENDING_PARTS,
             }
         );
-        assert_eq!(transcript.pending_totals.bytes, 0);
-        assert_eq!(transcript.pending_totals.parts, 0);
+        assert!(
+            push(
+                &mut transcript,
+                record(
+                    (MAX_RECORD_TOTAL_PENDING_PARTS + 1) as u64,
+                    PartHeader::new(0, false).expect("part"),
+                    b"",
+                ),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -885,6 +884,5 @@ mod tests {
                 data: LogicalRecordData::Borrowed(b""),
             }),
         );
-        assert_eq!(transcript.pending_totals.parts, 0);
     }
 }

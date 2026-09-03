@@ -10,12 +10,11 @@
   "scripts": {
     "build": "pnpm --recursive build",
     "changeset": "changeset",
-    "check": "pnpm build && pnpm lint && pnpm typecheck && pnpm test && pnpm test:fixtures && pnpm test:packages",
+    "check": "pnpm build && pnpm lint && pnpm typecheck && pnpm test && pnpm test:packages",
     "lint": "oxlint . --max-warnings 0",
     "release:publish": "changeset publish",
     "release:version": "changeset version",
     "test": "vitest run",
-    "test:fixtures": "node scripts/verify-fixtures.mjs",
     "test:packages": "node scripts/package-smoke.mjs",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },

@@ -1,5 +1,9 @@
 import { ProtocolError } from "./errors.js";
-import { MAX_SAFE_INTEGER_U64, MAX_U64, U64_PATTERN } from "./primitives.js";
+import {
+  MAX_SAFE_INTEGER_U64,
+  MAX_U64,
+  tryParseDecimalU64,
+} from "./primitives.js";
 
 export const DEFAULT_READ_TAIL_OFFSET = 0n;
 export const MIN_PLAYBACK_RATE = 0.1;
@@ -17,17 +21,17 @@ export type ReadStart =
 /** Conditions that make a stream read finite. */
 export interface ReadStop {
   /** Maximum number of physical records to deliver. */
-  readonly count?: bigint;
+  readonly count?: bigint | undefined;
   /** Exclusive ending timestamp in Unix epoch milliseconds. */
-  readonly untilTimestampMs?: bigint;
+  readonly untilTimestampMs?: bigint | undefined;
   /** Seconds to wait at the tail before ending this connection. */
-  readonly waitSeconds?: number;
+  readonly waitSeconds?: number | undefined;
 }
 
 export interface ReadRequest {
   readonly start: ReadStart;
-  readonly stop?: ReadStop;
-  readonly rate?: number;
+  readonly stop?: ReadStop | undefined;
+  readonly rate?: number | undefined;
 }
 
 const READ_START_PARAMETERS = [
@@ -179,10 +183,10 @@ function requiredU64(
   maximum = MAX_U64,
 ): bigint {
   const value = parameters.get(name);
-  if (value === null || !U64_PATTERN.test(value)) {
+  const parsed = value === null ? undefined : tryParseDecimalU64(value);
+  if (parsed === undefined) {
     throw invalidParameter(name, "must be a canonical decimal u64");
   }
-  const parsed = BigInt(value);
   if (parsed > maximum) {
     throw invalidParameter(name, `must not exceed ${maximum}`);
   }
@@ -190,11 +194,11 @@ function requiredU64(
 }
 
 function validateReadRequest(request: ReadRequest): void {
-  const selector = readSelectorValue(request.start);
+  const [startParameter, selector] = readStartValue(request.start);
   const stop = request.stop;
   if (selector < 0n || selector > MAX_SAFE_INTEGER_U64) {
     throw invalidParameter(
-      readStartParameter(request.start),
+      startParameter,
       `must not exceed ${MAX_SAFE_INTEGER_U64}`,
     );
   }
@@ -238,25 +242,14 @@ function validateReadRequest(request: ReadRequest): void {
   }
 }
 
-function readSelectorValue(start: ReadStart): bigint {
+function readStartValue(start: ReadStart): readonly [string, bigint] {
   switch (start.type) {
     case "seqNum":
-      return start.seqNum;
+      return ["seq_num", start.seqNum];
     case "timestampMs":
-      return start.timestampMs;
+      return ["timestamp", start.timestampMs];
     case "tailOffset":
-      return start.tailOffset;
-  }
-}
-
-function readStartParameter(start: ReadStart): string {
-  switch (start.type) {
-    case "seqNum":
-      return "seq_num";
-    case "timestampMs":
-      return "timestamp";
-    case "tailOffset":
-      return "tail_offset";
+      return ["tail_offset", start.tailOffset];
   }
 }
 

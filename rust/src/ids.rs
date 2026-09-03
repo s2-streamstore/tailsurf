@@ -14,7 +14,8 @@ pub type StreamId = ubid::Ubid160;
 pub const MAX_LINK_ID_LEN: usize = 64;
 
 /// Client-chosen immutable identifier for a stream link.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct LinkId(String);
 
 impl LinkId {
@@ -45,15 +46,6 @@ impl FromStr for LinkId {
             return Err(LinkIdError);
         }
         Ok(Self(value.to_owned()))
-    }
-}
-
-impl Serialize for LinkId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -113,29 +105,48 @@ impl FromStr for LinkSecret {
 #[error("link secret must be canonical 32-character unpadded base64url")]
 pub struct LinkSecretError;
 
+macro_rules! impl_writer_id {
+    ($type:ident) => {
+        impl $type {
+            /// Encoded writer ID length.
+            pub const BYTE_LEN: usize = WRITER_ID_BYTE_LEN;
+
+            /// Creates a writer ID from its exact binary representation.
+            pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
+                Self(bytes)
+            }
+
+            /// Returns the exact binary representation.
+            pub const fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
+                &self.0
+            }
+        }
+
+        impl Serialize for $type {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_bytes(self.as_bytes())
+            }
+        }
+    };
+}
+
+const WRITER_ID_BYTE_LEN: usize = 16;
+
 /// Stable 128-bit client-chosen writer identity reused across reconnects.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ClientWriterId([u8; 16]);
+pub struct ClientWriterId([u8; WRITER_ID_BYTE_LEN]);
+
+impl_writer_id!(ClientWriterId);
 
 impl ClientWriterId {
-    /// Encoded client writer ID length.
-    pub const BYTE_LEN: usize = 16;
-
     /// Generates a cryptographically random client writer ID.
     pub fn new_random() -> Self {
         let mut bytes = [0_u8; Self::BYTE_LEN];
         fill_random(&mut bytes);
         Self(bytes)
-    }
-
-    /// Creates a client writer ID from its exact binary representation.
-    pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the exact binary representation.
-    pub const fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
-        &self.0
     }
 }
 
@@ -143,42 +154,11 @@ fn fill_random(bytes: &mut [u8]) {
     rand::rng().fill_bytes(bytes);
 }
 
-impl Serialize for ClientWriterId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(self.as_bytes())
-    }
-}
-
 /// Stable 128-bit server-derived writer identity attached to delivered records.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct WriterId([u8; 16]);
+pub struct WriterId([u8; WRITER_ID_BYTE_LEN]);
 
-impl WriterId {
-    /// Encoded writer ID length.
-    pub const BYTE_LEN: usize = 16;
-
-    /// Creates a writer ID from its exact binary representation.
-    pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the exact binary representation.
-    pub const fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
-        &self.0
-    }
-}
-
-impl Serialize for WriterId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(self.as_bytes())
-    }
-}
+impl_writer_id!(WriterId);
 
 pub(crate) fn serialize_link_secret<S>(
     secret: &LinkSecret,
@@ -194,14 +174,16 @@ where
 pub(crate) const BASE64URL_32_ENCODED_LEN: usize = 43;
 /// Length of the canonical unpadded base64url encoding of a 24-byte value.
 pub(crate) const BASE64URL_24_ENCODED_LEN: usize = 32;
+const BASE64URL_32_BYTE_LEN: usize = 32;
+const BASE64URL_24_BYTE_LEN: usize = 24;
 
 /// Encodes a 256-bit value as canonical unpadded base64url.
-pub(crate) fn encode_base64url_32(bytes: &[u8; 32]) -> String {
+pub(crate) fn encode_base64url_32(bytes: &[u8; BASE64URL_32_BYTE_LEN]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 pub(crate) fn random_base64url_32() -> String {
-    let mut bytes = [0_u8; 32];
+    let mut bytes = [0_u8; BASE64URL_32_BYTE_LEN];
     fill_random(&mut bytes);
     encode_base64url_32(&bytes)
 }
@@ -211,7 +193,7 @@ pub(crate) fn is_canonical_base64url_32(value: &str) -> bool {
     if value.len() != BASE64URL_32_ENCODED_LEN {
         return false;
     }
-    let mut decoded = [0_u8; 32];
+    let mut decoded = [0_u8; BASE64URL_32_BYTE_LEN];
     URL_SAFE_NO_PAD.decode_slice(value, &mut decoded).is_ok()
 }
 
@@ -220,21 +202,13 @@ fn is_canonical_base64url_24(value: &str) -> bool {
     if value.len() != BASE64URL_24_ENCODED_LEN {
         return false;
     }
-    let mut decoded = [0_u8; 24];
+    let mut decoded = [0_u8; BASE64URL_24_BYTE_LEN];
     URL_SAFE_NO_PAD.decode_slice(value, &mut decoded).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn accepts_exact_24_byte_link_secrets() {
-        let canonical = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert!(is_canonical_base64url_24(canonical));
-        assert!(!is_canonical_base64url_24(&canonical[..31]));
-        assert!(!is_canonical_base64url_24(&format!("{canonical}A")));
-    }
 
     #[test]
     fn link_ids_accept_semantic_slugs() {

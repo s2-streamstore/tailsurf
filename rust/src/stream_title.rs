@@ -2,13 +2,14 @@
 
 use std::{fmt, str::FromStr};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Maximum number of Unicode code points in a stream title.
 pub const MAX_STREAM_TITLE_CODE_POINTS: usize = 120;
 
 /// Mutable human-facing metadata for one stream.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct StreamTitle(String);
 
 impl StreamTitle {
@@ -42,15 +43,6 @@ impl FromStr for StreamTitle {
             return Err(StreamTitleError::ForbiddenCharacter);
         }
         Ok(Self(input.to_owned()))
-    }
-}
-
-impl Serialize for StreamTitle {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
     }
 }
 

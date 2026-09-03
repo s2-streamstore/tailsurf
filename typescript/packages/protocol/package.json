@@ -11,12 +11,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./fixtures/rest-v1.json": "./fixtures/rest-v1.json",
-    "./fixtures/v1.json": "./fixtures/v1.json"
+    "./fixtures/rest-v1.json": "./dist/fixtures/rest-v1.json",
+    "./fixtures/v1.json": "./dist/fixtures/v1.json"
   },
   "files": [
     "dist",
-    "fixtures",
     "LICENSE",
     "README.md"
   ],
@@ -24,7 +23,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "pnpm run clean && tsc --project tsconfig.build.json",
+    "build": "pnpm run clean && tsc --project tsconfig.build.json && node ../../scripts/copy-protocol-fixtures.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist', { force: true, recursive: true })\"",
     "prepack": "pnpm run build"
   },

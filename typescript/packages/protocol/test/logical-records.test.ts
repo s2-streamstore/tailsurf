@@ -5,6 +5,7 @@ import {
   partHeader,
   parseWriterId,
   UNSPLIT_PART,
+  WRITER_ID_BYTE_LENGTH,
   type ReadRecord,
 } from "../src/index.js";
 
@@ -137,8 +138,11 @@ function record(
 }
 
 function writerId(index: number): ReadRecord["writerId"] {
-  const bytes = new Uint8Array(16);
-  new DataView(bytes.buffer).setUint32(12, index);
+  const bytes = new Uint8Array(WRITER_ID_BYTE_LENGTH);
+  new DataView(bytes.buffer).setUint32(
+    bytes.byteLength - Uint32Array.BYTES_PER_ELEMENT,
+    index,
+  );
   return parseWriterId(bytes);
 }
 

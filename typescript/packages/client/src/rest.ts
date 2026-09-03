@@ -5,9 +5,7 @@ import {
   createLinkResponseSchema,
   listLinksResponseSchema,
   parseStreamId,
-  parseStreamTitle,
   parseLinkId,
-  streamKindSchema,
   streamMetadataSchema,
   updateStreamRequestSchema,
   appendRecordsRequestSchema,
@@ -23,6 +21,7 @@ import {
   MAX_STATELESS_APPEND_JSON_BYTES,
   MAX_STATELESS_APPEND_PAYLOAD_BYTES,
   MAX_STATELESS_APPEND_RECORDS,
+  MAX_U64,
   parseLinkSecret,
   parseClientWriterId,
   partHeader,
@@ -36,6 +35,7 @@ import {
   type LinkPermissions,
   type Visibility,
   type StreamKind,
+  type StreamTitle,
 } from "@tailsurf/protocol";
 
 import {
@@ -58,14 +58,12 @@ import {
 import { connectSseReader as openSseReader } from "./sse.js";
 import type { ReadOptions, TsfReadSession } from "./reader.js";
 import {
-  INITIAL_RETRY_BACKOFF_MS,
   integerOption,
   isRetryableHttpStatus,
-  jitteredBackoffMs,
-  MAX_RETRY_BACKOFF_MS,
   MAX_TIMER_DELAY_MS,
+  retryOperation,
+  withTimeout,
 } from "./retry.js";
-import { sleep, withTimeout } from "./socket.js";
 
 export const DEFAULT_API_ORIGIN = "https://tail.surf";
 const API_PREFIX = "/api/v1";
@@ -77,17 +75,17 @@ interface Schema<T> {
 }
 
 export interface HttpClientOptions {
-  readonly apiOrigin?: string | URL;
-  readonly fetch?: typeof globalThis.fetch;
+  readonly apiOrigin?: string | URL | undefined;
+  readonly fetch?: typeof globalThis.fetch | undefined;
   /** Bounds REST requests and SSE opening handshakes. It does not time out an established SSE body. */
-  readonly httpRequestTimeoutMs?: number;
+  readonly httpRequestTimeoutMs?: number | undefined;
   /** Total attempts for bounded operations, including the initial attempt. */
-  readonly boundedOperationAttempts?: number;
+  readonly boundedOperationAttempts?: number | undefined;
 }
 
 export interface IdempotencyOptions {
   /** Sensitive recovery key retained across every attempt of one logical mutation. */
-  readonly idempotencyKey?: string;
+  readonly idempotencyKey?: string | undefined;
 }
 
 export interface InitialStreamLinkOptions {
@@ -96,24 +94,27 @@ export interface InitialStreamLinkOptions {
 }
 
 export interface CreateStreamInput {
-  readonly kind?: StreamKind;
-  readonly title?: string;
-  readonly visibility?: Visibility;
-  readonly expiresInSeconds?: number;
-  readonly links?: readonly InitialStreamLinkOptions[];
+  readonly kind?: StreamKind | undefined;
+  readonly title?: string | undefined;
+  readonly visibility?: Visibility | undefined;
+  readonly expiresInSeconds?: number | undefined;
+  readonly links?: readonly InitialStreamLinkOptions[] | undefined;
 }
 
 export interface PreparedCreateStreamRequest {
   readonly kind: StreamKind;
-  readonly title?: string;
+  readonly title?: StreamTitle | undefined;
   readonly visibility: Visibility;
-  readonly expiresInSeconds?: number;
-  readonly links: readonly InitialStreamLinkOptions[];
+  readonly expiresInSeconds?: number | undefined;
+  readonly links: readonly {
+    readonly linkId: LinkId;
+    readonly permissions: LinkPermissions;
+  }[];
 }
 
 /** Authorization for metadata reads. Public streams may omit the link secret. */
 export interface ReadAuthOptions {
-  readonly linkSecret?: string;
+  readonly linkSecret?: string | undefined;
 }
 
 /** Owner authorization for one stream-management request. */
@@ -127,22 +128,22 @@ export interface WriteAuthOptions {
 }
 
 export interface ListLinksOptions extends OwnerAuthOptions {
-  readonly limit?: number;
-  readonly cursor?: string;
+  readonly limit?: number | undefined;
+  readonly cursor?: string | undefined;
 }
 
 export interface CreateLinkInput {
   readonly linkId: string;
   readonly permissions: LinkPermissions;
-  readonly expiresAt?: string;
+  readonly expiresAt?: string | undefined;
 }
 
 export interface CreateLinkOptions extends OwnerAuthOptions, IdempotencyOptions {}
 
 export interface UpdateStreamInput {
-  readonly title?: string | null;
-  readonly visibility?: Visibility;
-  readonly expiresAt?: string;
+  readonly title?: string | null | undefined;
+  readonly visibility?: Visibility | undefined;
+  readonly expiresAt?: string | undefined;
 }
 
 export interface AppendRange {
@@ -151,7 +152,7 @@ export interface AppendRange {
 }
 
 export interface StatelessAppendRecord {
-  readonly part?: PartHeader;
+  readonly part?: PartHeader | undefined;
   readonly data: Uint8Array | string;
 }
 
@@ -159,7 +160,7 @@ export interface StatelessAppendRequest {
   readonly clientWriterId: ClientWriterId;
   readonly writerStartSeqNum: bigint;
   readonly records: readonly StatelessAppendRecord[];
-  readonly expectedNextSeqNum?: bigint;
+  readonly expectedNextSeqNum?: bigint | undefined;
 }
 
 export class BaseTsfClient {
@@ -246,9 +247,9 @@ export class BaseTsfClient {
       {
         method: "PATCH",
         body: JSON.stringify(updateStreamRequestSchema.parse({
-          ...(request.title === undefined ? {} : { title: request.title }),
-          ...(request.visibility === undefined ? {} : { visibility: request.visibility }),
-          ...(request.expiresAt === undefined ? {} : { expires_at: request.expiresAt }),
+          title: request.title,
+          visibility: request.visibility,
+          expires_at: request.expiresAt,
         })),
       },
       requiredLinkSecret(options, "update stream", "owner"),
@@ -259,15 +260,9 @@ export class BaseTsfClient {
     streamId: StreamId,
     options: OwnerAuthOptions,
   ): Promise<void> {
-    return this.#request(
+    return this.#delete(
       "delete stream",
       `/streams/${parseStreamId(streamId)}`,
-      async (response) => {
-        if (response.status !== 204) {
-          throw await httpStatusError(response, "delete stream");
-        }
-      },
-      { method: "DELETE" },
       requiredLinkSecret(options, "delete stream", "owner"),
     );
   }
@@ -283,7 +278,7 @@ export class BaseTsfClient {
     );
     const createRequest: WireCreateLinkRequestInput = {
       permissions: request.permissions,
-      ...(request.expiresAt === undefined ? {} : { expires_at: request.expiresAt }),
+      expires_at: request.expiresAt,
     };
     return this.#json(
       "create link",
@@ -348,7 +343,7 @@ export class BaseTsfClient {
       const page = await this.listLinks(streamId, {
         ...options,
         limit: MAX_LINK_PAGE_ITEMS,
-        ...(cursor === undefined ? {} : { cursor }),
+        cursor,
       });
       if (
         authorizingLinkId !== undefined &&
@@ -393,15 +388,9 @@ export class BaseTsfClient {
     linkId: LinkId,
     options: OwnerAuthOptions,
   ): Promise<void> {
-    return this.#request(
+    return this.#delete(
       "revoke link",
       `/streams/${parseStreamId(streamId)}/links/${parseLinkId(linkId)}`,
-      async (response) => {
-        if (response.status !== 204) {
-          throw await httpStatusError(response, "revoke link");
-        }
-      },
-      { method: "DELETE" },
       requiredLinkSecret(options, "revoke link", "owner"),
     );
   }
@@ -425,13 +414,18 @@ export class BaseTsfClient {
       const bytes = typeof record.data === "string"
         ? textEncoder.encode(record.data)
         : record.data;
-      validateStatelessRecordBytes(bytes.byteLength);
+      if (bytes.byteLength > MAX_RECORD_PAYLOAD_BYTES) {
+        throw new TsfClientError(
+          "invalid_client_option",
+          `each append record must not exceed ${MAX_RECORD_PAYLOAD_BYTES} bytes`,
+        );
+      }
       payloadBytes += bytes.byteLength;
       return {
         ...compactRecordPayload(bytes),
-        ...(part === undefined
-          ? {}
-          : { part: { index: part.index, is_final: part.isFinal } }),
+        part: part === undefined
+          ? undefined
+          : { index: part.index, is_final: part.isFinal },
       };
     });
     if (payloadBytes > MAX_STATELESS_APPEND_PAYLOAD_BYTES) {
@@ -441,7 +435,7 @@ export class BaseTsfClient {
       );
     }
     const finalWriterSeqNum = request.writerStartSeqNum + BigInt(request.records.length - 1);
-    if (request.writerStartSeqNum < 0n || finalWriterSeqNum >= 0xffff_ffff_ffff_ffffn) {
+    if (request.writerStartSeqNum < 0n || finalWriterSeqNum >= MAX_U64) {
       throw new TsfClientError(
         "invalid_client_option",
         "writer sequence range must end before u64::MAX",
@@ -463,9 +457,7 @@ export class BaseTsfClient {
         seq_num: request.writerStartSeqNum.toString(),
       },
       records,
-      ...(request.expectedNextSeqNum === undefined
-        ? {}
-        : { expected_next_seq_num: request.expectedNextSeqNum.toString() }),
+      expected_next_seq_num: request.expectedNextSeqNum?.toString(),
     });
     const encodedBody = JSON.stringify(body);
     if (textEncoder.encode(encodedBody).byteLength > MAX_STATELESS_APPEND_JSON_BYTES) {
@@ -497,7 +489,7 @@ export class BaseTsfClient {
     });
   }
 
-  async #json<T>(
+  #json<T>(
     operation: string,
     path: string,
     schema: Schema<T>,
@@ -546,16 +538,33 @@ export class BaseTsfClient {
     );
   }
 
-  async #request<T>(
+  #delete(
+    operation: string,
+    path: string,
+    linkSecret: string,
+  ): Promise<void> {
+    return this.#request(operation, path, async (response) => {
+      if (response.status !== 204) {
+        throw await httpStatusError(response, operation);
+      }
+    }, { method: "DELETE" }, linkSecret);
+  }
+
+  #request<T>(
     operation: string,
     path: string,
     consume: (response: Response) => Promise<T>,
     init: RequestInit = {},
     linkSecret?: string,
   ): Promise<T> {
-    return retryRest(
+    return retryOperation(
       () => this.#requestOnce(operation, path, consume, init, linkSecret),
-      this.boundedOperationAttempts,
+      {
+        attempts: this.boundedOperationAttempts,
+        shouldRetry: isRetryableRestError,
+        retryAfterMs: (error) =>
+          error instanceof TsfHttpError ? error.retryAfterMs : undefined,
+      },
     );
   }
 
@@ -631,15 +640,6 @@ function optionalLinkSecret(value: string | undefined): string | undefined {
   }
 }
 
-function validateStatelessRecordBytes(bytes: number): void {
-  if (bytes > MAX_RECORD_PAYLOAD_BYTES) {
-    throw new TsfClientError(
-      "invalid_client_option",
-      `each append record must not exceed ${MAX_RECORD_PAYLOAD_BYTES} bytes`,
-    );
-  }
-}
-
 function requiredLinkSecret(
   options: OwnerAuthOptions | WriteAuthOptions | undefined,
   operation: string,
@@ -680,35 +680,6 @@ export function parseApiOrigin(input: string | URL): string {
   return url.origin;
 }
 
-async function retryRest<T>(
-  attempt: () => Promise<T>,
-  boundedOperationAttempts: number,
-): Promise<T> {
-  let retryDelayMs = INITIAL_RETRY_BACKOFF_MS;
-  for (
-    let attemptIndex = 0;
-    attemptIndex < boundedOperationAttempts;
-    attemptIndex += 1
-  ) {
-    try {
-      return await attempt();
-    } catch (error) {
-      if (
-        attemptIndex + 1 === boundedOperationAttempts ||
-        !isRetryableRestError(error)
-      ) {
-        throw error;
-      }
-      const delayMs = error instanceof TsfHttpError && error.retryAfterMs !== undefined
-        ? Math.min(error.retryAfterMs, MAX_RETRY_BACKOFF_MS)
-        : jitteredBackoffMs(retryDelayMs);
-      await sleep(delayMs);
-      retryDelayMs = Math.min(MAX_RETRY_BACKOFF_MS, retryDelayMs * 2);
-    }
-  }
-  throw new Error("REST retry loop exhausted without returning");
-}
-
 function isRetryableRestError(error: unknown): boolean {
   if (error instanceof TsfHttpError) {
     return isRetryableHttpStatus(error.status);
@@ -732,16 +703,12 @@ export function prepareCreateStreamRequest(
   const requestedLinks = request.links ?? [];
   const links = requestedLinks.some((link) => link.permissions === "o")
     ? requestedLinks
-    : [{ linkId: parseLinkId("owner"), permissions: "o" as const }, ...requestedLinks];
+    : [{ linkId: "owner", permissions: "o" as const }, ...requestedLinks];
   return parsePreparedCreateStreamRequest({
     kind: request.kind ?? "transcript",
-    ...(request.title === undefined
-      ? {}
-      : { title: parseStreamTitle(request.title) }),
+    title: request.title,
     visibility: request.visibility ?? "private",
-    ...(request.expiresInSeconds === undefined
-      ? {}
-      : { expiresInSeconds: request.expiresInSeconds }),
+    expiresInSeconds: request.expiresInSeconds,
     links,
   });
 }
@@ -759,14 +726,11 @@ export function parsePreparedCreateStreamRequest(
       "normalized stream request is invalid",
     );
   }
-  const kind = streamKindSchema.parse(input.kind);
   const wire = createStreamRequestSchema.parse({
-    kind,
-    ...(input.title === undefined ? {} : { title: input.title }),
-    ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
-    ...(input.expiresInSeconds === undefined
-      ? {}
-      : { expires_in_seconds: input.expiresInSeconds }),
+    kind: input.kind,
+    title: input.title,
+    visibility: input.visibility,
+    expires_in_seconds: input.expiresInSeconds,
     links: input.links.map((link) => {
       if (!isRecord(link)) {
         throw new TsfClientError(
@@ -781,7 +745,7 @@ export function parsePreparedCreateStreamRequest(
     }),
   });
   return {
-    kind,
+    kind: wire.kind ?? "transcript",
     ...(wire.title === undefined ? {} : { title: wire.title }),
     visibility: wire.visibility,
     ...(wire.expires_in_seconds === undefined
@@ -799,15 +763,11 @@ function createStreamRequestToWire(
 ): WireCreateStreamRequest {
   return {
     ...(request.kind === "transcript" ? {} : { kind: request.kind }),
-    ...(request.title === undefined
-      ? {}
-      : { title: parseStreamTitle(request.title) }),
+    title: request.title,
     visibility: request.visibility,
-    ...(request.expiresInSeconds === undefined
-      ? {}
-      : { expires_in_seconds: request.expiresInSeconds }),
+    expires_in_seconds: request.expiresInSeconds,
     links: request.links.map((link) => ({
-      link_id: parseLinkId(link.linkId),
+      link_id: link.linkId,
       permissions: link.permissions,
     })),
   };

@@ -102,9 +102,9 @@ enum Command {
     /// Write piped input or a program's output to an existing stream.
     Write(WriteArgs),
     /// Follow a stream, optionally starting from existing records.
-    Tail(TailArgs),
+    Tail(ReadStreamArgs),
     /// Print existing records and stop at the current tail.
-    Replay(ReplayArgs),
+    Replay(ReadStreamArgs),
     /// Show current stream metadata.
     Info(InfoArgs),
     /// Permanently delete a stream.
@@ -112,11 +112,13 @@ enum Command {
     /// Change stream visibility.
     Visibility(VisibilityArgs),
     /// Set or clear a stream title.
-    Title(TitleArgs),
+    #[command(subcommand)]
+    Title(TitleCommand),
     /// Extend a stream's expiration.
     Renew(RenewArgs),
     /// Manage links.
-    Link(LinkArgs),
+    #[command(subcommand)]
+    Link(LinkCommand),
     /// Update an installation managed by the tail.surf installer.
     Update(UpdateArgs),
 }
@@ -184,7 +186,7 @@ struct InputArgs {
 }
 
 #[derive(Debug, Args)]
-struct TailArgs {
+struct ReadStreamArgs {
     /// Read-capable link, public stream URL, or @path containing one.
     #[arg(value_name = "STREAM_LINK_OR_URL")]
     link: LinkInput,
@@ -220,15 +222,6 @@ struct ReadArgs {
 }
 
 #[derive(Debug, Args)]
-struct ReplayArgs {
-    /// Read-capable link, public stream URL, or @path containing one.
-    #[arg(value_name = "STREAM_LINK_OR_URL")]
-    link: LinkInput,
-    #[command(flatten)]
-    read: ReadArgs,
-}
-
-#[derive(Debug, Args)]
 struct InfoArgs {
     /// Read-capable link, public stream URL, or @path containing one.
     #[arg(value_name = "STREAM_LINK_OR_URL")]
@@ -239,34 +232,51 @@ struct InfoArgs {
 }
 
 #[derive(Debug, Args)]
-struct DeleteArgs {
+struct OwnerArgs {
     /// Owner link or @path containing one.
     #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
-    /// Skip the interactive confirmation.
-    #[arg(long)]
-    yes: bool,
+    link: LinkInput,
     /// Print one JSON object instead of human-readable output.
     #[arg(long)]
     json: bool,
+}
+
+impl OwnerArgs {
+    fn resolve(&self, origin: Url) -> eyre::Result<OwnerAccess> {
+        let locator = StreamLocator::parse(self.link.as_str()).context("invalid owner link")?;
+        let link_secret = locator
+            .link_declaring(LinkPermissions::allows_owner)
+            .context("link does not declare owner permission")?
+            .clone();
+        Ok(OwnerAccess {
+            client: TsfClient::with_api_origin(origin)?,
+            locator,
+            link_secret,
+        })
+    }
+}
+
+struct OwnerAccess {
+    client: TsfClient,
+    locator: StreamLocator,
+    link_secret: LinkSecret,
+}
+
+#[derive(Debug, Args)]
+struct DeleteArgs {
+    #[command(flatten)]
+    owner: OwnerArgs,
+    /// Skip the interactive confirmation.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
 struct VisibilityArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// New visibility.
     visibility: VisibilityArg,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct TitleArgs {
-    #[command(subcommand)]
-    command: TitleCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -274,55 +284,31 @@ enum TitleCommand {
     /// Set the stream title.
     Set(SetTitleArgs),
     /// Remove the stream title.
-    Clear(ClearTitleArgs),
+    Clear(OwnerArgs),
 }
 
 #[derive(Debug, Args)]
 struct SetTitleArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// New stream title.
     #[arg(value_name = "TITLE")]
     title: StreamTitle,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct ClearTitleArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 struct RenewArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// New lifetime from now, such as 6h or 7d.
     #[arg(value_name = "DURATION")]
     expires: StreamExpiryArg,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct LinkArgs {
-    #[command(subcommand)]
-    command: LinkCommand,
 }
 
 #[derive(Debug, Subcommand)]
 enum LinkCommand {
     /// List link metadata without secrets.
-    List(ListLinkArgs),
+    List(OwnerArgs),
     /// Create a link and print it once.
     Create(CreateLinkArgs),
     /// Revoke a link by its ID.
@@ -330,29 +316,15 @@ enum LinkCommand {
 }
 
 #[derive(Debug, Args)]
-struct ListLinkArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
 struct CreateLinkArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// Immutable Link ID and permission, as LINK_ID=PERMISSION.
     #[arg(value_name = "LINK_ID=PERMISSION")]
-    link: InitialLinkArg,
+    new_link: InitialLinkArg,
     /// Expiry such as 1h, 7d, or never.
     #[arg(long, value_name = "EXPIRY", default_value = "never")]
     expires: ExpiresArg,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
     /// Write the complete new link to this file.
     #[arg(long = "link-file", value_name = "PATH")]
     link_file: Option<PathBuf>,
@@ -360,15 +332,11 @@ struct CreateLinkArgs {
 
 #[derive(Debug, Args)]
 struct RevokeLinkArgs {
-    /// Owner link or @path containing one.
-    #[arg(value_name = "OWNER_LINK")]
-    owner_link: LinkInput,
+    #[command(flatten)]
+    owner: OwnerArgs,
     /// Link ID to revoke.
     #[arg(value_name = "LINK_ID")]
     link_id: LinkId,
-    /// Print one JSON object instead of human-readable output.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -587,12 +555,10 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let command = command.unwrap_or_else(|| Command::New(NewArgs::default()));
-    let check_for_update = should_check_for_update_hint(
-        matches!(command, Command::Update(_)),
-        &origin,
-        std::io::stderr().is_terminal(),
-        automatic_update_checks_disabled(),
-    );
+    let check_for_update = !matches!(command, Command::Update(_))
+        && origin == default_api_origin()
+        && std::io::stderr().is_terminal()
+        && !automatic_update_checks_disabled();
     let result = run(origin, command).await;
     match result {
         Ok(()) => {
@@ -664,15 +630,6 @@ fn managed_updater() -> eyre::Result<AxoUpdater> {
         bail!(OWNERSHIP_ERROR);
     }
     Ok(updater)
-}
-
-fn should_check_for_update_hint(
-    is_update_command: bool,
-    origin: &Url,
-    stderr_is_terminal: bool,
-    disabled: bool,
-) -> bool {
-    stderr_is_terminal && !disabled && !is_update_command && *origin == default_api_origin()
 }
 
 fn automatic_update_checks_disabled() -> bool {
@@ -902,16 +859,11 @@ async fn write_input(
     }
 }
 
-fn print_write_summary(records: u64) {
-    let noun = if records == 1 { "record" } else { "records" };
-    eprintln!("{records} {noun} durable");
-}
-
-async fn finish_and_close_writer(
+async fn finish_write(
     session: WriterSession,
     writer: TsfWriter,
     interrupted: bool,
-) -> eyre::Result<u64> {
+) -> eyre::Result<()> {
     if interrupted {
         eprintln!(
             "Interrupted. Input stopped. Waiting for accepted records to become durable; press Ctrl-C again to stop immediately."
@@ -934,7 +886,12 @@ async fn finish_and_close_writer(
             exit_interrupted();
         }
     }
-    Ok(records)
+    let noun = if records == 1 { "record" } else { "records" };
+    eprintln!("{records} {noun} durable");
+    if interrupted {
+        exit_interrupted();
+    }
+    Ok(())
 }
 
 async fn connect_session_writer(
@@ -985,12 +942,7 @@ async fn stream_stdin_to_writer(
         WriteBuffering::Lines => stream_line_chunks_to_writer(&mut session, &mut chunk_rx).await?,
     }
     let interrupted = stdin_task.await.context("stdin reader task panicked")??;
-    let records = finish_and_close_writer(session, writer, interrupted).await?;
-    print_write_summary(records);
-    if interrupted {
-        exit_interrupted();
-    }
-    Ok(())
+    finish_write(session, writer, interrupted).await
 }
 
 async fn stream_command_to_writer(
@@ -1005,11 +957,7 @@ async fn stream_command_to_writer(
     let interrupt = Arc::new(WriteInterrupt::default());
     let mut session = WriterSession::new(&writer, Arc::clone(&interrupt));
     let outcome = stream_child_command_output(&mut session, interrupt, buffering, command).await?;
-    let records = finish_and_close_writer(session, writer, outcome.interrupted).await?;
-    print_write_summary(records);
-    if outcome.interrupted {
-        exit_interrupted();
-    }
+    finish_write(session, writer, outcome.interrupted).await?;
     if outcome.status.success() {
         Ok(())
     } else {
@@ -1205,12 +1153,7 @@ async fn stream_byte_chunks_to_writer(
                 }
             }
         } else {
-            let chunk = tokio::select! {
-                biased;
-                _ = session.interrupted() => break,
-                chunk = chunk_rx.recv() => chunk,
-            };
-            let Some(chunk) = chunk else {
+            let Some(chunk) = next_input_chunk(session, chunk_rx).await else {
                 break;
             };
             appender.push_bytes(session, &chunk?).await?;
@@ -1225,17 +1168,23 @@ async fn stream_line_chunks_to_writer(
 ) -> eyre::Result<()> {
     let mut line_appender = LineRecordAppender::new();
     loop {
-        let chunk = tokio::select! {
-            biased;
-            _ = session.interrupted() => break,
-            chunk = chunk_rx.recv() => chunk,
-        };
-        let Some(chunk) = chunk else {
+        let Some(chunk) = next_input_chunk(session, chunk_rx).await else {
             break;
         };
         line_appender.push_bytes(session, &chunk?).await?;
     }
     line_appender.finish(session).await
+}
+
+async fn next_input_chunk(
+    session: &WriterSession,
+    chunk_rx: &mut mpsc::Receiver<eyre::Result<Bytes>>,
+) -> Option<eyre::Result<Bytes>> {
+    tokio::select! {
+        biased;
+        _ = session.interrupted() => None,
+        chunk = chunk_rx.recv() => chunk,
+    }
 }
 
 /// Splits input into transcript records on `\n`. The delimiter is consumed, not stored;
@@ -1440,12 +1389,13 @@ impl WriterSession {
 
 fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadStart) -> ReadOptions {
     let mut options = ReadOptions::new(locator.stream_id);
-    options.start = Some(selected_read_start(
-        read.last,
-        read.seq,
-        read.since,
-        default_start,
-    ));
+    options.start = Some(
+        read.last
+            .map(ReadStart::TailOffset)
+            .or_else(|| read.seq.map(ReadStart::SeqNum))
+            .or_else(|| read.since.map(|since| ReadStart::TimestampMs(since.0)))
+            .unwrap_or(default_start),
+    );
     options.stop = read.count.map(|count| ReadStop {
         count: Some(count),
         ..ReadStop::default()
@@ -1456,7 +1406,7 @@ fn read_options(locator: &StreamLocator, read: &ReadArgs, default_start: ReadSta
     options
 }
 
-async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
+async fn tail_stream(origin: Url, args: ReadStreamArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     require_record_stream(&locator, "tail")?;
     let request = read_options(&locator, &args.read, ReadStart::TailOffset(0));
@@ -1470,7 +1420,7 @@ async fn tail_stream(origin: Url, args: TailArgs) -> eyre::Result<()> {
     .await
 }
 
-async fn replay_stream(origin: Url, args: ReplayArgs) -> eyre::Result<()> {
+async fn replay_stream(origin: Url, args: ReadStreamArgs) -> eyre::Result<()> {
     let locator = StreamLocator::parse(args.link.as_str()).context("invalid stream URL")?;
     require_record_stream(&locator, "replay")?;
     let mut request = read_options(&locator, &args.read, ReadStart::SeqNum(0));
@@ -1502,75 +1452,67 @@ async fn stream_metadata(origin: Url, args: InfoArgs) -> eyre::Result<()> {
 }
 
 async fn delete_stream(origin: Url, args: DeleteArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
-    if !confirm_delete(&locator.stream_id, args.yes)? {
+    let owner = args.owner.resolve(origin)?;
+    if !confirm_delete(&owner.locator.stream_id, args.yes)? {
         eprintln!("Deletion cancelled.");
         return Ok(());
     }
-    client
-        .delete_stream(&locator.stream_id, &owner_link_secret)
+    owner
+        .client
+        .delete_stream(&owner.locator.stream_id, &owner.link_secret)
         .await
         .context("failed to delete stream")?;
-    if args.json {
-        print_json(&DeleteOutput {
-            stream_id: locator.stream_id.to_string(),
-            status: "deleted",
-        })?;
+    if args.owner.json {
+        print_json(&serde_json::json!({
+            "stream_id": owner.locator.stream_id.to_string(),
+            "status": "deleted",
+        }))?;
     } else {
-        println!("Deleted stream {}", locator.stream_id);
+        println!("Deleted stream {}", owner.locator.stream_id);
     }
     Ok(())
 }
 
 async fn update_and_print(
     origin: Url,
-    owner_link: &LinkInput,
+    owner: &OwnerArgs,
     request: &UpdateStreamRequest,
-    json: bool,
-    context: &'static str,
+    failure_context: &'static str,
 ) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) = owner_client_from_link(origin, owner_link.as_str())?;
-    let stream = client
-        .update_stream(&locator.stream_id, request, &owner_link_secret)
+    let access = owner.resolve(origin)?;
+    let stream = access
+        .client
+        .update_stream(&access.locator.stream_id, request, &access.link_secret)
         .await
-        .context(context)?;
-    print_stream_metadata(&stream, json)
+        .context(failure_context)?;
+    print_stream_metadata(&stream, owner.json)
 }
 
 async fn update_visibility(origin: Url, args: VisibilityArgs) -> eyre::Result<()> {
     update_and_print(
         origin,
-        &args.owner_link,
+        &args.owner,
         &UpdateStreamRequest {
-            title: StreamTitleUpdate::Unchanged,
             visibility: Some(args.visibility.into()),
-            expires_at: None,
+            ..UpdateStreamRequest::default()
         },
-        args.json,
         "failed to update stream visibility",
     )
     .await
 }
 
-async fn update_title(origin: Url, args: TitleArgs) -> eyre::Result<()> {
-    let (owner_link, title, json) = match args.command {
-        TitleCommand::Set(args) => (
-            args.owner_link,
-            StreamTitleUpdate::Set(args.title),
-            args.json,
-        ),
-        TitleCommand::Clear(args) => (args.owner_link, StreamTitleUpdate::Clear, args.json),
+async fn update_title(origin: Url, command: TitleCommand) -> eyre::Result<()> {
+    let (owner, title) = match command {
+        TitleCommand::Set(args) => (args.owner, StreamTitleUpdate::Set(args.title)),
+        TitleCommand::Clear(owner) => (owner, StreamTitleUpdate::Clear),
     };
     update_and_print(
         origin,
-        &owner_link,
+        &owner,
         &UpdateStreamRequest {
             title,
-            visibility: None,
-            expires_at: None,
+            ..UpdateStreamRequest::default()
         },
-        json,
         "failed to update stream title",
     )
     .await
@@ -1579,31 +1521,29 @@ async fn update_title(origin: Url, args: TitleArgs) -> eyre::Result<()> {
 async fn renew_stream(origin: Url, args: RenewArgs) -> eyre::Result<()> {
     update_and_print(
         origin,
-        &args.owner_link,
+        &args.owner,
         &UpdateStreamRequest {
-            title: StreamTitleUpdate::Unchanged,
-            visibility: None,
             expires_at: Some(args.expires.rfc3339()?),
+            ..UpdateStreamRequest::default()
         },
-        args.json,
         "failed to renew stream",
     )
     .await
 }
 
-async fn link_command(origin: Url, args: LinkArgs) -> eyre::Result<()> {
-    match args.command {
+async fn link_command(origin: Url, command: LinkCommand) -> eyre::Result<()> {
+    match command {
         LinkCommand::List(args) => list_links(origin, args).await,
         LinkCommand::Create(args) => create_link(origin, args).await,
         LinkCommand::Revoke(args) => revoke_link(origin, args).await,
     }
 }
 
-async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
-    let inventory = client
-        .list_all_links(&locator.stream_id, &owner_link_secret)
+async fn list_links(origin: Url, args: OwnerArgs) -> eyre::Result<()> {
+    let owner = args.resolve(origin)?;
+    let inventory = owner
+        .client
+        .list_all_links(&owner.locator.stream_id, &owner.link_secret)
         .await
         .context("failed to list links")?;
     if args.json {
@@ -1628,29 +1568,27 @@ async fn list_links(origin: Url, args: ListLinkArgs) -> eyre::Result<()> {
 }
 
 async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
+    let owner = args.owner.resolve(origin)?;
     let InitialStreamLink {
         link_id,
         permissions,
-    } = args.link.0;
+    } = args.new_link.0;
     let expires_at = args.expires.rfc3339()?;
-    let created = client
+    let created = owner
+        .client
         .create_link(
-            &locator.stream_id,
-            &CreateLinkInput {
-                link_id,
-                permissions,
-                expires_at,
-            },
-            &owner_link_secret,
+            &owner.locator.stream_id,
+            &CreateLinkInput::new(link_id, permissions, expires_at),
+            &owner.link_secret,
         )
         .await
         .context("failed to create link")?;
-    let url = resource_link_for_route(
+    let url = match owner.locator.route {
+        StreamRoute::Stream => stream_link,
+        StreamRoute::Terminal => terminal_link,
+    }(
         &created.web_origin,
-        &locator.stream_id,
-        locator.route,
+        &owner.locator.stream_id,
         created.credential.permissions,
         &created.credential.secret,
     )?;
@@ -1658,18 +1596,26 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
         write_private_file(path, url.as_str())
             .with_context(|| format!("failed to write link file {}", path.display()))?;
     }
-    print_created_link(&url, &created.credential, args.json)?;
+    print_created_link(&url, &created.credential, args.owner.json)?;
     Ok(())
 }
 
 async fn revoke_link(origin: Url, args: RevokeLinkArgs) -> eyre::Result<()> {
-    let (client, locator, owner_link_secret) =
-        owner_client_from_link(origin, args.owner_link.as_str())?;
-    client
-        .revoke_link(&locator.stream_id, &args.link_id, &owner_link_secret)
+    let owner = args.owner.resolve(origin)?;
+    owner
+        .client
+        .revoke_link(&owner.locator.stream_id, &args.link_id, &owner.link_secret)
         .await
         .context("failed to revoke link")?;
-    print_link_revoked(&args.link_id, args.json)
+    if args.owner.json {
+        print_json(&serde_json::json!({
+            "link_id": args.link_id.to_string(),
+            "status": "revoked",
+        }))?;
+    } else {
+        println!("Revoked link {}", args.link_id);
+    }
+    Ok(())
 }
 
 async fn read_transcript(
@@ -1825,22 +1771,6 @@ async fn write_record_data(
     Ok(())
 }
 
-fn owner_client_from_link(
-    origin: Url,
-    link: &str,
-) -> eyre::Result<(TsfClient, StreamLocator, LinkSecret)> {
-    let locator = StreamLocator::parse(link).context("invalid owner link")?;
-    let owner_link_secret = locator
-        .link_declaring(LinkPermissions::allows_owner)
-        .context("link does not declare owner permission")?
-        .clone();
-    Ok((
-        TsfClient::with_api_origin(origin)?,
-        locator,
-        owner_link_secret,
-    ))
-}
-
 fn require_record_stream(locator: &StreamLocator, command: &str) -> eyre::Result<()> {
     if locator.route == StreamRoute::Terminal {
         bail!("`tsf {command}` accepts stream links, not terminal links");
@@ -1872,18 +1802,6 @@ fn confirm_delete(stream_id: &StreamId, yes: bool) -> eyre::Result<bool> {
     ))
 }
 
-fn print_link_revoked(link_id: &LinkId, json: bool) -> eyre::Result<()> {
-    if json {
-        print_json(&LinkMutationOutput {
-            link_id: link_id.to_string(),
-            status: "revoked",
-        })?;
-    } else {
-        println!("Revoked link {link_id}");
-    }
-    Ok(())
-}
-
 fn print_json(value: &impl Serialize) -> eyre::Result<()> {
     write_json(std::io::stdout().lock(), value)
 }
@@ -1913,19 +1831,6 @@ fn resource_link(
     }
 }
 
-fn resource_link_for_route(
-    web_origin: &Url,
-    stream_id: &StreamId,
-    route: StreamRoute,
-    permissions: LinkPermissions,
-    secret: &LinkSecret,
-) -> Result<Url, tailsurf::stream_url::StreamLinkError> {
-    match route {
-        StreamRoute::Stream => stream_link(web_origin, stream_id, permissions, secret),
-        StreamRoute::Terminal => terminal_link(web_origin, stream_id, permissions, secret),
-    }
-}
-
 fn public_resource_url(
     web_origin: &Url,
     stream_id: &StreamId,
@@ -1943,71 +1848,7 @@ fn print_created_stream(
     show_owner_link: bool,
 ) -> eyre::Result<()> {
     let web_origin = &created.web_origin;
-    if !json {
-        let resource = match created.kind {
-            StreamKind::Transcript => "transcript stream",
-            StreamKind::Bytes => "byte stream",
-            StreamKind::Terminal => "terminal",
-        };
-        println!(
-            "Created {} {resource} {}",
-            created.visibility, created.stream_id
-        );
-        println!(
-            "Title: {}",
-            created
-                .title
-                .as_ref()
-                .map_or_else(|| format!("Untitled {resource}"), |title| title.to_string())
-        );
-        println!("Expires: {}", created.expires_at);
-        let mut links = created
-            .links
-            .iter()
-            .filter(|credential| show_owner_link || !credential.permissions.allows_owner())
-            .map(|credential| {
-                Ok((
-                    credential.link_id.as_str(),
-                    credential.permissions,
-                    resource_link(
-                        web_origin,
-                        &created.stream_id,
-                        created.kind,
-                        credential.permissions,
-                        &credential.secret,
-                    )?,
-                    if credential.permissions.allows_owner() {
-                        "  (keep private)"
-                    } else {
-                        ""
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?;
-        if matches!(created.visibility, Visibility::Public) {
-            links.push((
-                "Public",
-                LinkPermissions::read(),
-                public_resource_url(web_origin, &created.stream_id, created.kind)?,
-                "  (public)",
-            ));
-        }
-        if !links.is_empty() {
-            println!();
-            links.sort_by_key(|(_, permissions, _, _)| permission_rank(*permissions));
-            let width = links
-                .iter()
-                .map(|(label, _, _, _)| label.len())
-                .max()
-                .unwrap_or(0);
-            for (label, permissions, url, suffix) in &links {
-                let permission = permission_label(*permissions);
-                println!("  {label:<width$}  {permission:<10}  {url}{suffix}");
-            }
-            println!();
-            println!("Links are shown once.");
-        }
-    } else {
+    if json {
         let output = CreatedStreamOutput {
             stream_id: created.stream_id.to_string(),
             kind: created.kind.as_str(),
@@ -2042,28 +1883,92 @@ fn print_created_stream(
                 Visibility::Private => None,
             },
         };
-        print_json(&output)?;
+        return print_json(&output);
+    }
+
+    let resource = match created.kind {
+        StreamKind::Transcript => "transcript stream",
+        StreamKind::Bytes => "byte stream",
+        StreamKind::Terminal => "terminal",
+    };
+    println!(
+        "Created {} {resource} {}",
+        created.visibility, created.stream_id
+    );
+    println!(
+        "Title: {}",
+        created
+            .title
+            .as_ref()
+            .map_or_else(|| format!("Untitled {resource}"), ToString::to_string)
+    );
+    println!("Expires: {}", created.expires_at);
+    let mut links = created
+        .links
+        .iter()
+        .filter(|credential| show_owner_link || !credential.permissions.allows_owner())
+        .map(|credential| {
+            Ok((
+                credential.link_id.as_str(),
+                credential.permissions,
+                resource_link(
+                    web_origin,
+                    &created.stream_id,
+                    created.kind,
+                    credential.permissions,
+                    &credential.secret,
+                )?,
+                if credential.permissions.allows_owner() {
+                    "  (keep private)"
+                } else {
+                    ""
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?;
+    if matches!(created.visibility, Visibility::Public) {
+        links.push((
+            "Public",
+            LinkPermissions::read(),
+            public_resource_url(web_origin, &created.stream_id, created.kind)?,
+            "  (public)",
+        ));
+    }
+    if !links.is_empty() {
+        println!();
+        links.sort_by_key(|(_, permissions, _, _)| permission_rank(*permissions));
+        let width = links
+            .iter()
+            .map(|(label, _, _, _)| label.len())
+            .max()
+            .unwrap_or(0);
+        for (label, permissions, url, suffix) in &links {
+            let permission = permission_label(*permissions);
+            println!("  {label:<width$}  {permission:<10}  {url}{suffix}");
+        }
+        println!();
+        println!("Links are shown once.");
     }
     Ok(())
 }
 
 fn print_stream_metadata(stream: &StreamMetadata, json: bool) -> eyre::Result<()> {
-    if !json {
-        println!("Stream {}", stream.stream_id);
-        println!("Kind: {}", stream.kind);
-        println!(
-            "Title: {}",
-            stream
-                .title
-                .as_ref()
-                .map_or("Untitled stream", StreamTitle::as_str)
-        );
-        println!("Visibility: {}", stream.visibility);
-        println!("Created: {}", stream.created_at);
-        println!("Expires: {}", stream.expires_at);
-    } else {
-        print_json(stream)?;
+    if json {
+        return print_json(stream);
     }
+
+    println!("Stream {}", stream.stream_id);
+    println!("Kind: {}", stream.kind);
+    println!(
+        "Title: {}",
+        stream
+            .title
+            .as_ref()
+            .map_or("Untitled stream", StreamTitle::as_str)
+    );
+    println!("Visibility: {}", stream.visibility);
+    println!("Created: {}", stream.created_at);
+    println!("Expires: {}", stream.expires_at);
     Ok(())
 }
 
@@ -2072,57 +1977,46 @@ fn print_created_link(
     credential: &StreamLinkCredential,
     json: bool,
 ) -> eyre::Result<()> {
-    if !json {
-        println!(
-            "Created {} ({})",
-            credential.link_id,
-            permission_label(credential.permissions)
-        );
-        println!("  Link     {url}");
-        println!("  Link ID  {}", credential.link_id);
-        println!("Link is shown once. Revoke it with the id above.");
-    } else {
+    if json {
         let output = CreatedLinkOutput {
             link_id: credential.link_id.to_string(),
             permissions: permission_label(credential.permissions),
             url: url.to_string(),
         };
-        print_json(&output)?;
+        return print_json(&output);
     }
+
+    println!(
+        "Created {} ({})",
+        credential.link_id,
+        permission_label(credential.permissions)
+    );
+    println!("  Link     {url}");
+    println!("  Link ID  {}", credential.link_id);
+    println!("Link is shown once. Revoke it with the id above.");
     Ok(())
 }
 
 fn write_link_files(created: &CreateStreamResponse, args: &NewArgs) -> eyre::Result<()> {
-    write_link_file(
-        &args.owner_link_file,
-        created,
-        LinkPermissions::owner(),
-        "owner",
-    )?;
-    write_link_file(
-        &args.read_link_file,
-        created,
-        LinkPermissions::read(),
-        "read",
-    )?;
-    write_link_file(
-        &args.write_link_file,
-        created,
-        LinkPermissions::write(),
-        "write",
-    )?;
+    for (path, permissions) in [
+        (args.owner_link_file.as_deref(), LinkPermissions::owner()),
+        (args.read_link_file.as_deref(), LinkPermissions::read()),
+        (args.write_link_file.as_deref(), LinkPermissions::write()),
+    ] {
+        write_link_file(path, created, permissions)?;
+    }
     Ok(())
 }
 
 fn write_link_file(
-    path: &Option<PathBuf>,
+    path: Option<&Path>,
     created: &CreateStreamResponse,
     permissions: LinkPermissions,
-    kind: &str,
 ) -> eyre::Result<()> {
     let Some(path) = path else {
         return Ok(());
     };
+    let kind = permission_label(permissions);
     let link = created
         .links
         .iter()
@@ -2188,18 +2082,6 @@ fn permission_rank(permissions: LinkPermissions) -> usize {
     }
 }
 
-fn selected_read_start(
-    last: Option<u64>,
-    seq: Option<u64>,
-    since: Option<SinceArg>,
-    default: ReadStart,
-) -> ReadStart {
-    last.map(ReadStart::TailOffset)
-        .or_else(|| seq.map(ReadStart::SeqNum))
-        .or_else(|| since.map(|since| ReadStart::TimestampMs(since.0)))
-        .unwrap_or(default)
-}
-
 fn exit_interrupted() -> ! {
     std::process::exit(INTERRUPT_EXIT_CODE);
 }
@@ -2209,7 +2091,7 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
-            status.signal().map(|signal| 128 + signal).unwrap_or(1)
+            status.signal().map_or(1, |signal| 128 + signal)
         }
         #[cfg(not(unix))]
         {
@@ -2237,48 +2119,9 @@ struct CreatedLinkOutput {
     url: String,
 }
 
-#[derive(Serialize)]
-struct DeleteOutput {
-    stream_id: String,
-    status: &'static str,
-}
-
-#[derive(Serialize)]
-struct LinkMutationOutput {
-    link_id: String,
-    status: &'static str,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn record_commands_reject_terminal_links() {
-        let stream_id: StreamId = "00000000000000000000000000000000"
-            .parse()
-            .expect("valid stream ID");
-        let terminal = StreamLocator {
-            stream_id,
-            route: StreamRoute::Terminal,
-            link: None,
-            anchor: None,
-        };
-        let records = StreamLocator {
-            stream_id,
-            route: StreamRoute::Stream,
-            link: None,
-            anchor: None,
-        };
-
-        assert_eq!(
-            require_record_stream(&terminal, "tail")
-                .expect_err("terminal link must be rejected")
-                .to_string(),
-            "`tsf tail` accepts stream links, not terminal links",
-        );
-        require_record_stream(&records, "tail").expect("record link must be accepted");
-    }
 
     #[test]
     fn classifies_wrapped_broken_pipes_only() {

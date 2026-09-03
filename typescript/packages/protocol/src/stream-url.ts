@@ -3,14 +3,16 @@ import { parseStreamId } from "./ids.js";
 import type { LinkPermissions } from "./permissions.js";
 import { parseLinkPermissions } from "./permissions.js";
 import { ProtocolError } from "./errors.js";
-import { canonicalBase64url, MAX_SAFE_INTEGER_U64, U64_PATTERN } from "./primitives.js";
+import {
+  canonicalBase64url,
+  MAX_SAFE_INTEGER_U64,
+  tryParseDecimalU64,
+} from "./primitives.js";
 
 export const LINK_SECRET_BYTES = 24;
 export const LINK_SECRET_ENCODED_LENGTH = Math.ceil(
   LINK_SECRET_BYTES * 8 / 6,
 );
-
-const LINK_SECRET_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 
 export interface StreamLinkParam {
   readonly declaredPermissions: LinkPermissions;
@@ -115,13 +117,23 @@ export function parseStreamUrl(input: string): StreamLocator {
 }
 
 function parseStreamAnchor(raw: string): StreamAnchor {
-  if (!U64_PATTERN.test(raw)) {
+  const seqNum = tryParseDecimalU64(raw);
+  if (seqNum === undefined) {
     throw new ProtocolError(
       "invalid_stream_anchor",
       "at must be a decimal sequence number",
     );
   }
-  const seqNum = BigInt(raw);
+  return streamAnchor(seqNum);
+}
+
+function streamAnchor(seqNum: bigint): StreamAnchor {
+  if (seqNum < 0n) {
+    throw new ProtocolError(
+      "invalid_stream_anchor",
+      "at must be a decimal sequence number",
+    );
+  }
   if (seqNum > MAX_SAFE_INTEGER_U64) {
     throw new ProtocolError(
       "invalid_stream_anchor",
@@ -154,18 +166,14 @@ export function buildPublicStreamUrl(
   baseUrl: string | URL,
   streamId: StreamId,
 ): URL {
-  const url = normalizedStreamUrl(baseUrl, "s", streamId);
-  url.hash = "";
-  return url;
+  return normalizedStreamUrl(baseUrl, "s", streamId);
 }
 
 export function buildPublicTerminalUrl(
   baseUrl: string | URL,
   streamId: StreamId,
 ): URL {
-  const url = normalizedStreamUrl(baseUrl, "t", streamId);
-  url.hash = "";
-  return url;
+  return normalizedStreamUrl(baseUrl, "t", streamId);
 }
 
 function buildLink(
@@ -177,17 +185,11 @@ function buildLink(
   anchor?: StreamAnchor,
 ): URL {
   const url = normalizedStreamUrl(baseUrl, prefix, streamId);
-  if (prefix === "t" && anchor !== undefined) {
-    throw new ProtocolError(
-      "terminal_anchor_not_allowed",
-      "terminal URLs do not accept record anchors",
-    );
-  }
   const fragment = new URLSearchParams([
     [parseLinkPermissions(permissions), parseLinkSecret(secret)],
   ]);
   if (anchor !== undefined) {
-    fragment.set("at", parseStreamAnchor(anchor.seqNum.toString()).seqNum.toString());
+    fragment.set("at", streamAnchor(anchor.seqNum).seqNum.toString());
   }
   url.hash = fragment.toString();
   return url;
@@ -209,11 +211,7 @@ function normalizedStreamUrl(
 }
 
 export function parseLinkSecret(input: string): string {
-  if (
-    input.length !== LINK_SECRET_ENCODED_LENGTH ||
-    !LINK_SECRET_PATTERN.test(input) ||
-    !canonicalBase64url(input, LINK_SECRET_BYTES)
-  ) {
+  if (!canonicalBase64url(input, LINK_SECRET_BYTES)) {
     throw new ProtocolError(
       "invalid_link_secret",
       `link secret must be ${LINK_SECRET_ENCODED_LENGTH} base64url characters`,

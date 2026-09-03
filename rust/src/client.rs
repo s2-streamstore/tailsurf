@@ -151,17 +151,9 @@ fn reconnect_delay(retry: usize) -> Duration {
         .checked_mul(multiplier)
         .unwrap_or(MAX_RETRY_BACKOFF)
         .min(MAX_RETRY_BACKOFF);
-    jittered_backoff(backoff)
-}
-
-fn jittered_backoff(backoff: Duration) -> Duration {
-    if backoff.is_zero() {
-        Duration::ZERO
-    } else {
-        backoff
-            .mul_f64(rand::rng().random_range(0.5_f64..=1.5_f64))
-            .min(MAX_RETRY_BACKOFF)
-    }
+    backoff
+        .mul_f64(rand::rng().random_range(0.5_f64..=1.5_f64))
+        .min(MAX_RETRY_BACKOFF)
 }
 
 /// Cloneable TSF REST, SSE, and v1 WebSocket client.
@@ -262,11 +254,10 @@ impl TsfClient {
         stream_id: &StreamId,
         link_secret: Option<&LinkSecret>,
     ) -> Result<StreamMetadata, TsfClientError> {
-        self.get_json_with_bearer(
-            format_args!("/streams/{stream_id}"),
-            "get stream",
-            link_secret,
-        )
+        let url = self.rest_url(format_args!("/streams/{stream_id}"));
+        self.retry_transient(|| {
+            self.send_json_with_bearer(self.http.get(url.clone()), "get stream", link_secret)
+        })
         .await
     }
 
@@ -410,7 +401,7 @@ impl TsfClient {
     ) -> Result<ListLinksResponse, TsfClientError> {
         let mut links = Vec::new();
         let mut cursor: Option<String> = None;
-        let mut authorizing_link_id = None;
+        let mut expected_authorizing_link_id = None;
         let mut seen_cursors = HashSet::new();
         let mut seen_link_ids = HashSet::new();
         loop {
@@ -424,7 +415,7 @@ impl TsfClient {
                     owner_link_secret,
                 )
                 .await?;
-            if authorizing_link_id
+            if expected_authorizing_link_id
                 .as_ref()
                 .is_some_and(|expected| expected != &page.authorizing_link_id)
             {
@@ -432,7 +423,6 @@ impl TsfClient {
                     "authorizing link changed across pages",
                 ));
             }
-            authorizing_link_id.get_or_insert(page.authorizing_link_id);
             // validate_link_page rejects duplicates within a page. Keep that invariant across
             // pages.
             for link in &page.links {
@@ -443,22 +433,21 @@ impl TsfClient {
                 }
             }
             links.extend(page.links);
-            match page.next_cursor {
-                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
-                Some(_) => {
-                    return Err(TsfClientError::InvalidLinkPage(
-                        "link pagination cursor repeated",
-                    ));
-                }
-                None => break,
+            let Some(next) = page.next_cursor else {
+                return Ok(ListLinksResponse {
+                    authorizing_link_id: page.authorizing_link_id,
+                    links,
+                    next_cursor: None,
+                });
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(TsfClientError::InvalidLinkPage(
+                    "link pagination cursor repeated",
+                ));
             }
+            cursor = Some(next);
+            expected_authorizing_link_id = Some(page.authorizing_link_id);
         }
-        Ok(ListLinksResponse {
-            authorizing_link_id: authorizing_link_id
-                .expect("link inventory always contains an authorizing link ID"),
-            links,
-            next_cursor: None,
-        })
     }
 
     /// Revokes a stream link by its non-secret identifier.
@@ -726,6 +715,7 @@ impl TsfClient {
                     "initial read completed without stream_metadata",
                 ))?;
         validate_read_stream_metadata(&options.stream_id, None, &connection.stream_metadata)?;
+        let reconnects = BoundedReadReconnects::new(self.config.bounded_operation_attempts);
         Ok(TsfSseReadSession {
             client: self.clone(),
             options,
@@ -734,7 +724,7 @@ impl TsfClient {
             parser: connection.parser,
             stream_metadata: connection.stream_metadata,
             last_caught_up: None,
-            reconnect_attempts: 0,
+            reconnects,
             last_event: connection.resume_event,
             finished: false,
         })
@@ -775,7 +765,7 @@ impl TsfClient {
         sse_request: &SseReadRequest,
         last_event: Option<&SseResumeEvent>,
     ) -> Result<Option<SseConnection>, TsfClientError> {
-        let mut request = self.apply_rest_auth(
+        let mut request = Self::apply_rest_auth(
             self.http
                 .get(sse_request.url.clone())
                 .header("Accept", "text/event-stream"),
@@ -870,7 +860,6 @@ impl TsfClient {
     }
 
     fn apply_rest_auth(
-        &self,
         request: reqwest::RequestBuilder,
         link_secret: Option<&LinkSecret>,
     ) -> reqwest::RequestBuilder {
@@ -892,30 +881,13 @@ impl TsfClient {
         Ok(url)
     }
 
-    async fn get_json_with_bearer<T: DeserializeOwned>(
-        &self,
-        path: impl Display,
-        operation: &'static str,
-        link_secret: Option<&LinkSecret>,
-    ) -> Result<T, TsfClientError> {
-        let url = self.rest_url(path);
-        self.retry_transient(|| {
-            self.send_json_with_bearer(self.http.get(url.clone()), operation, link_secret)
-        })
-        .await
-    }
-
     async fn send_json_with_bearer<T: DeserializeOwned>(
         &self,
         request: reqwest::RequestBuilder,
         operation: &'static str,
         link_secret: Option<&LinkSecret>,
     ) -> Result<T, TsfClientError> {
-        let response = self
-            .apply_rest_auth(request, link_secret)
-            .timeout(self.config.http_request_timeout)
-            .send()
-            .await?;
+        let response = self.send_request(request, link_secret).await?;
         json_response(response, operation).await
     }
 
@@ -925,16 +897,24 @@ impl TsfClient {
         operation: &'static str,
         link_secret: Option<&LinkSecret>,
     ) -> Result<(), TsfClientError> {
-        let response = self
-            .apply_rest_auth(request, link_secret)
-            .timeout(self.config.http_request_timeout)
-            .send()
-            .await?;
+        let response = self.send_request(request, link_secret).await?;
         let status = response.status();
         if status == StatusCode::NO_CONTENT {
             return Ok(());
         }
         Err(http_status_error(response, operation).await)
+    }
+
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        link_secret: Option<&LinkSecret>,
+    ) -> Result<reqwest::Response, TsfClientError> {
+        Self::apply_rest_auth(request, link_secret)
+            .timeout(self.config.http_request_timeout)
+            .send()
+            .await
+            .map_err(Into::into)
     }
 
     async fn retry_transient<T, Fut>(&self, run: impl FnMut() -> Fut) -> Result<T, TsfClientError>
@@ -958,10 +938,10 @@ impl TsfClient {
             match run().await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < attempts && should_retry(&error) => {
-                    let delay = error
-                        .retry_after()
-                        .map(|delay| delay.min(MAX_RETRY_BACKOFF))
-                        .unwrap_or_else(|| reconnect_delay(attempt - 1));
+                    let delay = error.retry_after().map_or_else(
+                        || reconnect_delay(attempt - 1),
+                        |delay| delay.min(MAX_RETRY_BACKOFF),
+                    );
                     if !delay.is_zero() {
                         sleep(delay).await;
                     }
@@ -1606,7 +1586,7 @@ async fn run_writer(
         if let Err(error) =
             send_pending(&mut session, &mut pending, &mut in_flight, &mut frame).await
         {
-            match recover_pending_appends(
+            if let Err(error) = recover_pending_appends(
                 &mut session,
                 &connection,
                 &mut pending,
@@ -1616,49 +1596,43 @@ async fn run_writer(
             )
             .await
             {
-                // Resend the unacknowledged queue on the fresh session at the loop top.
-                Ok(()) => continue,
-                Err(error) => {
-                    finish_writer_error(&mut pending, &mut close_tx, &shared.terminal_error, error);
-                    return;
-                }
+                finish_writer_error(&mut pending, &mut close_tx, &shared.terminal_error, error);
+                return;
             }
+            // Resend the unacknowledged queue on the fresh session at the loop top.
+            continue;
         }
 
-        if close_tx.is_some() && pending.is_empty() {
-            if let Some(close_tx) = close_tx.take() {
-                let _ = close_tx.send(Ok(()));
-            }
+        if pending.is_empty()
+            && let Some(close_tx) = close_tx.take()
+        {
+            let _ = close_tx.send(Ok(()));
             return;
         }
 
         tokio::select! {
             cmd = cmd_rx.recv(), if close_tx.is_none() => {
-                match cmd {
-                    Some(command) => {
-                        if let Err(error) = drain_queued_commands(
-                            &mut pending,
-                            &mut close_tx,
-                            &mut cursor,
-                            &mut cmd_rx,
-                            command,
-                        ) {
-                            finish_writer_error(
-                                &mut pending,
-                                &mut close_tx,
-                                &shared.terminal_error,
-                                error,
-                            );
-                            return;
-                        }
-                    }
-                    None => {
-                        fail_pending(
-                            &mut pending,
-                            &Arc::new(TsfClientError::AppendWriterDropped),
-                        );
-                        return;
-                    }
+                let Some(command) = cmd else {
+                    fail_pending(
+                        &mut pending,
+                        &Arc::new(TsfClientError::AppendWriterDropped),
+                    );
+                    return;
+                };
+                if let Err(error) = drain_queued_commands(
+                    &mut pending,
+                    &mut close_tx,
+                    &mut cursor,
+                    &mut cmd_rx,
+                    command,
+                ) {
+                    finish_writer_error(
+                        &mut pending,
+                        &mut close_tx,
+                        &shared.terminal_error,
+                        error,
+                    );
+                    return;
                 }
             }
 
@@ -2021,7 +1995,7 @@ pub struct TsfSseReadSession {
     parser: SseParser,
     stream_metadata: StreamMetadata,
     last_caught_up: Option<CaughtUpPosition>,
-    reconnect_attempts: usize,
+    reconnects: BoundedReadReconnects,
     last_event: Option<SseResumeEvent>,
     finished: bool,
 }
@@ -2067,17 +2041,10 @@ impl TsfSseReadSession {
                 Err(error) => return Err(error),
             };
             let Some(event) = event else {
-                let attempts = self.client.config.bounded_operation_attempts;
-                if self.reconnect_attempts + 1 >= attempts {
-                    return Err(TsfClientError::ReadReconnectLimitExceeded {
-                        max_connection_attempts: attempts,
-                    });
-                }
-                let delay = reconnect_delay(self.reconnect_attempts);
+                let delay = self.reconnects.next_delay()?;
                 if !delay.is_zero() {
                     sleep(delay).await;
                 }
-                self.reconnect_attempts += 1;
                 let Some(connection) = self
                     .client
                     .open_sse_connection(&self.request, self.last_event.as_ref())
@@ -2110,7 +2077,7 @@ impl TsfSseReadSession {
                     let (cursor, previous) = self.resume_cursors(&event)?;
                     validate_sse_read_batch_cursor(&batch, cursor, previous, &self.options)?;
                     self.last_event = event.id.map(|id| (id, cursor));
-                    self.reconnect_attempts = 0;
+                    self.reconnects.reset();
                     self.finished = advance_read_options_for_batch(&mut self.options, &batch);
                     return Ok(Some(batch));
                 }
@@ -2126,7 +2093,7 @@ impl TsfSseReadSession {
                     self.last_event = event.id.map(|id| (id, cursor));
                     self.options.start = Some(ReadStart::SeqNum(caught_up.next_seq_num));
                     self.last_caught_up = Some(caught_up);
-                    self.reconnect_attempts = 0;
+                    self.reconnects.reset();
                 }
                 "error" => return Err(TsfClientError::SseTerminal(event.data)),
                 "stream_metadata" => {
@@ -2158,8 +2125,8 @@ pub struct TsfReadSession {
     stream_metadata: StreamMetadata,
     finished: bool,
     last_caught_up: Option<CaughtUpPosition>,
-    no_progress_reconnects: usize,
-    reconnect_needed: bool,
+    reconnects: BoundedReadReconnects,
+    reconnect_delay: Option<Duration>,
 }
 
 impl TsfReadSession {
@@ -2170,6 +2137,7 @@ impl TsfReadSession {
         socket: ReadSocket,
         stream_metadata: StreamMetadata,
     ) -> Self {
+        let reconnects = BoundedReadReconnects::new(client.config.bounded_operation_attempts);
         Self {
             client,
             options,
@@ -2178,8 +2146,8 @@ impl TsfReadSession {
             stream_metadata,
             finished: false,
             last_caught_up: None,
-            no_progress_reconnects: 0,
-            reconnect_needed: false,
+            reconnects,
+            reconnect_delay: None,
         }
     }
 
@@ -2204,7 +2172,7 @@ impl TsfReadSession {
                 self.finished = true;
                 return Ok(None);
             }
-            if self.reconnect_needed {
+            if self.reconnect_delay.is_some() {
                 self.reconnect().await?;
             }
 
@@ -2241,8 +2209,9 @@ impl TsfReadSession {
     }
 
     async fn reconnect(&mut self) -> Result<(), TsfClientError> {
-        debug_assert!(self.reconnect_needed);
-        let delay = reconnect_delay(self.no_progress_reconnects.saturating_sub(1));
+        let delay = self
+            .reconnect_delay
+            .expect("reconnect is called only when one is pending");
         if !delay.is_zero() {
             sleep(delay).await;
         }
@@ -2260,46 +2229,61 @@ impl TsfReadSession {
         )?;
         self.socket = socket;
         self.stream_metadata = stream_metadata;
-        self.no_progress_reconnects = 0;
-        self.reconnect_needed = false;
+        self.reconnects.reset();
+        self.reconnect_delay = None;
         Ok(())
     }
 
     fn require_reconnect(&mut self) -> Result<(), TsfClientError> {
-        if self.reconnect_needed {
-            return Ok(());
+        if self.reconnect_delay.is_none() {
+            self.reconnect_delay = Some(self.reconnects.next_delay()?);
         }
-        let attempts = self.client.config.bounded_operation_attempts;
-        let max_reconnects = attempts.saturating_sub(1);
-        if self.no_progress_reconnects >= max_reconnects {
-            return Err(TsfClientError::ReadReconnectLimitExceeded {
-                max_connection_attempts: attempts,
-            });
-        }
-        self.no_progress_reconnects += 1;
-        self.reconnect_needed = true;
         Ok(())
     }
 
     fn batch_delivered(&mut self, batch: &ReadBatch) {
-        self.no_progress_reconnects = 0;
-        self.reconnect_needed = false;
+        self.reconnects.reset();
+        self.reconnect_delay = None;
         self.finished = advance_read_options_for_batch(&mut self.options, batch);
     }
 }
 
-fn advance_read_options_for_batch(options: &mut ReadOptions, batch: &ReadBatch) -> bool {
-    let last = batch.last();
-    advance_read_options(options, last.seq_num, batch.record_count())
+struct BoundedReadReconnects {
+    retries: usize,
+    max_connection_attempts: usize,
 }
 
-fn advance_read_options(options: &mut ReadOptions, last_seq_num: u64, record_count: usize) -> bool {
-    let Some(next_seq_num) = last_seq_num.checked_add(1) else {
+impl BoundedReadReconnects {
+    fn new(max_connection_attempts: usize) -> Self {
+        Self {
+            retries: 0,
+            max_connection_attempts,
+        }
+    }
+
+    fn next_delay(&mut self) -> Result<Duration, TsfClientError> {
+        if self.retries >= self.max_connection_attempts.saturating_sub(1) {
+            return Err(TsfClientError::ReadReconnectLimitExceeded {
+                max_connection_attempts: self.max_connection_attempts,
+            });
+        }
+        let delay = reconnect_delay(self.retries);
+        self.retries += 1;
+        Ok(delay)
+    }
+
+    fn reset(&mut self) {
+        self.retries = 0;
+    }
+}
+
+fn advance_read_options_for_batch(options: &mut ReadOptions, batch: &ReadBatch) -> bool {
+    let Some(next_seq_num) = batch.last().seq_num.checked_add(1) else {
         return true;
     };
     options.start = Some(ReadStart::SeqNum(next_seq_num));
     if let Some(remaining) = options.stop.as_mut().and_then(|stop| stop.count.as_mut()) {
-        *remaining = remaining.saturating_sub(record_count as u64);
+        *remaining = remaining.saturating_sub(batch.record_count() as u64);
     }
     options.stop.is_some_and(|stop| stop.count == Some(0))
 }
@@ -3035,9 +3019,8 @@ async fn next_server_frame(
                 ));
             }
             Message::Close(None) => return Ok(None),
-            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Text(_) => return Err(TsfClientError::UnexpectedTextMessage),
-            Message::Frame(_) => {}
         }
     }
 }
@@ -3450,9 +3433,8 @@ impl TsfClientError {
 
     fn is_resumable_read_interruption(&self) -> bool {
         match self {
-            Self::Timeout { .. } => true,
+            Self::Timeout { .. } | Self::WebSocketClosed => true,
             Self::WebSocket(error) => is_retryable_websocket_error(error),
-            Self::WebSocketClosed => true,
             Self::WebSocketClosedWithReason { code, .. } => is_retryable_close_code(*code),
             _ => false,
         }
@@ -3485,8 +3467,8 @@ fn is_retryable_websocket_error(error: &WebSocketError) -> bool {
         WebSocketError::ConnectionClosed
         | WebSocketError::Io(_)
         | WebSocketError::Tls(_)
-        | WebSocketError::WriteBufferFull(_) => true,
-        WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        | WebSocketError::WriteBufferFull(_)
+        | WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
         WebSocketError::Http(response) => is_retryable_http_status(response.status().as_u16()),
         _ => false,
     }

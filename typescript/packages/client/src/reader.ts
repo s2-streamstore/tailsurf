@@ -1,13 +1,8 @@
 import {
   DEFAULT_READ_TAIL_OFFSET,
-  MAX_SAFE_INTEGER_U64,
   MAX_U64,
-  MAX_PLAYBACK_RATE,
-  MAX_READ_WAIT_SECONDS,
-  MIN_PLAYBACK_RATE,
+  encodeReadQuery,
   parseStreamId,
-  type ClientFrame,
-  type ReadRequest,
   type ReadStart as ProtocolReadStart,
   type ReadStop as ProtocolReadStop,
   type ReadRecord,
@@ -32,23 +27,21 @@ import {
   reconnectSocket,
   requireLinkSecret,
   type SocketPolicy,
-  u64,
   unexpectedFrame,
   WEBSOCKET_READ_IDLE_TIMEOUT_MS,
-  withTimeout,
 } from "./socket.js";
-import { INITIAL_RETRY_BACKOFF_MS } from "./retry.js";
+import { INITIAL_RETRY_BACKOFF_MS, withTimeout } from "./retry.js";
 
 export interface ReadOptions {
   readonly streamId: StreamId;
   /** Cancels connection establishment. Close the returned session to stop reading. */
-  readonly signal?: AbortSignal;
-  readonly start?: ReadStart;
-  readonly stop?: ReadStop;
-  readonly rate?: number;
-  readonly linkSecret?: string;
-  readonly onCaughtUp?: (caughtUp: CaughtUpPosition) => void;
-  readonly onStreamMetadata?: (stream: StreamMetadata) => void;
+  readonly signal?: AbortSignal | undefined;
+  readonly start?: ReadStart | undefined;
+  readonly stop?: ReadStop | undefined;
+  readonly rate?: number | undefined;
+  readonly linkSecret?: string | undefined;
+  readonly onCaughtUp?: ((caughtUp: CaughtUpPosition) => void) | undefined;
+  readonly onStreamMetadata?: ((stream: StreamMetadata) => void) | undefined;
 }
 
 export interface TsfReadSession extends AsyncIterable<ReadRecord> {
@@ -65,73 +58,55 @@ export interface TsfReadSession extends AsyncIterable<ReadRecord> {
 export interface NormalizedReadOptions {
   readonly streamId: StreamId;
   start: ReadStart;
-  stop?: NormalizedReadStop;
-  readonly rate?: number;
-  readonly linkSecret?: string;
-  readonly onCaughtUp?: (caughtUp: CaughtUpPosition) => void;
-  readonly onStreamMetadata?: (stream: StreamMetadata) => void;
-  streamMetadata?: StreamMetadata;
-  lastCaughtUp?: CaughtUpPosition;
+  stop?: NormalizedReadStop | undefined;
+  readonly rate?: number | undefined;
+  readonly linkSecret?: string | undefined;
+  readonly onCaughtUp?: ((caughtUp: CaughtUpPosition) => void) | undefined;
+  readonly onStreamMetadata?: ((stream: StreamMetadata) => void) | undefined;
+  streamMetadata?: StreamMetadata | undefined;
+  lastCaughtUp?: CaughtUpPosition | undefined;
 }
 
 interface NormalizedReadStop {
-  count?: bigint;
-  readonly untilTimestampMs?: bigint;
-  readonly waitSeconds?: number;
+  count?: bigint | undefined;
+  readonly untilTimestampMs?: bigint | undefined;
+  readonly waitSeconds?: number | undefined;
 }
 
 export function normalizeReadOptions(
   options: ReadOptions,
 ): NormalizedReadOptions {
-  const start = normalizeReadStart(options.start ?? {
+  const start = options.start ?? {
     type: "tailOffset",
     tailOffset: DEFAULT_READ_TAIL_OFFSET,
-  });
+  };
+  const requestedStop = options.stop;
+  const stop = requestedStop === undefined ||
+      (requestedStop.count === undefined &&
+        requestedStop.untilTimestampMs === undefined &&
+        requestedStop.waitSeconds === undefined)
+    ? undefined
+    : { ...requestedStop };
   const rate = options.rate;
-  const stop = normalizeReadStop(options.stop);
-  if (
-    rate !== undefined &&
-    (!Number.isFinite(rate) || rate < MIN_PLAYBACK_RATE || rate > MAX_PLAYBACK_RATE)
-  ) {
+  try {
+    encodeReadQuery({ start, stop, rate });
+  } catch (cause) {
     throw new TsfClientError(
       "invalid_read_parameter",
-      `rate must be between ${MIN_PLAYBACK_RATE} and ${MAX_PLAYBACK_RATE}`,
-    );
-  }
-  if (
-    rate !== undefined &&
-    stop?.count === undefined &&
-    stop?.untilTimestampMs === undefined &&
-    stop?.waitSeconds !== 0
-  ) {
-    throw new TsfClientError(
-      "invalid_read_parameter",
-      "rate requires stop.count, stop.untilTimestampMs, or stop.waitSeconds=0",
+      cause instanceof Error ? cause.message : "invalid read parameters",
+      { cause },
     );
   }
   return {
     streamId: parseStreamId(options.streamId),
     start,
-    ...(stop === undefined ? {} : { stop }),
-    ...(rate === undefined ? {} : { rate }),
-    ...(options.linkSecret === undefined
-      ? {}
-      : { linkSecret: requireLinkSecret(options.linkSecret) }),
-    ...(options.onCaughtUp === undefined ? {} : { onCaughtUp: options.onCaughtUp }),
-    ...(options.onStreamMetadata === undefined
-      ? {}
-      : { onStreamMetadata: options.onStreamMetadata }),
-  };
-}
-
-export function openReadFrame(
-  linkSecret: string | undefined,
-): Extract<ClientFrame, { readonly type: "openRead" }> {
-  return {
-    type: "openRead",
-    ...(linkSecret === undefined
-      ? {}
-      : { linkSecret }),
+    stop,
+    rate,
+    linkSecret: options.linkSecret === undefined
+      ? undefined
+      : requireLinkSecret(options.linkSecret),
+    onCaughtUp: options.onCaughtUp,
+    onStreamMetadata: options.onStreamMetadata,
   };
 }
 
@@ -214,8 +189,33 @@ export abstract class BaseTsfReadSession implements TsfReadSession {
       this.pendingRecords = [];
       this.pendingRecordIndex = 0;
     }
-    this.finished = advanceReadOptions(this.options, record.seqNum);
+    if (record.seqNum === MAX_U64) {
+      this.finished = true;
+    } else {
+      this.options.start = { type: "seqNum", seqNum: record.seqNum + 1n };
+      if (this.options.stop?.count !== undefined) {
+        this.options.stop.count -= 1n;
+      }
+      this.finished = readExhausted(this.options);
+    }
     return record;
+  }
+
+  protected recordCaughtUp(caughtUp: CaughtUpPosition): void {
+    this.options.lastCaughtUp = caughtUp;
+    this.options.start = { type: "seqNum", seqNum: caughtUp.nextSeqNum };
+    this.notify(this.options.onCaughtUp, caughtUp);
+  }
+
+  protected recordStreamMetadata(stream: StreamMetadata): void {
+    try {
+      validateReadStreamMetadata(this.options, stream);
+    } catch (error) {
+      this.close();
+      throw error;
+    }
+    this.options.streamMetadata = stream;
+    this.notify(this.options.onStreamMetadata, stream);
   }
 
   protected notify<T>(observer: ((value: T) => void) | undefined, value: T): void {
@@ -325,21 +325,11 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
           nextSeqNum: frame.nextSeqNum,
           lastTimestampMs: frame.lastTimestampMs,
         };
-        this.options.lastCaughtUp = caughtUp;
-        this.options.start = { type: "seqNum", seqNum: caughtUp.nextSeqNum };
-        this.notify(this.options.onCaughtUp, caughtUp);
+        this.recordCaughtUp(caughtUp);
         continue;
       }
       if (frame.type === "streamMetadata") {
-        const stream = streamMetadataFromWire(frame.stream);
-        try {
-          validateReadStreamMetadata(this.options, stream);
-        } catch (error) {
-          this.close();
-          throw error;
-        }
-        this.options.streamMetadata = stream;
-        this.notify(this.options.onStreamMetadata, stream);
+        this.recordStreamMetadata(streamMetadataFromWire(frame.stream));
         continue;
       }
       throw unexpectedFrame(frame);
@@ -350,68 +340,6 @@ export class DefaultTsfReadSession extends BaseTsfReadSession {
   }
 }
 
-function readSelector(value: bigint, name: string): bigint {
-  const parsed = u64(value, name);
-  if (parsed > MAX_SAFE_INTEGER_U64) {
-    throw new TsfClientError(
-      "invalid_read_parameter",
-      `${name} cannot exceed ${MAX_SAFE_INTEGER_U64}`,
-    );
-  }
-  return parsed;
-}
-
-function readWaitSeconds(value: number): number {
-  if (!Number.isInteger(value) || value < 0 || value > MAX_READ_WAIT_SECONDS) {
-    throw new TsfClientError(
-      "invalid_read_parameter",
-      `waitSeconds must be an integer from 0 through ${MAX_READ_WAIT_SECONDS}`,
-    );
-  }
-  return value;
-}
-
-function normalizeReadStop(stop: ReadStop | undefined): NormalizedReadStop | undefined {
-  if (stop === undefined) {
-    return undefined;
-  }
-  const count = stop.count === undefined ? undefined : u64(stop.count, "stop.count");
-  const untilTimestampMs = stop.untilTimestampMs === undefined
-    ? undefined
-    : readSelector(stop.untilTimestampMs, "stop.untilTimestampMs");
-  const waitSeconds = stop.waitSeconds === undefined
-    ? undefined
-    : readWaitSeconds(stop.waitSeconds);
-  return count === undefined &&
-      untilTimestampMs === undefined &&
-      waitSeconds === undefined
-    ? undefined
-    : {
-        ...(count === undefined ? {} : { count }),
-        ...(untilTimestampMs === undefined ? {} : { untilTimestampMs }),
-        ...(waitSeconds === undefined ? {} : { waitSeconds }),
-      };
-}
-
-function normalizeReadStart(start: ReadStart): ReadStart {
-  switch (start.type) {
-    case "seqNum":
-      return { type: "seqNum", seqNum: readSelector(start.seqNum, "start.seqNum") };
-    case "timestampMs":
-      return {
-        type: "timestampMs",
-        timestampMs: readSelector(start.timestampMs, "start.timestampMs"),
-      };
-    case "tailOffset":
-      return {
-        type: "tailOffset",
-        tailOffset: readSelector(start.tailOffset, "start.tailOffset"),
-      };
-    default:
-      throw new TsfClientError("invalid_read_parameter", "start has an unknown selector type");
-  }
-}
-
 export function readExhausted(options: NormalizedReadOptions): boolean {
   return (
     options.stop?.count === 0n ||
@@ -419,16 +347,6 @@ export function readExhausted(options: NormalizedReadOptions): boolean {
       options.stop?.untilTimestampMs !== undefined &&
       options.start.timestampMs >= options.stop.untilTimestampMs)
   );
-}
-
-export function readRequestForConnection(
-  options: NormalizedReadOptions,
-): ReadRequest {
-  return {
-    start: options.start,
-    ...(options.stop === undefined ? {} : { stop: options.stop }),
-    ...(options.rate === undefined ? {} : { rate: options.rate }),
-  };
 }
 
 export function validateReadStreamMetadata(
@@ -450,20 +368,6 @@ export function validateReadStreamMetadata(
       "stream kind changed while reconnecting the reader",
     );
   }
-}
-
-function advanceReadOptions(
-  options: NormalizedReadOptions,
-  seqNum: bigint,
-): boolean {
-  if (seqNum === MAX_U64) {
-    return true;
-  }
-  options.start = { type: "seqNum", seqNum: seqNum + 1n };
-  if (options.stop?.count !== undefined) {
-    options.stop.count -= 1n;
-  }
-  return readExhausted(options);
 }
 
 export function validateReadBatchForRequest(

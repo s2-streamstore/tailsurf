@@ -40,10 +40,14 @@ export class LogicalRecordAssembler {
   public readonly maxReassemblyBytes: number;
 
   public constructor(options: LogicalRecordAssemblerOptions = {}) {
-    this.maxReassemblyBytes = recordLimit(
-      options.maxReassemblyBytes ?? DEFAULT_MAX_RECORD_REASSEMBLY_BYTES,
-      "reassembly bytes",
-    );
+    const maximum = options.maxReassemblyBytes ?? DEFAULT_MAX_RECORD_REASSEMBLY_BYTES;
+    if (!Number.isSafeInteger(maximum) || maximum < 0) {
+      throw new ProtocolError(
+        "invalid_record_limit",
+        "reassembly bytes limit must be a non-negative safe integer",
+      );
+    }
+    this.maxReassemblyBytes = maximum;
   }
 
   public pushRecord(record: ReadRecord): LogicalRecord | undefined {
@@ -155,16 +159,6 @@ export class LogicalRecordAssembler {
     this.#totalPendingParts -= pending.partCount;
     return pending;
   }
-}
-
-function recordLimit(value: number, name: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new ProtocolError(
-      "invalid_record_limit",
-      `${name} limit must be a non-negative safe integer`,
-    );
-  }
-  return value;
 }
 
 function concatenate(chunks: readonly Uint8Array[], length: number): Uint8Array {

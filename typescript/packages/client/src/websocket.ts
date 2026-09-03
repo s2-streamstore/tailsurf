@@ -11,8 +11,6 @@ import { TsfClientError } from "./errors.js";
 import {
   DefaultTsfReadSession,
   normalizeReadOptions,
-  openReadFrame,
-  readRequestForConnection,
   validateReadStreamMetadata,
   type NormalizedReadOptions,
   type ReadOptions,
@@ -23,13 +21,13 @@ import {
   connectInitialSocket,
   connectSocket,
   dataPlaneUrl,
+  type DataPlaneRoute,
   expectReady,
   expectReadHandshake,
   type FrameSocket,
   requireLinkSecret,
   type SocketPolicy,
   u64,
-  withTimeout,
   type WebSocketFactory,
   type WebSocketLike,
 } from "./socket.js";
@@ -38,7 +36,7 @@ import {
   type TsfWriter,
 } from "./writer.js";
 import { streamMetadataFromWire } from "./models.js";
-import { integerOption, MAX_TIMER_DELAY_MS } from "./retry.js";
+import { integerOption, MAX_TIMER_DELAY_MS, withTimeout } from "./retry.js";
 
 export interface TsfClientOptions extends HttpClientOptions {
   readonly webSocketFactory?: WebSocketFactory;
@@ -59,9 +57,6 @@ interface NormalizedWriteOptions {
   expectedNextSeqNum?: bigint;
   streamKind?: StreamKind;
 }
-
-type ReadOperation = "read" | "terminal/input/read" | "terminal/output/read";
-type WriteOperation = "write" | "terminal/input/write" | "terminal/output/write";
 
 export class TsfClient extends BaseTsfClient {
   readonly #socketPolicy: SocketPolicy;
@@ -86,37 +81,37 @@ export class TsfClient extends BaseTsfClient {
     };
   }
 
-  public async connectReader(
+  public connectReader(
     options: ReadOptions,
   ): Promise<TsfReadSession> {
-    return this.#connectReader(options, "read");
+    return this.#connectReader(options, "records");
   }
 
   /** Reads the browser-visible output of a terminal session. */
-  public async connectTerminalOutputReader(
+  public connectTerminalOutputReader(
     options: ReadOptions,
   ): Promise<TsfReadSession> {
-    return this.#connectReader(options, "terminal/output/read");
+    return this.#connectReader(options, "terminal/output");
   }
 
   /** Reads controller input for a terminal host. Requires an owner link. */
-  public async connectTerminalInputReader(
+  public connectTerminalInputReader(
     options: ReadOptions,
   ): Promise<TsfReadSession> {
-    return this.#connectReader(options, "terminal/input/read");
+    return this.#connectReader(options, "terminal/input");
   }
 
   async #connectReader(
     options: ReadOptions,
-    operation: ReadOperation,
+    route: DataPlaneRoute,
   ): Promise<TsfReadSession> {
     const normalized = normalizeReadOptions(options);
     const connect = (signal: AbortSignal) =>
-      this.#connectReadSocket(normalized, operation, signal);
+      this.#connectReadSocket(normalized, route, signal);
     return new DefaultTsfReadSession(
       normalized,
       await connectInitialSocket(
-        () => this.#connectReadSocket(normalized, operation, options.signal),
+        () => this.#connectReadSocket(normalized, route, options.signal),
         this.#socketPolicy,
         options.signal,
       ),
@@ -125,29 +120,29 @@ export class TsfClient extends BaseTsfClient {
     );
   }
 
-  public async connectWriter(
+  public connectWriter(
     options: DurableWriterOptions,
   ): Promise<TsfWriter> {
-    return this.#connectWriter(options, "write");
+    return this.#connectWriter(options, "records");
   }
 
   /** Sends input and resize events from a terminal controller. */
-  public async connectTerminalInputWriter(
+  public connectTerminalInputWriter(
     options: DurableWriterOptions,
   ): Promise<TsfWriter> {
-    return this.#connectWriter(options, "terminal/input/write");
+    return this.#connectWriter(options, "terminal/input");
   }
 
   /** Publishes PTY output from a terminal host. Requires an owner link. */
-  public async connectTerminalOutputWriter(
+  public connectTerminalOutputWriter(
     options: DurableWriterOptions,
   ): Promise<TsfWriter> {
-    return this.#connectWriter(options, "terminal/output/write");
+    return this.#connectWriter(options, "terminal/output");
   }
 
   async #connectWriter(
     options: DurableWriterOptions,
-    operation: WriteOperation,
+    route: DataPlaneRoute,
   ): Promise<TsfWriter> {
     const normalized: NormalizedWriteOptions = {
       streamId: parseStreamId(options.streamId),
@@ -162,7 +157,7 @@ export class TsfClient extends BaseTsfClient {
           ),
         }),
     };
-    const connect = () => this.#connectAppendSocket(normalized, operation);
+    const connect = () => this.#connectAppendSocket(normalized, route);
     const socket = await connectInitialSocket(connect, this.#socketPolicy);
     const streamKind = normalized.streamKind;
     if (streamKind === undefined) {
@@ -179,17 +174,20 @@ export class TsfClient extends BaseTsfClient {
 
   async #connectReadSocket(
     options: NormalizedReadOptions,
-    operation: ReadOperation,
+    route: DataPlaneRoute,
     signal?: AbortSignal,
   ): Promise<FrameSocket> {
-    const url = new URL(dataPlaneUrl(this.apiOrigin, options.streamId, operation));
-    const request = readRequestForConnection(options);
-    url.search = encodeReadQuery(request).toString();
+    const url = new URL(dataPlaneUrl(this.apiOrigin, options.streamId, route, "read"));
+    url.search = encodeReadQuery({
+      start: options.start,
+      stop: options.stop,
+      rate: options.rate,
+    }).toString();
     const socket = await connectSocket(
       url.href,
       this.#socketPolicy,
       signal,
-      openReadFrame(options.linkSecret),
+      { type: "openRead", linkSecret: options.linkSecret },
     );
     try {
       const metadata = await withTimeout(
@@ -212,10 +210,10 @@ export class TsfClient extends BaseTsfClient {
 
   async #connectAppendSocket(
     options: NormalizedWriteOptions,
-    operation: WriteOperation,
+    route: DataPlaneRoute,
   ): Promise<FrameSocket> {
     const socket = await connectSocket(
-      dataPlaneUrl(this.apiOrigin, options.streamId, operation),
+      dataPlaneUrl(this.apiOrigin, options.streamId, route, "write"),
       this.#socketPolicy,
       undefined,
       {

@@ -18,7 +18,7 @@ Publishing uses crates.io trusted publishing. Both crates trust the `s2-streamst
 
 ## Protocol and service upgrades
 
-Public protocol changes start in this repository. Update the Rust and TypeScript implementations and both fixture copies in one pull request.
+Public protocol changes start in this repository. Update the canonical files in `rust/fixtures` and both implementations in one pull request.
 
 Additive response fields can ship in the service first when every released client ignores them. Compatible request changes, frame changes, and stricter validation require client releases before the service uses them.
 

@@ -14,50 +14,36 @@ use tailsurf::protocol::rest::{
 fn rest_v1_fixtures_decode_forward_compatibly() {
     let fixtures: Value =
         serde_json::from_str(include_str!("../fixtures/rest-v1.json")).expect("REST fixture JSON");
-    assert_eq!(
-        fixture_usize(&fixtures, "max_stateless_append_records"),
-        MAX_STATELESS_APPEND_RECORDS
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_stateless_append_payload_bytes"),
-        MAX_STATELESS_APPEND_PAYLOAD_BYTES
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_stateless_append_json_bytes"),
-        MAX_STATELESS_APPEND_JSON_BYTES
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_rest_response_bytes"),
-        MAX_REST_RESPONSE_BYTES
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_rest_error_response_bytes"),
-        MAX_REST_ERROR_RESPONSE_BYTES
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_link_page_items"),
-        MAX_LINK_PAGE_ITEMS
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_initial_stream_links"),
-        MAX_INITIAL_STREAM_LINKS
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_sse_read_batch_records"),
-        MAX_SSE_READ_BATCH_RECORDS
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_sse_read_batch_payload_bytes"),
-        MAX_SSE_READ_BATCH_PAYLOAD_BYTES
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_sse_event_bytes"),
-        MAX_SSE_EVENT_BYTES
-    );
-    assert_eq!(
-        fixture_usize(&fixtures, "max_sse_unterminated_event_bytes"),
-        MAX_SSE_UNTERMINATED_EVENT_BYTES
-    );
+    for (name, expected) in [
+        ("max_stateless_append_records", MAX_STATELESS_APPEND_RECORDS),
+        (
+            "max_stateless_append_payload_bytes",
+            MAX_STATELESS_APPEND_PAYLOAD_BYTES,
+        ),
+        (
+            "max_stateless_append_json_bytes",
+            MAX_STATELESS_APPEND_JSON_BYTES,
+        ),
+        ("max_rest_response_bytes", MAX_REST_RESPONSE_BYTES),
+        (
+            "max_rest_error_response_bytes",
+            MAX_REST_ERROR_RESPONSE_BYTES,
+        ),
+        ("max_link_page_items", MAX_LINK_PAGE_ITEMS),
+        ("max_initial_stream_links", MAX_INITIAL_STREAM_LINKS),
+        ("max_sse_read_batch_records", MAX_SSE_READ_BATCH_RECORDS),
+        (
+            "max_sse_read_batch_payload_bytes",
+            MAX_SSE_READ_BATCH_PAYLOAD_BYTES,
+        ),
+        ("max_sse_event_bytes", MAX_SSE_EVENT_BYTES),
+        (
+            "max_sse_unterminated_event_bytes",
+            MAX_SSE_UNTERMINATED_EVENT_BYTES,
+        ),
+    ] {
+        assert_eq!(fixture_usize(&fixtures, name), expected, "{name}");
+    }
     let create: CreateStreamRequest = fixture(&fixtures, "create_request");
     assert_eq!(create.links.len(), 2);
     let stream: StreamMetadata = fixture(&fixtures, "stream_resource");

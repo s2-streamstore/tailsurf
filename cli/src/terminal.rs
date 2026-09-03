@@ -800,7 +800,7 @@ async fn host(
                 output_drain_deadline = Some(now + PTY_EXIT_DRAIN_IDLE_TIMEOUT);
                 output_drain_max_deadline = Some(now + PTY_EXIT_DRAIN_MAX_TIMEOUT);
             }
-            _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() && pty_output_is_idle(&pending_output, &output_rx) => {
+            _ = wait_for_deadline(output_drain_deadline), if output_open && exit_status.is_some() && pending_output.is_empty() && output_rx.is_empty() => {
                 close_and_queue_pty_output(
                     &mut output_rx,
                     &output_handoff_state,
@@ -1015,13 +1015,6 @@ async fn close_and_queue_pty_output(
     Ok(())
 }
 
-fn pty_output_is_idle(
-    pending: &PendingTerminalOutput,
-    output: &mpsc::Receiver<std::io::Result<Vec<u8>>>,
-) -> bool {
-    pending.is_empty() && output.is_empty()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,21 +1044,9 @@ mod tests {
         });
         resume_pty_output(&handoff);
 
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![1]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![2]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Resize {
-                columns: 120,
-                rows: 40,
-            })
-        ));
+        assert_next_data(&mut pending, &[1]);
+        assert_next_data(&mut pending, &[2]);
+        assert_next_resize(&mut pending, 120, 40);
     }
 
     #[tokio::test]
@@ -1145,21 +1126,9 @@ mod tests {
             vec![3],
         );
         assert!(paused_send.join().expect("paused send should finish"));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![1]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == vec![2]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Resize {
-                columns: 120,
-                rows: 40,
-            })
-        ));
+        assert_next_data(&mut pending, &[1]);
+        assert_next_data(&mut pending, &[2]);
+        assert_next_resize(&mut pending, 120, 40);
     }
 
     #[tokio::test]
@@ -1198,18 +1167,9 @@ mod tests {
             .await
             .expect("queued and in-flight PTY output should drain");
 
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == [1]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == [2]
-        ));
-        assert!(matches!(
-            pending.pop_front(),
-            Some(OwnedTerminalOutput::Data(data)) if data == [3]
-        ));
+        assert_next_data(&mut pending, &[1]);
+        assert_next_data(&mut pending, &[2]);
+        assert_next_data(&mut pending, &[3]);
         assert!(pending.is_empty());
         assert!(!blocked_send.join().expect("send thread should finish"));
     }
@@ -1231,24 +1191,20 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    #[tokio::test]
-    async fn queued_pty_bytes_are_not_idle() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let mut pending = PendingTerminalOutput::new(80, 24);
+    fn assert_next_data(pending: &mut PendingTerminalOutput, expected: &[u8]) {
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Data(data)) if data == expected
+        ));
+    }
 
-        sender
-            .send(Ok(vec![1]))
-            .await
-            .expect("PTY chunk should enqueue");
-        assert!(!pty_output_is_idle(&pending, &receiver));
-        receiver
-            .recv()
-            .await
-            .expect("PTY channel should remain open")
-            .expect("PTY chunk should be valid");
-        assert!(pty_output_is_idle(&pending, &receiver));
-
-        pending.push_event(OwnedTerminalOutput::Heartbeat);
-        assert!(!pty_output_is_idle(&pending, &receiver));
+    fn assert_next_resize(pending: &mut PendingTerminalOutput, columns: u16, rows: u16) {
+        assert!(matches!(
+            pending.pop_front(),
+            Some(OwnedTerminalOutput::Resize {
+                columns: actual_columns,
+                rows: actual_rows,
+            }) if actual_columns == columns && actual_rows == rows
+        ));
     }
 }

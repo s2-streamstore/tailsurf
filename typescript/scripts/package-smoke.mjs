@@ -61,12 +61,10 @@ try {
     readManifest(installedClient),
     readManifest(installedAlias),
   ]);
-  assert.equal(protocolManifest.private, undefined);
-  assert.equal(clientManifest.private, undefined);
-  assert.equal(aliasManifest.private, undefined);
-  assert.equal(protocolManifest.engines?.node, ">=22");
-  assert.equal(clientManifest.engines?.node, ">=22");
-  assert.equal(aliasManifest.engines?.node, ">=22");
+  for (const manifest of [protocolManifest, clientManifest, aliasManifest]) {
+    assert.equal(manifest.private, undefined);
+    assert.equal(manifest.engines?.node, ">=22");
+  }
   assert.equal(
     clientManifest.dependencies?.["@tailsurf/protocol"],
     `^${protocolManifest.version}`,
@@ -75,29 +73,37 @@ try {
     aliasManifest.dependencies?.["@tailsurf/client"],
     `^${clientManifest.version}`,
   );
+  for (const packageDirectory of [
+    installedProtocol,
+    installedClient,
+    installedAlias,
+  ]) {
+    await Promise.all(
+      ["LICENSE", "README.md"].map((name) =>
+        access(join(packageDirectory, name))
+      ),
+    );
+    await assert.rejects(access(join(packageDirectory, "src")));
+  }
   await Promise.all([
-    access(join(installedProtocol, "LICENSE")),
-    access(join(installedProtocol, "README.md")),
-    access(join(installedProtocol, "fixtures", "v1.json")),
-    access(join(installedClient, "LICENSE")),
-    access(join(installedClient, "README.md")),
-    access(join(installedAlias, "LICENSE")),
-    access(join(installedAlias, "README.md")),
+    access(join(installedProtocol, "dist", "fixtures", "rest-v1.json")),
+    access(join(installedProtocol, "dist", "fixtures", "v1.json")),
   ]);
-  await assert.rejects(access(join(installedProtocol, "src")));
-  await assert.rejects(access(join(installedClient, "src")));
-  await assert.rejects(access(join(installedAlias, "src")));
-  await assert.rejects(access(join(installedProtocol, "dist", ".tsbuildinfo")));
-  await assert.rejects(access(join(installedProtocol, "dist", "link-label.js")));
-  await assert.rejects(access(join(installedClient, "dist", ".tsbuildinfo")));
-  assert.equal(
-    (await readdir(join(installedProtocol, "dist"))).some((name) => name.endsWith(".map")),
-    false,
-  );
-  assert.equal(
-    (await readdir(join(installedClient, "dist"))).some((name) => name.endsWith(".map")),
-    false,
-  );
+  for (const path of [
+    join(installedProtocol, "dist", ".tsbuildinfo"),
+    join(installedProtocol, "dist", "link-label.js"),
+    join(installedClient, "dist", ".tsbuildinfo"),
+  ]) {
+    await assert.rejects(access(path));
+  }
+  for (const packageDirectory of [installedProtocol, installedClient]) {
+    assert.equal(
+      (await readdir(join(packageDirectory, "dist"))).some((name) =>
+        name.endsWith(".map")
+      ),
+      false,
+    );
+  }
 
   await writeFile(join(consumer, "node-smoke.mjs"), `
 import assert from "node:assert/strict";
@@ -137,39 +143,35 @@ async function collect(): Promise<readonly ReadRecord[]> {
 void factory;
 void collect;
 `);
-  await writeFile(join(consumer, "tsconfig.browser.json"), `${JSON.stringify({
-    compilerOptions: {
+  for (const [environment, compilerOptions] of Object.entries({
+    browser: {
       lib: ["ES2024", "DOM", "DOM.Iterable"],
       module: "ESNext",
       moduleResolution: "Bundler",
-      noEmit: true,
-      strict: true,
-      target: "ES2022",
     },
-    files: ["type-smoke.ts"],
-  }, null, 2)}\n`);
-  await run(process.execPath, [
-    typescriptCompiler,
-    "--project",
-    "tsconfig.browser.json",
-  ], consumer);
-  await writeFile(join(consumer, "tsconfig.node.json"), `${JSON.stringify({
-    compilerOptions: {
+    node: {
       lib: ["ES2024"],
       module: "NodeNext",
       moduleResolution: "NodeNext",
-      noEmit: true,
-      strict: true,
-      target: "ES2022",
       types: ["node"],
     },
-    files: ["type-smoke.ts"],
-  }, null, 2)}\n`);
-  await run(process.execPath, [
-    typescriptCompiler,
-    "--project",
-    "tsconfig.node.json",
-  ], consumer);
+  })) {
+    const config = `tsconfig.${environment}.json`;
+    await writeFile(join(consumer, config), `${JSON.stringify({
+      compilerOptions: {
+        ...compilerOptions,
+        noEmit: true,
+        strict: true,
+        target: "ES2022",
+      },
+      files: ["type-smoke.ts"],
+    }, null, 2)}\n`);
+    await run(
+      process.execPath,
+      [typescriptCompiler, "--project", config],
+      consumer,
+    );
+  }
 
   const bundle = await build({
     bundle: true,

@@ -8,6 +8,7 @@ import {
 } from "./ids.js";
 import {
   MAX_SAFE_INTEGER_U64,
+  MAX_PART_INDEX,
   MAX_U64,
 } from "./primitives.js";
 import {
@@ -52,7 +53,6 @@ export const MAX_ENCODED_FRAME_BYTES =
   MAX_READ_FRAME_RECORDS * (RECORD_LENGTH_BYTES + READ_RECORD_HEADER_BYTES) +
   MAX_FRAME_PAYLOAD_BYTES;
 export const PART_FINAL_BIT = 0x8000_0000;
-export const MAX_PART_INDEX = 0x7fff_ffff;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -63,17 +63,8 @@ const ClientOp = {
   AppendBatch: 0x03,
 } as const;
 
-const OpenReadFlag = {
-  LinkSecret: 0x01,
-} as const;
-
-const OpenWriteFlag = {
-  ExpectedNextSeqNum: 0x01,
-} as const;
-
-const OPEN_WRITE_FLAGS = OpenWriteFlag.ExpectedNextSeqNum;
-
-const OPEN_READ_FLAGS = OpenReadFlag.LinkSecret;
+const OPEN_READ_LINK_SECRET = 0x01;
+const OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM = 0x01;
 
 const ServerOp = {
   Ready: 0x80,
@@ -100,7 +91,7 @@ export interface AppendRecord {
 export type ClientFrame =
   | {
       readonly type: "openRead";
-      readonly linkSecret?: string;
+      readonly linkSecret?: string | undefined;
     }
   | {
       readonly type: "openWrite";
@@ -185,7 +176,7 @@ export function encodeClientFrame(frame: ClientFrame): Uint8Array {
       );
       const view = new DataView(output.buffer);
       output[0] = ClientOp.OpenWrite;
-      output[1] = expected === undefined ? 0 : OpenWriteFlag.ExpectedNextSeqNum;
+      output[1] = expected === undefined ? 0 : OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM;
       output.set(clientWriterId, 2);
       let offset = 2 + WRITER_ID_BYTE_LENGTH;
       if (expected !== undefined) {
@@ -240,13 +231,13 @@ export function decodeClientFrame(input: Uint8Array | ArrayBuffer): ClientFrame 
     case ClientOp.OpenWrite: {
       requireLength(bytes, 2 + WRITER_ID_BYTE_LENGTH);
       const flags = requireByte(bytes, 1);
-      if ((flags & ~OPEN_WRITE_FLAGS) !== 0) {
+      if ((flags & ~OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM) !== 0) {
         throw new ProtocolError(
           "unknown_open_write_flags",
-          `OpenWrite has unknown flags 0x${(flags & ~OPEN_WRITE_FLAGS).toString(16).padStart(2, "0")}`,
+          `OpenWrite has unknown flags 0x${(flags & ~OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM).toString(16).padStart(2, "0")}`,
         );
       }
-      const hasExpected = (flags & OpenWriteFlag.ExpectedNextSeqNum) !== 0;
+      const hasExpected = (flags & OPEN_WRITE_EXPECTED_NEXT_SEQ_NUM) !== 0;
       const expectedOffset = 2 + WRITER_ID_BYTE_LENGTH;
       const secretOffset = expectedOffset + (hasExpected ? 8 : 0);
       requireExactLength(
@@ -305,7 +296,7 @@ function encodeOpenRead(
   const secret = frame.linkSecret === undefined
     ? undefined
     : textEncoder.encode(parseLinkSecret(frame.linkSecret));
-  const flags = secret === undefined ? 0 : OpenReadFlag.LinkSecret;
+  const flags = secret === undefined ? 0 : OPEN_READ_LINK_SECRET;
   const output = new Uint8Array(
     2 + (secret === undefined ? 0 : LINK_SECRET_ENCODED_LENGTH),
   );
@@ -323,14 +314,14 @@ function decodeOpenRead(bytes: Uint8Array): Extract<
 > {
   requireLength(bytes, 2);
   const flags = requireByte(bytes, 1);
-  if ((flags & ~OPEN_READ_FLAGS) !== 0) {
+  if ((flags & ~OPEN_READ_LINK_SECRET) !== 0) {
     throw new ProtocolError(
       "unknown_open_read_flags",
-      `OpenRead has unknown flags 0x${(flags & ~OPEN_READ_FLAGS).toString(16).padStart(2, "0")}`,
+      `OpenRead has unknown flags 0x${(flags & ~OPEN_READ_LINK_SECRET).toString(16).padStart(2, "0")}`,
     );
   }
   let linkSecret: string | undefined;
-  if ((flags & OpenReadFlag.LinkSecret) !== 0) {
+  if ((flags & OPEN_READ_LINK_SECRET) !== 0) {
     requireExactLength(
       bytes,
       2 + LINK_SECRET_ENCODED_LENGTH,
