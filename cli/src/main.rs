@@ -1578,11 +1578,7 @@ async fn create_link(origin: Url, args: CreateLinkArgs) -> eyre::Result<()> {
         .client
         .create_link(
             &owner.locator.stream_id,
-            &CreateLinkInput {
-                link_id,
-                permissions,
-                expires_at,
-            },
+            &CreateLinkInput::new(link_id, permissions, expires_at),
             &owner.link_secret,
         )
         .await
