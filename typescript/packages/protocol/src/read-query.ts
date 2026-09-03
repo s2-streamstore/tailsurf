@@ -1,5 +1,9 @@
 import { ProtocolError } from "./errors.js";
-import { MAX_SAFE_INTEGER_U64, MAX_U64, U64_PATTERN } from "./primitives.js";
+import {
+  MAX_SAFE_INTEGER_U64,
+  MAX_U64,
+  tryParseDecimalU64,
+} from "./primitives.js";
 
 export const DEFAULT_READ_TAIL_OFFSET = 0n;
 export const MIN_PLAYBACK_RATE = 0.1;
@@ -179,10 +183,10 @@ function requiredU64(
   maximum = MAX_U64,
 ): bigint {
   const value = parameters.get(name);
-  if (value === null || !U64_PATTERN.test(value)) {
+  const parsed = value === null ? undefined : tryParseDecimalU64(value);
+  if (parsed === undefined) {
     throw invalidParameter(name, "must be a canonical decimal u64");
   }
-  const parsed = BigInt(value);
   if (parsed > maximum) {
     throw invalidParameter(name, `must not exceed ${maximum}`);
   }

@@ -9,8 +9,7 @@ import {
   encodeBase64url,
   MAX_PART_INDEX,
   MAX_SAFE_INTEGER_U64,
-  MAX_U64,
-  U64_PATTERN,
+  tryParseDecimalU64,
 } from "./primitives.js";
 import { parseLinkSecret } from "./stream-url.js";
 import { parseStreamTitle } from "./stream-title.js";
@@ -67,14 +66,13 @@ export const jsonU64Schema = z.number().check(
 );
 export const streamTimestampSchema = z.iso.datetime({ offset: true });
 export const decimalU64Schema = z.string().check(
-  z.regex(U64_PATTERN),
   z.refine(
-    (value) => BigInt(value) <= MAX_U64,
+    (value) => tryParseDecimalU64(value) !== undefined,
     "value must fit in an unsigned 64-bit integer",
   ),
 );
 export const decimalSafeU64Schema = decimalU64Schema.check(z.refine(
-  (value) => BigInt(value) <= MAX_SAFE_INTEGER_U64,
+  (value) => tryParseDecimalU64(value, MAX_SAFE_INTEGER_U64) !== undefined,
   `value must not exceed ${MAX_SAFE_INTEGER_U64}`,
 ));
 export const clientWriterIdBase64urlSchema = z.string().check(

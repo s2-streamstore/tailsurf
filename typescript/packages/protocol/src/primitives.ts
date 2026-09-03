@@ -17,12 +17,15 @@ export function decodeBase64url(value: string): Uint8Array {
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
 }
 
-export function tryParseDecimalU64(value: string): bigint | undefined {
+export function tryParseDecimalU64(
+  value: string,
+  maximum = MAX_U64,
+): bigint | undefined {
   if (!U64_PATTERN.test(value)) {
     return undefined;
   }
   const parsed = BigInt(value);
-  return parsed > MAX_U64 ? undefined : parsed;
+  return parsed > maximum ? undefined : parsed;
 }
 
 export function canonicalBase64url(value: string, expectedBytes?: number): boolean {
