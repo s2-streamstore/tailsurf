@@ -234,6 +234,10 @@ async function openConnection(
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason);
   signal?.addEventListener("abort", abort, { once: true });
+  const close = () => {
+    signal?.removeEventListener("abort", abort);
+    controller.abort();
+  };
   const timeoutMs = connectionOptions.httpRequestTimeoutMs;
   const timeoutError = new TsfClientError(
     "http_timeout",
@@ -241,14 +245,56 @@ async function openConnection(
   );
   try {
     return await withTimeout(
-      openConnectionResponse(
-        request,
-        connectionOptions,
-        controller,
-        signal,
-        abort,
-        lastEventId,
-      ),
+      (async () => {
+        const headers = new Headers({ accept: "text/event-stream" });
+        if (request.linkSecret !== undefined) {
+          headers.set("authorization", `Bearer ${request.linkSecret}`);
+        }
+        if (lastEventId !== undefined) {
+          headers.set("last-event-id", lastEventId);
+        }
+        let response: Response;
+        try {
+          response = await connectionOptions.fetch(
+            request.url,
+            { headers, signal: controller.signal },
+          );
+        } catch (cause) {
+          throw new TsfClientError("http_transport", "SSE read request failed", {
+            cause,
+          });
+        }
+        if (response.status === 204) {
+          close();
+          return undefined;
+        }
+        if (!response.ok) {
+          throw await httpStatusError(response, "SSE read");
+        }
+        if (response.body === null) {
+          throw new TsfClientError("invalid_api_response", "SSE response has no body");
+        }
+        const events = parseSse(response.body, controller);
+        const first = await events.next();
+        if (first.done || first.value.event !== "stream_metadata") {
+          throw new TsfClientError(
+            "invalid_api_response",
+            "SSE response must begin with stream_metadata",
+          );
+        }
+        const stream = streamMetadataFromWire(
+          parseJsonEvent(first.value, streamMetadataSchema),
+        );
+        const resumeId = first.value.id === undefined
+          ? undefined
+          : resumeCursor(first.value).value;
+        return {
+          events,
+          stream,
+          ...(resumeId === undefined ? {} : { resumeEventId: resumeId }),
+          close,
+        };
+      })(),
       timeoutMs,
       "SSE handshake",
       undefined,
@@ -258,71 +304,9 @@ async function openConnection(
       },
     );
   } catch (error) {
-    signal?.removeEventListener("abort", abort);
-    controller.abort();
+    close();
     throw error;
   }
-}
-
-async function openConnectionResponse(
-  request: SseRequest,
-  connectionOptions: SseConnectOptions,
-  controller: AbortController,
-  signal: AbortSignal | undefined,
-  abort: () => void,
-  lastEventId: string | undefined,
-): Promise<SseConnection | undefined> {
-  const headers = new Headers({ accept: "text/event-stream" });
-  if (request.linkSecret !== undefined) {
-    headers.set("authorization", `Bearer ${request.linkSecret}`);
-  }
-  if (lastEventId !== undefined) {
-    headers.set("last-event-id", lastEventId);
-  }
-  let response: Response;
-  try {
-    response = await connectionOptions.fetch(
-      request.url,
-      { headers, signal: controller.signal },
-    );
-  } catch (cause) {
-    signal?.removeEventListener("abort", abort);
-    throw new TsfClientError("http_transport", "SSE read request failed", { cause });
-  }
-  if (response.status === 204) {
-    signal?.removeEventListener("abort", abort);
-    controller.abort();
-    return undefined;
-  }
-  if (!response.ok) {
-    throw await httpStatusError(response, "SSE read");
-  }
-  if (response.body === null) {
-    controller.abort();
-    throw new TsfClientError("invalid_api_response", "SSE response has no body");
-  }
-  const events = parseSse(response.body, controller);
-  const first = await events.next();
-  if (first.done || first.value.event !== "stream_metadata") {
-    controller.abort();
-    throw new TsfClientError(
-      "invalid_api_response",
-      "SSE response must begin with stream_metadata",
-    );
-  }
-  const stream = streamMetadataFromWire(parseJsonEvent(first.value, streamMetadataSchema));
-  const resumeId = first.value.id === undefined
-    ? undefined
-    : resumeCursor(first.value).value;
-  return {
-    events,
-    stream,
-    ...(resumeId === undefined ? {} : { resumeEventId: resumeId }),
-    close: () => {
-      signal?.removeEventListener("abort", abort);
-      controller.abort();
-    },
-  };
 }
 
 async function openConnectionWithRetry(
