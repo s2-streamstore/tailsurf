@@ -177,12 +177,6 @@ function buildLink(
   anchor?: StreamAnchor,
 ): URL {
   const url = normalizedStreamUrl(baseUrl, prefix, streamId);
-  if (prefix === "t" && anchor !== undefined) {
-    throw new ProtocolError(
-      "terminal_anchor_not_allowed",
-      "terminal URLs do not accept record anchors",
-    );
-  }
   const fragment = new URLSearchParams([
     [parseLinkPermissions(permissions), parseLinkSecret(secret)],
   ]);
