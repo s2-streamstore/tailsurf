@@ -36,6 +36,7 @@ import {
   type LinkPermissions,
   type Visibility,
   type StreamKind,
+  type StreamTitle,
 } from "@tailsurf/protocol";
 
 import {
@@ -105,10 +106,13 @@ export interface CreateStreamInput {
 
 export interface PreparedCreateStreamRequest {
   readonly kind: StreamKind;
-  readonly title?: string | undefined;
+  readonly title?: StreamTitle | undefined;
   readonly visibility: Visibility;
   readonly expiresInSeconds?: number | undefined;
-  readonly links: readonly InitialStreamLinkOptions[];
+  readonly links: readonly {
+    readonly linkId: LinkId;
+    readonly permissions: LinkPermissions;
+  }[];
 }
 
 /** Authorization for metadata reads. Public streams may omit the link secret. */
@@ -791,11 +795,11 @@ function createStreamRequestToWire(
 ): WireCreateStreamRequest {
   return {
     ...(request.kind === "transcript" ? {} : { kind: request.kind }),
-    title: request.title === undefined ? undefined : parseStreamTitle(request.title),
+    title: request.title,
     visibility: request.visibility,
     expires_in_seconds: request.expiresInSeconds,
     links: request.links.map((link) => ({
-      link_id: parseLinkId(link.linkId),
+      link_id: link.linkId,
       permissions: link.permissions,
     })),
   };
