@@ -1852,71 +1852,7 @@ fn print_created_stream(
     show_owner_link: bool,
 ) -> eyre::Result<()> {
     let web_origin = &created.web_origin;
-    if !json {
-        let resource = match created.kind {
-            StreamKind::Transcript => "transcript stream",
-            StreamKind::Bytes => "byte stream",
-            StreamKind::Terminal => "terminal",
-        };
-        println!(
-            "Created {} {resource} {}",
-            created.visibility, created.stream_id
-        );
-        println!(
-            "Title: {}",
-            created
-                .title
-                .as_ref()
-                .map_or_else(|| format!("Untitled {resource}"), ToString::to_string)
-        );
-        println!("Expires: {}", created.expires_at);
-        let mut links = created
-            .links
-            .iter()
-            .filter(|credential| show_owner_link || !credential.permissions.allows_owner())
-            .map(|credential| {
-                Ok((
-                    credential.link_id.as_str(),
-                    credential.permissions,
-                    resource_link(
-                        web_origin,
-                        &created.stream_id,
-                        created.kind,
-                        credential.permissions,
-                        &credential.secret,
-                    )?,
-                    if credential.permissions.allows_owner() {
-                        "  (keep private)"
-                    } else {
-                        ""
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?;
-        if matches!(created.visibility, Visibility::Public) {
-            links.push((
-                "Public",
-                LinkPermissions::read(),
-                public_resource_url(web_origin, &created.stream_id, created.kind)?,
-                "  (public)",
-            ));
-        }
-        if !links.is_empty() {
-            println!();
-            links.sort_by_key(|(_, permissions, _, _)| permission_rank(*permissions));
-            let width = links
-                .iter()
-                .map(|(label, _, _, _)| label.len())
-                .max()
-                .unwrap_or(0);
-            for (label, permissions, url, suffix) in &links {
-                let permission = permission_label(*permissions);
-                println!("  {label:<width$}  {permission:<10}  {url}{suffix}");
-            }
-            println!();
-            println!("Links are shown once.");
-        }
-    } else {
+    if json {
         let output = CreatedStreamOutput {
             stream_id: created.stream_id.to_string(),
             kind: created.kind.as_str(),
@@ -1951,7 +1887,71 @@ fn print_created_stream(
                 Visibility::Private => None,
             },
         };
-        print_json(&output)?;
+        return print_json(&output);
+    }
+
+    let resource = match created.kind {
+        StreamKind::Transcript => "transcript stream",
+        StreamKind::Bytes => "byte stream",
+        StreamKind::Terminal => "terminal",
+    };
+    println!(
+        "Created {} {resource} {}",
+        created.visibility, created.stream_id
+    );
+    println!(
+        "Title: {}",
+        created
+            .title
+            .as_ref()
+            .map_or_else(|| format!("Untitled {resource}"), ToString::to_string)
+    );
+    println!("Expires: {}", created.expires_at);
+    let mut links = created
+        .links
+        .iter()
+        .filter(|credential| show_owner_link || !credential.permissions.allows_owner())
+        .map(|credential| {
+            Ok((
+                credential.link_id.as_str(),
+                credential.permissions,
+                resource_link(
+                    web_origin,
+                    &created.stream_id,
+                    created.kind,
+                    credential.permissions,
+                    &credential.secret,
+                )?,
+                if credential.permissions.allows_owner() {
+                    "  (keep private)"
+                } else {
+                    ""
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, tailsurf::stream_url::StreamLinkError>>()?;
+    if matches!(created.visibility, Visibility::Public) {
+        links.push((
+            "Public",
+            LinkPermissions::read(),
+            public_resource_url(web_origin, &created.stream_id, created.kind)?,
+            "  (public)",
+        ));
+    }
+    if !links.is_empty() {
+        println!();
+        links.sort_by_key(|(_, permissions, _, _)| permission_rank(*permissions));
+        let width = links
+            .iter()
+            .map(|(label, _, _, _)| label.len())
+            .max()
+            .unwrap_or(0);
+        for (label, permissions, url, suffix) in &links {
+            let permission = permission_label(*permissions);
+            println!("  {label:<width$}  {permission:<10}  {url}{suffix}");
+        }
+        println!();
+        println!("Links are shown once.");
     }
     Ok(())
 }
