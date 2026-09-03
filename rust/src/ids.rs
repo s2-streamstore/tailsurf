@@ -174,14 +174,16 @@ where
 pub(crate) const BASE64URL_32_ENCODED_LEN: usize = 43;
 /// Length of the canonical unpadded base64url encoding of a 24-byte value.
 pub(crate) const BASE64URL_24_ENCODED_LEN: usize = 32;
+const BASE64URL_32_BYTE_LEN: usize = 32;
+const BASE64URL_24_BYTE_LEN: usize = 24;
 
 /// Encodes a 256-bit value as canonical unpadded base64url.
-pub(crate) fn encode_base64url_32(bytes: &[u8; 32]) -> String {
+pub(crate) fn encode_base64url_32(bytes: &[u8; BASE64URL_32_BYTE_LEN]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 pub(crate) fn random_base64url_32() -> String {
-    let mut bytes = [0_u8; 32];
+    let mut bytes = [0_u8; BASE64URL_32_BYTE_LEN];
     fill_random(&mut bytes);
     encode_base64url_32(&bytes)
 }
@@ -191,7 +193,7 @@ pub(crate) fn is_canonical_base64url_32(value: &str) -> bool {
     if value.len() != BASE64URL_32_ENCODED_LEN {
         return false;
     }
-    let mut decoded = [0_u8; 32];
+    let mut decoded = [0_u8; BASE64URL_32_BYTE_LEN];
     URL_SAFE_NO_PAD.decode_slice(value, &mut decoded).is_ok()
 }
 
@@ -200,7 +202,7 @@ fn is_canonical_base64url_24(value: &str) -> bool {
     if value.len() != BASE64URL_24_ENCODED_LEN {
         return false;
     }
-    let mut decoded = [0_u8; 24];
+    let mut decoded = [0_u8; BASE64URL_24_BYTE_LEN];
     URL_SAFE_NO_PAD.decode_slice(value, &mut decoded).is_ok()
 }
 
