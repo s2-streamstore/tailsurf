@@ -854,9 +854,6 @@ fn decode_client_frame(input: Bytes) -> Result<ClientFrame, FrameCodecError> {
                     validate_expected_next_seq_num(value)?;
                     (Some(value), decoder.rest())
                 };
-            if secret_bytes.len() != LinkSecret::ENCODED_LEN {
-                return Err(FrameCodecError::InvalidLinkSecret);
-            }
             let link_secret = parse_link_secret(utf8_tail(secret_bytes)?)?;
             Ok(ClientFrame::OpenWrite {
                 client_writer_id: ClientWriterId::from_bytes(client_writer_id),
