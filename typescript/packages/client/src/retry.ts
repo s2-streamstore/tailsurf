@@ -95,22 +95,15 @@ export async function withTimeout<T>(
   }
 }
 
-function jitteredBackoffMs(backoffMs: number): number {
-  if (backoffMs === 0) {
-    return 0;
-  }
-  return Math.min(
-    MAX_RETRY_BACKOFF_MS,
-    Math.floor(backoffMs * (0.5 + Math.random())),
-  );
-}
-
 export function retryWaitMs(
   backoffMs: number,
   retryAfterMs?: number,
 ): number {
   return retryAfterMs === undefined
-    ? jitteredBackoffMs(backoffMs)
+    ? Math.min(
+      MAX_RETRY_BACKOFF_MS,
+      Math.floor(backoffMs * (0.5 + Math.random())),
+    )
     : Math.min(retryAfterMs, MAX_RETRY_BACKOFF_MS);
 }
 
