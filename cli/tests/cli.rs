@@ -1485,7 +1485,6 @@ async fn fake_write_flow(state: Arc<FakeWriteState>, mut socket: WebSocket) {
 struct SseAttempt {
     query: Option<String>,
     last_event_id: Option<String>,
-    authorization: Option<String>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1542,11 +1541,6 @@ async fn fake_sse_read(
             last_event_id: request
                 .headers()
                 .get("last-event-id")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned),
-            authorization: request
-                .headers()
-                .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned),
         });
