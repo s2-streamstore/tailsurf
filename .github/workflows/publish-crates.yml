@@ -47,7 +47,7 @@ jobs:
                 exit 1
                 ;;
             esac
-          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select((.publish == null) or (.publish | index("crates-io"))) | [.name, .version] | @tsv')
+          done < <(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select((.publish == null) or (.publish | index("crates-io"))) | [.name, .version] | @tsv')
           echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
 
   release:

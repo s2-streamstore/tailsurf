@@ -12,6 +12,18 @@ PR titles must follow [Conventional Commits](https://www.conventionalcommits.org
 
 Rust SDK and CLI versions are managed by release-plz. Do not bump versions or edit `CHANGELOG.md` by hand.
 
+Use nightly Cargo for dependency changes so that the repository publication cooldown applies:
+
+```sh
+cargo +nightly add <crate>
+cargo +nightly update
+cargo +nightly update -p <crate>
+cargo +nightly remove <crate>
+cargo +nightly generate-lockfile
+```
+
+Do not use stable Cargo for dependency changes or edit dependency declarations and `Cargo.lock` directly.
+
 A change to a published TypeScript package needs a changeset. Run `pnpm changeset` in `typescript/` and commit the result. See [RELEASING.md](typescript/RELEASING.md).
 
 The Rust and TypeScript protocol fixture copies must remain byte-identical. Change both together.
@@ -24,9 +36,9 @@ Formatting uses nightly rustfmt. Run the Rust workspace checks from the reposito
 
 ```sh
 cargo +nightly fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+cargo test --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 scripts/verify-packages.sh
 ```
 
