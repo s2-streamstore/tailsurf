@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.14.9](https://github.com/s2-streamstore/tailsurf/compare/v0.14.8...v0.14.9) - 2026-10-22
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.14.8](https://github.com/s2-streamstore/tailsurf/compare/v0.14.7...v0.14.8) - 2026-09-03
 
 ### Other
