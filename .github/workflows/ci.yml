@@ -13,7 +13,7 @@ jobs:
     name: Rust dependency cooldown gate
     permissions:
       contents: read
-    uses: s2-streamstore/s2/.github/workflows/rust-dependency-cooldown.yml@main
+    uses: s2-streamstore/s2/.github/workflows/rust-dependency-cooldown.yml@01e603663424d023cbc53908fcaff1775aebad13 # main
 
   rust:
     name: Rust SDK and CLI (stable)
