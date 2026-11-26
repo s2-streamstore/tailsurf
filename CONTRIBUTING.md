@@ -22,7 +22,7 @@ cargo +nightly remove <crate>
 cargo +nightly generate-lockfile
 ```
 
-Do not use stable Cargo for dependency changes or edit dependency declarations and `Cargo.lock` directly.
+Do not use stable Cargo for dependency changes. Avoid editing dependency declarations or `Cargo.lock` directly; if you need to, ask for explicit permission first and flag the risk.
 
 A change to a published TypeScript package needs a changeset. Run `pnpm changeset` in `typescript/` and commit the result. See [RELEASING.md](typescript/RELEASING.md).
 
