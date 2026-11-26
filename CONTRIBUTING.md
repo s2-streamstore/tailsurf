@@ -12,17 +12,17 @@ PR titles must follow [Conventional Commits](https://www.conventionalcommits.org
 
 Rust SDK and CLI versions are managed by release-plz. Do not bump versions or edit `CHANGELOG.md` by hand.
 
-Use nightly Cargo for dependency changes so that the repository publication cooldown applies:
+Use Cargo dependency commands so that the repository publication cooldown applies:
 
 ```sh
-cargo +nightly add <crate>
-cargo +nightly update
-cargo +nightly update -p <crate>
-cargo +nightly remove <crate>
-cargo +nightly generate-lockfile
+cargo add <crate>
+cargo update
+cargo update -p <crate>
+cargo remove <crate>
+cargo generate-lockfile
 ```
 
-Do not use stable Cargo for dependency changes. Avoid editing dependency declarations or `Cargo.lock` directly; if you need to, ask for explicit permission first and flag the risk.
+Avoid editing dependency declarations or `Cargo.lock` directly; if you need to, ask for explicit permission first and flag the risk.
 
 A change to a published TypeScript package needs a changeset. Run `pnpm changeset` in `typescript/` and commit the result. See [RELEASING.md](typescript/RELEASING.md).
 
